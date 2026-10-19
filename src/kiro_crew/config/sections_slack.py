@@ -20,8 +20,9 @@ class SlackConfig:
         default_factory=list,
         metadata=_meta(
             "Allowed Users",
-            "Ignored for access: Slack is owner-only, so only the owner can interact. "
-            "A name here is only a display-name fallback. Each entry: {slack_id, name}.",
+            "Slack user IDs authorized to drive the agent, in addition to the owner. "
+            "Each entry: {slack_id, name}. The owner (KIROCREW_OWNER_ID) is always "
+            "authorized regardless of this list.",
         ),
     )
     tracking_channels: list[dict] = field(

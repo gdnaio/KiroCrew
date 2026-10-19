@@ -243,14 +243,21 @@ def add_trusted_session(
 
 
 def is_allowed_user(user_id: str) -> bool:
-    """Check if user_id is the owner.
+    """Check if user_id is the owner or on the configured allowlist.
 
-    Multi-user access is disabled for security — only the owner
-    (KIROCREW_OWNER_ID) is authorized to interact via Slack.
+    Option A (gdna-fde fork): multi-user Slack access is honored again.
+    The owner (KIROCREW_OWNER_ID) is always authorized; in addition, any
+    Slack user id present in ``slack.allowed_users`` (populated into
+    ``_allowed_users`` at gateway init) is authorized. This restores the
+    upstream allowlist behavior that was previously hard-locked to
+    owner-only. NOTE: broadens who can drive the agent via Slack — anything
+    touching production/AWS/git must still require owner sign-off downstream.
     """
     if not user_id:
         return False
-    return is_owner(user_id)
+    if is_owner(user_id):
+        return True
+    return user_id in _allowed_users
 
 
 def set_tracking_channels(channel_ids: set[str]) -> None:
