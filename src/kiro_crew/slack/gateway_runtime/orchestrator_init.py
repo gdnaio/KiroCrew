@@ -83,18 +83,27 @@ def __init__(
     self._app_token = creds.get(CRED_SLACK_APP_TOKEN, "")
     self._bot_token = creds.get(CRED_SLACK_BOT_TOKEN, "")
     self._owner_id = creds.get(CRED_OWNER_ID, "")
-    # Multi-user access is disabled — only owner is authorized.
-    # Prune stale allowed_users entries from config and warn.
-    stale = {u["slack_id"] for u in cfg.slack.allowed_users} - (
-        {self._owner_id} if self._owner_id else set()
-    )
-    if stale:
-        logger.warning(
-            "Pruning %d stale allowlist entries (multi-user disabled): %s",
-            len(stale),
-            stale,
-        )
+    # Option A (gdna-fde fork): honor the configured allowlist again.
+    # The owner is always authorized; any slack_id listed in
+    # slack.allowed_users is added alongside it. Entries missing a
+    # slack_id are skipped (and warned) rather than silently pruned.
     self._allowed_users = {self._owner_id} if self._owner_id else set()
+    bad = 0
+    for u in cfg.slack.allowed_users:
+        sid = u.get("slack_id", "") if isinstance(u, dict) else ""
+        if sid:
+            self._allowed_users.add(sid)
+        else:
+            bad += 1
+    if bad:
+        logger.warning(
+            "Skipping %d slack.allowed_users entries with no slack_id", bad
+        )
+    if len(self._allowed_users) > 1:
+        logger.info(
+            "Slack multi-user access enabled: %d authorized user(s)",
+            len(self._allowed_users),
+        )
     self._tracking_channels = {
         c["channel_id"] for c in cfg.slack.tracking_channels if c.get("channel_id")
     }

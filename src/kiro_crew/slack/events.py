@@ -1109,10 +1109,10 @@ async def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
         orch.slack = None
         return
 
-    # Invariant: _allowed_users contains only the owner (multi-user disabled)
+    # _allowed_users is owner + any configured slack.allowed_users (Option A).
     assert orch._owner_id, "owner_id must be set"
 
-    # Share owner-only allowlist and tracking channels with handler modules
+    # Share the allowlist and tracking channels with handler modules
     set_allowed_users(orch._allowed_users)
     set_tracking_channels(orch._tracking_channels)
     set_open_channels(orch._open_channels)

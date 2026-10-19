@@ -2408,11 +2408,15 @@ class TestPureHelpers:
         monkeypatch.setattr(h, "_owner_id", "")
         assert h.is_owner("U1") is False
 
-    def test_is_allowed_user_requires_owner(self, monkeypatch):
+    def test_is_allowed_user_owner_or_allowlisted(self, monkeypatch):
+        # Option A: owner is always allowed; configured allowlist users are
+        # allowed too; everyone else is denied.
         monkeypatch.setattr(h, "_owner_id", "U1")
+        monkeypatch.setattr(h, "_allowed_users", {"U1", "U2"})
         assert h.is_allowed_user("") is False
-        assert h.is_allowed_user("U1") is True
-        assert h.is_allowed_user("U2") is False
+        assert h.is_allowed_user("U1") is True  # owner
+        assert h.is_allowed_user("U2") is True  # on the allowlist
+        assert h.is_allowed_user("U3") is False  # neither
 
     def test_open_channels_are_disabled(self):
         h.set_open_channels({"C1"})
