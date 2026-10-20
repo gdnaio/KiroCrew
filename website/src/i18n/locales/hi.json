@@ -6435,6 +6435,7 @@
       "killing": "बंद किया जा रहा है…",
       "killing_session": "सत्र बंद किया जा रहा है",
       "let_the_agent_read_one_of_your_files": "एजेंट को अपनी कोई फ़ाइल पढ़ने दें",
+      "list_indent_hint": "सूची वाली पंक्ति में Tab इंडेंट करता है और Shift+Tab इंडेंट हटाता है। संदेश इनपुट से बाहर जाने के लिए Esc दबाओ, फिर Tab दबाओ।",
       "message_input": "संदेश इनपुट",
       "message_placeholder": "{{bot}} को मैसेज करो… (/command · @file · $skill)",
       "message_placeholder_crewmate": "{{bot}} को मैसेज करो…",
@@ -15746,7 +15747,10 @@
       "secrets_revoke_all_confirm": "सब निरस्त करें?",
       "retried_n_times_one": "{{count}} बार पुनः प्रयास किया गया",
       "retried_n_times_other": "{{count}} बार पुनः प्रयास किया गया",
-      "jobs_table": "शेड्यूल किए गए जॉब"
+      "jobs_table": "शेड्यूल किए गए जॉब",
+      "type_crewmate": "क्रूमेट",
+      "filter_by_crewmate": "क्रूमेट के अनुसार फ़िल्टर",
+      "all_crewmates": "सभी क्रूमेट"
     },
     "servicesTab": {
       "channels": "चैट प्लेटफ़ॉर्म",
@@ -16388,6 +16392,7 @@
         "expand_the_side_panel_to_the_git_tab_each_time_yo": "जब भी आप किसी git प्रोजेक्ट में चैट शुरू करते हैं, साइड पैनल को Git टैब पर खोलता है। बंद होने पर भी Git टैब बनता है।",
         "expanded_icon_name_stats": "विस्तृत (आइकन + नाम + आँकड़े)",
         "failed_to_load_config": "कॉन्फ़िग लोड नहीं हो सका।",
+        "failed_to_load_config_kiro_signed_out": "Kiro CLI साइन इन नहीं है या इसका लॉगिन समाप्त हो गया है। टर्मिनल में 'kiro-cli login' चलाओ, फिर \"Retry\" पर क्लिक करो।",
         "failed_to_load_dashboard_config": "डैशबोर्ड कॉन्फ़िग लोड नहीं हो सका।",
         "failed_to_save_auto_compact_threshold": "ऑटो-कॉम्पैक्ट थ्रेशोल्ड सहेजने में विफल",
         "failed_to_save_completion_keep_characters": "कम्प्लीशन-कीप कैरेक्टर सहेजने में विफल",
@@ -17958,6 +17963,7 @@
         "auto_connect": "crew स्वतः कनेक्ट करें",
         "auto_connect_desc": "चालू होने पर, वेब ऐप खोलने पर हर crew अपने आप कनेक्ट हो जाता है और टैब पर लौटने पर फिर से कनेक्ट हो जाता है। बंद करने पर crew से तभी कनेक्ट होता है जब उस पर स्विच किया जाए।",
         "awaiting_sign_in": "तुम्हारी पुष्टि का इंतज़ार है",
+        "aws_cli_refused": "तुम्हारे AWS क्रेडेंशियल नहीं जाँचे गए। {{diagnosis}}",
         "before_you_start": "Before you start — your AWS setup",
         "billing": "This runs in your AWS account and is billed to you — one EC2 instance, its disk, and a small S3 bucket used during setup. Charges depend on your region, size, and any discounts.",
         "cancel": "Cancel",

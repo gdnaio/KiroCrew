@@ -6325,6 +6325,7 @@
       "killing": "終了中…",
       "killing_session": "セッション終了中",
       "let_the_agent_read_one_of_your_files": "エージェントにファイルを読み込ませる",
+      "list_indent_hint": "リストの行では、Tab でインデント、Shift+Tab でインデント解除します。メッセージ入力から出るには、Esc を押してから Tab を押します。",
       "message_input": "メッセージ入力",
       "message_placeholder": "{{bot}} にメッセージ… (/command · @file · $skill)",
       "message_placeholder_crewmate": "{{bot}} にメッセージ…",
@@ -15489,7 +15490,10 @@
       "secrets_revoke_all": "すべてのシークレットを取り消す",
       "secrets_revoke_all_confirm": "すべて取り消しますか？",
       "retried_n_times_other": "{{count}}回再試行しました",
-      "jobs_table": "スケジュール済みのジョブ"
+      "jobs_table": "スケジュール済みのジョブ",
+      "type_crewmate": "クルーメイト",
+      "filter_by_crewmate": "クルーメイトで絞り込み",
+      "all_crewmates": "すべてのクルーメイト"
     },
     "servicesTab": {
       "channels": "チャットプラットフォーム",
@@ -16122,6 +16126,7 @@
         "expand_the_side_panel_to_the_git_tab_each_time_yo": "git プロジェクトでチャットを開始するたびに、サイドパネルを Git タブで開きます。オフでも Git タブは作成されます。",
         "expanded_icon_name_stats": "展開（アイコン + 名前 + 統計）",
         "failed_to_load_config": "設定の読み込みに失敗しました。",
+        "failed_to_load_config_kiro_signed_out": "Kiro CLI にサインインしていないか、ログインの有効期限が切れているよ。ターミナルで 'kiro-cli login' を実行してから、「再試行」をクリックしてね。",
         "failed_to_load_dashboard_config": "ダッシュボード設定の読み込みに失敗しました。",
         "failed_to_save_auto_compact_threshold": "自動圧縮のしきい値を保存できませんでした",
         "failed_to_save_completion_keep_characters": "完了保持文字数を保存できませんでした",
@@ -17692,6 +17697,7 @@
         "auto_connect": "crew を自動接続",
         "auto_connect_desc": "オンにすると、ウェブアプリを開いたときにすべての crew へ自動的に接続し、タブに戻ったときに再接続します。オフにすると、crew に切り替えたときだけ接続します。",
         "awaiting_sign_in": "あなたの承認を待っています",
+        "aws_cli_refused": "AWS の認証情報は確認されていません。{{diagnosis}}",
         "before_you_start": "Before you start — your AWS setup",
         "billing": "This runs in your AWS account and is billed to you — one EC2 instance, its disk, and a small S3 bucket used during setup. Charges depend on your region, size, and any discounts.",
         "cancel": "Cancel",

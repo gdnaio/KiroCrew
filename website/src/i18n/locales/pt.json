@@ -6545,6 +6545,7 @@
       "killing": "Encerrando à força…",
       "killing_session": "Encerrando a sessão à força",
       "let_the_agent_read_one_of_your_files": "Permite que o agente leia um dos seus arquivos",
+      "list_indent_hint": "Em uma linha de lista, Tab aumenta o recuo e Shift+Tab o reduz. Pressione Esc e depois Tab para sair da entrada de mensagem.",
       "message_input": "Entrada de mensagem",
       "message_placeholder": "Enviar mensagem para {{bot}}… (/command · @file · $skill)",
       "message_placeholder_crewmate": "Enviar mensagem para {{bot}}…",
@@ -16003,7 +16004,10 @@
       "retried_n_times_many": "{{count}} novas tentativas",
       "retried_n_times_one": "{{count}} nova tentativa",
       "retried_n_times_other": "{{count}} novas tentativas",
-      "jobs_table": "Tarefas agendadas"
+      "jobs_table": "Tarefas agendadas",
+      "type_crewmate": "Colega",
+      "filter_by_crewmate": "Filtrar por colega",
+      "all_crewmates": "Todos os colegas"
     },
     "servicesTab": {
       "channels": "Plataformas de chat",
@@ -16654,6 +16658,7 @@
         "expand_the_side_panel_to_the_git_tab_each_time_yo": "Abre o painel lateral na aba Git sempre que você inicia um chat em um projeto git. A aba Git é criada de qualquer forma.",
         "expanded_icon_name_stats": "Expandido (ícone + nome + estatísticas)",
         "failed_to_load_config": "Falha ao carregar a configuração.",
+        "failed_to_load_config_kiro_signed_out": "O Kiro CLI não está conectado ou a sua sessão expirou. Execute 'kiro-cli login' no terminal e clique em \"Tentar novamente\".",
         "failed_to_load_dashboard_config": "Falha ao carregar a configuração do dashboard.",
         "failed_to_save_auto_compact_threshold": "Falha ao salvar o limite de compactação automática",
         "failed_to_save_completion_keep_characters": "Falha ao salvar os caracteres do evento de conclusão",
@@ -18224,6 +18229,7 @@
         "auto_connect": "Conectar crews automaticamente",
         "auto_connect_desc": "Quando ativado, abrir o app web conecta cada crew automaticamente e os reconecta quando você volta para a aba. Desative para conectar um crew somente ao alternar para ele.",
         "awaiting_sign_in": "Aguardando sua aprovação",
+        "aws_cli_refused": "Suas credenciais da AWS não foram verificadas. {{diagnosis}}",
         "before_you_start": "Before you start — your AWS setup",
         "billing": "This runs in your AWS account and is billed to you — one EC2 instance, its disk, and a small S3 bucket used during setup. Charges depend on your region, size, and any discounts.",
         "cancel": "Cancel",

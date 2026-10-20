@@ -1458,10 +1458,15 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "MCP probe results",
-        "dashboard/handlers/mcp.py",
+        "dashboard/handlers/mcp_probe.py",
         "Cached MCP probe results returned by the dashboard HTTP API to the browser. "
         "Configured header values and reflected credentials in probe errors receive "
         "redaction before they cross that boundary.",
+    ),
+    (
+        "MCP apply errors",
+        "dashboard/handlers/mcp.py",
+        "Uninstall and agent-rebuild errors the apply route returns: URL, then credential.",
     ),
     (
         "MCP server metadata",
@@ -1849,6 +1854,13 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # manifest-supplied and its path or query can carry a token, so the redaction
         # keeps that out of the log ring and /api/logs. Neither module writes to a
         # human-bound or third-party output, so neither is an egress boundary.
+        #
+        # `download_to` also RETURNS its failure string with the url cut to
+        # scheme+host and the exception reduced to its type, never `{exc}`. The
+        # callers own where that string goes: Papyrus's Tectonic install puts it in
+        # its install state and PPTX Maker's engine install in its provision log,
+        # and each app's own routes hand that to the dashboard. Those two app
+        # modules call no redactor themselves, so they are not listed.
         "asset_downloader.py",
         "feature_videos_manifest.py",
         # Same transfer-side hygiene for the KAS engine installer: a fetch failure
@@ -2302,12 +2314,12 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "dashboard/session_control_parts/model_switch.py",
         "dashboard/session_control_parts/session_create.py",
         # The owners composed into dashboard/chat_runner.py: the redactor calls of the runner's
-        # helpers and _run_chat's closures moved into them (deny rows, the eager-spawn error
-        # detail, file-change snapshots, the MCP sign-in banner, the fallback hop's model id,
-        # native cards, prompt and skill mentions, the queued-turn drain, cross-surface legs, the
-        # segment flush, tool rows, the terminal directive's tool-call ids, the partial reply and
-        # stream flushes, spec-hook notices, the stats footer), unchanged. Their output reaches the
-        # surfaces it reached from the runner; the set of egress paths did not change.
+        # helpers, _run_chat's closures and its prologue phases, unchanged (deny rows, the
+        # eager-spawn error detail, file-change snapshots, the MCP sign-in banner, the fallback
+        # hop's model id, native cards, prompt and skill mentions, the queued-turn drain, the
+        # admission logs, the stream redactors, cross-surface legs, the segment flush, tool rows,
+        # the terminal directive's tool-call ids, the partial reply and stream flushes, spec-hook
+        # notices, the stats footer). Their output reaches the surfaces it reached from the runner.
         "dashboard/chat_turn/deny_chokepoints.py",
         "dashboard/chat_turn/eager_spawn.py",
         "dashboard/chat_turn/file_changes.py",
@@ -2319,6 +2331,8 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "dashboard/chat_turn/recipient.py",
         "dashboard/chat_turn/segment_flush.py",
         "dashboard/chat_turn/tool_rows.py",
+        "dashboard/chat_turn/turn_admission.py",
+        "dashboard/chat_turn/turn_entry.py",
         "dashboard/chat_turn/turn_ledgers.py",
         "dashboard/chat_turn/turn_reply_seams.py",
         "dashboard/chat_turn/turn_spec_hooks.py",
@@ -2687,17 +2701,6 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "cloud/connect.py",
         "cloud/login.py",
         "embeddings_download.py",
-        # NOTE: papyrus's tectonic.py is deliberately NOT here — see the sinks
-        # list below. Its redacted URL does reach the dashboard, so filing it as
-        # non-egress was wrong and would have let the drift guard miss a future
-        # change that started returning `{exc}` verbatim.
-        # Same shape again: pptx-maker's digest-pinned engine download redacts the
-        # DOWNLOAD URL (userinfo + signed query) before logging it, so a
-        # mirrored/presigned KIROCREW_PPTX_ENGINE_URL override cannot leak
-        # credentials into a log. Nothing here reaches a user-facing surface — the
-        # app's own egress path (model-authored deck names and brief previews)
-        # redacts separately in pptx_maker/backend/decks.py.
-        "apps/builtins/pptx_maker/backend/engine_source.py",
         # Uses the redactor as a PREDICATE, not a transform: `resolve_deck_dir`
         # compares `redact(deck_id) != deck_id` to decide whether to refuse the deck
         # outright. A deck id cannot be scrubbed on the way out — it is the directory
@@ -2844,13 +2847,6 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "apps/builtins/meetings/backend/routes/meeting_lifecycle.py",
         "apps/builtins/meetings/backend/routes/tasks.py",
         "apps/builtins/papyrus/backend/routes.py",
-        # A real egress boundary, not a log-only redaction: `_download_to` returns
-        # `f"download failed (...) from {redact_url(url)}"`, which lands in the
-        # persisted job state, rides `GET /health`, and is rendered verbatim in the
-        # dashboard's install banner. The redaction itself is host-only (so a
-        # credentialed mirror override cannot leak), but it must be REGISTERED here
-        # or the drift guard cannot notice a change that starts returning `{exc}`.
-        "apps/builtins/papyrus/backend/tectonic.py",
         "apps/builtins/pptx_maker/backend/decks.py",
         "apps/builtins/pptx_maker/backend/routes.py",
         # A behavior-preserving decomposition of the Spec Builder app backend.
@@ -2859,6 +2855,9 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "apps/builtins/spec_builder/backend/handlers.py",
         "apps/builtins/spec_builder/backend/parsers.py",
         "apps/builtins/spec_builder/backend/repository.py",
+        "apps/builtins/spec_builder/backend/repository_discovery.py",
+        "apps/builtins/spec_builder/backend/repository_git.py",
+        "apps/builtins/spec_builder/backend/repository_sentinel.py",
         "apps/builtins/spec_builder/backend/runtime.py",
         "apps/builtins/workflows/server.py",
         # Bundled dev-skill scripts: print CI/review findings to a developer

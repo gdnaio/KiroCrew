@@ -6325,6 +6325,7 @@
       "killing": "正在终止…",
       "killing_session": "正在终止会话",
       "let_the_agent_read_one_of_your_files": "让代理读取你的某个文件",
+      "list_indent_hint": "在列表行中，Tab 增加缩进，Shift+Tab 减少缩进。要离开消息输入框，先按 Esc，再按 Tab。",
       "message_input": "消息输入",
       "message_placeholder": "给 {{bot}} 发消息… (/command · @file · $skill)",
       "message_placeholder_crewmate": "给 {{bot}} 发消息…",
@@ -15489,7 +15490,10 @@
       "secrets_revoke_all": "撤销全部密钥",
       "secrets_revoke_all_confirm": "撤销全部？",
       "retried_n_times_other": "已重试 {{count}} 次",
-      "jobs_table": "计划任务"
+      "jobs_table": "计划任务",
+      "type_crewmate": "队友",
+      "filter_by_crewmate": "按队友筛选",
+      "all_crewmates": "所有队友"
     },
     "servicesTab": {
       "channels": "聊天平台",
@@ -16122,6 +16126,7 @@
         "expand_the_side_panel_to_the_git_tab_each_time_yo": "每次在 git 项目里新建聊天时，把右侧边栏展开到 Git 标签页。关闭后 Git 标签页依然会创建，只是不会自动展开。",
         "expanded_icon_name_stats": "展开（图标 + 名称 + 统计）",
         "failed_to_load_config": "加载配置失败。",
+        "failed_to_load_config_kiro_signed_out": "Kiro CLI 未登录或登录已过期。请在终端中运行 'kiro-cli login'，然后点击“重试”。",
         "failed_to_load_dashboard_config": "加载仪表板配置失败。",
         "failed_to_save_auto_compact_threshold": "保存自动压缩阈值失败",
         "failed_to_save_completion_keep_characters": "保存完成事件保留字符数失败",
@@ -17692,6 +17697,7 @@
         "auto_connect": "自动连接 crew",
         "auto_connect_desc": "开启后，打开网页应用时会自动连接所有 crew，并在你切回该标签页时重新连接。关闭后，仅在切换到某个 crew 时才连接它。",
         "awaiting_sign_in": "等待你确认",
+        "aws_cli_refused": "未检查你的 AWS 凭证。{{diagnosis}}",
         "before_you_start": "Before you start — your AWS setup",
         "billing": "This runs in your AWS account and is billed to you — one EC2 instance, its disk, and a small S3 bucket used during setup. Charges depend on your region, size, and any discounts.",
         "cancel": "Cancel",

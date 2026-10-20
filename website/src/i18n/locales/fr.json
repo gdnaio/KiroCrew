@@ -6545,6 +6545,7 @@
       "killing": "Arrêt forcé…",
       "killing_session": "Arrêt forcé de la session",
       "let_the_agent_read_one_of_your_files": "Autoriser l'agent à lire l'un de vos fichiers",
+      "list_indent_hint": "Sur une ligne de liste, Tab ajoute un retrait et Maj+Tab le retire. Appuie sur Échap puis sur Tab pour quitter la saisie du message.",
       "message_input": "Saisie du message",
       "message_placeholder": "Envoyer un message à {{bot}}… (/command · @file · $skill)",
       "message_placeholder_crewmate": "Envoyer un message à {{bot}}…",
@@ -16003,7 +16004,10 @@
       "retried_n_times_many": "{{count}} nouvelles tentatives",
       "retried_n_times_one": "{{count}} nouvelle tentative",
       "retried_n_times_other": "{{count}} nouvelles tentatives",
-      "jobs_table": "Tâches planifiées"
+      "jobs_table": "Tâches planifiées",
+      "type_crewmate": "Coéquipier",
+      "filter_by_crewmate": "Filtrer par coéquipier",
+      "all_crewmates": "Tous les coéquipiers"
     },
     "servicesTab": {
       "channels": "Plateformes de chat",
@@ -16654,6 +16658,7 @@
         "expand_the_side_panel_to_the_git_tab_each_time_yo": "Ouvre le panneau latéral sur l'onglet Git chaque fois que tu démarres une discussion dans un projet git. L'onglet Git est créé dans tous les cas.",
         "expanded_icon_name_stats": "Étendu (icône + nom + statistiques)",
         "failed_to_load_config": "Échec du chargement de la configuration.",
+        "failed_to_load_config_kiro_signed_out": "Kiro CLI n'est pas connecté ou ta session a expiré. Exécute 'kiro-cli login' dans le terminal, puis clique sur « Réessayer ».",
         "failed_to_load_dashboard_config": "Échec du chargement de la configuration du tableau de bord.",
         "failed_to_save_auto_compact_threshold": "Échec de l’enregistrement du seuil de compactage automatique",
         "failed_to_save_completion_keep_characters": "Échec de l’enregistrement des caractères conservés de l’événement de fin",
@@ -18224,6 +18229,7 @@
         "auto_connect": "Connecter les crews automatiquement",
         "auto_connect_desc": "Lorsque cette option est activée, l'ouverture de l'application web connecte automatiquement chaque crew et les reconnecte lorsque vous revenez sur l'onglet. Désactivez-la pour ne connecter un crew que lorsque vous basculez dessus.",
         "awaiting_sign_in": "En attente de votre validation",
+        "aws_cli_refused": "Tes identifiants AWS n’ont pas été vérifiés. {{diagnosis}}",
         "before_you_start": "Before you start — your AWS setup",
         "billing": "This runs in your AWS account and is billed to you — one EC2 instance, its disk, and a small S3 bucket used during setup. Charges depend on your region, size, and any discounts.",
         "cancel": "Cancel",

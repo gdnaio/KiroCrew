@@ -6545,6 +6545,7 @@
       "killing": "Terminando…",
       "killing_session": "Terminando la sesión",
       "let_the_agent_read_one_of_your_files": "Permite que el agente lea uno de tus archivos",
+      "list_indent_hint": "En una línea de lista, Tab aplica sangría y Mayús+Tab la quita. Pulsa Esc y luego Tab para salir del campo de mensaje.",
       "message_input": "Campo de mensaje",
       "message_placeholder": "Enviar mensaje a {{bot}}… (/command · @file · $skill)",
       "message_placeholder_crewmate": "Enviar mensaje a {{bot}}…",
@@ -16003,7 +16004,10 @@
       "retried_n_times_many": "{{count}} reintentos",
       "retried_n_times_one": "{{count}} reintento",
       "retried_n_times_other": "{{count}} reintentos",
-      "jobs_table": "Tareas programadas"
+      "jobs_table": "Tareas programadas",
+      "type_crewmate": "Compañero",
+      "filter_by_crewmate": "Filtrar por compañero",
+      "all_crewmates": "Todos los compañeros"
     },
     "servicesTab": {
       "channels": "Plataformas de chat",
@@ -16654,6 +16658,7 @@
         "expand_the_side_panel_to_the_git_tab_each_time_yo": "Abre el panel lateral en la pestaña Git cada vez que inicias un chat en un proyecto git. La pestaña Git se crea de todos modos.",
         "expanded_icon_name_stats": "Expandido (icono + nombre + estadísticas)",
         "failed_to_load_config": "No se pudo cargar la configuración.",
+        "failed_to_load_config_kiro_signed_out": "Kiro CLI no ha iniciado sesión o tu sesión ha caducado. Ejecuta 'kiro-cli login' en la terminal y haz clic en «Reintentar».",
         "failed_to_load_dashboard_config": "No se pudo cargar la configuración del panel.",
         "failed_to_save_auto_compact_threshold": "No se pudo guardar el umbral de compactación automática",
         "failed_to_save_completion_keep_characters": "No se pudieron guardar los caracteres del evento de finalización",
@@ -18224,6 +18229,7 @@
         "auto_connect": "Conectar Crews automáticamente",
         "auto_connect_desc": "Cuando está activado, al abrir la aplicación web se conecta cada Crew automáticamente y se vuelve a conectar al regresar a la pestaña. Desactívalo para conectar un Crew solo cuando cambies a él.",
         "awaiting_sign_in": "Esperando tu aprobación",
+        "aws_cli_refused": "No se comprobaron tus credenciales de AWS. {{diagnosis}}",
         "before_you_start": "Before you start — your AWS setup",
         "billing": "This runs in your AWS account and is billed to you — one EC2 instance, its disk, and a small S3 bucket used during setup. Charges depend on your region, size, and any discounts.",
         "cancel": "Cancel",

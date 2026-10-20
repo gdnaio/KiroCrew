@@ -6655,6 +6655,7 @@
       "killing": "Завершение…",
       "killing_session": "Завершение сессии",
       "let_the_agent_read_one_of_your_files": "Разрешить агенту прочитать один из ваших файлов",
+      "list_indent_hint": "В строке списка Tab добавляет отступ, а Shift+Tab убирает его. Нажми Esc, а затем Tab, чтобы выйти из поля ввода сообщения.",
       "message_input": "Поле ввода сообщения",
       "message_placeholder": "Написать {{bot}}… (/command · @file · $skill)",
       "message_placeholder_crewmate": "Написать {{bot}}…",
@@ -16260,7 +16261,10 @@
       "retried_n_times_many": "{{count}} повторных попыток",
       "retried_n_times_one": "{{count}} повторная попытка",
       "retried_n_times_other": "{{count}} повторные попытки",
-      "jobs_table": "Запланированные задания"
+      "jobs_table": "Запланированные задания",
+      "type_crewmate": "Товарищ по команде",
+      "filter_by_crewmate": "Фильтр по товарищу по команде",
+      "all_crewmates": "Все товарищи по команде"
     },
     "servicesTab": {
       "channels": "Чат-платформы",
@@ -16920,6 +16924,7 @@
         "expand_the_side_panel_to_the_git_tab_each_time_yo": "Открывает боковую панель на вкладке Git каждый раз, когда вы начинаете чат в git-проекте. Вкладка Git создаётся в любом случае.",
         "expanded_icon_name_stats": "Развёрнуто (значок + имя + статистика)",
         "failed_to_load_config": "Не удалось загрузить конфигурацию.",
+        "failed_to_load_config_kiro_signed_out": "Kiro CLI не выполнил вход или срок действия входа истёк. Выполни 'kiro-cli login' в терминале, затем нажми «Повторить».",
         "failed_to_load_dashboard_config": "Не удалось загрузить настройки панели управления.",
         "failed_to_save_auto_compact_threshold": "Не удалось сохранить порог автосжатия",
         "failed_to_save_completion_keep_characters": "Не удалось сохранить количество символов события завершения",
@@ -18490,6 +18495,7 @@
         "auto_connect": "Автоподключение команд",
         "auto_connect_desc": "Когда включено, открытие веб-приложения автоматически подключает каждую команду и переподключает их при возврате на вкладку. Отключите, чтобы подключать команду только при переходе к ней.",
         "awaiting_sign_in": "Ждёт вашего подтверждения",
+        "aws_cli_refused": "Твои учётные данные AWS не проверены. {{diagnosis}}",
         "before_you_start": "Before you start — your AWS setup",
         "billing": "This runs in your AWS account and is billed to you — one EC2 instance, its disk, and a small S3 bucket used during setup. Charges depend on your region, size, and any discounts.",
         "cancel": "Cancel",
