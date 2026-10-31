@@ -7,7 +7,7 @@ import { useOptimisticConfigPaths, setConfigPathValue } from '../settings/useOpt
 import { useFolderSortRead, type FolderSortConfigBody } from '../../hooks/useFolderSortMode'
 import { type FolderSortMode, folderComparator, coveredByHiddenAncestor, collectFolderSubtreeIds } from '../../utils/folderTree'
 import { api } from '../../api/client'
-import { CHAT_FOLDERS_WRITE_KEY, invalidateFoldersWhenIdle } from '../../api/chatFoldersWrite'
+import { CHAT_FOLDERS_WRITE_KEY, invalidateFoldersWhenIdle, seedCreatedChatFolder } from '../../api/chatFoldersWrite'
 import { errMessage } from '../../utils/thunkError'
 import { i18nT } from '../../i18n/t'
 import { computeActiveSubtree, folderIsHidden } from '../../utils/folderVisibility'
@@ -374,18 +374,21 @@ export function useFolderMutations({ queryClient, setFolderActionError, setFolde
 }) {
   // Folder mutations
   const createFolderMutation = useMutation({
-    mutationFn: (v: { name: string; parentId?: string; projectDir?: string; defaultAgent?: string; color?: string; icon?: string; tags?: string[]; steeringDirs?: string[] }) =>
+    mutationFn: (v: { name: string; parentId?: string; projectDir?: string; defaultAgent?: string; defaultDestinationCrew?: string; color?: string; icon?: string; tags?: string[]; steeringDirs?: string[] }) =>
       api.createChatFolder(v.name.trim(), v.parentId, {
         project_dir: v.projectDir || undefined,
         default_agent: v.defaultAgent || undefined,
+        default_destination_crew: v.defaultDestinationCrew || undefined,
         color: v.color || undefined,
         icon: v.icon || undefined,
         tags: v.tags && v.tags.length > 0 ? v.tags : undefined,
         steering_dirs: v.steeringDirs && v.steeringDirs.length > 0 ? v.steeringDirs : undefined,
       }),
-    // Through the idle gate, not a direct invalidate: a refetch here would
-    // land inside a still-pending update's optimistic window.
-    onSuccess: () => invalidateFoldersWhenIdle(queryClient),
+    // The create modal reveals the new folder right after this resolves, and the
+    // reveal looks the folder up in the cache, so the server's record is seeded
+    // there before the refetch (`seedCreatedChatFolder` says why, and why only
+    // into a list that already loaded).
+    onSuccess: (created: unknown) => seedCreatedChatFolder(queryClient, created),
     onError: (e) => { setFolderActionError((errMessage(e) || i18nT('components.errorBoundary.something_went_wrong'))); setFolderOfflineNotice('') },
   })
   const deleteFolderMutation = useMutation({

@@ -22,7 +22,7 @@ from uuid import uuid4
 from kiro_crew import _facade_mirror
 from kiro_crew.embeddings import PRIORITY_NORMAL
 from kiro_crew.llm_helpers import _extract_json_of_type
-from kiro_crew.security import (
+from kiro_crew.security import (  # noqa: F401 - pinned by test_ingestion_facade.py
     is_sensitive_path,
     redact_credentials,
     redact_exfiltration_urls,
@@ -224,8 +224,8 @@ def _redact(text: str | None) -> str | None:
     """Redact LLM-derived text before storing."""
     if not text:
         return text
-    text, _ = redact_exfiltration_urls(text)
-    text, _ = redact_credentials(text)
+    from kiro_crew.security import redact
+    text = redact(text)
     return text
 
 
@@ -237,8 +237,8 @@ def _redact_for_ingest(text: str) -> str:
     credential pasted into a file never reaches the extraction worker or the index.
     Same helper the artifact path uses on its body.
     """
-    cleaned, _ = redact_credentials(text)
-    cleaned, _ = redact_exfiltration_urls(cleaned)
+    from kiro_crew.security import redact
+    cleaned = redact(text)
     return cleaned
 
 
@@ -844,8 +844,10 @@ class IngestionPipeline:
             uri = src_row["uri"] if src_row else display_name
             props = json.loads(src_row["properties"] or "{}") if src_row else {}
         else:
-            # Local file path: find or create source by URI
-            uri = str(p.resolve())
+            # Local file path: find or create source by URI. Reuse the path
+            # resolved off the loop for the sensitive-path check above: a second
+            # resolve() here would stat the disk on the event loop.
+            uri = resolved
             existing = await asyncio.to_thread(self.store.get_source_by_uri, uri)
             if existing:
                 props = json.loads(existing.get('properties', '{}')) if isinstance(existing.get('properties'), str) else existing.get('properties', {})

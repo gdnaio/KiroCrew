@@ -8,64 +8,70 @@ import asyncio
 import functools
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.config.loader import normalize_agent_model
+from kiro_crew.context import discard_memory_prefetch
+from kiro_crew.dashboard.chat_utils import (
+    _KIRO_ONLY_BLOCKED_SLASH_COMMANDS,
+    APP_AGENT_REFUSED_KIND,
+    _normalize_model,
+    slot_history_key,
+    tighten_live_slot_memory_mode,
+)
+from kiro_crew.dashboard.state import durable_row_count
+from kiro_crew.llm_helpers import _billing_stats
+from kiro_crew.members import DM_SLOT_MODE, is_dispatchable_member_name, member_lifecycle
+from kiro_crew.platform import redact_log_via_context
+from kiro_crew.quick_prompts import QUICK_PROMPTS
+
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
-        _KIRO_ONLY_BLOCKED_SLASH_COMMANDS,
-        APP_AGENT_REFUSED_KIND,
-        DM_SLOT_MODE,
+        ACP_BACKEND_KIRO,
         MAX_PROMPT_BYTES,
-        QUICK_PROMPTS,
         KiroCrewConfig,
         ResolvedBindings,
+        Routing,
         SessionBusyError,
         _AppAgentNotLoaded,
-        _billing_stats,
-        _expand_prompt_mention_off_loop,
         _MemoryUnavailable,
-        _normalize_model,
-        _prewarm_startup_query,
         capabilities_of,
         crew_log_emit,
-        durable_row_count,
         effective_session_key,
         expire_slack_options,
         invalidate_stale_kas_session,
-        is_dispatchable_member_name,
         logger,
-        member_lifecycle,
-        normalize_agent_model,
         publish_turn_identity,
         record_activity,
         record_agent_selection,
-        redact_log_via_context,
         refresh_materialized_agents,
         reproject_claimed_session,
         resolve_agent_bindings,
         resolve_session_agent_bindings,
+        routing_for,
         save_slot_off_loop,
         sel,
-        slot_history_key,
         slot_switch_session_lock,
         subprocess_executor,
         telemetry_channel_of,
-        tighten_live_slot_memory_mode,
         warm_project_agent_names,
     )
     from kiro_crew.dashboard.chat_turn.account_identity import _retire_sessions_on_identity_change
     from kiro_crew.dashboard.chat_turn.app_agent_binding import (
         _app_agent_host_allowed,
-        _app_agent_start_dirs,
-        _app_agent_turn_host_allowed,
+        _app_agent_turn_backend,
+        _provider_backend,
         _recover_app_agent_binding,
         _retire_app_agent_session,
+        _runs_app_agent_launch,
         app_agent_binding_applies,
     )
+    from kiro_crew.dashboard.chat_turn.context_cap import _cap_conductor_context
     from kiro_crew.dashboard.chat_turn.crew_log_attribution import (
         _crew_log_class,
         _crew_log_inherited_parent,
         _crew_log_lineage,
         _crew_log_model,
         _crew_log_seed_tree,
+        _crew_log_tree_depth,
         _crew_log_workspace,
         _slot_predecessor_store,
     )
@@ -79,6 +85,11 @@ if TYPE_CHECKING:
         _inherited_default_model,
         _settle_session_model,
     )
+    from kiro_crew.dashboard.chat_turn.prompt_assembly import (
+        _expand_prompt_mention_off_loop,
+        _prewarm_startup_query,
+    )
+    from kiro_crew.dashboard.chat_turn.regenerate_swap import rows_before_regenerate_target
     from kiro_crew.dashboard.chat_turn.session_reset import _consume_pending_reset
     from kiro_crew.dashboard.chat_turn.slash_commands import _refuse_blocked_slash
     from kiro_crew.dashboard.chat_turn.tool_approval import _persistable_session_policy
@@ -95,6 +106,8 @@ if TYPE_CHECKING:
     )
     from kiro_crew.dashboard.chat_turn.turn_reply_seams import _steer_segment_cut
     from kiro_crew.dashboard.chat_turn.turn_spec_hooks import (
+        _notice_seed_declined,
+        _notice_steer_upgrade,
         _prepare_spec_hooks,
         _surface_agent_welcome,
     )
@@ -134,22 +147,41 @@ def _require_current_binding(turn, *, project_may_be_staged: bool = False) -> No
         )
 
 
-def _check_owner(turn) -> str | None:
+def _check_owner(turn) -> tuple[str | None, str]:
+    """The refusal of an app-owned turn (None when it may run) and the launch copy it runs as.
+
+    The copy's name is empty unless the turn runs on kiro-cli.
+    """
     # Only kiro-cli and KAS launch the app's named spec; checked first,
     # since the name check below means nothing on another backend.
-    from kiro_crew.apps.manager import app_agent_backend_refusal, app_command_agent_refusal
+    from kiro_crew.apps.agent_launch import AppAgentLaunchError, publish_app_agent_launch
+    from kiro_crew.apps.manager import (
+        app_agent_backend_refusal,
+        app_agent_launch_refusal,
+        app_command_agent_refusal,
+    )
 
+    _owner_backend = turn._owner_backend
     _owner_host_allowed = turn._owner_host_allowed
-    _owner_project = turn._owner_project
     owner_agent = turn.owner_agent
     owner_app = turn.owner_app
-    session_key = turn.session_key
-    state = turn.state
     if not _owner_host_allowed:
-        return app_agent_backend_refusal(owner_app)
-    # Both halves touch the filesystem (the work-dir root, the specs).
-    dirs = _app_agent_start_dirs(state, session_key, _owner_project)
-    return app_command_agent_refusal(owner_app, owner_agent, *dirs)
+        return app_agent_backend_refusal(owner_app), ""
+    # Reads the user-level specs. No checkout is consulted: on both allowed
+    # backends the turn runs the app's registered file, never a checkout's
+    # same-named spec (apps.manager.app_command_agent_refusal).
+    refused = app_command_agent_refusal(owner_app, owner_agent)
+    if refused:
+        return refused, ""
+    if _owner_backend == ACP_BACKEND_KIRO:
+        try:
+            launch = publish_app_agent_launch(owner_app, owner_agent)
+        except AppAgentLaunchError as exc:
+            return app_agent_launch_refusal(owner_app, exc.detail), ""
+        # kiro-cli reads no checkout spec for the copy's name: it runs from the
+        # empty launch directory (apps.agent_launch.launch_process_cwd).
+        return None, launch
+    return None, ""
 
 
 def _release_dispatch_lock(turn) -> None:
@@ -161,6 +193,8 @@ def _release_dispatch_lock(turn) -> None:
 
 async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     """Admit the turn onto its session: the admission wait, the dispatch lock, the bindings and the session claim."""
+    from kiro_crew.dashboard import gateway_notice as gn
+
     _spec_hooks: list
     _spec_hooks_cwd: str | None
     _turn_stats0: object
@@ -191,8 +225,9 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # the slot-switch busy scan, ``_switch_target_busy``) for the whole
     # memory-preparation wait, while ``slot.task`` already says a turn is
     # running. A turn refused at admission (timeout, Stop) leaves through
-    # the same finally, which compare-and-clears only an identity this
-    # turn actually published, so a successor's key is never wiped.
+    # the same finally, whose _turn_release_session (chat_turn/session_reset.py)
+    # compare-and-clears only an identity this turn actually published, so a
+    # successor's key is never wiped.
     slot._active_turn_session_key = session_key
 
     if slot.mode == DM_SLOT_MODE and not is_dispatchable_member_name(slot.agent):
@@ -204,6 +239,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
             "error",
             "This thread's crew name cannot be dispatched. Rename or recreate the Crew Member.",
             "msg msg-err",
+            meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_CREW_NAME_UNDISPATCHABLE),
         )
         return _Flow.END
 
@@ -301,7 +337,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # be waited on in turn. Exits between acquire and release (a binding
     # that changed during preparation, a provider that failed to start,
     # cancellation) reach _run_chat's finally, which releases first
-    # thing.
+    # thing, in _turn_record_outcome (chat_turn/queue_cycle.py).
     _dispatch_lock = slot_switch_session_lock(session_key)
     turn._dispatch_lock = _dispatch_lock
     await _dispatch_lock.acquire()
@@ -357,14 +393,25 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
         # miss falls through to the fail-loud below. Strictly guarded: the
         # common hot path (no ``_app``, or already resolved) does zero extra
         # work and zero extra I/O.
-        if slot._app and not bindings.requested_resolved:
+        #
+        # Step (1) also covers a named non-app slot while the installed snapshot
+        # is incomplete: a scan that could not read a spec, or a boot
+        # scan that has not landed, may be missing a template whose file is on
+        # disk, and the turn below would otherwise fail memory_unavailable for
+        # it. One rescan, then the same fail-loud. A complete snapshot is
+        # trusted, so a really removed agent costs no I/O here.
+        from kiro_crew.config.loader_snapshots import materialized_snapshot_complete
+
+        if not bindings.requested_resolved and (
+            slot._app or (slot.agent and not materialized_snapshot_complete())
+        ):
             try:
                 await asyncio.get_running_loop().run_in_executor(
                     subprocess_executor(), refresh_materialized_agents
                 )
             except Exception:  # noqa: BLE001 — warm failure only costs the fail-loud below
                 logger.warning(
-                    "Failed to warm materialized agents for app slot %s",
+                    "Failed to warm materialized agents for slot %s",
                     slot.key,
                     exc_info=True,
                 )
@@ -384,7 +431,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
             turn.memory_store = memory_store
             agent_model = normalize_agent_model(bindings.model)
             turn.agent_model = agent_model
-            if not bindings.requested_resolved:
+            if slot._app and not bindings.requested_resolved:
                 bindings = await _recover_app_agent_binding(
                     cfg, slot, project=selected_binding[1] or None
                 )
@@ -427,23 +474,59 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
             "error",
             "This thread's crew name cannot be dispatched. Rename or recreate the Crew Member.",
             "msg msg-err",
+            meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_CREW_NAME_UNDISPATCHABLE),
         )
         return _Flow.END
-    # A session a palette command opened to run as its app's OWN agent resolves
-    # that agent by bare name, project-first. Refuse the turn -- before any
-    # app-authored prompt reaches the provider -- unless that name still means
-    # the app's registered spec; otherwise the prompt would run with another
-    # spec's tools and auto-approvals.
+    # A session a palette command opened to run as its app's OWN agent runs the
+    # app's registered spec and nothing else. Refuse the turn -- before any
+    # app-authored prompt reaches the provider -- when that spec is not the one
+    # the turn can run; otherwise the prompt would run with another spec's tools
+    # and auto-approvals.
     owner_app, _, owner_agent = (slot.app_agent_owner or "").partition("/")
     turn.owner_app = owner_app
     turn.owner_agent = owner_agent
+    # On kiro-cli the turn launches the app's launch copy, by a name Crew
+    # writes, instead of the bare name kiro-cli would resolve project-first
+    # (apps.agent_launch). Empty on every other turn.
+    _app_launch_agent = ""
+    # The spec file this turn's session is pinned to (``skill_scope_pin``): the
+    # app's registered file for an admitted app-owned turn, on kiro-cli and KAS
+    # alike, else none. A pinned session's skill scope and injected prompt are
+    # read from that file by path, so a checkout's same-named spec sets neither.
+    # Published only once this turn holds the session's lease, so a sibling turn
+    # waiting for it cannot clear the pin from under the turn that is running.
+    _pinned_spec = None
+    if not app_agent_binding_applies(slot):
+        from kiro_crew.apps.agent_launch import unbind_session_app_agent
+
+        # This turn's session is not the app's: a binding left by an earlier
+        # app-owned turn of the key (the slot switched agents, or was deleted and
+        # recreated under the same name) must not decide what it projects.
+        unbind_session_app_agent(session_key)
     if app_agent_binding_applies(slot):
-        _owner_project = selected_binding[1] or None
-        turn._owner_project = _owner_project
-        _owner_host_allowed = await _app_agent_turn_host_allowed(state, session_key, loaded_cfg)
+        _owner_backend = await _app_agent_turn_backend(state, session_key, loaded_cfg)
+        turn._owner_backend = _owner_backend
+        _owner_host_allowed = (
+            _owner_backend is not None and routing_for(_owner_backend) is Routing.AGENT_SPEC
+        )
         turn._owner_host_allowed = _owner_host_allowed
 
-        refusal = await asyncio.to_thread(_check_owner, turn)
+        refusal, _app_launch_agent = await asyncio.to_thread(_check_owner, turn)
+        if not refusal:
+            from kiro_crew.apps.agent_launch import bind_session_app_agent, registered_spec_path
+
+            _pinned_spec = registered_spec_path(owner_app, owner_agent)
+            # Before the claim, so a KAS session started for this turn projects the
+            # registered file by its path (acp.harness.kas), never the bare name.
+            bind_session_app_agent(session_key, owner_app, owner_agent)
+        if not refusal and _app_launch_agent:
+            # A session already registered under the key was started as
+            # something other than the copy (the bare name, before this turn
+            # chose the copy); it must not serve this turn, so the claim
+            # below cold-starts under the copy.
+            live = state.sessions.get_provider(session_key)
+            if live is not None and not _runs_app_agent_launch(live, _app_launch_agent):
+                await _retire_app_agent_session(state, slot, session_key)
         if refusal:
             logger.warning(
                 "refusing an app-owned agent turn for slot %s: %s",
@@ -582,6 +665,22 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
             execution_context = tightened_execution
             turn.execution_context = execution_context
             bindings.execution_context = tightened_execution
+        # A crewmate's conductor chat and each of its workers take the
+        # crewmate's Profile Permissions before the provider is claimed, so a
+        # session restored after a restart (slot trust is in memory only) does
+        # not fall back to asking for every tool.
+        from kiro_crew.dashboard.crewmate_approval import seed_for_turn
+
+        seed_for_turn(state, slot, loaded_cfg, execution_context)
+        # A crewmate's worker runs in the crewmate's own git worktree of the
+        # repository this turn is about, never in the shared checkout.
+        from kiro_crew.dashboard.crewmate_worktree_scope import scope_worker_turn
+
+        if await scope_worker_turn(state, slot, loaded_cfg, execution_context, message):
+            # The project is part of the captured binding; this turn now
+            # runs on the worktree, under the dispatch lock it still holds.
+            selected_binding = _current_binding(turn)
+            turn.selected_binding = selected_binding
 
     # FAIL-LOUD: an app-owned slot whose agent STILL did not resolve after the
     # self-heal must NOT run the default agent — that generic-substitution is
@@ -624,6 +723,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # so the consume below cold-starts this turn on the new model.
     # circular import: session_control imports this package's modules at module level.
     from kiro_crew.dashboard.session_control import (
+        apply_deferred_model_switch,
         apply_pending_model_pick,
         arm_model_switch_reset,
         prewarm_enabled_check,
@@ -672,9 +772,20 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
                 _stamped,
             )
             arm_model_switch_reset(state, slot)
+    # A model pick the picker took while a turn ran on this session, not yet
+    # landed: normally the end of that turn lands it (``_end_turn_tail``), and
+    # this is the backstop for a turn that ended without its tail or ran on a
+    # sibling alias. Before the consume below, because landing it may ARM the
+    # reset that consume spends. ``session_lock_held=True``: this turn already
+    # holds ``slot_switch_session_lock(session_key)`` for its cold start, so the
+    # helper must take only ``_model_pick_lock`` -- that lock is not reentrant,
+    # and re-acquiring it here would hang the turn at session creation.
+    await apply_deferred_model_switch(state, slot, session_lock_held=True)
     # Consume a deferred project-change reset queued while idle, before
-    # get_or_create or we'd reuse the stale session for one turn. Safe here:
-    # no session lock is held yet, so reset() can't self-kill.
+    # get_or_create or we'd reuse the stale session for one turn. Safe even
+    # though the dispatch lock (slot_switch_session_lock) is held here: reset()
+    # does not take that lock, and driven from the gateway rather than from
+    # inside the session's own process group it cannot self-kill its caller.
     await _consume_pending_reset(state, slot)
     # Same "before get_or_create or we reuse a stale session for one turn"
     # reasoning as the reset above, for a staleness the session map cannot
@@ -683,6 +794,11 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # account instead of running as the previous one.
     await _retire_sessions_on_identity_change(state)
     _require_current_binding(turn)
+    # The conductor context cap, before the claim for the same reason as the two
+    # above and after the binding check, so it reads the binding this turn runs on: a
+    # goal conductor's KAS chat over its marks is trimmed, and this turn starts a new
+    # session seeded from the transcript instead of re-sending it all.
+    await _cap_conductor_context(state, slot, session_key, loaded_cfg, is_slash=is_slash)
     # A linked channel can retain a dashboard-owned key. Resolve both the
     # dedicated Slack field and any inbound-capable channel-neutral mirror
     # before provider construction, so a restart cannot erase the dispatcher
@@ -721,6 +837,10 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
         start_priority=_turn_priority,
         **_app_allocation_kwargs(slot),
     )
+    if _app_launch_agent:
+        # An app-owned kiro-cli turn asks kiro-cli for the app's launch copy;
+        # the session keeps the agent's own name as its identity.
+        _allocation_kwargs["app_launch_agent"] = _app_launch_agent
     turn._allocation_kwargs = _allocation_kwargs
 
     # The switch lock is held for the COLD START only: the window it
@@ -759,7 +879,12 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
         and not _message_rewritten_before_build(slot, message)
     ):
         await _prewarm_startup_query(
-            state, slot, message, memory_store=memory_store, execution_context=execution_context
+            state,
+            slot,
+            message,
+            memory_store=memory_store,
+            execution_context=execution_context,
+            prefetch_memory=True,
         )
     # The crew log this slot was last writing to, read BEFORE allocation
     # publishes the successor's id over it. A slot outlives its ACP session, so
@@ -825,9 +950,14 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
             break
         except SessionBusyError:
             if _wait_if_busy or _claim:
+                discard_memory_prefetch(slot.workspace or None, memory_store, message)
                 raise
             _release_dispatch_lock(turn)
             _wait_if_busy = True
+        except BaseException:
+            # A start that failed builds nothing: drop the memory read early for it.
+            discard_memory_prefetch(slot.workspace or None, memory_store, message)
+            raise
     # Registered: the switch handlers' busy scan sees this session from
     # here on, so the lock has done its job and the turn must not hold it.
     _release_dispatch_lock(turn)
@@ -895,12 +1025,31 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # app-authored prompt without the app's spec, so it is refused here
     # before anything is sent, and the session is reset so the next turn
     # allocates afresh from the current selection.
-    if app_agent_binding_applies(slot) and not _app_agent_host_allowed(client):
+    # On kiro-cli the claimed provider must also have been started as the
+    # app's launch copy and nothing else: the pre-claim read may have chosen
+    # another backend, so this turn passed the bare name, which kiro-cli would
+    # resolve project-first.
+    _claimed_off_spec = app_agent_binding_applies(slot) and (
+        not _app_agent_host_allowed(client)
+        or (
+            _provider_backend(client) == ACP_BACKEND_KIRO
+            and not _runs_app_agent_launch(client, _app_launch_agent)
+        )
+    )
+    if _claimed_off_spec:
         from kiro_crew.apps import manager as app_manager
 
-        refusal = await asyncio.to_thread(app_manager.app_agent_backend_refusal, owner_app)
+        if _app_agent_host_allowed(client):
+            refusal = await asyncio.to_thread(
+                app_manager.app_agent_launch_refusal,
+                owner_app,
+                "this chat's session did not start from the app's own agent spec. "
+                "Run the command again from the command palette.",
+            )
+        else:
+            refusal = await asyncio.to_thread(app_manager.app_agent_backend_refusal, owner_app)
         logger.warning(
-            "refusing an app-owned agent turn for slot %s: backend not allowed",
+            "refusing an app-owned agent turn for slot %s: claimed session off the app spec",
             redact_log_via_context(slot.key),
         )
         try:
@@ -921,6 +1070,11 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
         turn.needs_session_reset = needs_session_reset
         slot.append("error", refusal, "msg msg-err", meta={"kind": APP_AGENT_REFUSED_KIND})
         return _Flow.END
+    # This turn holds the session now: the launch copy's skills and prompt are read
+    # from the app's registered file, and every other turn of the key reads by name.
+    from kiro_crew.skill_scope_pin import pin_session_skill_spec
+
+    pin_session_skill_spec(session_key, _pinned_spec)
     # The acquired provider is the final authority for harness-specific slash
     # gates. A dead live row can be replaced during the get_or_create call
     # above. The positive capability fails closed for unknown adapters and
@@ -965,7 +1119,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # armed below from this turn's FRESH observation and settled once a turn
     # keeps its history with the provider, carries the debt across that
     # failure. Read without clearing, exactly like ``_replay_pending``. The
-    # debt is settled when _run_chat's finally predicate holds: a normal
+    # debt is settled when the predicate in _turn_settle_debts holds: a normal
     # ``STOP_REASON_END_TURN`` (non-synthetic, no empty-response verdict), OR
     # any exit that KEPT the session (``_turn_emitted`` and not cancelled and
     # no empty-response verdict — a non-transient error / timeout after output
@@ -978,8 +1132,9 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # Arm the durable debt from a FRESH observation (``is_new`` with no native
     # resume): the context-bearing first turn is owed its history until a turn
     # durably delivers it. ``resumed`` sessions replayed their transcript
-    # natively and must NOT re-inject, so they never arm. _run_chat's finally-block
-    # settle consumes it on a kept-session exit: a normal ``end_turn``, any
+    # natively and must NOT re-inject, so they never arm. The settle in
+    # _turn_settle_debts (chat_turn/prompt_assembly.py) consumes it on a kept-session
+    # exit: a normal ``end_turn``, any
     # ``_turn_emitted`` exit that was not cancelled and had no empty-response
     # verdict (output stayed with the provider even if an error followed), or
     # a completed compaction. A cancelled / empty-response / pre-output-5xx
@@ -991,8 +1146,8 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
         # The sid's unlanded marker must land before the turn does, or a
         # crash in the debounce window keeps the sid without it. Awaited
         # off the loop; a failed write fails the turn before it is sent,
-        # and _run_chat's finally hands the session back. A marker left
-        # by an earlier turn whose write failed is flushed again here, as a
+        # and _turn_release_session (chat_turn/session_reset.py) hands the session back.
+        # A marker left by an earlier turn whose write failed is flushed again here, as a
         # warm retry is not ``is_new``. Only a backend whose resume honours
         # the marker ever carries one, so other turns await nothing.
         await state.sessions.aflush()
@@ -1012,13 +1167,16 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     turn._spec_hooks = _spec_hooks
     turn._spec_hooks_unreadable = _spec_hooks_unreadable
     turn._spec_hooks_cwd = _spec_hooks_cwd
+    if is_new:
+        _notice_steer_upgrade(state, slot, client)
+        await _notice_seed_declined(state, slot, client)
     # A member DM's first turn carries the four-layer member section as
     # session-start context. Record that it is at stake HERE — the moment
     # the session client exists — not at the context build: every early
     # return between this point and build_message (a blocked/oversized
     # @prompt expansion, a pre-build abort) leaves a warm session whose
-    # member section was never delivered, and _run_chat's finally-block re-arm
-    # reads this flag to make the next turn re-deliver it. The
+    # member section was never delivered, and the re-arm in _turn_settle_debts
+    # (chat_turn/prompt_assembly.py) reads this flag to make the next turn re-deliver it. The
     # delivery-at-stake verdict is the chokepoint's own
     # (MemberLifecycle.delivers_section — the same source
     # member_turn_context reads), keyed on the slot's member MODE rather
@@ -1026,7 +1184,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # build, and delivery is at stake from this point regardless.
     # needs_reinjection is pinned False: the one-shot flag is not consumed
     # until the context build, and an aborted WARM_REINJECTION delivery is
-    # covered by _needs_reinjection in the same finally-block re-arm.
+    # covered by _needs_reinjection in the same _turn_settle_debts re-arm.
     _member_session_start_pending = (
         slot.mode == "member"
         and member_lifecycle(
@@ -1081,7 +1239,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
         await expire_slack_options(state, session_key)
     # Publish the live inner AcpClient onto the slot so a concurrent request
     # (the dashboard steer handler) can reach the running session's client
-    # to inject a mid-turn steer. Cleared in _run_chat's finally.
+    # to inject a mid-turn steer. Cleared in _turn_release_handles (chat_turn/turn_entry.py).
     slot._acp_client = getattr(client, "client", None)
     # Billing stats as they stand BEFORE this turn's prompt is sent. The
     # runtime installs a fresh per-turn stats object only inside the dispatch
@@ -1092,7 +1250,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     _turn_stats0 = _billing_stats(client)
     turn._turn_stats0 = _turn_stats0
     # Append-only the session's log (flag-gated, fail-soft). The id is read once here and
-    # reused at every later emit site in _turn_admit, _turn_dispatch_gates and _run_chat, so
+    # reused at every later emit site in _turn_admit, _turn_dispatch_gates and later phases, so
     # a turn that never got a session id emits nothing rather than guessing one. ``owner`` is
     # "default" because a crew-bound slot never reaches this local runner.
     _crew_log_sid = crew_log_emit.session_id_of(client)
@@ -1104,6 +1262,13 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # AcpSessionProvider forwards it to the handle, other providers ignore.
     try:
         setattr(client, "child_fidelity_aware", True)
+    except Exception:  # pragma: no cover - providers without the attr
+        pass
+    # This consumer can put an MCP server's elicitation to the person (the
+    # elicitation card) -- opt in so the driver yields those events here
+    # instead of declining them itself. Same attribute shape as above.
+    try:
+        setattr(client, "accepts_elicitation", True)
     except Exception:  # pragma: no cover - providers without the attr
         pass
     # Companion steer handle: lets the steer handler cut the current text
@@ -1189,6 +1354,12 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
         resumed=bool(resumed),
         parent_slot=_creator_key,
         parent_sid=_creator_sid,
+        # Resolved from the SAME creator this entry cites, after both sources
+        # for it are settled, so the depth and the `parent` cannot describe
+        # two different edges. One in-memory read of the tree the fold already
+        # holds, never a disk read, and it answers `None` -- no key written --
+        # whenever the chain above this session cannot be established.
+        depth=_crew_log_tree_depth(slot, _creator_key),
         memory=_class_memory,
         app=_class_app,
         channel=_class_channel,
@@ -1305,8 +1476,11 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # `durable_row_count` is the SHARED counting rule every
     # site that sets or advances that base uses, so the ordinal cannot disagree
     # with the base about which rows are durable.
+    # A Regenerate leaves the reply it replaces in the window until the turn
+    # ends; that reply is not counted, so the re-run draws the ordinal of the
+    # turn it repeats and the emitter's `attempt` increments.
     _crew_log_turn_no = int(getattr(slot, "_disk_older_durable_count", 0) or 0) + durable_row_count(
-        slot.messages
+        rows_before_regenerate_target(slot, slot.messages)
     )
     turn._crew_log_turn_no = _crew_log_turn_no
     # A quick prompt is a REPLACING expansion, the same class as @prompt: the

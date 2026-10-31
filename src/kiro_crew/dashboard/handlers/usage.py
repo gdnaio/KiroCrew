@@ -43,6 +43,7 @@ from kiro_crew.dashboard.handlers.usage_store import (  # noqa: F401 - usage_ser
     _usage_number,
 )
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.metrics.harness import HARNESS_UNKNOWN, harness_of
 from kiro_crew.metrics.turns import (
     OUTCOME_UNCLASSIFIED,
     emit_turn_duration,
@@ -123,8 +124,8 @@ def _wrapper_chain(source: object) -> list[object]:
     attribute-synthesizing sources, not a depth limit.
 
     ``_runtime`` is traversed **last** deliberately. It is the only holder of
-    ``_agent`` for the session-provider shape (``runtime.py:273``), but it also
-    carries the process-level ``--model`` argument (``runtime.py:280``); visiting
+    ``_agent`` for the session-provider shape (``AcpRuntime._agent``), but it also
+    carries the process-level ``--model`` argument (``AcpRuntime._model``); visiting
     it after the whole ``_handle`` subtree keeps session-level model state ahead
     of process-level state when :func:`read_effective_model` falls through to
     ``_model``.
@@ -201,18 +202,25 @@ def read_effective_model(source: object) -> str:
 
 
 def _source_requests_auto(source: object) -> bool:
-    """Whether the provider chain still reports Auto as its model request.
+    """Whether the provider chain reports Auto, as a request or from the backend.
 
     This is deliberately separate from :func:`read_effective_model`: ``auto``
     is not a resolved model id, but it is useful attribution when a completed
-    turn has no more specific id from the backend. A blank request does not
-    prove Auto was selected, so it remains blank in the row store.
+    turn has no more specific id from the backend. Two signals count: a
+    ``_model`` request of ``auto``, and a ``_resolved_model_id`` of ``auto``.
+    The second is what a session on the default model holds: the start path
+    never calls ``set_model`` for it, so ``_model`` stays ``""``, while
+    ``session/new`` stores the backend's ``currentModelId`` (``auto``) as the
+    resolved id. That is the backend saying Auto served the session. A blank
+    ``_model`` with a blank or missing ``_resolved_model_id`` proves nothing
+    was selected, so it remains blank in the row store.
     """
     try:
         return any(
-            isinstance(candidate := getattr(node, "_model", ""), str)
+            isinstance(candidate := getattr(node, attr, ""), str)
             and candidate.strip().lower() == "auto"
             for node in _wrapper_chain(source)
+            for attr in ("_model", "_resolved_model_id")
         )
     except Exception:
         return False
@@ -231,7 +239,10 @@ def read_turn_model(source: object) -> str:
     honest answer to "who chose", which is all the backend discloses when
     Auto routes a turn (the ACP per-turn metadata frame carries context and
     metering only). Callers that need a concrete id for a pricing or window
-    lookup must keep using :func:`read_effective_model`. Never raises.
+    lookup must keep using :func:`read_effective_model`. ``"auto"`` comes back
+    when the chain requests Auto or the backend reported ``auto`` as the
+    resolved id (a session left on the default model); a chain with neither
+    stays ``""``. Never raises.
     """
     resolved = read_effective_model(source)
     if resolved:
@@ -340,6 +351,10 @@ def _build_token_record(
         "agent": agent or "",
         "context_used": _coerce_int(context_used),
         "context_window": _coerce_int(context_window),
+        # Additive: the context occupancy after each of the turn's model calls,
+        # added up (kiro-cli reports it per call; ``turns`` above counts the
+        # calls). Read off the turn's usage, so no caller passes it.
+        "context_sum": _coerce_int(getattr(u, "context_sum_tokens", 0)),
         # Additive: the turn's terminal stop reason ("" when the producer has
         # none). str-coerced so a non-string on a test double / legacy event
         # can't break json.dumps.
@@ -596,7 +611,11 @@ async def persist_token_record_async(
         # Before the offloaded write: a file-write failure must not cost the
         # latency sample, which needs nothing from disk.
         if emit_metric:
-            _emit_turn_histogram(record, slot_key, event)
+            # The harness is read off model_source, the live provider every
+            # surface already hands in to name the model that ran: it is the one
+            # object here that knows the session's EFFECTIVE backend, overrides
+            # included. Not written to the row; it labels the latency sample only.
+            _emit_turn_histogram(record, slot_key, event, harness=harness_of(model_source))
         await asyncio.to_thread(_write_token_record, record, now)
     except Exception:
         logger.debug("Failed to persist token record for slot %s", slot_key, exc_info=True)
@@ -606,6 +625,8 @@ def _emit_turn_histogram(
     record: dict,
     slot_key: str,
     event: object,
+    *,
+    harness: str = HARNESS_UNKNOWN,
 ) -> None:
     """Emit this turn's OTEL samples from a built record.
 
@@ -646,6 +667,7 @@ def _emit_turn_histogram(
         outcome=outcome,
         model=model,
         provider=provider,
+        harness=harness,
     )
     emit_turn_usage(
         input_tokens=record.get("input"),
@@ -748,14 +770,18 @@ __all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("
 
 if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
     from kiro_crew.dashboard.handlers.usage_context import (  # noqa: F401
+        _CATEGORY_LABEL,
         _CONTEXT_CACHE,
         _CONTEXT_CACHE_KEY,
         _CONTEXT_CACHE_TS,
         _CONTEXT_CACHE_TTL,
         _CONTEXT_TOP_SESSIONS,
+        _as_blocks,
         _row_iso,
+        _usage_read,
         context_occupancy,
         context_trace,
+        context_turn_detail,
     )
     from kiro_crew.dashboard.handlers.usage_cost import (  # noqa: F401
         _COMPACTION_DROP_PCT,
@@ -777,9 +803,6 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _parse_token_history,
     )
     from kiro_crew.dashboard.handlers.usage_sessions import (  # noqa: F401
-        _CLI_SESSION_JSON_MAX_BYTES,
-        _EST_CHARS_PER_TOKEN,
-        _EST_COUNT_MAX,
         _SESSIONS_CACHE,
         _SESSIONS_CACHE_LOCK,
         _SESSIONS_CACHE_TS,
@@ -787,12 +810,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _USAGE_SESSION_WAIT_SECONDS,
         _cached_parse_sessions,
         _empty_session_summary,
-        _est_count,
-        _est_percent,
-        _estimate_cli_tokens,
         _parse_sessions,
-        _sum_estimate,
-        _turn_window,
     )
     from kiro_crew.dashboard.handlers.usage_spend import (  # noqa: F401
         _BARE_CHAT_SLOT_RE,
@@ -833,10 +851,6 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.config.paths import data_home, kiro_sessions_dir  # noqa: F401
     from kiro_crew.constants import crew_log_enabled, env_file_display  # noqa: F401
     from kiro_crew.context_blocks import USER_LABEL  # noqa: F401
-    from kiro_crew.hooks import (  # noqa: F401
-        FileTooLargeError,
-        safe_read_file_bytes_nolink,
-        validate_file_path,
-    )
+    from kiro_crew.hooks import validate_file_path  # noqa: F401
     from kiro_crew.jsonl_util import bounded_records  # noqa: F401
     from kiro_crew.messaging.link import telemetry_channel_of  # noqa: F401

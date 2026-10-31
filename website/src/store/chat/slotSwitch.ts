@@ -9,6 +9,7 @@ import type { ChatMessage } from '../../types'
 import { emitSlotRead } from '../../lib/slotReadRelay'
 import { devLog, inspectorOn } from '../../dev/scrollInspector'
 import { armConfirmedCloseHold, markSlotRead, removeSlotOptimistic } from '../dashboardSlice'
+import { slotLastTsOf } from '../slotLastTs'
 import { mergePreservedPastes } from '../../utils/pasteTokens'
 import { errMessage, isMissingSlotError, type StatusRejection } from '../../utils/thunkError'
 import { i18nT } from '../../i18n/t'
@@ -16,7 +17,7 @@ import { recentErrors, recordError, redactSecrets, type ErrorReport } from '../.
 import { chatSlotDetailPath } from '../../api/chatSlotPaths'
 import type { ChatState } from './state'
 import { fetchSlotDetail, isUnsafeKey, safeKey } from './wire'
-import { deduplicateByMid, finalizePageStreaming, floorForGen, olderHeadAbovePage, preserveSettledMcpOauth, preserveSettledStopState, raiseChunkSeq, sameTranscript, serverRowCount, snapshotChunkGen, snapshotChunkSeq, tailNotInPage } from './transcript'
+import { deduplicateByMid, finalizePageStreaming, floorForGen, olderHeadAbovePage, preserveSettledMcpOauth, preserveSettledStopState, preserveSettledUpsertRows, raiseChunkSeq, sameTranscript, serverRowCount, snapshotChunkGen, snapshotChunkSeq, tailNotInPage } from './transcript'
 import { abortActiveOlderFetch, pagingCursorAfterKeptHead, slotCoverageShortfall, slotSwitchFetchLimit } from './paging'
 import { mergePreservedThinking, reinsertThinkingOrphans, type ThinkingAnchor } from './thinking'
 import {
@@ -56,8 +57,21 @@ import { walkWindowBackTo } from './windowWalk'
  *    recovery paths (auto-improvement, issue-radar, cold-boot restore, the
  *    Slack-token reconnect) silently fall back to a fresh session — so
  *    announcing there would double-report or contradict a successful
- *    recovery. */
-export type SwitchSlotArg = string | { key: string; keepTargetOnMissing?: boolean; announceOnMissing?: boolean }
+ *    recovery.
+ *  - `automatic`: the chat page's own auto-select after it lost the active
+ *    chat. The move counts in `activeSlotAutoMoves`, so a pending fork still
+ *    opens its child (see `forkMayOpen`).
+ *  - `requestSeq`: a fork opening its child, with the fork's origin `seq`.
+ *    The move counts in `activeSlotRequestMoves`, so a request clicked after
+ *    the fork still opens, and one clicked before it does not take the view
+ *    back (see `forkMayOpen`).
+ *  - `gesture`: the user opened this session themselves, by a click, a key or
+ *    a palette pick in this window. Only then does the landing record
+ *    `ChatState.userOpen`, which reads that chat's cron notes (#23564).
+ *    Opt-IN and separate from `announceOnMissing`: some announced switches
+ *    are the page's own (a late `?sid=` recovery, a forwarded nav intent), and
+ *    those must never count as the user having looked. */
+export type SwitchSlotArg = string | { key: string; keepTargetOnMissing?: boolean; announceOnMissing?: boolean; automatic?: boolean; requestSeq?: number; gesture?: boolean }
 
 /** The slot key of a `switchSlot` argument, in either spelling. Non-object
  *  values pass through untouched: a hand-rolled test dispatch can omit
@@ -205,7 +219,7 @@ export const switchSlot = createAsyncThunk<
     // relays. Optional-chained like the slotRun guard below: a partial
     // preloaded test state can omit the dashboard slice, and throwing here
     // would abort the switch fetch itself.
-    const _newestSlotTs = () => (getState() as RootState).dashboard?.slots?.find(s => s.key === key)?.last_ts
+    const _newestSlotTs = () => slotLastTsOf((getState() as RootState).dashboard, key)
     // Bounded to the page size so opening a long session costs one page, not the
     // whole chained transcript; `loadOlderMessages` walks back from the cursor
     // this fetch returns, and a window that misses rows this tab already holds
@@ -422,6 +436,7 @@ export function addSlotSwitchCases(builder: ActionReducerMapBuilder<ChatState>):
             ? { hasMore: state.slotHasMore, nextBefore: state.slotOldestIndex, olderError: state.slotOlderError }
             : null,
           run: { state: state.slotState, running: state.slotRunning, stopping: state.slotStopping },
+          sidePanelReopenSlot: state.sidePanelReopenSlot,
         }
       }
       // Cache the outgoing slot's messages before the switch fields below are
@@ -466,7 +481,10 @@ export function addSlotSwitchCases(builder: ActionReducerMapBuilder<ChatState>):
       // the target -- so the hand-back inside reads the mirror while it still
       // describes the outgoing slot. WS events for the new slot are accepted
       // from here on.
-      enterActiveSlot(state, target)
+      const switchArg = typeof action.meta.arg === 'object' && action.meta.arg !== null ? action.meta.arg : null
+      const openedBy = typeof switchArg?.requestSeq === 'number' ? switchArg.requestSeq : null
+      enterActiveSlot(state, target, switchArg?.automatic === true ? true : openedBy !== null ? 'request' : false)
+      if (openedBy !== null) state.activatedRequestSeq = Math.max(state.activatedRequestSeq ?? 0, openedBy)
       if (target !== outgoingSlot) {
         state.lastChunkSeq = runs[safeKey(target)]?.lastChunkSeq
         state.lastChunkGen = runs[safeKey(target)]?.lastChunkGen
@@ -517,6 +535,11 @@ export function addSlotSwitchCases(builder: ActionReducerMapBuilder<ChatState>):
       const { key, messages: fetchedMessages, hasMore, queue, nextBefore } = action.payload
       if (isUnsafeKey(key)) return
       if (state.activeSlot !== key) return  // user switched away during fetch
+      // A user's open of this session has landed (see `ChatState.userOpen`).
+      const openArg = action.meta?.arg
+      if (typeof openArg === 'object' && openArg !== null && openArg.gesture === true) {
+        state.userOpen = { key, seq: (state.userOpen?.seq ?? 0) + 1 }
+      }
       const reportedRunning = action.payload.running
       const running = historyReportsRunning(state, key, reportedRunning, action.payload)
       const endedTurnHistory = reportedRunning && !running
@@ -726,6 +749,7 @@ export function addSlotSwitchCases(builder: ActionReducerMapBuilder<ChatState>):
       parked[safeKey(key)] = [...reseated.remaining, ...orphaned]
       next = hydrateQueuedBubbles(next, queue)
       next = preserveSettledMcpOauth(existing, next)
+      next = preserveSettledUpsertRows(existing, next)
       next = deduplicateByMid(next)
       next = preserveSettledStopState(existing, next)
       // Switching back to an already-loaded slot re-fetches a history that is
@@ -786,6 +810,17 @@ export function addSlotSwitchCases(builder: ActionReducerMapBuilder<ChatState>):
         state.slotHistory = state.slotHistory.filter(k => k !== origin.key)
         // Swap the origin's cached activity back in (pending loaded the target's).
         loadSlotActivity(state, origin.key)
+        // The held-off side panel's reopen: `enterActiveSlot` moved it to the
+        // gone target. If the field still names the target, the origin's value
+        // from before the switch comes back. If the hold lifted during the
+        // read, the lift used that reopen on the gone target, so the origin's
+        // saved reopen opens the origin's panel now. A toggle or the setting
+        // turning off during the read cleared the saved value (see
+        // `toggleActivity` and `setSidePanelAlwaysOpen`). Not covered: a hold
+        // that starts, or lifts and comes back, during the read can leave the
+        // origin's panel closed when the hold lifts. It never opens a panel.
+        if (state.sidePanelReopenSlot === target) state.sidePanelReopenSlot = origin.sidePanelReopenSlot
+        else if (state.sidePanelAlwaysOpen && origin.sidePanelReopenSlot === origin.key) state.activityOpen = true
         // Run mirror: the snapshot applies verbatim. It was captured at
         // pending and kept CURRENT by `syncOriginRun` at every non-active
         // run write, so a transition mid-flight is already in it -- and a

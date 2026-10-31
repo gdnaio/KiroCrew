@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import overload
 
 from kiro_crew.config.fields import _meta
+from kiro_crew.config.sections_shared_crew import SharedCrewConfig
 from kiro_crew.config.sections_tailnet import TailscaleConfig
 
 # The terminal apps the desktop shell can open in a project directory
@@ -24,6 +25,23 @@ EXTERNAL_TERMINAL_APPS: tuple[str, ...] = (
     "konsole",
     "wezterm",
     "xfce4-terminal",
+)
+
+# The dashboard's feature-preview switches (Settings > Developer > Feature
+# previews) stored under ``dashboard.feature_previews``, by name. Each name is a
+# ``mc-preview-<name>`` key in ``website/src/utils/previewFlags.ts`` with its
+# hyphens written as underscores (config paths are snake_case); that file keeps
+# the browser's copy as a cache of this section, and
+# test_feature_previews_config.py pins the two lists equal.
+FEATURE_PREVIEW_FLAGS: tuple[str, ...] = (
+    "artifact_deploy",
+    "crew_mode",
+    "crewmate_harness",
+    "folder_conductor",
+    "layout_harness",
+    "remote_crew_chat",
+    "session_environments",
+    "webhooks",
 )
 
 
@@ -166,6 +184,15 @@ class DashboardConfig:
             "Reach the dashboard over your tailnet via `tailscale serve`.",
         ),
     )
+    shared_crew: SharedCrewConfig = field(
+        default_factory=SharedCrewConfig,
+        metadata=_meta(
+            "Shared Crew",
+            "Fair admission and per-person limits for a shared Crew. Not active in "
+            "this build yet: nothing reads these settings, so changing one does nothing.",
+            restart=True,
+        ),
+    )
     restore_sessions: bool = field(
         default=False,
         metadata=_meta(
@@ -186,8 +213,8 @@ class DashboardConfig:
     crewmate_threads: bool = field(
         default=False,
         metadata=_meta(
-            "Reply threads on crewmate chat messages",
-            "Let any message in a crewmate's chat carry its own reply thread, "
+            "Reply threads on mate chat messages",
+            "Let any message in a mate's chat carry its own reply thread, "
             "opened in the side panel while the main chat stays visible. Off by "
             "default: the thread routes answer not-found, no thread frame is sent, "
             "and the dashboard draws no Reply in thread control. Takes effect on "
@@ -197,14 +224,36 @@ class DashboardConfig:
     crewmates_in_agent_picker: bool = field(
         default=False,
         metadata=_meta(
-            "Crewmates in the chat agent picker",
-            "List crewmates in the chat composer's agent picker, beside the agent "
-            "templates, so a chat can be switched onto a crewmate (and its own "
+            "Mates in the chat agent picker",
+            "List mates in the chat composer's agent picker, beside the agent "
+            "templates, so a chat can be switched onto a mate (and its own "
             "workspace and memory) without opening it from the Crew page. Off by "
-            "default: the picker lists templates plus any crewmate no listed "
+            "default: the picker lists templates plus any mate no listed "
             "template already covers; the default agent stays even when covered, "
             "unless a template shares its name. Takes effect when the dashboard is "
             "reloaded; no gateway restart.",
+        ),
+    )
+    feature_previews: dict = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Feature previews",
+            "Which unreleased dashboard features are turned on under Settings > "
+            "Developer > Feature previews, by name, each true or false. Kept here "
+            "so a switch stays as set on every browser, device and dashboard "
+            "address of this gateway. A name that is absent reads as off. Takes "
+            "effect on the next dashboard read; no restart.",
+            properties={
+                name: {
+                    "type": "boolean",
+                    "default": False,
+                    "x-meta": {
+                        "label": f"Feature preview: {name}",
+                        "help": f"Turn on the '{name}' feature preview.",
+                    },
+                }
+                for name in FEATURE_PREVIEW_FLAGS
+            },
         ),
     )
     qr_session_until_restart: bool = field(
@@ -522,7 +571,9 @@ class DashboardConfig:
             "task is not interrupted by the machine going to sleep. Off by default. "
             "Uses caffeinate on macOS, systemd-inhibit on Linux, and "
             "SetThreadExecutionState on Windows; on a host with no keep-awake "
-            "backend it is a no-op.",
+            "backend it is a no-op. On some Windows laptops (Modern Standby), "
+            "locking the screen can still let it sleep, so keep the screen on "
+            "for long tasks.",
         ),
     )
     quick_send: bool = field(
@@ -583,6 +634,27 @@ class DashboardConfig:
             "itself is always created either way, so it is one click away.",
         ),
     )
+    side_panel_always_open: bool = field(
+        default=False,
+        metadata=_meta(
+            "Keep the side panel open",
+            "Open the chat's right side panel in every chat you open, new or "
+            "existing, and after a reload. Closing it hides it until you switch "
+            "chats. Each chat still remembers its own open or closed panel, and "
+            "turning this off brings that back. This setting does not apply on a "
+            "phone.",
+        ),
+    )
+    side_panel_pin_summary: bool = field(
+        default=False,
+        metadata=_meta(
+            "Pin Summary in the side panel",
+            "Show the session Summary as the first side panel tab, which cannot be "
+            "closed, and show it each time the panel opens. A panel opened for "
+            "something specific, such as a file, still shows that. Works only "
+            "while session summaries are on.",
+        ),
+    )
     # Default TRUE: the chip strip shipped unconditionally before this switch
     # existed, so a config that never mentions the key must render exactly what
     # it rendered before.
@@ -633,7 +705,23 @@ class DashboardConfig:
                         "help": (
                             "Ceiling on concurrent terminal sessions across every chat, "
                             "server-wide. Each chat's activity bar caps its own terminals "
-                            "below this; a session beyond the ceiling is refused."
+                            "below this. At the ceiling, opening a terminal ends the shell "
+                            "that has had no browser attached the longest (at least a "
+                            "minute) and posts a notice; with none, the open is refused."
+                        ),
+                    },
+                },
+                "orphan_timeout_s": {
+                    "type": "integer",
+                    "default": 43200,
+                    "x-meta": {
+                        "label": "Detached terminal timeout (seconds)",
+                        "help": (
+                            "How long a terminal's shell keeps running with no browser "
+                            "attached, for example while your laptop sleeps, before it and "
+                            "everything running in it are ended. Default 43200 (12 hours); "
+                            "values below 60 count as 60. Run jobs that must outlive this "
+                            "inside tmux."
                         ),
                     },
                 },
@@ -749,6 +837,20 @@ class DashboardConfig:
             "project. Empty = off; new chats use the default project.",
         ),
     )
+    # A folder ID, not a name or path, so renaming or moving the folder keeps it.
+    # Read at each create and ignored when the folder is gone, so a deleted or
+    # hand-edited value leaves new chats unfiled instead of refusing them.
+    default_session_folder: str = field(
+        default="",
+        metadata=_meta(
+            "Default Sidebar Folder for New Chats",
+            "ID of the sidebar folder that new dashboard chats are filed into when "
+            "they are started from New without choosing a folder. A chat started in "
+            "a specific folder still goes there, and every other create path, such "
+            "as apps, crons, channels and agents, keeps its own placement. Empty = "
+            "new chats are unfiled.",
+        ),
+    )
     theme_mode: str = field(
         default="",
         metadata=_meta(
@@ -793,6 +895,15 @@ class DashboardConfig:
             "Recent Session Tint Count",
             "Number of most-recently-active sessions to highlight in the sidebar with a "
             "graded accent stripe (0-10; 0 = off).",
+        ),
+    )
+    show_unread_dot: bool = field(
+        default=True,
+        metadata=_meta(
+            "Show Unread Dot on Session Cards",
+            "Show the unread dot on a sidebar session card when the agent finished "
+            "and you have not read the result. Folder and aggregate unread counts "
+            "are not affected.",
         ),
     )
     # Literal enum rather than FOLDER_SORT_MODES: that constant lives in
@@ -849,6 +960,21 @@ class DashboardConfig:
             "no Settings control reads it, so it carries no schema properties.",
         ),
     )
+    translucent_panels: str = field(
+        default="",
+        metadata=_meta(
+            "Translucent Panels",
+            "Show the top bar, the tab bar, the message box, the suggestion chips and "
+            "the search fields as frosted glass over the content that scrolls under "
+            "them (the Liquid Glass primitive): 'on', or 'off' for solid cards. "
+            "Empty = never chosen on this workspace (the browser's own stored choice "
+            "holds, as before the setting was server-backed). Stored here like the "
+            "theme mode, not only in the browser, so the choice follows the user "
+            "across ports, browsers and the desktop app; the browser keeps a copy "
+            "only so the first paint already matches.",
+            enum=["", "on", "off"],
+        ),
+    )
     onboarded: bool = field(
         default=False,
         metadata=_meta(
@@ -878,11 +1004,11 @@ class DashboardConfig:
     crewmates_onboarded: bool = field(
         default=False,
         metadata=_meta(
-            "Crewmates Onboarded",
-            "Whether the user has finished or dismissed the first-run Meet CrewMates "
-            "flow (the four-step introduction that creates the first crewmate). "
+            "Mates Onboarded",
+            "Whether the user has finished or dismissed the first-run Meet Mates "
+            "flow (the four-step introduction that creates the first mate). "
             "Server-backed like the other first-run flags so a second machine does "
-            "not replay it. Also set when the flow is re-run from the Crewmates page.",
+            "not replay it. Also set when the flow is re-run from the Mates page.",
         ),
     )
     user_role: str = field(
@@ -937,6 +1063,15 @@ class DashboardConfig:
             "Feature Videos Cache Size (MB)",
             "Disk budget for downloaded clips. Whole release folders are evicted "
             "oldest-first to fit; the running release is never evicted. 0 = no cap.",
+        ),
+    )
+    milestones_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Milestones Enabled",
+            "Show the milestones indicator, panel, new-chat feature cards and quiet "
+            "notices. Off hides them; counting continues, so turning it back on shows "
+            "true progress.",
         ),
     )
     folder_suggestions_enabled: bool = field(
@@ -1056,6 +1191,27 @@ class DashboardConfig:
             "BITBUCKET_SERVER_TOKEN_<HEX> (the host's hex encoding, as the "
             "panel's setup message names it) serves one host of several. "
             "Without a token the read is anonymous.",
+        ),
+    )
+    gerrit_hosts: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Gerrit Hosts",
+            "Exact hostnames (optionally host:port) of Gerrit Code Review "
+            "instances whose change URLs the Changes panel and session source "
+            "links may read, read-only, over the instance's REST API. Empty = "
+            "none (deny-by-default): a /c/<project>/+/<number> URL is only "
+            "fetched when its host is an exact member of this list. Suffixes "
+            "and wildcards are not matched. A host that is also listed in "
+            "gitlab_hosts, jira_hosts, github_hosts or bitbucket_server_hosts "
+            "is refused. Gerrit refuses anonymous REST reads on most instances, "
+            "so the gateway authenticates with the HTTP credential of the "
+            "listed host only: the vault secret GERRIT_HTTP_CREDENTIAL, holding "
+            "<username>:<HTTP password> as generated under the Gerrit account's "
+            "HTTP Credentials settings, serves a single listed host, and "
+            "GERRIT_HTTP_CREDENTIAL_<HEX> (the host's hex encoding) serves one "
+            "host of several. Settings > Secrets offers one labelled row per "
+            "listed host, so the name is never typed by hand.",
         ),
     )
     jira_auth: list[JiraAuthEntry] = field(

@@ -8,14 +8,16 @@ Each function here whose first parameter is ``self`` is an ``AcpClient`` method:
 class binds it by name, so it reads and writes the session's own state on the instance,
 and a patch of the method on the class or on an instance reaches every caller.
 
-Instance fields written: ``_background_launches``, ``_bound_workspace_fd``, ``_buffer``,
+Instance fields written: ``_background_launches``, ``_between_turn_credits``, ``_bound_workspace_fd``, ``_buffer``,
 ``_cancel_grace_secs``, ``_cancel_ts``, ``_cancelled``, ``_capability_projection_gaps``,
 ``_channel_id``, ``_child_pids``, ``_claude_settings_authored``,
 ``_claude_settings_claim_unrevoked``, ``_claude_settings_shared``,
 ``_claude_settings_written``, ``_confirmed_capability_session``, ``_consult_future``,
+``_copilot_mcp_config_path``,
 ``_fork_request``, ``_kill_sent``, ``_last_activity``, ``_last_stop_reason``,
 ``_liveness_oracle``, ``_loaded_capability_template``, ``_mcp_ref_spec``,
-``_mcp_report``, ``_mcp_report_frame_floor``, ``_oauth_emitted_servers``,
+``_mcp_report``, ``_mcp_report_frame_floor``, ``_member_stub_allowlist``,
+``_oauth_emitted_servers``,
 ``_opencode_denies_in_force``, ``_opencode_denies_unenforced``,
 ``_opencode_native_mounts``, ``_pending_oauth_requests``,
 ``_permission_surface_share_validated``, ``_pi_mcp_handoff``, ``_pi_mcp_server_names``,
@@ -54,8 +56,10 @@ from kiro_crew.acp.liveness import LivenessOracle, _consume_future_exception
 from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.runtime_process_tree import ChildRecord
 from kiro_crew.acp.transport_errors import (
+    AcpDelegateLaunchFailed,
     AcpError,
     AcpSandboxInitFailed,
+    is_delegate_launch_failure_output,
     is_sandbox_init_failure_output,
     registration_throttle_line,
     sandbox_init_failure,
@@ -178,6 +182,9 @@ def rekey(
     # previous session's context_pct to the new chat and the first
     # check_context_usage() compacts an empty conversation.
     self.last_prompt_stats.reset_context_state()
+    # Credits held between turns belong to the session served before the
+    # claim; the claiming session's first turn must not bill them.
+    self._between_turn_credits = 0.0
     # Claim-push: tell gatewayd this runtime PID now belongs to
     # ``session_key`` so every MCP stub connection under it carries the
     # right ``_meta.caller`` immediately — event-driven replacement for
@@ -606,6 +613,15 @@ def _reset_state(self: AcpClient) -> None:
             os.remove(handoff_path)
         except OSError:
             pass
+    # The Copilot CLI launch MCP config of a spawn that never reached initialize
+    # (a spawn error after resolve_spawn wrote it): same shape, one unlink.
+    copilot_config = getattr(self, "_copilot_mcp_config_path", "")
+    self._copilot_mcp_config_path = ""
+    if copilot_config:
+        try:
+            os.remove(copilot_config)
+        except OSError:
+            pass
     # The settings.local.json THIS session seeded is removed by
     # _discard_claude_settings_seed, which every caller awaits in the `try` of
     # the `finally` that reaches here -- it is async because the ownership hash,
@@ -658,6 +674,7 @@ def _reset_state(self: AcpClient) -> None:
     self._session_mcp_cache = None
     self._session_mcp_snapshot = None
     self._session_agent_spec = None
+    self._member_stub_allowlist = None
     self._loaded_capability_template = ""
     self._capability_projection_gaps = ()
     # Per SESSION, not per spawn: a replacement process' session is judged on its
@@ -874,6 +891,26 @@ async def _sandbox_init_failure(self: AcpClient) -> AcpSandboxInitFailed | None:
         mode=self._sandbox_mode,
         extra_hidden_dirs=self._sandbox_hidden_dirs,
     )
+
+
+async def _delegate_launch_failure(self: AcpClient) -> AcpDelegateLaunchFailed | None:
+    """The delegate-launch error for this child's stderr, or ``None``.
+
+    The ``AcpClient`` side of the classification ``AcpRuntime`` latches per
+    stderr line: the same shared :func:`is_delegate_launch_failure_output`
+    signature, read off the ring buffer the way :meth:`_sandbox_init_failure`
+    reads it, so the two transports cannot disagree about what a
+    ``kiro-cli-chat`` launch failure is. ``None`` when nothing was retained (a
+    restricted-memory session keeps no stderr by design, so it keeps today's
+    behaviour rather than a guessed verdict). The message is fixed wording, so
+    no child output rides it and nothing needs redacting.
+    """
+    await self._settle_stderr()
+    if not self._stderr_lines:
+        return None
+    if not is_delegate_launch_failure_output("\n".join(self._stderr_lines)):
+        return None
+    return AcpDelegateLaunchFailed()
 
 
 async def _registration_throttle_line(self: AcpClient) -> str | None:

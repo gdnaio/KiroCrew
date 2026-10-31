@@ -21,13 +21,14 @@ import json
 import math
 import os
 import sys as _sys
+import threading
 import time as _time
-from collections.abc import Container, Iterable, Iterator
+from collections.abc import Callable, Container, Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from kiro_crew import _facade_mirror
+from kiro_crew import _facade_mirror, history_listing_memo
 from kiro_crew._sqlite_compat import is_cjk_char, script_runs  # noqa: F401 - facade re-exports
 from kiro_crew.history_cache import _GroupRecencyMemo
 from kiro_crew.history_index import (
@@ -65,6 +66,8 @@ from kiro_crew.history_search_memo import (  # noqa: F401 - facade re-exports
 )
 from kiro_crew.history_search_query import (  # noqa: F401 - facade re-exports
     _CJK_CHAR_WEIGHT,
+    _CJK_SEGMENTER_BACKOFF_SECS,
+    _CJK_WORDS_MEMO_RUNS,
     _FORGE_CHAIN_ONLY_WORDS,
     _FORGE_LEAD_PUNCT,
     _FORGE_MR_WORDS,
@@ -81,8 +84,18 @@ from kiro_crew.history_search_query import (  # noqa: F401 - facade re-exports
     _SEARCH_MAX_FORGE_REFS,
     _SEARCH_MAX_SCORING_EXTRAS,
     _SHORT_NEEDLE_MAX_CHARS,
+    _TITLE_SCOPE_PREFIX,
+    CJK_SEGMENT_MAX_RUN_CHARS,
+    CJK_SEGMENT_MAX_RUNS,
     SEARCH_MAX_TOKENS,
+    CjkSegmenter,
     SearchNeedle,
+    TitleScope,
+    _cjk_slot,
+    _cjk_words,
+    _cjk_words_lock,
+    _cjk_words_memo,
+    _CjkSegmenterSlot,
     _forge_lead_in,
     _forge_spellings,
     _forge_type_suffix,
@@ -95,15 +108,24 @@ from kiro_crew.history_search_query import (  # noqa: F401 - facade re-exports
     _provider_search_ref,
     _saturates,
     _script_runs,
+    _snippet_tiers,
+    _valid_words,
     count_needle,
+    is_han_run,
     logger,
     needles_match_text,
     parse_search_query,
+    register_cjk_segmenter,
     register_search_ref_resolver,
+    reset_cjk_segmenter_for_tests,
     reset_search_ref_resolver_for_tests,
+    snippet_needle_tiers,
     snippet_needles,
+    split_title_scope,
+    tiered_first_hit,
 )
 from kiro_crew.jsonl_util import bounded_records
+from kiro_crew.shared_crew.attribution import public_attribution_from_meta
 
 if TYPE_CHECKING:
     from kiro_crew.history import ConversationLog
@@ -170,6 +192,43 @@ def _jsonl_stem(name: str) -> str:
     return name[:-6] if len(name) > 6 else name
 
 
+#: Session files whose stat failed with something other than ENOENT, already
+#: warned about. One such file marks every listing incomplete, which keeps the
+#: dashboard's unread drain held for the process lifetime, so the warning must
+#: be visible; the listing runs every few seconds, so it is also logged only
+#: once per path per process rather than on every pass.
+_unreadable_session_files_warned: set[str] = set()
+#: Listings run on executor threads, so the check and the add share one lock.
+_unreadable_session_files_lock = threading.Lock()
+
+
+#: The metadata-line fields a catalog row carries so a reader can tell a Crew Mode
+#: root from a crew member without opening the file: the creator stamp, the agent's
+#: namespace and the Crew Mode stamp (``crew_mode.saved_row_is_root``).
+_CREW_CATALOG_FIELDS: tuple[str, ...] = ("created_by", "agent_kind", "crew_mode_agent")
+
+
+def _project_crew_fields(meta: dict, line: dict) -> None:
+    """Copy the non-empty :data:`_CREW_CATALOG_FIELDS` of metadata *line* onto catalog row *meta*."""
+    for field in _CREW_CATALOG_FIELDS:
+        value = line.get(field)
+        if isinstance(value, str) and value:
+            meta[field] = value
+
+
+def _warn_unreadable_session_file(path: str, error: OSError) -> None:
+    with _unreadable_session_files_lock:
+        if path in _unreadable_session_files_warned:
+            return
+        _unreadable_session_files_warned.add(path)
+    logger.warning(
+        "Session file %s cannot be stat'd (%s); the session list is reported "
+        "incomplete and unread dots stay held until it is readable or removed",
+        path,
+        error,
+    )
+
+
 class SessionCatalogProjection:
     """List, aggregate, search, and snippet-project conversation sessions."""
 
@@ -177,7 +236,7 @@ class SessionCatalogProjection:
         self._log = log
         self._index: "SessionSearchIndex | None" = None
         #: ``digest + needle key -> (count, cost)`` over the folded text of a
-        #: session the index vouches for, and ``digest + repr(query) ->
+        #: session the index vouches for, and ``digest + repr(snippet tiers) ->
         #: (snippet, cost)`` for the same sessions; each ``None`` when switched
         #: off. Shared with every projection over this directory.
         self._count_memo: "_GroupRecencyMemo[_MemoValue] | None"
@@ -281,6 +340,15 @@ class SessionCatalogProjection:
         return [(stem, mtime) for mtime, stem in newest], counted > max_entries
 
     def list_sessions(self, *, keys: Iterable[str] | None = None) -> list[dict]:
+        return self._list_sessions_status(keys=keys)[0]
+
+    def list_sessions_status(self) -> tuple[list[dict], bool]:
+        """Return sessions plus whether the directory listing was complete."""
+        return self._list_sessions_status()
+
+    def _list_sessions_status(
+        self, *, keys: Iterable[str] | None = None
+    ) -> tuple[list[dict], bool]:
         """Return metadata for session files, newest first.
 
         Deduplicates stacked ``dashboard_`` prefix files, keeping the
@@ -290,8 +358,21 @@ class SessionCatalogProjection:
         holding one transcript lock can refresh its row without a directory scan.
         """
         sessions: list[dict] = []
-        if not self._log._dir.exists():
-            return sessions
+        try:
+            dir_stat = self._log._dir.stat()
+        except FileNotFoundError:
+            return sessions, True
+        except OSError:
+            return sessions, False
+        memo_dir = os.fspath(self._log._dir)
+        memo_key = (dir_stat.st_mtime_ns, self._log._dir_write_epoch())
+        if keys is None:
+            memoized = history_listing_memo.lookup(memo_dir, memo_key)
+            if memoized is not None:
+                return memoized, True
+        built_at = history_listing_memo.clock()
+        reusable = True
+        complete = True
         # Deduplicate stacked dashboard_ prefixes by canonical key, keeping newer
         by_canon: dict[str, dict] = {}
         if keys is None:
@@ -312,7 +393,7 @@ class SessionCatalogProjection:
                         if os.path.normcase(e.name).endswith(".jsonl")
                     ]
             except OSError:
-                entries = []
+                return [], False
         else:
             entries = []
             for key in keys:
@@ -329,7 +410,11 @@ class SessionCatalogProjection:
                 # identity would never equal the one every other reader takes
                 # from path.stat(); there the entry answers only is_symlink.
                 stat = os.stat(path) if entry is None or os.name == "nt" else entry.stat()
-            except OSError:
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                _warn_unreadable_session_file(path, exc)
+                complete = False
                 continue
             identity = self._log._cache_identity(stat)
             # Skip symlinks — these are handoff aliases pointing to the real session
@@ -358,6 +443,8 @@ class SessionCatalogProjection:
                 meta["memory_mode"] = d.get("memory_mode", "persistent")
                 if d.get("folder_id"):
                     meta["folder_id"] = d["folder_id"]
+                _project_crew_fields(meta, d)
+                meta["attribution"] = public_attribution_from_meta(d, key=key)
             else:
                 # Read only the first line for metadata
                 try:
@@ -375,6 +462,8 @@ class SessionCatalogProjection:
                             meta["memory_mode"] = d.get("memory_mode", "persistent")
                             if d.get("folder_id"):
                                 meta["folder_id"] = d["folder_id"]
+                            _project_crew_fields(meta, d)
+                            meta["attribution"] = public_attribution_from_meta(d, key=key)
                             # Guarded publish — discard the fill if a write
                             # invalidated this key inside the stat → read
                             # window (see the generation snapshot above).
@@ -398,9 +487,12 @@ class SessionCatalogProjection:
                                 gen=gen,
                             )
                 except Exception:
-                    pass
+                    reusable = False
             # Ensure memory_mode is always present (old sessions lack it)
             meta.setdefault("memory_mode", "persistent")
+            # A session with no readable metadata line has no creator: Unattributed.
+            if "attribution" not in meta:
+                meta["attribution"] = public_attribution_from_meta(None, key=key)
             # Extract first user message as title fallback
             if "title" not in meta:
                 msg_cached = self._log._msg_cache.get(key)
@@ -424,7 +516,10 @@ class SessionCatalogProjection:
                             meta["title"] = scanned[2]
                     else:
                         found = self._scan_head_title(path)
-                        if found is not _UNREADABLE:
+                        if found is _UNREADABLE:
+                            # A failed head read is retried on the next listing.
+                            reusable = False
+                        else:
                             if found is not None:
                                 meta["title"] = found
                             # Guarded like the metadata fill above.
@@ -444,7 +539,10 @@ class SessionCatalogProjection:
                 by_canon[canon] = meta
         sessions = list(by_canon.values())
         sessions.sort(key=lambda s: s.get("modified", 0), reverse=True)
-        return sessions
+        # Only a complete listing that no in-process write raced is reusable.
+        if keys is None and complete and reusable and self._log._dir_write_epoch() == memo_key[1]:
+            history_listing_memo.store(memo_dir, memo_key, built_at, sessions)
+        return sessions, complete
 
     def agent_usage(self) -> dict[str, tuple[int, float]]:
         """Return ``{agent_name: (session_count, last_used_mtime)}`` per agent.
@@ -590,6 +688,13 @@ class SessionCatalogProjection:
         decisively better old match still wins (the boost tops out at ×2.5 and
         never drops below ×1).
 
+        Rows sort by the number of ``verbatim`` needles they hold first and by
+        score second. Only a pure-Han run the dictionary split into words carries
+        one (see :func:`parse_search_query`): the run is the user's own term, and
+        the split words are how a session WITHOUT it still matches. So a session
+        holding the run as typed ranks above one holding its words apart, however
+        often those words repeat. Every other query sorts by score alone.
+
         Title matches get a strong field boost - titles are short and
         intentional, so a hit there is strong evidence.  Content matches
         are normalized by a sqrt length factor so a long session with a
@@ -607,9 +712,26 @@ class SessionCatalogProjection:
         crowd an allowed one off the page; an app-token caller passes the keys
         it owns. Membership is re-judged under the transcript lock through snippet
         extraction for each output row; a failed check or lock timeout drops the row.
+
+        A query that starts with ``title:`` (see :func:`split_title_scope`) is
+        scoped to titles: only sessions whose title matches its term qualify, and
+        any text after the term is searched as above among them. With nothing after
+        the term, :meth:`_search_titles` answers from titles alone. A bare
+        ``title:`` names no title yet and matches nothing.
         """
         if not query or limit <= 0 or not self._log._dir.exists():
             return []
+        title_filter: Callable[[str], bool] | None = None
+        scope = split_title_scope(query)
+        if scope is not None:
+            if not scope.term:
+                return []
+            title_filter = scope.title_filter()
+            if not scope.rest:
+                return self._search_titles(title_filter, limit, keys)
+            # The rest is the query from here on: it is what the content gate
+            # and the snippet look for, and the term only narrows the window.
+            query = scope.rest
         needles, phrase, adjacency_floor = parse_search_query(query)
         if not needles:
             # Whitespace-only query: no needles to require, so nothing can match.
@@ -626,8 +748,36 @@ class SessionCatalogProjection:
         gate = _MemoGate(needles, phrase, multi)
         # Pinned for the whole query: a memo full of other terms evicts those,
         # never the terms this query is reading and filling right now.
-        with _pinned(self._count_memo, gate.memo_keys), _pinned(self._snippet_memo, [repr(query)]):
-            return self._search_parsed(query, limit, keys, needles, phrase, adjacency_floor, gate)
+        snippet_group = repr(_snippet_tiers(needles, phrase))
+        with (
+            _pinned(self._count_memo, gate.memo_keys),
+            _pinned(self._snippet_memo, [snippet_group]),
+        ):
+            return self._search_parsed(
+                query, limit, keys, needles, phrase, adjacency_floor, gate, title_filter
+            )
+
+    def _search_titles(
+        self, title_filter: Callable[[str], bool], limit: int, keys: Container[str] | None
+    ) -> list[dict]:
+        """A ``title:`` query with nothing after its term: match on titles alone.
+
+        Reads no transcript: ``list_sessions`` already carries every title, so
+        this skips the index shortlist, the content folds and the snippets a
+        content search pays for. For the same reason it is not held to the scan
+        window, so a known chat older than the newest ``_SEARCH_SCAN_WINDOW``
+        sessions is still found by its name. Rows keep ``list_sessions`` order,
+        newest first, and carry no snippet. *keys* restricts the rows exactly as
+        in :meth:`_search_parsed`, re-judged under the lock for each output row.
+        """
+        picked = [
+            (meta, False)
+            for meta in self._log.list_sessions()
+            # The title first: it is a string test, while an app caller's *keys*
+            # judges ownership per key.
+            if title_filter(meta.get("title") or "") and (keys is None or meta["key"] in keys)
+        ]
+        return self._result_rows(picked[:limit], keys, "")
 
     def _search_parsed(
         self,
@@ -638,22 +788,42 @@ class SessionCatalogProjection:
         phrase: str,
         adjacency_floor: bool,
         gate: "_MemoGate",
+        title_filter: Callable[[str], bool] | None = None,
     ) -> list[dict]:
-        """The scoring and snippet half of :meth:`_search_sessions`."""
+        """The scoring and snippet half of :meth:`_search_sessions`.
+
+        *title_filter*, when given (a ``title:`` query's term), makes the window
+        the newest ``_SEARCH_SCAN_WINDOW`` sessions whose title it accepts, chosen
+        from every session after the memo prune. Judging a title reads no
+        transcript, so an older session that ``title:x`` finds is still searched
+        for ``title:x more``, and the cap still bounds the transcripts scored.
+        Like *keys*, it skips the content-memo prune, which must see every
+        window session's row; the per-session cache prune still sees the usual
+        window. What an older match adds to the caches and memos stays inside
+        their byte budgets, and the next unrestricted search under pressure
+        releases it.
+        """
         multi = gate.multi
         now = _time.time()
-        # (score, -rank, meta, needs_snippet)
-        scored: list[tuple[float, int, dict, bool]] = []
-        window = self._log.list_sessions()[: _facade_search_scan_window()]
+        # (verbatim runs hit, score, -rank, meta, needs_snippet)
+        scored: list[tuple[int, float, int, dict, bool]] = []
+        sessions = self._log.list_sessions()
+        scan_window = _facade_search_scan_window()
+        window = sessions[:scan_window]
         self._log._prune_search_memos({m["key"] for m in window})
+        if title_filter is not None:
+            window = [m for m in sessions if title_filter(m.get("title") or "")]
         if keys is not None:
             # After the prune, which must see the whole window: the memos are
             # shared with every unrestricted search.
             window = [m for m in window if m["key"] in keys]
+        if title_filter is not None:
+            window = window[:scan_window]
         allowed, rowids = self._index_shortlist(window, needles)
-        if keys is None:
-            # Only an unrestricted search sees every live session's row; a
-            # restricted one would prune entries other callers still reach.
+        if keys is None and title_filter is None:
+            # Only an unrestricted search sees every live session's row; one
+            # restricted by *keys* or by a title would prune entries other
+            # callers still reach.
             self._prune_content_memos(rowids)
         needle_keys = gate.needle_keys
         phrase_key = gate.phrase_key
@@ -674,6 +844,7 @@ class SessionCatalogProjection:
             saturated_hits = 0.0
             title_hits = 0.0
             adjacency_hits = 0
+            verbatim_runs = 0
             disqualified = False
             for needle, needle_key in zip(needles, needle_keys):
                 in_content = content.count(needle, needle_key)
@@ -683,6 +854,11 @@ class SessionCatalogProjection:
                     # session, so stop counting the rest.
                     disqualified = True
                     break
+                if needle.verbatim:
+                    # Ranks by the sort key below, not by score: its repeats
+                    # already score through the words it is made of.
+                    verbatim_runs += bool(in_content or in_title)
+                    continue
                 if needle.adjacency:
                     adjacency_hits += in_content + in_title
                 if needle.saturate_body:
@@ -711,7 +887,9 @@ class SessionCatalogProjection:
                 # each word is itself a bigram hit. The parse WAIVES the floor
                 # (adjacency_floor=False) when its bigram set was truncated —
                 # judging "no adjacency anywhere" against a partial set would
-                # hide long-query matches (see parse_search_query).
+                # hide long-query matches — and when a required dictionary word
+                # of 2+ characters already proves adjacency (see
+                # parse_search_query).
                 continue
             if multi:
                 # Reward the words appearing together, in order, as typed.
@@ -725,8 +903,12 @@ class SessionCatalogProjection:
             # extra weight every _RECENCY_HALF_WEIGHT_DAYS of age.
             age_days = max(0.0, now - meta.get("modified", 0.0)) / 86400
             score *= 1.0 + _RECENCY_MAX_BOOST / (1.0 + age_days / _RECENCY_HALF_WEIGHT_DAYS)
-            # Negate rank so a smaller (newer) rank wins ties after score desc sort.
-            scored.append((score, -rank, meta, (content_hits or saturated_hits) > 0))
+            # Verbatim runs first: a session holding more of the query's split
+            # runs exactly as typed outranks every session holding fewer, at any
+            # score. Zero for every query with no dictionary split, so their
+            # order is the score order it always was. Negate rank so a smaller
+            # (newer) rank wins ties after the descending sort.
+            scored.append((verbatim_runs, score, -rank, meta, (content_hits or saturated_hits) > 0))
         scored.sort(reverse=True)
 
         # Snippets are attached AFTER the sort+slice, so the cost is proportional
@@ -735,8 +917,19 @@ class SessionCatalogProjection:
         # original text, so offsets line up), so building one per match put a
         # full re-read back on the hot path — dominating the query once the fold
         # itself was memoized.
+        picked = [(meta, needs_snippet) for _v, _s, _r, meta, needs_snippet in scored[:limit]]
+        return self._result_rows(picked, keys, query)
+
+    def _result_rows(
+        self, picked: list[tuple[dict, bool]], keys: Container[str] | None, query: str
+    ) -> list[dict]:
+        """The output rows for ranked *picked* ``(meta, needs_snippet)`` pairs.
+
+        A row flagged for a snippet gets the excerpt of *query* from its transcript.
+        With *keys*, each row is re-judged under its transcript lock first.
+        """
         out: list[dict] = []
-        for _score, _rank, meta, needs_snippet in scored[:limit]:
+        for meta, needs_snippet in picked:
             if keys is not None:
                 # Scoring-time folds may race ownership and affect ranking/inclusion
                 # only; the lock-held re-judge keeps foreign rows/snippets out of output.
@@ -1284,13 +1477,16 @@ class SessionCatalogProjection:
         string's length, so the window may be off by a character or two.
 
         For a multi-word query the exact phrase is tried first and each needle
-        is tried as a fallback (via :func:`snippet_needles`, highest-signal
+        is tried as a fallback (via :func:`snippet_needle_tiers`, highest-signal
         first), mirroring :meth:`search_sessions`' AND-over-needles matching —
         otherwise every session that matched on scattered words would come back
-        with no snippet at all. Needles are tried per message, so the first
-        MESSAGE containing any of them wins rather than the best needle overall;
-        that preserves the streaming early-exit above, and this string is
-        display-only.
+        with no snippet at all. Within a tier needles are tried per message, so
+        the first MESSAGE containing any of them wins rather than the best
+        needle overall; that preserves the streaming early-exit above. A query
+        with no dictionary words is one tier. A query with them reads on past a
+        lower-tier hit until a message holds the phrase, a verbatim run or a
+        longer word, so a lone character in an early message cannot take the
+        snippet from the phrase later on.
 
         Returns ``''`` when no needle is locatable in any single message, or
         when the file cannot be read (display-only — never raises at the caller).
@@ -1299,63 +1495,60 @@ class SessionCatalogProjection:
         row's content digest, and a memoized snippet is built only from the
         stored text that the same read confirms still carries that digest.
         """
-        needles = snippet_needles(query)
-        if not needles:
+        tiers = snippet_needle_tiers(query)
+        if not tiers:
             return ""
         memo = self._snippet_memo
         index = self._index
         if memo is None or index is None or not index.available:
-            return self._build_snippet(key, needles)
+            return self._build_snippet(key, tiers)
         try:
             st = self._stat_key(key)
         except OSError:
-            return self._build_snippet(key, needles)
+            return self._build_snippet(key, tiers)
         digest = index.fresh_digest(key, st)
         if digest is None:
-            return self._build_snippet(key, needles)
-        mkey = digest + repr(query)
+            return self._build_snippet(key, tiers)
+        # Keyed by the tiers, not the query: the snippet is a function of the
+        # text and the tiers, and one query's tiers change when a segmenter
+        # starts or stops answering.
+        mkey = digest + repr(tiers)
         hit = memo.get(mkey)
         if hit is not None:
             return hit[0]  # type: ignore[return-value]
         texts = index.iter_raw_texts(key, st, digest)
         if texts is None:
-            return self._build_snippet(key, needles)
+            return self._build_snippet(key, tiers)
         try:
-            snippet = self._snippet_from(texts, needles)
+            snippet = self._snippet_from(texts, tiers)
         except ChunkDecodeError:
-            return self._build_snippet(key, needles)
+            return self._build_snippet(key, tiers)
         memo[mkey] = (snippet, _memo_entry_cost(mkey, snippet))
         return snippet
 
-    def _build_snippet(self, key: str, needles: list[str]) -> str:
+    def _build_snippet(self, key: str, tiers: list[list[str]]) -> str:
         """The match-centered window :meth:`_content_snippet` returns, uncached."""
         try:
-            return self._snippet_from(self._log._snippet_texts(key), needles)
+            return self._snippet_from(self._log._snippet_texts(key), tiers)
         except OSError:
             return ""
 
-    def _snippet_from(self, texts: Iterable[str], needles: list[str]) -> str:
-        """The window around the first needle found in the first matching text.
+    def _snippet_from(self, texts: Iterable[str], tiers: list[list[str]]) -> str:
+        """The window around the best anchor :func:`tiered_first_hit` finds.
 
-        An ``OSError`` while reading *texts* reports as no snippet; any other
-        error propagates.
+        An ``OSError`` while reading *texts* keeps the best hit read so far (none
+        reports as no snippet); any other error propagates.
         """
-        try:
-            for text in texts:
-                folded = text.casefold()
-                for needle in needles:
-                    pos = folded.find(needle)
-                    if pos < 0:
-                        continue
-                    start = max(0, pos - self._log._SNIPPET_LEAD)
-                    end = min(len(text), pos + len(needle) + self._log._SNIPPET_TRAIL)
-                    frag = " ".join(text[start:end].split())
-                    prefix = "…" if start > 0 else ""
-                    suffix = "…" if end < len(text) else ""
-                    return (prefix + frag + suffix)[: self._log._SNIPPET_MAX]
-        except OSError:
+        found = tiered_first_hit(texts, tiers)
+        if found is None:
             return ""
-        return ""
+        text, pos, needle = found
+        start = max(0, pos - self._log._SNIPPET_LEAD)
+        end = min(len(text), pos + len(needle) + self._log._SNIPPET_TRAIL)
+        frag = " ".join(text[start:end].split())
+        prefix = "…" if start > 0 else ""
+        suffix = "…" if end < len(text) else ""
+        return (prefix + frag + suffix)[: self._log._SNIPPET_MAX]
 
 
 # --------------------------------------------------------------------------- #

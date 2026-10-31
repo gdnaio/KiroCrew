@@ -32,8 +32,17 @@ from kiro_crew.dashboard.chat import _run_chat
 from kiro_crew.dashboard.handlers.sessions import api_approval_resolve
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot, parse_cls_meta
 from kiro_crew.providers.base import EVENT_TEXT_CHUNK, EVENT_THINKING_CHUNK, LLMEvent
+from kiro_crew.testing.wait import async_wait_until
 
-_ANSWER_POLL_SECS = 0.01
+
+def _card_outcomes(slot: _ChatSlot) -> dict[str, str]:
+    """Each approval card's request id mapped to the decision its row shows."""
+    outcomes = {}
+    for row in slot.messages:
+        if row.get("role") == "permission":
+            meta = parse_cls_meta(row["cls"]) or {}
+            outcomes[meta.get("approval_id", "")] = meta.get("resolved", "")
+    return outcomes
 
 
 class TestBatchRejection:
@@ -129,6 +138,7 @@ class TestDenialCascadeLifetime:
         # The revised call was PROMPTED and could be approved — never swallowed.
         client.approve_tool.assert_any_call("req-2")
         assert ("req-2",) not in [c.args for c in client.reject_tool.call_args_list]
+        assert _card_outcomes(slot) == {"req-1": "rejected", "req-2": "approved"}
 
     @pytest.mark.asyncio
     async def test_same_group_still_cascades_after_the_fix(self, tmp_path):
@@ -159,6 +169,7 @@ class TestDenialCascadeLifetime:
         client.reject_tool.assert_any_call("req-1")
         client.reject_tool.assert_any_call("req-2")
         client.approve_tool.assert_not_called()
+        assert _card_outcomes(slot) == {"req-1": "rejected", "req-2": "rejected"}
 
 
 class TestBatchCascadeAttribution:
@@ -265,6 +276,7 @@ class TestBatchCascadeAttribution:
         client.reject_tool.assert_any_call("req-1")
         client.reject_tool.assert_any_call("req-2")
         client.steer.assert_not_called()
+        assert _card_outcomes(slot) == {"req-1": "rejected", "req-2": "rejected"}
 
     @pytest.mark.asyncio
     async def test_one_notice_covers_the_whole_cascaded_remainder(self, tmp_path):
@@ -440,30 +452,40 @@ class TestDenyOnce:
         assert "rejected_once" in repr(log.warning.call_args)
 
     @pytest.mark.asyncio
-    async def test_api_reject_once_maps_to_decision_override(self):
+    async def test_api_reject_once_maps_to_decision_override(self, monkeypatch):
         """The HTTP seam: ``reject_once`` is a valid action and sets the flag.
 
         Pinned at the handler, not in redux: a frontend-only test passes even when
-        the action never reaches ``resolve_approval``, leaving Deny once wired to
-        the plain batch reject in production.
+        the action never reaches the resolver, leaving Deny once wired to the plain
+        batch reject in production. The handler resolves through the Shared Crew
+        decision registry, which is where the flag must arrive.
         """
+        from kiro_crew.shared_crew import decisions as shared_decisions
+
         state = MagicMock()
-        state.resolve_approval.return_value = True
+        seen: list[dict] = []
+
+        def _resolve(_state, _request, approval_id, **kwargs):
+            seen.append({"id": approval_id, **kwargs})
+            return 200, {"ok": True}
+
+        monkeypatch.setattr(shared_decisions, "resolve_approval_by_id", _resolve)
 
         async def _call(action: str):
             request = MagicMock()
             request.get = {"app": ""}.get  # the dashboard user: an empty app claim
             request.app = {"state": state}
             request.match_info = {"id": "req-9", "action": action}
+            request.can_read_body = False
             return await api_approval_resolve(request)
 
         assert (await _call("reject_once")).status == 200
-        assert state.resolve_approval.call_args.args == ("req-9", False)
-        assert state.resolve_approval.call_args.kwargs["rejected_once"] is True
+        assert (seen[-1]["id"], seen[-1]["approved"]) == ("req-9", False)
+        assert seen[-1]["rejected_once"] is True
 
         # Plain reject must keep the cascading behavior (no override).
         assert (await _call("reject")).status == 200
-        assert state.resolve_approval.call_args.kwargs["rejected_once"] is False
+        assert seen[-1]["rejected_once"] is False
 
         # Unknown actions are still refused.
         assert (await _call("reject_twice")).status == 400
@@ -513,7 +535,6 @@ class TestToolCompletionTracking:
         with _patch_stats():
             await _run_chat(state, slot, "hello")
 
-        # Verify tool_call broadcast includes tool_call_id
         calls = [c for c in state.broadcast_ws.call_args_list if c[0][0] == "tool_call"]
         assert len(calls) > 0
         assert calls[0][0][1]["tool_call_id"] == "tc-42"
@@ -633,15 +654,13 @@ class TestExpiredApprovalRetiresTheCard:
         task = asyncio.get_running_loop().create_task(
             state.request_approval(request_id, "dashboard", "fs_write", slot=slot_key)
         )
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _ANSWER_WAIT_SECS
-        while request_id not in state._pending_approvals:
-            assert loop.time() < deadline, (
+        await async_wait_until(
+            lambda: request_id in state._pending_approvals,
+            describe=lambda: (
                 f"approval {request_id!r} was never registered — the wait "
                 f"never started, so there is nothing to expire or resolve"
-            )
-            # flake-ok: pre-existing 10 ms poll inside a deadline-bounded wait for a registration -- moved verbatim; tracked for a de-flake pass
-            await asyncio.sleep(_ANSWER_POLL_SECS)
+            ),
+        )
         return task
 
     @pytest.mark.asyncio
@@ -848,8 +867,9 @@ class TestStateMetaAndPermissions:
 
     def test_mark_permission_resolved_not_found(self):
         slot = _make_slot()
-        # Should not raise
+        slot.append("permission", "tool_x", '{"request_id": "req-42"}', broadcast=False)
         slot.mark_permission_resolved("nonexistent", "approved")
+        assert slot.messages[-1]["cls"] == '{"request_id": "req-42"}'
 
     def test_parse_cls_meta_normalizes_request_id(self):
         meta = parse_cls_meta('{"request_id": "req-1", "tool_input": "x"}')

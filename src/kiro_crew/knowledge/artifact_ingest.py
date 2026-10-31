@@ -53,11 +53,7 @@ from datetime import datetime
 from pathlib import Path
 
 from kiro_crew.artifacts import ArtifactNotFoundError, ArtifactStore
-from kiro_crew.security import (
-    is_sensitive_path,
-    redact_credentials,
-    redact_exfiltration_urls,
-)
+from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
 
 from .ingestion import DUPLICATE_JOB_STATUS, IngestionPipeline, run_to_completion
@@ -101,8 +97,8 @@ def _redact_for_ingest(text: str) -> str:
     (never persist secrets), run the same redaction the chat
     path applies before the text lands in the Knowledge store.
     """
-    cleaned, _ = redact_credentials(text)
-    cleaned, _ = redact_exfiltration_urls(cleaned)
+    from kiro_crew.security import redact
+    cleaned = redact(text)
     return cleaned
 
 
@@ -374,9 +370,10 @@ async def ingest_artifact(
         # File-backed artifact: art_store.get() read live content from
         # source_path on disk. Refuse to ingest a file that resolves to a
         # sensitive credential path into the searchable Knowledge store
-        # (defense-in-depth; resolves symlinks before checking).
+        # (defense-in-depth; resolves symlinks before checking). Resolving stats
+        # the disk, so it runs in a worker thread, not on the event loop.
         try:
-            resolved = str(Path(art.source_path).expanduser().resolve())
+            resolved = str(await asyncio.to_thread(Path(art.source_path).expanduser().resolve))
         except (OSError, ValueError, RuntimeError):
             return None
         if is_sensitive_path(resolved):
@@ -925,6 +922,9 @@ class ArtifactKnowledgeSync:
         self._loop = loop
         self._lock = asyncio.Lock()
         self._reconcile_task: asyncio.Task | None = None
+        # Ingest/remove tasks ``_schedule`` starts, held until each finishes: the
+        # loop keeps only a weak reference to a task.
+        self._tasks: set[asyncio.Task] = set()
 
     @property
     def kstore(self) -> KnowledgeStore:
@@ -944,6 +944,8 @@ class ArtifactKnowledgeSync:
 
     def _schedule(self, action: str, slug: str) -> None:
         task = asyncio.ensure_future(self._handle(action, slug))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
         task.add_done_callback(self._on_task_done)
 
     @staticmethod

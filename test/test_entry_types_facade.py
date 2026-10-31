@@ -51,7 +51,7 @@ CREW_LOG_DIR = Path(entry_types.__file__).resolve().parent
 #: first 32 hex digits of the SHA-256 of ``_canonical(declaration)``, in table order.
 _GOLDEN_TABLES: dict[str, tuple[tuple[str, str], ...]] = {
     KIND_SESSION: (
-        ("session/opened", "bbda01118211d123f58d2688615b262b"),
+        ("session/opened", "04ef8a56827e9c9078a86c3d509e96db"),
         ("session/class", "7524b2522063f07a57b88f8e09af6293"),
         ("session/closed", "a71c964802e62a75e05ac609e252f45e"),
         ("session/unrestored", "8e9b3dfe651250654e3a55429d30c595"),
@@ -68,6 +68,7 @@ _GOLDEN_TABLES: dict[str, tuple[tuple[str, str], ...]] = {
         ("message/queued", "6180274d3d30cd59a97b4d0c201a1aed"),
         ("request/configured", "994852b3f44c8bbf3a64e1dd89d1298d"),
         ("context/composed", "62ed63072024699617c932b98cfe6cc7"),
+        ("context/measured", "e45ef38bb8c2fb8f5a20289daba2f7e2"),
         ("step/started", "fab7519e4fc65ffab0a6b4206e48b580"),
         ("step/completed", "36a041f74224ac4dcfadcc5a861aa0ef"),
         ("tool/called", "065b59afb41bbc227a40882367dfb6f5"),
@@ -77,7 +78,7 @@ _GOLDEN_TABLES: dict[str, tuple[tuple[str, str], ...]] = {
         ("model/selected", "3b6f12f703b6d53c5e20d98c3afccc27"),
         ("compaction/applied", "59e1ed367b9351f74b6789c68ddec2f6"),
         ("plan/updated", "7cd018ea037a3ceb9a538bf75dc79821"),
-        ("subagent/spawned", "6b2c100e7c1ef6bea6a9d24340939362"),
+        ("subagent/spawned", "9a8a6655c888333f1432e016097898e0"),
         ("subagent/steered", "cbc89e1578be381a9422777246b13456"),
         ("subagent/dismissed", "cf8c93120ff10fc62430e1d01ff85877"),
         ("subagent/completed", "3d9c7a881ccb9cc2d74d40d131e8d84e"),
@@ -86,7 +87,8 @@ _GOLDEN_TABLES: dict[str, tuple[tuple[str, str], ...]] = {
         ("ledger/recorded", "ce8a9e0246ca5f62f01fe4d9edaad4b9"),
         ("object/observed", "e7708ecf53c90b1b1e5e5340c59a97e0"),
         ("radar/recorded", "f5da674a52d214bb4b0e46b717ff3042"),
-        ("work/recorded", "1ac92d4c2807e9a154400278e9de0f23"),
+        ("work/recorded", "cc70cbd04f19d8f6cf8b6c3ada680d8a"),
+        ("work/charged", "dfafeefd53bcb426be1351ea831bb481"),
         ("panel/published", "3bed4520ab9f3b183255124dfa140c1e"),
         ("dashboard/instance_changed", "f8187ea96d4c04bc538184bbbbffaca2"),
         ("dashboard/agentic_value", "5fa08587836bf07bca2f89201f0ffc28"),
@@ -96,18 +98,21 @@ _GOLDEN_TABLES: dict[str, tuple[tuple[str, str], ...]] = {
         ("guide/offered", "721d8590a703806a77e0e40a10ef2048"),
         ("guide/started", "ebf18278dee992c5eea17a2d0b0341d6"),
         ("guide/finished", "613fdb310da277c35eea97f7911d901b"),
+        ("dashboard/goal_recorded", "d9a0196325963ff3db8e6fbdf7c84004"),
+        ("dashboard/waiting_changed", "cb4f1800ba39b67fd925d785de126b7b"),
+        ("dashboard/custom_value", "5d84827cd8f329bb4a9be149447dce62"),
     ),
     KIND_CREW: (
         ("crew/dispatch", "5820b02abe6583c997f2cf40fb1465ff"),
-        ("crew/report", "3d913390b8f1b81de87b1ad1cd8abe30"),
+        ("crew/report", "46b293a4663ad9dc56da3afe016b8844"),
     ),
 }
 
 #: SHA-256 of ``render_markdown(kind)`` when the registry was split into owners. The
 #: member kind declares nothing here, so its digest is of the heading alone.
 _GOLDEN_RENDER: dict[str, str] = {
-    KIND_SESSION: "62623dfbd9be917d8ea1b6a3bd8a8dbd1a2d9964c85f6354913c8d2e3edcb264",
-    KIND_CREW: "ed6c1e44dfba1f48ab44f900b866bf63f6403ee793284a7afa81b3fef970ad9b",
+    KIND_SESSION: "38bed9911f5f1c590a7056e3777f8258213cf62a1a3b85a442125990715774e5",
+    KIND_CREW: "b6938d4f70730ae5ffce4ec6983a609443976a9fca7b013c04152e426dd8be8e",
     "member": "5cb4ea02ed8121eb6b285806b4723251aed568df0aa54b9ac8505c9ad389fa8d",
 }
 

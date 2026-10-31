@@ -55,6 +55,11 @@ def _redact(text: str) -> str:
     return text
 
 
+# The longest serialized result a completion message carries whole. A longer one is
+# shown as a plain-text preview with a pointer to the complete value.
+_MAX_RESULT_CHARS = 4000
+
+
 def _summarize(snapshot: dict) -> str:
     """Build the chat message body from a terminal run snapshot."""
     name = snapshot.get("name") or snapshot.get("run_id", "")
@@ -64,10 +69,18 @@ def _summarize(snapshot: dict) -> str:
     if status == "finished":
         result = snapshot.get("result")
         try:
-            body = json.dumps(result, indent=2, default=str)
+            body, fence = json.dumps(result, indent=2, default=str), "json"
         except Exception:  # noqa: BLE001
-            body = str(result)
-        lines.append("\nResult:\n```json\n" + body[:4000] + "\n```")
+            body, fence = str(result), "text"
+        if len(body) <= _MAX_RESULT_CHARS:
+            lines.append(f"\nResult:\n```{fence}\n{body}\n```")
+        else:
+            # A cut JSON document is not JSON, so the preview is never labelled json.
+            lines.append(
+                f"\nResult (truncated: first {_MAX_RESULT_CHARS} of {len(body)} characters;"
+                f" the complete value is the `result` field of workflow_result('{run_id}')):"
+                f"\n```text\n{body[:_MAX_RESULT_CHARS]}\n```"
+            )
         # Surface any artifact file paths the run produced, so the chat agent can
         # open/act on them directly instead of digging through the result blob.
         artifacts: list[str] = []
@@ -188,6 +201,9 @@ def inject_workflow_result(
                 slot.invalidate_source_links()
                 slot._dismissed_hydrated = False
                 note_crew_log_class(state, slot)
+                from kiro_crew.dashboard.transcript_binding import bind_transcript
+
+                bind_transcript(state, slot)
             slot.title = f"Workflow: {snapshot.get('name') or run_id}"
 
         # Dedup: don't double-inject the same result on a re-fire.
@@ -266,7 +282,7 @@ def _seed_turn_timeout(slot: Any, meta: Optional[dict]) -> None:
     unhydrated, so its saves carry the on-disk value forward instead of
     replacing it with "follow the global".
     """
-    from kiro_crew.dashboard.slot_persistence.metadata_codec import _validate_turn_timeout_secs
+    from kiro_crew.dashboard.slot_persistence.metadata_values import _validate_turn_timeout_secs
 
     if meta is None:
         slot.turn_timeout_secs = None

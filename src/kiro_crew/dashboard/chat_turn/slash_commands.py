@@ -1,7 +1,8 @@
 """The dashboard's local slash commands and the turn's slash gate (``_turn_slash_gate``, which
 answers a local slash command before a session is claimed): /workflow, /agent and /goal, the
 backend a slash command would run on, the refusal of a slash command the dashboard does not
-offer, and the answer to a slash command no channel can take."""
+offer, the answer to a slash command no channel can take, and the answer to a /compact the
+session did not compact for (``_turn_compact_command``)."""
 
 from __future__ import annotations
 
@@ -10,47 +11,69 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.agent_sdk.capabilities import capabilities_for
+from kiro_crew.agent_sdk.provider_identity import is_claude_code
+from kiro_crew.agent_switch_command import agent_switch_target, switch_announcement
+from kiro_crew.autonudge import FINISHED_LOOP_REASONS, reason_in
+from kiro_crew.autonudge_authz import normalize_banner
+from kiro_crew.dashboard.chat_utils import (
+    _KIRO_ONLY_BLOCKED_SLASH_COMMANDS,
+    _append_compaction_notice,
+    is_harness_slash_command,
+    parse_workflow_command,
+)
+from kiro_crew.dashboard.kas_local_commands import (
+    KAS_LOCAL_INSPECT_COMMANDS,
+    answer_kas_inspect_command,
+)
+from kiro_crew.dashboard.session_directive_apply import _reset_conversation
+from kiro_crew.dashboard.state import (
+    HOOK_CONTINUATION_RECOVERY_PREFIX,
+    MONITOR_WAKE_PREFIX,
+    SUBAGENT_SYNTHESIS_PREFIX,
+)
+from kiro_crew.messaging.commands import compact_unsupported_backend, compact_unsupported_reply
+from kiro_crew.security import redact
+
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
         _BLOCKED_SLASH_COMMANDS,
-        _KIRO_ONLY_BLOCKED_SLASH_COMMANDS,
-        ACP_BACKEND_KAS,
         ACP_BACKEND_KIRO,
         ACP_BACKENDS_COMPACT,
         ACP_BACKENDS_LOCAL_CLEAR,
-        FINISHED_LOOP_REASONS,
-        HOOK_CONTINUATION_RECOVERY_PREFIX,
+        ACP_BACKENDS_LOCAL_HARNESS_COMMANDS,
         MAX_PROMPT_BYTES,
-        MONITOR_WAKE_PREFIX,
-        SUBAGENT_SYNTHESIS_PREFIX,
         DashboardState,
         KiroCrewConfig,
         RepeatLoopTracker,
         _ChatSlot,
-        _expand_prompt_mention_off_loop,
         _list_aim_prompts,
-        _reset_conversation,
         _run_chat,
-        agent_switch_target,
-        capabilities_for,
         capabilities_of,
-        compact_unsupported_backend,
-        compact_unsupported_reply,
         data_home,
         get_instance,
-        is_claude_code,
-        is_harness_slash_command,
-        normalize_banner,
-        parse_workflow_command,
-        reason_in,
+        logger,
         sel,
         select_provider_backend,
-        switch_announcement,
     )
     from kiro_crew.dashboard.chat_turn.eager_spawn import schedule_eager_spawn
-    from kiro_crew.dashboard.chat_turn.segment_flush import _append_command_reply
+    from kiro_crew.dashboard.chat_turn.prompt_assembly import _expand_prompt_mention_off_loop
+    from kiro_crew.dashboard.chat_turn.queue_cycle import _send_chat_done
+    from kiro_crew.dashboard.chat_turn.recovery import (
+        _COMPACT_FAIL_REASON_MAX_CHARS,
+        COMPACT_FRESH_SESSION_NOTICE,
+        COMPACT_REPLAY_PENDING_NOTICE,
+    )
+    from kiro_crew.dashboard.chat_turn.regenerate_swap import note_regenerate_reply
+    from kiro_crew.dashboard.chat_turn.segment_flush import (
+        _append_command_reply,
+        _cleared_segment_text,
+    )
     from kiro_crew.dashboard.chat_turn.session_reset import _consume_pending_reset
+    from kiro_crew.dashboard.chat_turn.turn_context import _restore_skills_context_after_compaction
     from kiro_crew.dashboard.chat_turn.turn_locals import _ChatTurn, _Flow
+    from kiro_crew.dashboard.chat_turn.turn_reply_seams import _drop_wire_tail
+    from kiro_crew.dashboard.chat_turn.turn_stats import _context_usage_payload
 
 
 async def _slash_command_backend(state: DashboardState, session_key: str) -> str:
@@ -63,17 +86,26 @@ async def _slash_command_backend(state: DashboardState, session_key: str) -> str
     provider = state.sessions.get_provider(session_key)
     if provider is not None and await state.sessions.is_provider_alive(session_key) is True:
         return capabilities_of(provider).backend
-    agent_cfg = KiroCrewConfig.load().agent
-    backend = select_provider_backend(
-        session_key,
-        getattr(agent_cfg, "member_acp_backend", ""),
-        getattr(agent_cfg, "acp_backend", ""),
-    )
+    from kiro_crew.crewmate_harness import CrewmateHarnessUnavailable, crewmate_backend_pin
+
+    cfg = KiroCrewConfig.load()
+    agent_cfg = cfg.agent
+    try:
+        backend = select_provider_backend(
+            session_key,
+            getattr(agent_cfg, "member_acp_backend", ""),
+            getattr(agent_cfg, "acp_backend", ""),
+            crew_backend=crewmate_backend_pin(cfg, session_key),
+        )
+    except CrewmateHarnessUnavailable:
+        # Only a pre-check: the turn goes on to the session start, which refuses
+        # the unstartable pin inside the turn's error handling, with its reason.
+        return ACP_BACKEND_KIRO
     return backend if isinstance(backend, str) else ACP_BACKEND_KIRO
 
 
 async def _answer_slash_without_channel(
-    state: DashboardState, slot: _ChatSlot, session_key: str, command: str
+    state: DashboardState, slot: _ChatSlot, session_key: str, command: str, message: str = ""
 ) -> str:
     """Answer a harness command the backend cannot run, as a local command.
 
@@ -83,10 +115,18 @@ async def _answer_slash_without_channel(
     refuses the discard (busy, sub-agents attached) keeps it queued for a later
     turn boundary.
 
-    Returns the outcome it records: ``discarded``, ``queued`` or
-    ``unsupported_backend``.
+    ``/model``, ``/tools`` and ``/mcp`` are answered from the dashboard's own state
+    (``kas_local_commands``); *message* is the whole command line, for
+    ``/model <id>``.
+
+    Returns the outcome it records: ``discarded``, ``queued``, ``shown``,
+    ``switched``, ``error``, ``no_session`` or ``unsupported_backend``.
     """
-    if command.lower() == "/clear":
+    if command.lower() in KAS_LOCAL_INSPECT_COMMANDS:
+        text, outcome = await answer_kas_inspect_command(
+            state, slot, session_key, message or command
+        )
+    elif command.lower() == "/clear":
         await _reset_conversation(slot, session_key, {})
         torn_down = await _consume_pending_reset(state, slot, allow_discard=True)
         # The consumer's True also covers a queued project reset; only a spent
@@ -348,10 +388,15 @@ def _refuse_blocked_slash(turn) -> None:
         outcome="blocked",
         metadata={"slot": slot.key},
     )
-    slot.append(
-        "assistant",
-        f"⚠️ `{first_word}` is not available in the dashboard.",
-        "msg msg-a",
+    # Recorded like every command answer: a Regenerate of this command
+    # replaces its previous reply with this row (``regenerate_swap``).
+    note_regenerate_reply(
+        slot,
+        slot.append(
+            "assistant",
+            f"⚠️ `{first_word}` is not available in the dashboard.",
+            "msg msg-a",
+        ),
     )
     state.push_slots_update()
 
@@ -551,10 +596,14 @@ async def _turn_slash_gate(turn: _ChatTurn) -> _Flow | None:
         except Exception:
             prompts = []
         if not prompts:
-            slot.append(
-                "assistant",
-                "No prompts found. Create prompts in `~/.kiro/prompts/` (or `~/.kiro/crew/prompts/`).",
-                "msg msg-a",
+            note_regenerate_reply(
+                slot,
+                slot.append(
+                    "assistant",
+                    "No prompts found. Create prompts in `~/.kiro/prompts/` "
+                    "(or `~/.kiro/crew/prompts/`).",
+                    "msg msg-a",
+                ),
             )
             sel().log_tool_invocation(
                 session_key="",
@@ -634,12 +683,23 @@ async def _turn_slash_gate(turn: _ChatTurn) -> _Flow | None:
         else:
             # A dead registry row is not the harness dispatch would reach:
             # get_or_create evicts it and uses this same member-aware selector.
-            _agent_cfg = KiroCrewConfig.load().agent
-            _cfg_backend = select_provider_backend(
-                session_key,
-                getattr(_agent_cfg, "member_acp_backend", ""),
-                getattr(_agent_cfg, "acp_backend", ""),
+            from kiro_crew.crewmate_harness import (
+                CrewmateHarnessUnavailable,
+                crewmate_backend_pin,
             )
+
+            _cfg = KiroCrewConfig.load()
+            _agent_cfg = _cfg.agent
+            try:
+                _cfg_backend = select_provider_backend(
+                    session_key,
+                    getattr(_agent_cfg, "member_acp_backend", ""),
+                    getattr(_agent_cfg, "acp_backend", ""),
+                    crew_backend=crewmate_backend_pin(_cfg, session_key),
+                )
+            except CrewmateHarnessUnavailable:
+                # As in _slash_command_backend: the session start reports it.
+                _cfg_backend = None
             _compact_unsupported = (
                 _cfg_backend
                 if isinstance(_cfg_backend, str) and _cfg_backend not in ACP_BACKENDS_COMPACT
@@ -663,22 +723,28 @@ async def _turn_slash_gate(turn: _ChatTurn) -> _Flow | None:
             # outside ``ACP_BACKENDS_COMPACT``, which is true of one of them --
             # and this is the dashboard, where the claim is most visible. The
             # markdown register matches what that helper already emits.
-            slot.append(
-                "assistant",
-                compact_unsupported_reply(_compact_unsupported),
-                "msg msg-a",
+            note_regenerate_reply(
+                slot,
+                slot.append(
+                    "assistant",
+                    compact_unsupported_reply(_compact_unsupported),
+                    "msg msg-a",
+                ),
             )
             state.push_slots_update()
             return _Flow.END
 
     # ── Harness commands on KAS, which has no command channel ──
+    # (``ACP_BACKENDS_LOCAL_HARNESS_COMMANDS``; GET /api/slash-commands reads the
+    # same set to leave these commands out of the / menu.)
     # The session handle runs a command natively only on kiro-cli; KAS gets it
     # as session/prompt text, and KAS has no built-in /clear there, so the
     # model reads "/clear" as a request and the conversation stays. KAS also
     # refuses _kiro.dev/commands/execute itself, so that verb is no way out.
     # Answer here instead, before any session work: /clear takes the same discard
-    # reset_conversation queues, and every other command gets a notice rather
-    # than reaching the model. /compact passes through: on KAS the session handle
+    # reset_conversation queues, /model, /tools and /mcp are read from the
+    # dashboard's own state, and every other command gets a notice rather than
+    # reaching the model. /compact passes through: on KAS the session handle
     # sends it as the engine's own compaction verb, not as prompt text. A /todos
     # that got past its own gate is on a harness that runs it natively.
     # The other harnesses in ACP_BACKENDS_LOCAL_CLEAR have no /clear of their own
@@ -691,11 +757,11 @@ async def _turn_slash_gate(turn: _ChatTurn) -> _Flow | None:
         and first_word not in _KIRO_ONLY_BLOCKED_SLASH_COMMANDS
     ):
         _command_backend = await _slash_command_backend(state, session_key)
-        if _command_backend == ACP_BACKEND_KAS or (
+        if _command_backend in ACP_BACKENDS_LOCAL_HARNESS_COMMANDS or (
             _this_turn_is_clear and _command_backend in ACP_BACKENDS_LOCAL_CLEAR
         ):
             turn_exit.local_command = first_word
-            await _answer_slash_without_channel(state, slot, session_key, first_word)
+            await _answer_slash_without_channel(state, slot, session_key, first_word, message)
             return _Flow.END
 
     _is_monitor_wake = message.startswith(MONITOR_WAKE_PREFIX)
@@ -703,10 +769,18 @@ async def _turn_slash_gate(turn: _ChatTurn) -> _Flow | None:
     _acquired = False
     turn._acquired = _acquired
     # Whether this turn holds the session-switch lock (see the acquire in _turn_admit);
-    # read by _run_chat's finally so an exit between acquire and release never leaks it.
+    # read by _turn_record_outcome (chat_turn/queue_cycle.py), from _run_chat's finally, so
+    # an exit between acquire and release never leaks it.
     turn._dispatch_lock_held = False
     _mirror_stream_ts: str = ""
     turn._mirror_stream_ts = _mirror_stream_ts
+    # The task stream opens lazily on the first mirrored tool call; one attempt
+    # per turn, so a stream Slack refuses is not re-requested on every tool.
+    turn._mirror_stream_tried = False
+    # ts of the mirror's "Thinking…" placeholder; "" once it has been deleted.
+    turn._mirror_thinking_ts = ""
+    # Whether this turn posted its prompt echo; a recovery requeue reads it.
+    turn._mirror_echo_posted = False
     _mirror_chan: str | None = ""
     turn._mirror_chan = _mirror_chan
     _mirror_active_task = ""
@@ -728,9 +802,148 @@ async def _turn_slash_gate(turn: _ChatTurn) -> _Flow | None:
     client: Any = None
     turn.client = client
     # The pre-acquisition gate accepted this command. Keep its deferred OPTIONS
-    # drain owned by _run_chat's finally until acquisition either refuses or drains it.
+    # drain owned by _turn_release_session (chat_turn/session_reset.py), from _run_chat's
+    # finally, until acquisition either refuses or drains it.
     _deferred_options_expiry = (
         _prompt_depth == 0 and first_word in _KIRO_ONLY_BLOCKED_SLASH_COMMANDS
     )
     turn._deferred_options_expiry = _deferred_options_expiry
     return None
+
+
+async def _turn_compact_command(turn: _ChatTurn) -> None:
+    """Answer a /compact the session did not compact for."""
+    _replay_pending = turn._replay_pending
+    client = turn.client
+    first_word = turn.first_word
+    saw_compaction = turn.saw_compaction
+    session_key = turn.session_key
+    slot = turn.slot
+    state = turn.state
+    # /compact acknowledged but compaction deferred — send a lightweight
+    # follow-up that triggers the actual compaction so the user doesn't have to.
+    logger.debug("Compaction check: first_word=%r saw_compaction=%s", first_word, saw_compaction)
+    if first_word == "/compact" and not saw_compaction:
+        # Clear streamed "Compacting conversation..." text from kiro-cli.
+        # claude-agent-acp streams its own "Compacting..." notice, which the
+        # ACP layer recognises and reports as a status event WITHOUT deleting
+        # the chunk (`parse_claude_compaction_notice`) — so on that backend
+        # the notice is cleared by this same purge rather than by suppression
+        # upstream.
+        slot.purge_chunks()
+        _drop_wire_tail(turn)
+        turn.assistant_text = _cleared_segment_text(slot)
+        turn._produced_visible_output = True
+        await _send_chat_done(state, slot, continuing=True, ends_turn=False)
+
+        # claude-agent-acp performs /compact synchronously inside session/prompt;
+        # there is no out-of-band _kiro.dev/compaction/status notification, so
+        # EVENT_COMPLETE is the done signal. Skip the kiro-only async wait.
+        #
+        # This arm is now a FALLBACK, not the normal path: the ACP layer
+        # translates the adapter's own "Compacting..." / "Compacting
+        # completed." notices into EVENT_COMPACTION_STATUS, so a manual
+        # /compact on this backend normally leaves `saw_compaction` True and
+        # never reaches here. It still earns its place — if the adapter
+        # reworks those literals the translation stops matching, and this
+        # keeps `/compact` acknowledged instead of silent.
+        #
+        # Note: the success message is hardcoded so no redaction pass is
+        # needed today. If claude-agent-acp ever returns a compaction
+        # summary (e.g. via EVENT_COMPLETE payload growing a `summary`
+        # field), pipe it through redact_credentials + redact_exfiltration_urls
+        # before interpolation — matching the kiro-cli path below.
+        #
+        # Gated on `SessionCapabilities.compacts_inline` -- does this backend
+        # finish the compaction inside the prompt turn? -- rather than on which
+        # harness it is. The two arms are not interchangeable: acknowledging a
+        # backend that reports asynchronously loses the notice, and awaiting one
+        # that already finished strands the waiter for its whole timeout.
+        if _replay_pending:
+            # A slash command never delivers the replay, so the lease is
+            # still armed and the provider session is empty: kiro-cli ends
+            # the turn with "Conversation too short to compact." and sends
+            # no compaction status. Awaiting one would hold the chat for the
+            # whole compaction timeout. Nothing was compacted, so skills
+            # context is not re-armed and the lease stays for the next prompt.
+            _append_compaction_notice(state, slot, COMPACT_REPLAY_PENDING_NOTICE)
+        elif (
+            not capabilities_of(client).compacts_inline
+            and state.sessions.first_turn_history_owed_pending(session_key) is True
+        ):
+            # A FRESH provider session (a brand-new chat) that no ordinary
+            # prompt has reached yet: the first-turn history debt is armed at
+            # admission and only a kept non-slash turn settles it, so the
+            # native session holds no conversation. kiro-cli ends this turn
+            # with "Conversation too short to compact." and sends no
+            # compaction status, the same shape as the replay case
+            # above. Answer now rather than wait out the compaction timeout;
+            # nothing was compacted, so the debt and skills context stay as
+            # they are for the next prompt.
+            _append_compaction_notice(state, slot, COMPACT_FRESH_SESSION_NOTICE)
+        elif capabilities_of(client).compacts_inline:
+            _restore_skills_context_after_compaction(turn)
+            msg = "✅ Conversation compacted."
+            _append_compaction_notice(state, slot, msg)
+            state.broadcast_context_usage(slot.key, _context_usage_payload(slot.key, client))
+        else:
+            # Tell frontend to show compacting state and disable input
+            logger.info("Deferred compaction: waiting for compaction result")
+            state.broadcast_ws(
+                "chat_message",
+                {"slot": slot.key, "role": "compacting", "content": ""},
+            )
+            # kiro-cli fires compaction asynchronously after EVENT_COMPLETE —
+            # just wait for the result without sending another prompt.
+            compaction_result = await client.wait_for_compaction(
+                timeout=state.sessions.compact_wait_budget_secs()
+            )
+            logger.info("Deferred compaction result: %s", compaction_result)
+            if compaction_result["type"] == "completed":
+                _restore_skills_context_after_compaction(turn)
+                summary = redact(compaction_result.get("summary", ""))
+                msg = (
+                    f"✅ Conversation compacted: {summary}"
+                    if summary
+                    else "✅ Conversation compacted."
+                )
+            elif compaction_result["type"] == "failed":
+                # The provider ships the reason on `failed` too, and every
+                # other surface already tells the user what it was — Slack,
+                # Telegram, Discord, and this dashboard's own AUTO-compact
+                # notice (see chat_utils._compaction_notice_text). Dropping
+                # it here left the one path a user takes deliberately as the
+                # only one that says nothing, so a `/compact` that fails
+                # because the conversation is too large is indistinguishable
+                # from one that failed because the backend was unreachable —
+                # and the user's next move differs in those two cases.
+                #
+                # Redacted with the same pair as the completed branch above:
+                # the text is backend-echoed, so it is not trusted to be
+                # free of credentials or exfiltration URLs even though the
+                # provider already redacts once at its own boundary.
+                error = redact(compaction_result.get("summary", ""))
+                error = error.strip()
+                if len(error) > _COMPACT_FAIL_REASON_MAX_CHARS:
+                    # A notice is a one-line receipt, not a log: a provider
+                    # that echoes a wall of text (a stack trace, a dumped
+                    # payload) would otherwise push the whole transcript out
+                    # of the reader's view.
+                    error = error[:_COMPACT_FAIL_REASON_MAX_CHARS].rstrip() + "…"
+                msg = f"❌ Compaction failed: {error}" if error else "❌ Compaction failed."
+            else:
+                msg = "⚠️ Compaction timed out."
+            _append_compaction_notice(state, slot, msg)
+            # Update the context meter from the provider's post-compaction
+            # state. On success the provider has dropped its stale counts by
+            # the time the completed status arrives (reset_after_compaction),
+            # and wait_for_compaction grace-drains for kiro's fresh
+            # post-compaction metadata (~1s after the status), which
+            # re-derives REAL numbers against the kept served window.
+            # _context_usage_payload ships those accurate counts when the
+            # metadata has landed, and otherwise a `reset` frame (used == 0)
+            # carrying whatever pct the provider currently reports, so the
+            # frontend drops its stale counts and the meter self-corrects on
+            # the next turn. On failure/timeout `used` is unchanged and still
+            # valid, so the same call re-sends the real counts as-is.
+            state.broadcast_context_usage(slot.key, _context_usage_payload(slot.key, client))

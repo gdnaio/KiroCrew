@@ -64,10 +64,20 @@ describe('AgentDropdownList', () => {
     // Guard against the loop passing vacuously (e.g. rows moved into a portal).
     expect(checked).toBeGreaterThan(0)
   })
+
+  it('draws the keyboard focus ring inside each row, so the host scroller cannot clip it', () => {
+    // Rows sit flush with the host's `overflow-y-auto` edge. The global
+    // `:focus-visible` outline is offset 2px OUTSIDE the box, so on the first
+    // row the scroller cut its top edge off. The inset utility opts out of it.
+    render(<AgentDropdownList agents={agents} activeAgent="kirocrew" defaultAgent="" onSelect={() => {}} />)
+    for (const option of screen.getAllByRole('option')) {
+      expect(option).toHaveClass('focus-ring-accent-inset')
+    }
+  })
 })
 
 describe('AgentDropdownList namespaces (member vs template)', () => {
-  it('names a crewmate by its label alone; a template by its name', () => {
+  it('names a mate by its label alone; a template by its name', () => {
     const rows: AgentItem[] = [
       { name: 'mate', source: 'builtin', selection_kind: 'member', display_name: 'Pebble' },
       { name: 'mate', source: 'kirocrew', selection_kind: 'template', display_name: 'Ignored' },
@@ -88,7 +98,7 @@ describe('AgentDropdownList namespaces (member vs template)', () => {
   it('groups by kind and keeps a same-name member and template as two rows', () => {
     render(<AgentDropdownList agents={both} activeAgent="" defaultAgent="" onSelect={() => {}} />)
     const groups = screen.getAllByRole('group')
-    expect(groups.map(g => g.getAttribute('aria-label'))).toEqual(['Custom agents', 'Crewmates'])
+    expect(groups.map(g => g.getAttribute('aria-label'))).toEqual(['Custom agents', 'Mates'])
     expect(screen.getAllByRole('option')).toHaveLength(3)
     expect(screen.getAllByText('reviewer')).toHaveLength(2)
   })
@@ -135,7 +145,7 @@ describe('AgentDropdownList namespaces (member vs template)', () => {
     expect(onSelect).toHaveBeenNthCalledWith(2, 'reviewer', 'member')
   })
 
-  it('draws the roster avatar on a crewmate row and none on a template row', () => {
+  it('draws the roster avatar on a mate row and none on a template row', () => {
     // A member is a crewmate with a face; a template is a definition. The same
     // CrewAvatar the roster renders (a decorative img) sits before the name on
     // member rows only, so a same-name pair is told apart at a glance.
@@ -296,7 +306,7 @@ describe('ManageAgentsFooter', () => {
   it('calls onManage when the link is activated', () => {
     const onManage = vi.fn()
     render(<ManageAgentsFooter onManage={onManage} />)
-    fireEvent.click(screen.getByText('Manage crewmates…'))
+    fireEvent.click(screen.getByText('Manage mates…'))
     expect(onManage).toHaveBeenCalledTimes(1)
   })
 

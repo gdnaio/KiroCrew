@@ -32,6 +32,7 @@ from pathlib import Path
 from types import ModuleType as _ModuleType
 from typing import Any
 
+from kiro_crew import md_notebook_state as _md_notebook_state
 from kiro_crew import platform_compat
 from kiro_crew.apps import deps_boot as _deps_boot_module
 from kiro_crew.apps.execution import (
@@ -57,6 +58,7 @@ from kiro_crew.sandbox import (
     MD_NOTEBOOK_APP_NAME,
     RLIMIT_PROFILE_BUILD,
     RLIMIT_PROFILE_TOOL,
+    _md_notebook_degraded_mask_dirs,
     app_backend_visible_targets,
     carveout_shadowed_by_foreign_mask,
     cgroup_scope_argv,
@@ -290,6 +292,16 @@ def _shebang_argv(entry: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _starting_reservation(app_name: str) -> AppProcess:
+    """A STARTING record that holds *app_name*'s slot while a spawn is in flight.
+
+    It names no process and carries no provenance. The single-flight spawn below and the
+    restart's drain both publish one, so a concurrent start waits on it instead of
+    reading the slot as free.
+    """
+    return AppProcess(app_name=app_name, starting=True, started_at=time.time())
+
+
 def start_app_backend(app_name: str) -> AppProcess | None:
     """Start an app's backend process if it declares one.
 
@@ -335,9 +347,7 @@ def _start_app_backend(app_name: str) -> AppProcess | None:
                 await_inflight = True
         if not await_inflight:
             # Reserve a STARTING placeholder so a concurrent call sees this spawn in flight.
-            spawn_placeholder = AppProcess(
-                app_name=app_name, starting=True, started_at=time.time()
-            )
+            spawn_placeholder = _starting_reservation(app_name)
             _processes[app_name] = spawn_placeholder
     if await_inflight:
         logger.info("App %s backend is already starting — awaiting the in-flight spawn", app_name)
@@ -730,6 +740,12 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
     # start an app on a host that is running perfectly well.
     if central_ceiling_installed():
         _platform_extra[POLICY_CACHE_ONLY_ENV] = "1"
+        # An enterprise child adopts only the cache for the profile this gateway is
+        # pinned to; minimal_env() would otherwise drop the pin it inherits.
+        from kiro_crew.platform.enterprise_policy_fetch import PROFILE_PIN_ENV
+
+        if os.environ.get(PROFILE_PIN_ENV):
+            _platform_extra[PROFILE_PIN_ENV] = os.environ[PROFILE_PIN_ENV]
         # The EFFECTIVE bound, not the env var: a fleet is just as likely to declare
         # max_cache_age_secs in the published document, and reading only the environment
         # would leave this child with no bound at all — accepting an arbitrarily stale
@@ -1167,6 +1183,37 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
     _visible: tuple[str, ...] = ()
     if is_builtin_app(app_root=execution_path, app_name=app_name):
         _visible = app_backend_visible_targets(app_name)
+    if _shipped_md_notebook:
+        # Move legacy Notes state into the state directory before the backend reads it.
+        # Spawn prep runs the same move on sandboxed hosts; this call covers a host with no
+        # sandbox wrap (Windows). Marker-gated, so a second call is one stat. Until it is
+        # sealed the backend does not start, so no backend write can race the move.
+        if not _md_notebook_state.sealed_default_legacy_state():
+            logger.error(
+                "App %s: not starting until its one-time state move finishes (see the "
+                "warning above); the next start retries it",
+                app_name,
+            )
+            return None
+        _active_home = str(config_dir())
+
+        def _under_active_home(path: str) -> bool:
+            try:
+                return os.path.commonpath([_active_home, path]) == _active_home
+            except ValueError:  # another drive on Windows: not under this home
+                return False
+
+        if any(_under_active_home(d) for d in _md_notebook_degraded_mask_dirs()):
+            # A link under ``workspace/md-notebook`` makes every spawn mask that whole
+            # directory with a writable, namespace-only stand-in, and without its carve-out
+            # the state directory is one too. Any attach, clone or PAT save would then
+            # succeed and vanish on restart, so the backend does not start at all.
+            logger.error(
+                "App %s: not starting: workspace/md-notebook is reached through a link, so "
+                "its writes would be lost on restart; replace the link with a real directory",
+                app_name,
+            )
+            return None
     if _cache_visible:
         # SECURITY: refuse rather than carve when the cache sits beneath an
         # independently masked directory (a data home relocated under a credential

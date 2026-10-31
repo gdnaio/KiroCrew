@@ -8,7 +8,7 @@
 #   4. Stage the dashboard into the package's static dir
 #   5. Prune caches/tests/unused stdlib to shrink the bundle
 #   6. (opt-in, BUNDLE_KIRO_CLI=1) Stage a pinned kiro-cli into backend-dist/kiro-cli/
-#   6b. Stage the pinned KAS engine bundle into backend-dist/kas[-<arch>]/
+#   6b. Stage the pinned KAS engine bundle into backend-dist/kas/
 #   7. Package the desktop app with electron-builder -> DMG / AppImage / NSIS
 #
 # The result is a double-clickable app that embeds the whole Python backend +
@@ -183,29 +183,37 @@ is_macos_intel_backend() {
   }
 }
 
-# The audio decoder wheel a backend installs, or nothing.
+# Install the pinned audio decoder into a backend's site-packages, or nothing.
+#
+# The bytes come from kiro_crew.stt.decoder's own pin table (`python -m
+# kiro_crew.stt.decoder --install-into`), downloaded from that module's release
+# and verified by size and SHA-256, so this build cannot ship a decoder the
+# runtime would refuse. It lands in site-packages/kirocrew_ffmpeg/bin
+# (stt.decoder.PACKAGED_DIR), which is where the runtime looks for it.
 #
 # The macOS Intel backend installs NONE and resolves a system FFmpeg the way a
 # source install does (kiro_crew.stt.decoder.bundle_carries_decoder). Do not add
-# the wheel back for it: the runtime carries no pin for that platform, so a
-# bundled copy would never be authenticated or used.
-#   $1 = target arch, as build_backend receives it
-desktop_decoder_requirement() {
-  if is_macos_intel_backend "$1"; then
+# one back for it: the runtime carries no pin for that platform, so a bundled
+# copy would never be authenticated or used.
+#   $1 = bundled interpreter, $2 = its site-packages, $3 = target arch
+install_desktop_decoder() {
+  if is_macos_intel_backend "$3"; then
     return 0
   fi
-  printf '%s\n' "imageio-ffmpeg==0.6.0"
+  log "Installing the pinned audio decoder…"
+  env PYTHONNOUSERSITE=1 PYTHONPATH= "$1" -s -m kiro_crew.stt.decoder \
+    --install-into "$2/kirocrew_ffmpeg/bin"
 }
 
 # NOTE ON THE APPLE-SILICON DECODER -- do NOT re-introduce a compressed payload.
 #
-# The arm64 imageio-ffmpeg executable ships as a PLAIN Mach-O under
+# The arm64 decoder executable ships as a PLAIN Mach-O under
 # Contents/Resources, so the app signer signs it with Developer ID + hardened
 # runtime + secure timestamp along with every other nested binary
 # (packaging/signing/generate-manifest.py enumerates it).
 #
 # #6746 instead stored it as inert gzip data, to keep the bytes byte-identical to
-# the pinned upstream wheel across signing. The Apple notary service DECOMPRESSES
+# the pinned upstream bytes across signing. The Apple notary service DECOMPRESSES
 # archive members and scans what is inside them, so that made notarization fail
 # closed on the whole release (submission 3dbd3c7d, three `error` issues on
 # .../binaries/ffmpeg-macos-aarch64-v7.1.gz/ffmpeg-macos-aarch64-v7.1: not signed
@@ -214,7 +222,7 @@ desktop_decoder_requirement() {
 # is the working shape.
 #
 # The runtime consequence is handled in kiro_crew.transcribe: the packaged decoder
-# is accepted either at the pinned upstream digest (local builds and the build gate
+# is accepted either at the pinned digest (local builds and the build gate
 # below, which run BEFORE signing) or on a valid Developer ID signature from our
 # team (the released app, whose bytes signing necessarily rewrote).
 
@@ -507,12 +515,10 @@ build_backend() {
   # installs from this checkout) prevents a surprise CMake/C++ source build. Missing
   # recogniser wheels fail every supported desktop build: local dictation is the
   # default and must be usable immediately. macOS Intel is the sole legacy exception.
-  local decoder_req
-  decoder_req="$(desktop_decoder_requirement "$want_arch")"
   env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
     "$out/bin/python3.12" -m pip install --prefer-binary \
     --no-warn-script-location --disable-pip-version-check \
-    "$ROOT[voice-aws]" ${decoder_req:+"$decoder_req"}
+    "$ROOT[voice-aws]"
   if ! env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
       "$out/bin/python3.12" -m pip install --prefer-binary \
       --only-binary pywhispercpp \
@@ -528,6 +534,7 @@ build_backend() {
 
   # Stage the dashboard dist into the package's static dir.
   sp="$out/lib/python3.12/site-packages"
+  install_desktop_decoder "$out/bin/python3.12" "$sp" "$want_arch"
   log "Staging dashboard dist into kiro_crew/static/dist…"
   mkdir -p "$sp/kiro_crew/static"
   ( cd "$sp/kiro_crew/static" && rm -rf dist && cp -R "$ROOT/website/dist" dist )
@@ -730,7 +737,7 @@ build_backend_windows() {
   env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
     "$out/python.exe" -m pip install --prefer-binary \
     --no-warn-script-location --disable-pip-version-check \
-    "kirocrew[voice-aws] @ $root_uri" "imageio-ffmpeg==0.6.0"
+    "kirocrew[voice-aws] @ $root_uri"
   env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
     "$out/python.exe" -m pip install --prefer-binary \
     --only-binary pywhispercpp \
@@ -738,6 +745,7 @@ build_backend_windows() {
     "kirocrew[voice] @ $root_uri"
 
   sp="$out/Lib/site-packages"
+  install_desktop_decoder "$out/python.exe" "$sp" ""
   log "Staging dashboard dist into kiro_crew/static/dist…"
   mkdir -p "$sp/kiro_crew/static"
   ( cd "$sp/kiro_crew/static" && rm -rf dist && cp -R "$ROOT/website/dist" dist )
@@ -763,6 +771,13 @@ build_backend_windows() {
   # interactive cmd window keeps their own PYTHONPATH afterwards.
   mkdir -p "$out/bin"
   printf '@echo off\r\nsetlocal\r\nset "PYTHONPATH="\r\nset "PYTHONHOME="\r\n"%%~dp0..\\python.exe" -s -P -m kiro_crew %%*\r\n' > "$out/bin/kirocrew.cmd"
+  # pip also dropped Scripts\kirocrew.exe, whose embedded shebang is THIS build
+  # machine's absolute python.exe path, so it dies with "Fatal error in
+  # launcher" once the bundle is installed anywhere else. Replace it
+  # with the same relocatable shim: Scripts\ is one level below the bundle
+  # root like bin\, so "%~dp0..\python.exe" resolves the same interpreter.
+  rm -f "$out/Scripts/kirocrew.exe" "$out/Scripts/kirocrew-script.py"
+  printf '@echo off\r\nsetlocal\r\nset "PYTHONPATH="\r\nset "PYTHONHOME="\r\n"%%~dp0..\\python.exe" -s -P -m kiro_crew %%*\r\n' > "$out/Scripts/kirocrew.cmd"
 
   log "Verifying self-containment ($(basename "$out"))…"
   PYTHONNOUSERSITE=1 "$out/python.exe" -s -P -m kiro_crew --version >/dev/null \
@@ -777,6 +792,7 @@ build_backend_windows() {
     rm -rf Lib/test Lib/idlelib Lib/tkinter Lib/turtledemo Lib/ensurepip Lib/lib2to3 \
            include libs tcl \
            Lib/site-packages/kiro_crew/_vendor/llama_cpp_libs/linux_aarch64 \
+           Lib/site-packages/kiro_crew/_vendor/llama_cpp_libs/linux_aarch64_dotprod \
            Lib/site-packages/kiro_crew/_vendor/llama_cpp_libs/linux_x86_64 \
            Lib/site-packages/kiro_crew/_vendor/llama_cpp_libs/macos_arm64 \
            Lib/site-packages/kiro_crew/_vendor/llama_cpp_libs/macos_x86_64 \
@@ -935,7 +951,7 @@ fi
 # ahead of the SKIP_ELECTRON return so a backend-only build cannot leave a
 # stale declaration behind for a hand-run electron-builder to pack. The baked
 # auth allowlist (step 3b2) is cleared the same way.
-rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED" "$ELECTRON_DIR/AUTH-SERVER-ALLOWLIST"
+rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED" "$ELECTRON_DIR/AUTH-SERVER-ALLOWLIST" "$ELECTRON_DIR/EDITION"
 
 if [ "${SKIP_ELECTRON:-0}" = "1" ]; then
   log "SKIP_ELECTRON=1 — backend(s) ready under $ELECTRON_DIR/backend-dist/"
@@ -1020,10 +1036,31 @@ if [ -n "${KIROCREW_AUTH_SERVER_ALLOWLIST:-}" ]; then
     process.stdout.write(v);
   ' "$ELECTRON_DIR/auth-allowlist.js" "$KIROCREW_AUTH_SERVER_ALLOWLIST")" \
     || { echo "❌ KIROCREW_AUTH_SERVER_ALLOWLIST rejected: $KIROCREW_AUTH_SERVER_ALLOWLIST" >&2; exit 1; }
-  trap 'rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED" "$ELECTRON_DIR/AUTH-SERVER-ALLOWLIST"' EXIT
+  trap 'rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED" "$ELECTRON_DIR/AUTH-SERVER-ALLOWLIST" "$ELECTRON_DIR/EDITION"' EXIT
   printf '%s\n' "$AUTH_ALLOWLIST" > "$ELECTRON_DIR/AUTH-SERVER-ALLOWLIST"
   log "Baking AUTH-SERVER-ALLOWLIST into the app: $AUTH_ALLOWLIST"
 fi
+
+# --- 3b3. Baked EDITION (enterprise only) ------------------------------------
+# The same stamp the backend's kiro_crew/edition.py gets from setup.py:
+# KIROCREW_BUILD_EDITION (`make desktop EDITION=enterprise`). An enterprise build
+# stages $ELECTRON_DIR/EDITION, packed into app.asar by package.json's `files`
+# list and read by website/electron/edition.js, so the app gives its local
+# gateway time for the login and policy checks it runs before binding. An oss
+# build stages nothing, so its app is unchanged. Any other value fails the
+# build, as setup.py refuses it. Removed on exit with the other baked inputs.
+case "${KIROCREW_BUILD_EDITION:-oss}" in
+  oss) ;;
+  enterprise)
+    trap 'rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED" "$ELECTRON_DIR/AUTH-SERVER-ALLOWLIST" "$ELECTRON_DIR/EDITION"' EXIT
+    printf 'enterprise\n' > "$ELECTRON_DIR/EDITION"
+    log "Baking EDITION=enterprise into the app"
+    ;;
+  *)
+    echo "❌ KIROCREW_BUILD_EDITION must be oss or enterprise, not: ${KIROCREW_BUILD_EDITION}" >&2
+    exit 1
+    ;;
+esac
 
 # --- 3c. Bundle kiro-cli into the app resources (opt-in) ----------------------
 # OFF by default. The shipped app detects the kiro-cli the user installed, and
@@ -1254,33 +1291,44 @@ print(p["sha256"])' "$cache/manifest.json" "$file")"
     # Stage the four beside the executable, where the loader looks first. This
     # is the deployment the bundle already relies on elsewhere: the Python
     # runtime it ships carries vcruntime140.dll next to its own interpreter,
-    # for the same reason.
+    # for the same reason. They come from Microsoft's redistributable, pinned
+    # in packaging/vc-runtime-pin.json (installer and each DLL sha256-verified,
+    # fail closed), never from this build host's System32: the application
+    # directory wins over System32, so a stale host copy would shadow a user's
+    # newer runtime. vc_runtime.py also records the version in
+    # VC-RUNTIME-VERSION beside BUNDLED-VERSION.
     #
     # The runtime is one of two things the executable needs and the MSI does not
     # bring. The other is DirectML: it imports DMLCreateDevice1 from
     # directml.dll as a static import, so the loader resolves it before main.
-    # That one is left to the host because it is an OS component on desktop
-    # Windows, which is where the app runs and what an unbundled kiro-cli
-    # install already relies on -- but a build host without it (a Windows Server
-    # Core image carries none) needs it supplied, and the probe below is where
-    # that shows up.
-    local crt_dir crt
-    local -a crt_missing=()
-    crt_dir="$(cygpath -u "${SYSTEMROOT:-${WINDIR:-C:\\Windows}}")/System32"
-    for crt in vcruntime140.dll vcruntime140_1.dll msvcp140.dll msvcp140_1.dll; do
-      if [ -f "$crt_dir/$crt" ]; then
-        cp -a "$crt_dir/$crt" "$dest/$crt"
-      else
-        crt_missing+=("$crt")
-      fi
-    done
-    if [ "${#crt_missing[@]}" -ne 0 ]; then
-      echo "ERROR: this build host has no Visual C++ runtime to stage beside kiro-cli" >&2
-      echo "       $crt_dir lacks: ${crt_missing[*]}" >&2
-      echo "       kiro-cli.exe imports them and cannot start without them." >&2
-      echo "       Install the Visual C++ 2015-2022 x64 redistributable." >&2
-      exit 1
+    # DirectML is deliberately NOT bundled: it is an OS component on desktop
+    # Windows, which is where the app runs and what upstream's own standalone
+    # kiro-cli installer relies on too. A build host without it (a Windows
+    # Server Core image carries none) needs it supplied, and the probe below is
+    # where that shows up.
+    #
+    # Fetched exactly like the kiro-cli archive above: a sha-verified cache
+    # entry, else a fresh download into a cache-local temp file renamed into
+    # place only once it verifies.
+    local vcrt_cache vcrt_source vcrt_sha vcrt_url vcrt_bundle vcrt_fresh
+    vcrt_cache="$HOME/.cache/kirocrew-build/vc-runtime"
+    mkdir -p "$vcrt_cache"
+    vcrt_source="$(python3 "$ROOT/packaging/vc_runtime.py" source)"
+    # Native Windows Python prints CRLF; command substitution removes only LF.
+    vcrt_source="${vcrt_source%$'\r'}"
+    vcrt_sha="${vcrt_source%% *}"
+    vcrt_url="${vcrt_source#* }"
+    vcrt_bundle="$vcrt_cache/$vcrt_sha-VC_redist.x64.exe"
+    if [ ! -f "$vcrt_bundle" ] || ! kiro_cli_sha_ok "$vcrt_sha" "$vcrt_bundle"; then
+      vcrt_fresh="$(mktemp "$vcrt_cache/.download.XXXXXX")"
+      curl --proto '=https' --tlsv1.2 -fsSL "$vcrt_url" -o "$vcrt_fresh"
+      kiro_cli_sha_ok "$vcrt_sha" "$vcrt_fresh" \
+        || { rm -f "$vcrt_fresh"; echo "ERROR: VC++ redistributable sha256 mismatch: refusing to bundle" >&2; exit 1; }
+      rm -f "$vcrt_bundle"
+      mv -f "$vcrt_fresh" "$vcrt_bundle"
     fi
+    python3 "$ROOT/packaging/vc_runtime.py" stage "$(cygpath -w "$dest")" \
+      --bundle "$(cygpath -w "$vcrt_bundle")"
   else
     local tmp
     tmp="$(mktemp -d)"
@@ -1447,14 +1495,23 @@ fi
 # the same code `kirocrew kas install` runs, so the staged tree is byte-for-byte
 # what an install would lay down and the backend reads it with the same reader.
 #
-# Layout mirrors the backend trees: one root per architecture on a universal
-# macOS build (backend-dist/kas-arm64/, backend-dist/kas-x64/: Node ships no
-# universal binary, the engine's own JS is shared), backend-dist/kas/ otherwise.
-# Each root holds <version>/{bundle,node,install.json} plus a BUNDLED-VERSION
-# provenance file beside it, which the Electron shell reads to know which
-# version directory's record to check (gateway-env.js, bundledKasEnvironment)
-# before it exports KIROCREW_BUNDLED_KAS_DIR. The backend ranks the data home's own
-# install ahead of this root, so `kirocrew kas install` keeps working in the app.
+# One root, backend-dist/kas/, on every build. It holds
+# <version>/{bundle,node,install.json} plus a BUNDLED-VERSION provenance file
+# beside it, which the Electron shell reads to know which version directory's
+# record to check (gateway-env.js, bundledKasEnvironment) before it exports
+# KIROCREW_BUNDLED_KAS_DIR. The backend ranks the data home's own install ahead
+# of this root, so `kirocrew kas install` keeps working in the app.
+#
+# A universal macOS build stages the engine ONCE: the engine tarball is already
+# darwin-universal, and make_universal_node `lipo -create`s the arm64 and x64
+# Node builds into one Mach-O at the record's node_bin path, probing each slice
+# through `arch`, then trims the tree to what runs (trim_for_shipping): Node's
+# binary and license, the engine minus its C sources, headers, source maps and
+# web-tree-sitter's debug build. A single-arch build stages the tree as
+# `kirocrew kas install` lays it down, untrimmed. The universal staged tree
+# holds only regular files and directories -- no symlink, no hardlink (the
+# macOS signing service refuses a bundle with shared trees); the gate after the
+# installer fails the universal build on either.
 #
 # BUNDLE_KAS=0 opts a build out; the switch then needs `kirocrew kas install`
 # first, exactly as a pip install does. Fetches from KAS_BUNDLE_URL (default:
@@ -1462,8 +1519,9 @@ fi
 # the manifest digest is the pin, so nothing stale can be reused by mistake.
 #   $1 = backend tree (its python runs the installer)   $2 = dest root
 #   $3 = platform.system() name   $4 = platform.machine() name
+#   $5 = "universal" to lipo both Mac Node builds into one binary (Darwin only)
 stage_kas_bundle() {
-  local tree="$1" dest="$2" system="$3" machine="$4" py
+  local tree="$1" dest="$2" system="$3" machine="$4" universal="${5:-}" py links
   if [ -x "$tree/bin/python3.12" ]; then
     py="$tree/bin/python3.12"
   elif [ -x "$tree/python.exe" ]; then
@@ -1477,7 +1535,7 @@ stage_kas_bundle() {
   # Paths and names reach Python via argv, never string splicing. -I (isolated):
   # no user site, no PYTHONPATH, no PYTHON* env, so `kiro_crew` resolves to the
   # backend this build just installed and nothing else on the build host.
-  "$py" -I - "$dest" "$system" "$machine" "${KAS_BUNDLE_URL:-}" <<'PY'
+  "$py" -I - "$dest" "$system" "$machine" "${KAS_BUNDLE_URL:-}" "$universal" <<'PY'
 import sys
 from pathlib import Path
 
@@ -1486,31 +1544,53 @@ from kiro_crew.acp.kas_pin import KAS_PIN_MANIFEST_SHA256, KAS_PIN_VERSION
 from kiro_crew.config.sections import KAS_BUNDLE_DEFAULT_URL
 
 dest, system, machine, base = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+universal = sys.argv[5] == "universal"
 base = base or KAS_BUNDLE_DEFAULT_URL
-print(f"    KAS {KAS_PIN_VERSION} for {system}/{machine} from {base}")
+print(f"    KAS {KAS_PIN_VERSION} for {system}/{machine}{' + universal Node' if universal else ''} from {base}")
 manifest, url = kas_bundle.fetch_manifest(
     base, version=KAS_PIN_VERSION, sha256=KAS_PIN_MANIFEST_SHA256
 )
 installed = kas_bundle.install_bundle(
     manifest, source=url, root=dest, system=system, machine=machine
 )
+if universal:
+    installed = kas_bundle.make_universal_node(manifest, installed, source=url)
+    freed = kas_bundle.trim_for_shipping(installed)
+    print(f"    trimmed {freed / 1048576:.0f} MiB the engine never runs")
 # Re-read through the same reader the gateway will use: a tree the reader
 # rejects is a build error here, not a refusal on the user's first prompt.
 again = kas_bundle.installed_bundle(root=dest, version=KAS_PIN_VERSION)
 assert again is not None and again.acp_server == installed.acp_server, "staged tree does not read back"
+assert again.node_bin == installed.node_bin, "staged Node does not read back"
 (dest / "BUNDLED-VERSION").write_text(KAS_PIN_VERSION + "\n", encoding="utf-8")
 print(f"    engine: {installed.acp_server.relative_to(dest)}")
 print(f"    node:   {installed.node_bin.relative_to(dest)} (v{installed.node_version})")
 PY
   kiro_cli_layout_gate "$dest"
+  if [ "$universal" = "universal" ]; then
+    # Only regular files and directories: a symlink or a hardlinked file inside
+    # the universal app is what the macOS signing service refuses. A single-arch
+    # tree is staged as `kirocrew kas install` lays it down, Node's bin links
+    # included, and is not checked here.
+    links="$(find "$dest" \( -type l -o \( -type f -links +1 \) \) -print 2>/dev/null | head -5)"
+    if [ -n "$links" ]; then
+      echo "ERROR: the staged KAS tree carries a symlink or hardlink the signer refuses:" >&2
+      printf '       %s\n' "$links" >&2
+      exit 1
+    fi
+  fi
+  if [ "$universal" = "universal" ]; then
+    echo "    node slices: $(lipo -archs "$dest/$(cat "$dest/BUNDLED-VERSION")"/node/*/bin/node)"
+  fi
   echo "    staged KAS bundle -> backend-dist/$(basename "$dest")/ ($(du -sh "$dest" 2>/dev/null | cut -f1))"
 }
 
 if [ "${BUNDLE_KAS:-1}" = "1" ]; then
   log "Staging the pinned KAS engine bundle…"
   if [ "$UNIVERSAL" = "1" ]; then
-    stage_kas_bundle "$ELECTRON_DIR/backend-dist/kirocrew-backend-arm64" "$ELECTRON_DIR/backend-dist/kas-arm64" Darwin arm64
-    stage_kas_bundle "$ELECTRON_DIR/backend-dist/kirocrew-backend-x64" "$ELECTRON_DIR/backend-dist/kas-x64" Darwin x86_64
+    # The arm64 tree's interpreter runs the installer natively; the x64 Node
+    # slice is probed under Rosetta, as the x64 backend gate is.
+    stage_kas_bundle "$ELECTRON_DIR/backend-dist/kirocrew-backend-arm64" "$ELECTRON_DIR/backend-dist/kas" Darwin arm64 universal
   else
     case "$OS" in
       darwin)  KAS_SYSTEM=Darwin ;;
@@ -1716,6 +1796,35 @@ if [ "$OS" = "darwin" ] && { [ "$UNIVERSAL" = "1" ] || [ -n "${TARGET_ARCH:-}" ]
     echo "    $APP_BIN: $LIPO_ARCHS"
   else
     echo "ERROR: shell binary is not ${TARGET_ARCH}-only (lipo -archs: $LIPO_ARCHS)" >&2
+    exit 1
+  fi
+fi
+
+# macOS universal update-zip size gate. The zip is the update payload, and the
+# Squirrel.Mac inside every INSTALLED app (Electron 43 and 44.0-44.6) downloads
+# it into one NSData whose capacity doubles as it grows: past 1 GiB it asks for
+# 2 GiB, which Electron's PartitionAlloc refuses by design, and the running app
+# dies mid-update. The install is performed by the OLD app's Squirrel, so a
+# newer Electron in THIS build does not help the users receiving it; only the
+# artifact's size does.
+#
+# 1000 MiB leaves 24 MiB below the 1024 MiB cliff for the bytes signing and
+# notarization add (sign-and-notarize.yml rebuilds the zip with ditto after
+# signing). Lowering the ceiling is fine; raising it past 1024 MiB ships the crash.
+if [ "$OS" = "darwin" ] && [ "$UNIVERSAL" = "1" ]; then
+  MAC_ZIP_MAX_MIB=1000
+  MAC_ZIP="$(find "$ELECTRON_DIR/dist" -maxdepth 1 -name '*-mac.zip' -print -quit 2>/dev/null)"
+  if [ -z "$MAC_ZIP" ]; then
+    echo "ERROR: no *-mac.zip under $ELECTRON_DIR/dist to size-check" >&2
+    exit 1
+  fi
+  MAC_ZIP_BYTES="$(stat -f%z "$MAC_ZIP")"
+  MAC_ZIP_MIB=$(( MAC_ZIP_BYTES / 1048576 ))
+  echo "    $(basename "$MAC_ZIP"): ${MAC_ZIP_BYTES} bytes, ${MAC_ZIP_MIB} MiB (ceiling ${MAC_ZIP_MAX_MIB} MiB; the installed updater's cliff is 1024 MiB)"
+  if [ "$MAC_ZIP_MIB" -ge "$MAC_ZIP_MAX_MIB" ]; then
+    echo "ERROR: the universal update zip is ${MAC_ZIP_MIB} MiB, at or over the ${MAC_ZIP_MAX_MIB} MiB ceiling." >&2
+    echo "       Every installed app's Squirrel.Mac crashes on a zip past 1 GiB." >&2
+    echo "       Shrink the payload (du -sh backend-dist/* names the trees); do not raise the ceiling." >&2
     exit 1
   fi
 fi

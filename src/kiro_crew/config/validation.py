@@ -72,7 +72,7 @@ _APP_OWNED_TOP_KEYS: frozenset = frozenset({"dev_fleet"})
 # Excluded only in the shape the reader keeps -- a JSON object -- so a scalar
 # written by hand keeps the one warning that says it is being ignored.
 #   * voice_reply -- the dashboard/Slack voice settings block. Written by
-#     slack/interactions.py (``data.setdefault("voice_reply", {})``) and
+#     slack/interactions_modals.py (``data.setdefault("voice_reply", {})``) and
 #     dashboard/chat_voice.py (persisted with json.dump), and read back on
 #     startup by slack/handler_runtime/voice.py::load_voice_reply_config
 #     (``cfg.raw.get("voice_reply")``), and also by
@@ -96,6 +96,12 @@ except ImportError:  # pragma: no cover
 # Config-validation warnings are part of the loader's observable contract, so
 # they are emitted on the loader's logger channel (see module docstring).
 logger = logging.getLogger("kiro_crew.config.loader")
+
+#: What a present non-string ``agent.acp_backend`` is replaced with in the loaded
+#: data: the Kiro CLI floor for an unusable value, kept apart from a stored Kiro
+#: CLI pick (``"kiro"``). Never written to disk: full-document saves restore the
+#: harness fields from the file (``_restore_stored_harness_fields``).
+MALFORMED_BACKEND_FLOOR = "\x00malformed-acp-backend"
 
 # Deprecated fields survive load and save, so repeated config reads cannot clear
 # their warning. A digest remembers each observed field value for this process
@@ -162,6 +168,16 @@ def _holds_nothing(value: object) -> bool:
     deprecation notice.
     """
     return value is None or (isinstance(value, (dict, list, str)) and not value)
+
+
+def _is_own_default(value: object, default: object) -> bool:
+    """True when a stored value is the field's own default.
+
+    Such a value behaves exactly as an absent key, so there is nothing for the
+    operator to migrate. A bool never equals a number here, so a deprecated
+    flag's ``False`` is not read as a numeric ``0`` default or the reverse.
+    """
+    return isinstance(value, bool) == isinstance(default, bool) and value == default
 
 
 def _get_help_text(schema: dict, dot_path: str) -> str:
@@ -603,7 +619,10 @@ def validate_config_data(data: dict) -> dict:
     # nothing (an empty map/list/string, or null) carries nothing for the
     # operator to migrate, so it is not announced: warning on bare presence would
     # scold an install whose earlier build materialized the key's empty default
-    # into every save, which the operator never wrote and cannot act on.
+    # into every save, which the operator never wrote and cannot act on. The
+    # same holds for a key holding the field's own default: the default-config
+    # writer serializes every field, so a config Kiro Crew has just created
+    # already carries it, and the loader would warn about its own write.
     for entry in SCHEMA_REGISTRY:
         if not entry.deprecated:
             continue
@@ -617,7 +636,7 @@ def validate_config_data(data: dict) -> dict:
             else:
                 found = False
                 break
-        if found and not _holds_nothing(node):
+        if found and not _holds_nothing(node) and not _is_own_default(node, entry.default_value):
             value_digest = hashlib.sha256(repr(node).encode("utf-8")).digest()
             warning_key = (entry.path, value_digest)
             with _DEPRECATED_WARNING_LOCK:
@@ -634,6 +653,14 @@ def validate_config_data(data: dict) -> dict:
     agent = data.get("agent")
     if isinstance(agent, dict) and isinstance(agent.get("log_level"), str):
         agent["log_level"] = agent["log_level"].upper()
+    # These two loaders fold case (and, for the heartbeat key, spaces) before
+    # matching, so a stored "Dashboard" or "WAL" is a valid value; spelled the
+    # loader's way here, the enum check keeps it instead of popping it.
+    if isinstance(agent, dict) and isinstance(agent.get("task_store_journal_mode"), str):
+        agent["task_store_journal_mode"] = agent["task_store_journal_mode"].lower()
+    heartbeat = data.get("heartbeat")
+    if isinstance(heartbeat, dict) and isinstance(heartbeat.get("default_deliver"), str):
+        heartbeat["default_deliver"] = heartbeat["default_deliver"].strip().lower()
 
     # 3b. ``auto_update`` decides whether an unattended installer runs, and its
     # two wrong answers are not symmetric, so a type mismatch must not be
@@ -663,9 +690,18 @@ def validate_config_data(data: dict) -> dict:
     # makes the resolved value and the log identical whether or not ``jsonschema``
     # is installed, which is the whole point: this function is a no-op without it.
     stt = data.get("stt")
+    # An edition-registered provider passes the resolver above but is not in the
+    # schema's enum, which lists only the built-ins (the schema is built once at
+    # import, before any context exists). Held aside across the enum check and put
+    # back after it, so the check cannot delete a value the resolver accepted.
+    registered_stt_provider: str | None = None
     if isinstance(stt, dict):
         if "provider" in stt:
             stt["provider"] = _validated_stt_provider(stt["provider"])
+            from kiro_crew.config.sections_stt import _VALID_STT_PROVIDERS
+
+            if stt["provider"] not in _VALID_STT_PROVIDERS:
+                registered_stt_provider = stt.pop("provider")
         if "model" in stt:
             # The sibling pair travels with the name: ``custom`` is only a usable
             # selection when both halves are set, and validating it without them
@@ -676,6 +712,12 @@ def validate_config_data(data: dict) -> dict:
                 custom_path=stt.get("custom_model_path", ""),
                 custom_sha256=stt.get("custom_model_sha256", ""),
             )
+        # `"auto"` is a documented spelling of 0, so it must become the int before
+        # the integer type check deletes it with a misleading "wrong type" notice.
+        if "threads" in stt:
+            from kiro_crew.config.sections import _validated_stt_threads
+
+            stt["threads"] = _validated_stt_threads(stt["threads"])
 
     # 3d. The harness fields have a product default distinct from their safety
     # floor. Absent or "" is "no choice" and takes the default, but a PRESENT
@@ -698,7 +740,15 @@ def validate_config_data(data: dict) -> dict:
                     harness_key,
                     agent[harness_key],
                 )
-                agent[harness_key] = backend_to_stored(GOVERNANCE_FLOOR_BACKEND)
+                # ``agent.acp_backend`` gets a marker, not ``"kiro"``: a stored Kiro
+                # CLI pick can run on KAS (``KIRO_SELECTION_BACKEND``), and this is
+                # the floor for an unusable value, not that pick. The loader reads
+                # the marker as the floor (``_read_backend_choice``).
+                agent[harness_key] = (
+                    MALFORMED_BACKEND_FLOOR
+                    if harness_key == "acp_backend"
+                    else backend_to_stored(GOVERNANCE_FLOOR_BACKEND)
+                )
 
     # 4. Preserve numeric values written by older config writers.
     _coerce_legacy_numeric_values(data, JSON_SCHEMA)
@@ -763,5 +813,8 @@ def validate_config_data(data: dict) -> dict:
                     err.message,
                     "using default" if removed else "value kept (validated by its consumer)",
                 )
+
+    if registered_stt_provider is not None and isinstance(data.get("stt"), dict):
+        data["stt"]["provider"] = registered_stt_provider
 
     return data

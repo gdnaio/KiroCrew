@@ -54,10 +54,12 @@ class RendererCapabilities:
     """
 
     #: Tier directories the cc tier leaves VISIBLE, because the renderer cannot mask a
-    #: directory while re-exposing one file inside it. The Linux launcher restores a
-    #: read-only copy of ``~/.aws/config`` into the empty mask; Seatbelt rules are path
-    #: rules with no such copy, and ``credential_process`` and the SSO caches live
-    #: under ``~/.aws``, so Seatbelt keeps the whole directory readable.
+    #: directory while re-exposing one file inside it. Neither renderer needs it today:
+    #: the Linux launcher restores a read-only copy of ``~/.aws/config`` into the empty
+    #: mask, and Seatbelt denies the ``~/.aws`` subpath with a ``require-not literal``
+    #: exception for ``~/.aws/config`` (the same shape as ``~/.ssh/known_hosts``). So
+    #: on both backends cc hides the credentials file and the SSO caches and keeps
+    #: only ``config`` readable.
     cc_unmaskable_dirs: frozenset[str]
 
 
@@ -67,7 +69,7 @@ CAPABILITIES: Mapping[str, RendererCapabilities] = {
         cc_unmaskable_dirs=frozenset(),
     ),
     BACKEND_SEATBELT: RendererCapabilities(
-        cc_unmaskable_dirs=frozenset({".aws"}),
+        cc_unmaskable_dirs=frozenset(),
     ),
 }
 
@@ -108,6 +110,12 @@ class SandboxRequest:
     #: optionally followed by the kind the name reached and the referent's dev and ino.
     mask_occupants: tuple[tuple[str, tuple[int, ...]], ...] = ()
     crew_home_aliases: tuple[tuple[str, str, int, int], ...] = ()
+    #: A directory the launcher enters after every seal and before it execs, so the
+    #: agent starts in it through the sealed mount; it must then be read-only and
+    #: empty, or the launch fails closed. Empty: the agent starts in the launcher's
+    #: own working directory (an app agent's launch copy sets it,
+    #: ``apps.agent_launch.launch_process_cwd``).
+    exec_cwd: str = ""
 
 
 @dataclass(frozen=True)
@@ -328,6 +336,8 @@ class ConfinementPlan:
     identities: NamespaceIdentities
     cancellations: tuple[Cancellation, ...]
     refusals: tuple[Refusal, ...]
+    #: :attr:`SandboxRequest.exec_cwd`, carried to the namespace launcher.
+    exec_cwd: str = ""
 
     @property
     def sensitive_dirs(self) -> tuple[str, ...]:
@@ -925,6 +935,7 @@ def _namespace_plan(
         identities=identities,
         cancellations=cancellations,
         refusals=tuple(window_refusals + carveout_refusals),
+        exec_cwd=request.exec_cwd,
     )
 
 
@@ -1111,6 +1122,7 @@ def namespace_payload(plan: ConfinementPlan) -> dict[str, Any]:
         "sensitive_files": list(plan.sensitive_files),
         "fail_closed_file_masks": [list(entry) for entry in ids.fail_closed_file_masks],
         "alias_credential_ids": [list(pair) for pair in ids.alias_credential_ids],
+        "exec_cwd": plan.exec_cwd,
         "required_mask_targets": list(ids.required_mask_targets),
         # The link flag is an INT, not a bool: this data is embedded in the launcher as
         # PYTHON SOURCE, and ``json.dumps`` spells a bool ``true``/``false``, which

@@ -84,7 +84,7 @@ it is read from code and still needs a fault-injected run.
 | E6 | `mcp_gateway/manager.py` `_LIVENESS_PING_INTERVAL_SECS` 30 L56, `_PING_TIMEOUT_SECS` 2.0 L50 (10s on the branch), `_LIVENESS_MAX_CONSECUTIVE_FAILURES` 3 L64 | Ping failure ⇒ zombie ⇒ kill + respawn | 已复现 (incident: daemon killed while forking) | Separate overload from death using loop lag, pressure, progress (§7) |
 | E7 | `mcp_gateway/stub.py` `_RECONNECT_TOTAL_BUDGET_SECS` 60 L85 (600 on the branch); `_reconnect` L1334 replays `initialize`, refuses when live subscriptions cannot be restored | Transport recovery exists; nothing above it resumes the task | 已复现 | Close the loop transport → runtime → task (§7) |
 | E8 | `taskrunner_parts/run_lifecycle.py` `_MAX_CONCURRENT_TASKS` 3, refusal in `TaskRunner.start_background` and `TaskRunner.execute_plan`, crash → `paused` in `TaskRunner._load_runs`; `workflows/registry.py` L234–239 running → `interrupted` failed | Persistent stores exist; excess is refused, restart parks work | 待验证 (restart path read from code) | Cross-entry queue, resume and re-dispatch (§3, §12) |
-| E9 | `dashboard/session_health.py` `_PATTERNS` L38 regex over `gateway.log`; `acp/runtime.py` `_session_start_stalled` L3034 | Health is log-scraped; ACP has liveness but no task state | 已复现 | Structured health from task + runtime state (§10) |
+| E9 | `dashboard/session_health.py` `_PATTERNS` L38 regex over `gateway.log`; `acp/runtime_session_registry.py` `_session_start_stalled` | Health is log-scraped; ACP has liveness but no task state | 已复现 | Structured health from task + runtime state (§10) |
 | E10 | `mcp_tools/spawn_parts/wave.py` `spawn_sub_agents` `max_wait` clamp 60..7200 vs subagent 10800 | Caller wait ends before child budget | 已复现 | Return `still_running` ids, never mark the child failed (§8) |
 | E11 | `acp/runtime.py` `_COLD_START_MAX_CONCURRENT` 2 L187, `_SESSION_NEW_TIMEOUT` 90 L255, `acp/runtime_session_create.py` `create_session` (`_session_inits_in_flight` is diagnostic only); `acp/worker_pool.py` `DEFAULT_MAX_STARTING` 2 L59; `workflows/context.py` `DEFAULT_MAX_AGENTS_PER_RUN` 1000 L33; `subagent_manager/run_turn.py` `_run_inner_impl` ANY start exception → dedicated process | Per-entry semaphores; a timed-out `session/new` still creates a session remotely and the late reply is dropped (`_pending_requests.pop` L3767) | 已复现 (dedicated-process amplifier in incident) | One host budget across entries; tracked session-start ownership (§4.4) |
 
@@ -836,6 +836,9 @@ Question text is kept as asked; the decision below it is final for this PR.
   through `resource_status.probe`, so the figures below are measured through
   the probe the floor compares against; `platform_compat._macos_available_mib`
   is a tighter sum behind `host_available_mib`, which the floor does not read.
+  (Since #21574 the floor does read it on macOS; the recorder figures below
+  were taken through the looser sum, so on the same host the floor now sees
+  less memory than they show. The posture still reads the looser sum.)
   Through that probe a 16 GB Apple silicon host in ordinary desktop use read a
   median of 4.84 GB over one day of recorder samples (n = 3010; p25 4.48, p75
   5.26, min 2.55, max 8.28; 26 % of samples below 4.5 GB and 59 % below 5.0 GB)
@@ -1199,7 +1202,7 @@ branched on `STOP_REASON_TOOL_STALL` and ran its own continuation bounded by
 
 `classify_stop_reason(event) -> (state, retryable, reason)` lives in
 `acp/types.py`; the sub-agent run (`subagent_manager/run_turn.py`, `run_yields.py`),
-`chat_runner.py`, workflow agents and TaskRunner call
+the main chat (`_on_complete` in `dashboard/chat_turn/turn_stats.py`), workflow agents and TaskRunner call
 it instead of reading `stop_reason` ad hoc. Recovery continues from the stored
 result and checkpoint, never by re-submitting the original task text.
 

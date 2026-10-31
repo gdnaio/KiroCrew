@@ -62,6 +62,7 @@ from kiro_crew.acp.harness import opencode as opencode_harness
 from kiro_crew.acp.harness import pi as pi_harness
 from kiro_crew.credential_errors import is_credential_propagation_delay
 from kiro_crew.start_priority import StartPriority
+from kiro_crew.testing.wait import await_until, finished
 
 # The patch-target scan parses every test file once; keep it on one worker.
 pytestmark = pytest.mark.xdist_group(name="tree_scan_acp_refactor_facade")
@@ -397,7 +398,13 @@ _MOVED: dict[str, dict[str, tuple[str, ...]]] = {
 #: there is a seam like any moved helper's.
 _MOVED_METHODS: dict[str, dict[str, tuple[str, ...]]] = {
     "kiro_crew.acp.client": {
-        "kiro_crew.acp.harness.opencode": ("_verify_opencode_routing",),
+        "kiro_crew.acp.harness.opencode": (
+            "_verify_opencode_routing",
+            # The version gate's probe reads the same client-owned
+            # spawn-env internals as the routing read-back beside it, by the same
+            # function-local import.
+            "_opencode_reported_major",
+        ),
         "kiro_crew.acp.harness.pi": ("_verify_pi_gate",),
         "kiro_crew.acp.harness.deepseek": ("_verify_deepseek_gate",),
     },
@@ -666,7 +673,7 @@ async def test_a_patched_concurrency_resolver_reaches_the_session_start_gate(
     monkeypatch.setattr(acp_runtime, "_resolve_session_start_concurrency", lambda: 7)
     loop = asyncio.get_running_loop()
     try:
-        gate = await asyncio.wait_for(acp_runtime.session_start_gate(), timeout=5)
+        gate = await finished(acp_runtime.session_start_gate(), "the session start gate resolves")
         assert gate.limit == 7
     finally:
         acp_runtime._session_start_gates.pop(loop, None)
@@ -912,7 +919,7 @@ async def test_a_clock_rebound_on_the_runtime_reaches_the_start_collector(
     )
     assert collector.created_at == 7.0
     future.set_result({})
-    await asyncio.wait_for(collector.start().settled.wait(), timeout=5)
+    await await_until(collector.start().settled, what="the start collector settles")
     assert collector.outcome == runtime_start.START_OUTCOME_ERROR
 
 
@@ -931,7 +938,7 @@ async def test_a_death_class_rebound_on_the_runtime_reaches_the_start_collector(
     collector = runtime_start.StartCollector(
         _collector_runtime(), 2, future, permit=None, timeout=5
     ).start()
-    await asyncio.wait_for(collector.settled.wait(), timeout=5)
+    await await_until(collector.settled, what="the start collector settles")
     assert collector.outcome == runtime_start.START_OUTCOME_RUNTIME_DEAD
 
 
@@ -948,7 +955,7 @@ async def test_a_handle_class_rebound_on_the_runtime_reaches_the_transcript_clea
     collector = runtime_start.StartCollector(
         _collector_runtime(), 3, future, permit=None, timeout=5, memory_mode="incognito"
     ).start()
-    await asyncio.wait_for(collector.settled.wait(), timeout=5)
+    await await_until(collector.settled, what="the start collector settles")
     assert collector.outcome == runtime_start.START_OUTCOME_TORN_DOWN
     assert cleaned == ["late-1"]
 
@@ -1396,6 +1403,10 @@ _SEAM_IMPORTS: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = {
             ("kiro_crew.acp.harness.pi", "_verify_pi_gate"),
             ("kiro_crew.acp.harness.deepseek", "_verify_deepseek_gate"),
             ("kiro_crew.acp.harness.opencode", "_verify_opencode_routing"),
+            # The version gate's probe builds its child's env by the SAME
+            # bindings, so the probe's answer describes the environment the
+            # read-back and the spawn actually run under.
+            ("kiro_crew.acp.harness.opencode", "_opencode_reported_major"),
         )
     },
 }

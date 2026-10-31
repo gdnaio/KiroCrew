@@ -6,7 +6,8 @@ pages this surface exists for: a dispatch tree, a chart, a 3D scene are layouts 
 renderer knows, and a catalog that grew a type per picture would be the host writing every
 page anyway.
 
-So a view is EITHER a block list or one HTML page, never both and never neither. The page
+So a view is one HTML page. A stored block list is read as the page it becomes,
+one way, and the block catalog is gone. The page
 is agent-authored and may run JS, and what keeps that safe is not a check on the markup --
 it is :mod:`kiro_crew.dashboard_frame`: text-only bindings, ``connect-src 'none'``,
 ``allow-scripts`` and nothing else, over an opaque origin. The checks here are the ones
@@ -70,13 +71,17 @@ class TestOneViewOrTheOther:
         assert out["view"] == {"html": '<p data-dashboard-field="boards"></p>'}
         assert "blocks" not in out["view"]
 
-    def test_a_block_list_is_still_a_view(self) -> None:
-        """The shape every stored package uses today. A new view kind that invalidated
-        the old one would make this change a migration rather than an addition."""
+    def test_a_saved_block_list_is_read_as_its_page(self) -> None:
+        """One way: a stored block list is the page it becomes, whatever its
+        type -- there is no catalog left to ask."""
         out = dp.validate_package(
-            package(view={"blocks": [{"id": "b", "type": "stat", "fields": ["boards"]}]})
+            package(view={"blocks": [{"id": "b", "type": "hologram", "fields": ["boards"]}]})
         )
-        assert out["view"]["blocks"][0]["id"] == "b"
+        assert out["view"] == {
+            "html": '<section><dl><div><dt>Boards</dt><dd data-dashboard-field="boards"></dd>'
+            "</div></dl></section>"
+        }
+        assert dp.validate_package(out)["view"] == out["view"]
 
     def test_both_at_once_is_refused(self) -> None:
         """Two views is a package with no answer to "what does this page look like".
@@ -95,7 +100,7 @@ class TestOneViewOrTheOther:
 
     def test_neither_is_refused(self) -> None:
         said = refusal(package(view={}))
-        assert "html" in said and "blocks" in said
+        assert "must hold 'html'" in said
 
 
 class TestThePageItself:
@@ -526,3 +531,51 @@ class TestAScriptsOffPageStillShowsItsValues:
 
         page = '<b data-dashboard-field="goal" title="a>b"><i>nested</i></b>'
         assert frame.fill_bindings_as_text(page, self._read(goal="land it")) == page
+
+
+class TestThePageWearsItsTheme:
+    """A package's ``theme`` is drawn on its page: tokens on ``:root``, then its css.
+
+    The gate accepts both halves and the save tool tells the author to set the look
+    there, so a renderer that dropped them served a page in the host's plain look while
+    its author had been told the style was live.
+    """
+
+    @staticmethod
+    def _body(theme: dict[str, Any]) -> str:
+        from kiro_crew import dashboard_frame
+        from kiro_crew.dashboard.handlers import member_dashboard_fields as fields
+
+        read = dashboard_frame.read_payload({"boards": 2})
+        return fields.render_package_page(dp.validate_package(package(theme=theme)), read)
+
+    def test_the_tokens_and_the_css_reach_the_page(self) -> None:
+        body = self._body(
+            {"tokens": {"--panel-bg": "#20262a"}, "css": ".board{font-family:cursive}"}
+        )
+        assert ":root{--panel-bg:#20262a;}" in body
+        assert ".board{font-family:cursive}" in body
+        # After the host's stylesheet, so a token the package sets wins over the default.
+        assert body.index("--panel-bg:#20262a") > body.index("<style>")
+        assert body.index(".board{font-family:cursive}") < body.index(
+            '<p data-dashboard-field="boards">'
+        )
+
+    def test_a_credential_in_the_theme_is_redacted_on_the_page(self) -> None:
+        token = "ghp_" + "a" * 36
+        body = self._body({"tokens": {}, "css": f".board{{content:'{token}'}}"})
+        assert token not in body
+        assert ".board{" in body
+
+    def test_an_empty_theme_adds_no_style(self) -> None:
+        assert self._body({"tokens": {}}).count("<style>") == 1
+
+    def test_a_theme_the_gate_would_refuse_draws_nothing(self) -> None:
+        from kiro_crew import dashboard_frame
+        from kiro_crew.dashboard.handlers import member_dashboard_fields as fields
+
+        stored = dp.validate_package(package())
+        # Written under an older validator: a css that closes the element.
+        stored["theme"] = {"tokens": {}, "css": "</style><script>alert(1)</script>"}
+        body = fields.render_package_page(stored, dashboard_frame.read_payload({"boards": 2}))
+        assert "alert(1)" not in body

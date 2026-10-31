@@ -192,7 +192,6 @@ class TestScriptHookStore:
             }
         )
 
-        # Load from same file
         store2 = ScriptHookStore(tmp_path)
         retrieved = store2.get(hook.id)
         assert retrieved is not None
@@ -977,3 +976,153 @@ class TestLastError:
         # and must default to "".
         hook = ScriptHook.from_dict({"id": "bad", "name": "x", "last_error": 12345})
         assert hook.last_error == ""
+
+
+class TestRunScriptHookShellDenyList:
+    """A hook command runs via ``/bin/sh -c`` OUTSIDE the ACP tool gate, so
+    ``run_script_hook`` vets it through the same shell deny-list a bash tool call
+    passes. A deny-listed command is refused before it spawns; a benign one runs
+    unchanged; a command denied only by a rule the user opted out of still runs.
+
+    Every hook command here is portable across the POSIX and Windows shells: the
+    witness that proves a spawn ran is the test interpreter (``_script_command``),
+    not a POSIX-only utility, and the opted-out case asserts on the GATE verdict
+    rather than on a command cmd.exe cannot run.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _passthrough_sandbox(self, _floor_monkeypatch):
+        # The isolation floor's own MonkeyPatch, not the shared ``monkeypatch``:
+        # an autouse fixture patching through the shared one is lifted by any test
+        # that calls ``monkeypatch.undo()`` (D11), so it is undone independently.
+        # Strip sandbox + cgroup wrapping so a benign command is a plain shell
+        # spawn here, and the deny gate (which runs BEFORE wrap_argv) is what every
+        # assertion turns on.
+        _floor_monkeypatch.setattr(
+            "kiro_crew.sandbox.wrap_argv", lambda argv, **k: (list(argv), None)
+        )
+        _floor_monkeypatch.setattr("kiro_crew.sandbox.cgroup_scope_argv", lambda argv: list(argv))
+
+    @pytest.mark.asyncio
+    async def test_a_denylisted_command_is_refused_before_it_runs(self, tmp_path: Path):
+        # A sandboxed process can plant this straight into hooks.json; the deny
+        # gate is what stops the command running. ``git push origin main`` is
+        # refused by the always-on git-publish floor. The witness writes a file via
+        # the portable interpreter and is chained with ``&&`` BEFORE the push, so
+        # had the command reached the shell the file would exist -- its absence
+        # proves the refusal happened before any spawn, on POSIX and Windows alike.
+        sentinel = tmp_path / "ran"
+        witness = _script_command(
+            tmp_path / "witness.py", f"open({str(sentinel)!r}, 'w').close()\n"
+        )
+        hook = ScriptHook(
+            id="deny-1",
+            name="denied",
+            event=HOOK_EVENT_PRE_TOOL_USE,
+            command=f"{witness} && git push origin main",
+            timeout=30,
+            enabled=True,
+        )
+        result = await run_script_hook(hook, "ctx")
+        assert result.exit_code == 2  # PreToolUse "block tool" convention
+        assert result.refused  # never ran: told apart from a hook that exited 2
+        assert result.pre_tool_blocks  # a Hooks-page hook stays fail-closed
+        assert not sentinel.exists(), "the denied command reached the shell"
+        assert "Blocked by security policy" in result.error
+        assert hook.last_status == "blocked"
+        assert hook.last_error and "Blocked by security policy" in hook.last_error
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("spec_origin", "vetted"),
+        [("user", False), ("project", True), ("", True)],
+        ids=["user-level-spec", "project-spec", "hooks-page"],
+    )
+    async def test_only_a_user_level_spec_hook_skips_the_deny_list(
+        self, tmp_path: Path, spec_origin: str, vetted: bool
+    ):
+        # The deny list guards commands a model or a sandboxed process chose. A
+        # user-level spec hook is operator-written into a tree every sandboxed
+        # process sees read-only, so it runs as kiro-cli runs it; a project spec
+        # (an agent-writable checkout) and a Hooks-page hook stay vetted. The
+        # witness runs first and the push is refused by the git-publish floor.
+        sentinel = tmp_path / "ran"
+        witness = _script_command(
+            tmp_path / "witness.py", f"open({str(sentinel)!r}, 'w').close()\n"
+        )
+        hook = ScriptHook(
+            id="spec:a1:PreToolUse:0",
+            name="spec",
+            event=HOOK_EVENT_PRE_TOOL_USE,
+            # ``|| true`` keeps the exit 0 once the push itself fails to reach a remote.
+            command=f"{witness} && git push origin main --dry-run >/dev/null 2>&1 || true",
+            timeout=30,
+            enabled=True,
+            spec_origin=spec_origin,
+        )
+        result = await run_script_hook(hook, "ctx", cwd=str(tmp_path))
+        assert result.refused is vetted
+        assert sentinel.exists() is not vetted
+
+    def test_hooks_json_cannot_claim_a_spec_origin(self):
+        # The exemption is keyed on an in-memory field that from_dict never reads
+        # and to_dict never writes, so a sandboxed process editing hooks.json
+        # cannot opt its hook out of the deny list.
+        hook = ScriptHook.from_dict(
+            {"id": "spec:x", "event": HOOK_EVENT_PRE_TOOL_USE, "spec_origin": "user"}
+        )
+        assert hook.spec_origin == ""
+        assert "spec_origin" not in ScriptHook(spec_origin="user").to_dict()
+
+    @pytest.mark.asyncio
+    async def test_a_benign_command_still_runs_unchanged(self, tmp_path: Path):
+        # The no-regression half: an ordinary command matches no deny rule and runs
+        # exactly as before the gate existed. The hook runs the test interpreter,
+        # so the spawn is portable rather than a POSIX-only utility.
+        sentinel = tmp_path / "ran"
+        command = _script_command(tmp_path / "benign.py", f"open({str(sentinel)!r}, 'w').close()\n")
+        hook = ScriptHook(
+            id="benign-1",
+            name="benign",
+            event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+            command=command,
+            timeout=30,
+            enabled=True,
+        )
+        result = await run_script_hook(hook, "ctx")
+        assert result.exit_code == 0, result.error or result.stderr
+        assert sentinel.exists(), "a benign hook command must still run"
+        assert hook.last_status == "ok"
+
+    @pytest.mark.asyncio
+    async def test_a_command_denied_only_by_an_opted_out_rule_still_runs(
+        self, tmp_path: Path, monkeypatch
+    ):
+        # The gate vets against the EFFECTIVE deny set the tool path uses, not every
+        # built-in, so a command matching only a rule the user disabled must not be
+        # blocked -- otherwise the fix would over-block the owner's own hooks.
+        # ``chmod 777`` matches a disableable built-in rule (unlike the always-on
+        # git-publish floor); with the effective set empty (opted out of
+        # everything) the gate must let it through.
+        from kiro_crew.security import is_denied
+
+        command = f"chmod 777 {tmp_path / 'probe'}"
+        # Precondition: this command IS denied by default, so the pass below is the
+        # opt-out at work and not a command the gate never matched.
+        assert is_denied(command), "precondition: chmod 777 is a default deny rule"
+
+        monkeypatch.setattr("kiro_crew.hooks.effective_denied_regexes_from_config", lambda: [])
+        hook = ScriptHook(
+            id="optout-1",
+            name="optout",
+            event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+            command=command,
+            timeout=30,
+            enabled=True,
+        )
+        result = await run_script_hook(hook, "ctx")
+        # Asserted on the GATE verdict, not on chmod running: the Windows cmd shell
+        # has no chmod, so the spawn's own exit is platform-specific, but "the deny
+        # gate did not block it" (exit 2 is the block convention) holds on both.
+        assert result.exit_code != 2
+        assert hook.last_status != "blocked"

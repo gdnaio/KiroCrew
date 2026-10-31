@@ -10,6 +10,7 @@ the configured mode clamped to the governance floor. One of the owners
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 import stat
@@ -27,7 +28,6 @@ from kiro_crew.sandbox_leaves import (
     _CREW_HOME_DEFAULT,
     _CREW_HOME_PREFIXES,
     _MD_NOTEBOOK_STAGING_LEAF,
-    _MD_NOTEBOOK_STATE_LEAVES,
     _POLICY_CACHE_LEAF,
     _RELOCATED_CREW_HIDDEN_LEAVES,
     MD_NOTEBOOK_APP_NAME,
@@ -193,10 +193,9 @@ _APP_BACKEND_OWNED_LEAVES: dict[str, tuple[str, ...]] = {
     # the gateway execs next. The pointer stays masked; Dev Fleet moves the cutover to a
     # gateway-process route instead (``dev_fleet/gateway_routes.py``).
     MD_NOTEBOOK_APP_NAME: (
-        *_MD_NOTEBOOK_STATE_LEAVES,
-        # The writers stage here and rename onto the leaves above, so the backend needs
-        # this directory back too — carving out only the three targets would leave every
-        # state write failing on the masked staging dir instead of the masked leaf.
+        # The whole state directory, handed back as one unit: the state files, their staged
+        # temps and the migration marker all live inside it, so the publish rename stays on
+        # one mount. The retired bare spellings are NOT here; the backend never reads them.
         _MD_NOTEBOOK_STAGING_LEAF,
     ),
 }
@@ -233,6 +232,98 @@ def app_backend_visible_targets(app_name: str, mode: str = "standard") -> tuple[
         if not carveout_shadowed_by_foreign_mask(target, mode=mode)
         and not carveout_chain_has_planted_link(target)
     )
+
+
+def enterprise_policy_cache_view(
+    mode: str = "standard", extra_hidden_dirs: tuple[str, ...] = ()
+) -> tuple[str, ...]:
+    """The governance cache to lift READ-ONLY for a sandboxed spawn, in an enterprise build.
+
+    An enterprise build always enters the central tier (RFC D2), including a Kiro Crew
+    MCP server kiro-cli starts inside the agent sandbox. That process reaches neither the
+    sign-in nor the control plane, so it resolves the ceiling from the cache in cache-only
+    mode (``policy_distribution_source.cache_only``) and fails closed without it. The cache
+    holds only the document the agent is already governed by, a digest of the build's
+    fixed source and the fetch validators; no credential. The vault and every other
+    credential path stay hidden.
+
+    Lifted the way ``apps/backend.py`` lifts it for a cache-only backend: one spelling,
+    refused when it sits beneath a foreign mask (:func:`carveout_shadowed_by_foreign_mask`),
+    and kept read-only by the plan for every spelling (``sandbox_plan.is_policy_cache_dir``).
+    ``()`` in an oss build, so an oss sandbox is unchanged.
+
+    Also ``()``, so the cache stays masked and a cache-only child fails closed, when:
+
+    * one of the caller's own *extra_hidden_dirs* is the cache or an ancestor of it. A
+      lift cancels every mask that contains it, so lifting would take down a mask the
+      caller asked for (a whole crew home hidden from agent-authored test code);
+    * the metadata is in the format older builds wrote, which recorded the source URL
+      in plain text, and a pre-signed URL is a credential. The gateway's next fetch or
+      304 rewrites it without the source.
+    """
+    try:
+        from kiro_crew.edition import is_enterprise
+
+        if not is_enterprise():
+            return ()
+        target = os.path.join(str(config_dir()), _POLICY_CACHE_LEAF)
+    except Exception:
+        logger.debug("could not resolve the governance cache for the sandbox", exc_info=True)
+        return ()
+    if extra_hidden_dirs and _caller_mask_contains(target, extra_hidden_dirs):
+        return ()
+    if carveout_shadowed_by_foreign_mask(target, mode=mode):
+        return ()
+    if _policy_cache_meta_names_its_source(target):
+        logger.warning(
+            "the governance cache still carries its source in plain text; keeping it hidden "
+            "from the sandbox until the gateway's next fetch rewrites it"
+        )
+        return ()
+    return (target,)
+
+
+def _caller_mask_contains(target: str, hidden: tuple[str, ...]) -> bool:
+    """Would a lift of *target* cancel one of the caller's *hidden* masks?
+
+    Checked both as written (the Seatbelt plan compares spellings) and with the crew-home
+    alias fold the namespace plan applies (``sandbox_plan.fold_crew_home_alias``), so a
+    mask spelled under ``$HOME`` still counts when the data home resolves elsewhere. An
+    alias table that cannot be built reads as "contains": the mask is kept.
+    """
+    try:
+        aliases = _crew_home_alias_roots()
+    except Exception:
+        logger.debug("could not resolve the crew-home aliases", exc_info=True)
+        return True
+    folded_target = sandbox_plan.fold_crew_home_alias(os.path.abspath(target), aliases)
+    for path in hidden:
+        if sandbox_plan.hidden_path_contains_visible_path(path, (target,)):
+            return True
+        folded = sandbox_plan.fold_crew_home_alias(os.path.abspath(path), aliases)
+        if sandbox_plan.hidden_path_contains_visible_path(folded, (folded_target,)):
+            return True
+    return False
+
+
+#: The cache's metadata leaf, mirroring ``policy_distribution_cache._CACHE_META_LEAF``.
+_POLICY_CACHE_META_LEAF = "policy.meta.json"
+
+
+def _policy_cache_meta_names_its_source(cache: str) -> bool:
+    """Does the cache metadata carry a plaintext ``source``? Unreadable reads as yes."""
+    try:
+        with open(os.path.join(cache, _POLICY_CACHE_META_LEAF), "rb") as handle:
+            raw = handle.read(64 * 1024)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        meta = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return True  # the reader refuses it anyway, and its bytes are not known to be clean
+    return not isinstance(meta, dict) or "source" in meta
 
 
 def crew_home_visible_spellings(path: str) -> tuple[str, ...]:
@@ -1057,7 +1148,7 @@ def configured_sandbox_mode() -> str:
 # Kiro Crew namespace sandbox. Deny-by-default: the gate keys ONLY on the
 # explicit, single-purpose ``KIROCREW_SANDBOX_ACTIVE``, which is exported at
 # exactly one site — the namespace launcher's ``scrub_env`` stage
-# (``sandbox_launcher_program``, which ``_build_launcher_script`` renders). We
+# (``sandbox_launcher_parts/exec_lockdown.py``, which ``_build_launcher_script`` renders). We
 # deliberately do NOT key on ``KIROCREW_HOST_PID``:
 # it is dual-purpose session-identity plumbing, and gating a security-relevant
 # passthrough on a variable set for other reasons is a latent bypass. Since the
@@ -1073,6 +1164,14 @@ def configured_sandbox_mode() -> str:
 # below safe for callers that use ``wrap_argv`` directly rather than
 # ``sandboxed_spawn_argv``.
 _IN_SANDBOX_MARKER = "KIROCREW_SANDBOX_ACTIVE"
+
+# Companion to ``_IN_SANDBOX_MARKER``: the single name for the systemd slice every
+# agent scope nests under (``kirocrew.slice/kirocrew-agents.slice`` inside the user
+# manager), and the aggregate enforcement boundary (``ensure_agents_slice_limits``).
+# It lives here, in the lowest sandbox layer, so BOTH the confinement-evidence probe
+# in ``sandbox_unavailable`` and the scope machinery in ``sandbox_cgroup`` read one
+# constant rather than repeating the literal — a renamed slice moves in one place.
+_CGROUP_AGENTS_SLICE = "kirocrew-agents.slice"
 
 # Companion to ``_IN_SANDBOX_MARKER``: records WHICH tier the outer sandbox was
 # built at (``standard``/``cc``/``strict``), exported at the same two launcher
@@ -1197,8 +1296,13 @@ def _clamp_sandbox_mode_to_floor(mode: str, floor: str | None) -> str:
     reads as "floor absent".  Here, an unknown floor/mode value raises rather
     than ranking it as 0 (which would fail open).
     """
+    from kiro_crew.edition_locks import sandbox_mode_floor
     from kiro_crew.platform.governance import _ORDINAL_SCALES, OrdinalControl
 
+    # Enterprise: ``off`` reads as the shipped default tier, so no caller-supplied
+    # mode goes below Crew's own sandbox (RFC enterprise edition, Red "Minimum
+    # sandbox level"). The governance floor below still clamps it further up.
+    mode = sandbox_mode_floor(mode, _SANDBOX_MODE_FALLBACK)
     if not floor:
         return mode
     scale = _ORDINAL_SCALES["sandbox"]

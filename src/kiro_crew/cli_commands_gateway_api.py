@@ -1,7 +1,9 @@
 """``kirocrew spawn`` and ``kirocrew artifact``: commands served by the running gateway.
 
-Both call the dashboard's internal HTTP API on the IPv4 loopback, authenticated with
-the per-session secret ``_internal_secret`` reads. ``_spawn`` lists subagents or
+Both call the dashboard's internal HTTP API, authenticated with the per-session
+secret ``_internal_secret`` reads. Every request goes through
+``_owner_verified_secret_urlopen``, so the secret is written only after the peer on
+that very connection is proven to be this install's recorded gateway. ``_spawn`` lists subagents or
 starts one (``_spawn_run``, which waits for the result unless told not to);
 ``_artifact`` lists, saves, shows, updates and deletes artifacts and lists an
 artifact's versions.
@@ -22,9 +24,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from kiro_crew.config.loader import KiroCrewConfig, read_local_secret
-from kiro_crew.dashboard.origin import parse_dashboard_url
-from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew.config.loader import read_local_secret
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.subagent_wait_reasons import queued_wait_text
 from kiro_crew.terminal_safe import safe_terminal_line
@@ -52,6 +52,30 @@ def _internal_secret(port: int) -> str:
     return read_local_secret(port, dial_host="127.0.0.1")
 
 
+def _gateway_send(req: urllib.request.Request, port: int, timeout: float, operation: str):
+    """Open *req* to the gateway on *port* through the connection-bound peer proof.
+
+    Every request here carries ``X-Internal-Secret``, so it goes through
+    ``cli_server_peer._owner_verified_secret_urlopen``: the secret is written only
+    after the peer on that very connection is proven to be this install's recorded
+    gateway, on the owner-only unix socket when one exists and on loopback TCP
+    otherwise. An unproven peer raises ``_GatewayPeerRefused`` (not an ``OSError``),
+    the type :func:`_peer_refusal` returns. Imported in-function: a module-scope
+    import would surface on this split module's star-import facade (cli_commands),
+    and the call-time read lets a patch through ``kiro_crew.cli_server`` reach it.
+    """
+    from kiro_crew.cli_server_peer import _owner_verified_secret_urlopen
+
+    return _owner_verified_secret_urlopen(req, port, timeout, operation=operation)
+
+
+def _peer_refusal() -> type[Exception]:
+    """The peer proof's refusal type, for an ``except`` clause (imported at call time)."""
+    from kiro_crew.cli_server_peer import _GatewayPeerRefused
+
+    return _GatewayPeerRefused
+
+
 def _spawn_row_text(row: dict[str, object]) -> str:
     """A ``spawn list`` row's id and task, as one terminal line.
 
@@ -63,8 +87,23 @@ def _spawn_row_text(row: dict[str, object]) -> str:
     return f"{row_id}  {task}"
 
 
+def _client_port(cli_port: int | None) -> int:
+    """The gateway port this command calls, found the way ``kirocrew status`` finds it.
+
+    ``resolve_client_port`` walks the flag, ``KIROCREW_PORT``, the bound port, the
+    port in ``dashboard.url`` and the running gateway's marker, so a gateway on a
+    non-default port is reached without a ``--port``. Imported in-function: a
+    module-scope import would surface on this split module's star-import facade
+    (cli_commands).
+    """
+    from kiro_crew.port_resolution import resolve_client_port
+
+    return resolve_client_port(cli_port)
+
+
 def _spawn(args: argparse.Namespace) -> None:
     """Dispatch spawn subcommands: run, list."""
+    args.port = _client_port(getattr(args, "port", None))
     base = f"http://127.0.0.1:{args.port}"
     action = getattr(args, "spawn_action", None)
 
@@ -74,8 +113,11 @@ def _spawn(args: argparse.Namespace) -> None:
             headers={"X-Internal-Secret": _internal_secret(args.port)},
         )
         try:
-            with loopback_urlopen(req, timeout=5) as resp:
+            with _gateway_send(req, args.port, 5, "cli_spawn_list") as resp:
                 data = json.loads(resp.read())
+        except _peer_refusal() as e:
+            print(f"Error: gateway ownership not verified: {e}")
+            sys.exit(1)
         except urllib.error.HTTPError as e:
             try:
                 body = json.loads(e.read())
@@ -83,8 +125,21 @@ def _spawn(args: argparse.Namespace) -> None:
             except Exception:
                 print(f"Error: {e.code} {e.reason}")
             sys.exit(1)
-        except (urllib.error.URLError, OSError):
-            print("Error: gateway not running (cannot reach dashboard on port %d)" % args.port)
+        except (urllib.error.URLError, OSError) as e:
+            # A timeout means something took the request, so the gateway is up
+            # but busy -- reporting it as not running sends the operator to
+            # restart a healthy gateway. A refused connection stays not running.
+            # Imported in-function: a module-scope import would surface on this
+            # split module's star-import facade (cli_commands).
+            from kiro_crew.loopback_http import deadline_expired
+
+            if deadline_expired(e):
+                print(
+                    "Error: gateway on port %d is up but did not answer in time "
+                    "(busy); try again in a moment" % args.port
+                )
+            else:
+                print("Error: gateway not running (cannot reach dashboard on port %d)" % args.port)
             sys.exit(1)
         agents = data.get("agents", [])
         queued = [q for q in data.get("queued") or [] if isinstance(q, dict) and q.get("id")]
@@ -121,19 +176,21 @@ def _spawn(args: argparse.Namespace) -> None:
 def _spawn_run(args: argparse.Namespace, base: str) -> None:
     """Spawn a subagent via the dashboard API.
 
-    ``--agent`` and ``--crew`` travel as the request's ``agent`` and ``crew``
-    fields, the ones the native ``spawn_run`` tool sends, so the gateway's
-    admission resolves and refuses them for both callers alike. A blank name
-    is refused here: the gateway reads an empty field as "no pin", which would
-    run the default the caller did not ask for.
+    ``--agent``, ``--crew`` and ``--model`` travel as the request's ``agent``,
+    ``crew`` and ``model`` fields, the ones the native ``spawn_run`` tool sends,
+    so the gateway's admission resolves and refuses them for both callers alike.
+    A value that sanitizes to empty is refused here: the gateway reads it as "no
+    pin", which would run the default the caller did not ask for.
     """
+    from kiro_crew.validation import sanitize_string
+
     body: dict[str, str] = {"task": args.task}
-    for flag in ("agent", "crew"):
+    for flag in ("agent", "crew", "model"):
         name = getattr(args, flag, None)
         if name is None:
             continue
-        if not name.strip():
-            print(f"Error: --{flag} needs a name")
+        if not sanitize_string(name):
+            print(f"Error: --{flag} needs a value")
             sys.exit(1)
         body[flag] = name
     data = json.dumps(body).encode()
@@ -146,8 +203,11 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
         },
     )
     try:
-        with loopback_urlopen(req, timeout=5) as resp:
+        with _gateway_send(req, args.port, 5, "cli_spawn_run") as resp:
             result = json.loads(resp.read())
+    except _peer_refusal() as e:
+        print(f"Error: gateway ownership not verified: {e}")
+        sys.exit(1)
     except urllib.error.HTTPError as e:
         try:
             body = json.loads(e.read())
@@ -155,8 +215,24 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
         except Exception:
             print(f"Error: {e.code} {e.reason}")
         sys.exit(1)
-    except (urllib.error.URLError, OSError):
-        print("Error: gateway not running (cannot reach dashboard on port %d)" % args.port)
+    except (urllib.error.URLError, OSError) as e:
+        # A timeout means something took the request, so the gateway is up but
+        # busy -- reporting it as not running sends the operator to restart a
+        # healthy gateway. A refused connection stays not running. The spawn
+        # POST is not idempotent: the gateway may have created the subagent
+        # after this client timed out, so the operator checks `spawn list`
+        # rather than re-running, which would start the task twice. Imported
+        # in-function: a module-scope import would surface on this split
+        # module's star-import facade (cli_commands).
+        from kiro_crew.loopback_http import deadline_expired
+
+        if deadline_expired(e):
+            print(
+                "Error: gateway on port %d is up but busy; the spawn may have "
+                "started -- check `kirocrew spawn list` before re-running" % args.port
+            )
+        else:
+            print("Error: gateway not running (cannot reach dashboard on port %d)" % args.port)
         sys.exit(1)
 
     agent_id = result["id"]
@@ -192,8 +268,11 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
         _time.sleep(2)
         poll_req = urllib.request.Request(poll_url, headers={"X-Internal-Secret": secret})
         try:
-            with loopback_urlopen(poll_req, timeout=5) as resp:
+            with _gateway_send(poll_req, args.port, 5, "cli_spawn_poll") as resp:
                 status = json.loads(resp.read())
+        except _peer_refusal() as e:
+            print(f"Error: gateway ownership not verified: {e}", file=sys.stderr)
+            sys.exit(1)
         except Exception:
             print("Error: lost connection to gateway", file=sys.stderr)
             sys.exit(1)
@@ -219,8 +298,7 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
 
 def _artifact(args: argparse.Namespace) -> None:
     """List, save, view, update, or delete artifacts."""
-    cfg = KiroCrewConfig.load()
-    _host, port = parse_dashboard_url(cfg.dashboard.url)
+    port = _client_port(None)
     base = f"http://127.0.0.1:{port}"
 
     action = getattr(args, "artifact_action", None) or "list"
@@ -234,9 +312,11 @@ def _artifact(args: argparse.Namespace) -> None:
             h["Content-Type"] = "application/json"
         req = urllib.request.Request(f"{base}{path}", data=data, headers=h, method=method)
         try:
-            with loopback_urlopen(req, timeout=30) as resp:
+            with _gateway_send(req, port, 30, "cli_artifact") as resp:
                 raw = resp.read()
                 return json.loads(raw) if raw else {}
+        except _peer_refusal() as exc:
+            return {"error": f"gateway ownership not verified: {exc}"}
         except urllib.error.HTTPError as exc:
             try:
                 return {"error": json.loads(exc.read()).get("error", str(exc))}
@@ -256,7 +336,20 @@ def _artifact(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            return p.read_text(encoding="utf-8")
+            # A missing file, a folder or non-UTF-8 bytes is the caller's input,
+            # not a crash: one line and exit 1, like the other errors here.
+            try:
+                return p.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                reason = "not UTF-8 text"
+            except OSError as exc:
+                reason = exc.strerror or str(exc)
+            print(
+                f"Error: could not read --content-file {safe_terminal_line(str(p))}: "
+                f"{safe_terminal_line(reason)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if getattr(args, "content", None):
             return args.content
         if not sys.stdin.isatty():
@@ -265,6 +358,24 @@ def _artifact(args: argparse.Namespace) -> None:
             "Error: provide --content, --content-file, or pipe content via stdin", file=sys.stderr
         )
         sys.exit(1)
+
+    def _slug_segment(slug: str) -> str:
+        """Return *slug* as one encoded URL path segment, or exit 2.
+
+        The slug is spliced into ``/api/artifacts/<slug>``. Unencoded, a slug
+        like ``x/publish`` reaches a different route (DELETE on it unpublishes
+        ``x``) and ``?``/``#`` cut the path short; ``.`` and ``..`` are dot
+        segments a URL normalizer collapses. Real slugs are none of these, so
+        refuse them and the empty slug outright, and encode everything else.
+        """
+        if not slug or "/" in slug or slug in (".", ".."):
+            print(
+                f"Error: invalid artifact slug {slug!r}: it must be non-empty, "
+                "not '.' or '..', and contain no '/'",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        return urllib.parse.quote(slug, safe="")
 
     def _parse_tags(s: str | None) -> list[str]:
         if not s:
@@ -295,11 +406,11 @@ def _artifact(args: argparse.Namespace) -> None:
         return
 
     if action == "show":
-        slug = args.slug
+        seg = _slug_segment(args.slug)
         version = getattr(args, "version", None)
-        path = f"/api/artifacts/{slug}"
-        if version:
-            path = f"/api/artifacts/{slug}/versions/{int(version)}"
+        path = f"/api/artifacts/{seg}"
+        if version is not None:
+            path = f"/api/artifacts/{seg}/versions/{int(version)}"
         d = _request("GET", path)
         if d.get("error"):
             print(f"Error: {d['error']}", file=sys.stderr)
@@ -353,8 +464,8 @@ def _artifact(args: argparse.Namespace) -> None:
             )
         # Relayed from the gateway (same pattern as slug_collided_with): the
         # handler computes the theme-contrast verdict at the convergence
-        # point, so this CLI path -- the one the motivating incident traveled
-        # -- hears it without duplicating the detector. Advisory only.
+        # point, so this CLI path hears it without duplicating the detector.
+        # Advisory only.
         if d.get("theme_contrast_warning"):
             print(
                 "Warning: content hardcodes colors with no theme variables — it "
@@ -367,6 +478,7 @@ def _artifact(args: argparse.Namespace) -> None:
 
     if action == "update":
         slug = args.slug
+        seg = _slug_segment(slug)
         body = {}
         # Only read stdin when explicit content args are absent. In non-
         # interactive environments (CI, cron, piped /dev/null) sys.stdin.isatty()
@@ -389,14 +501,14 @@ def _artifact(args: argparse.Namespace) -> None:
         if not body:
             print("Error: provide content/--name/--description/--tags", file=sys.stderr)
             sys.exit(1)
-        d = _request("PATCH", f"/api/artifacts/{slug}", body)
+        d = _request("PATCH", f"/api/artifacts/{seg}", body)
         if d.get("error"):
             print(f"Error: {d['error']}", file=sys.stderr)
             sys.exit(1)
         print(f"Updated: slug={d.get('slug', slug)} version={d.get('version', '?')}")
-        # Relayed from the gateway (see the save action above) -- the PATCH
-        # path is exactly how the motivating incident's script pushed its
-        # hardcoded-palette page. Advisory only; the update succeeded.
+        # Relayed from the gateway (see the save action above), so a script
+        # PATCHing a hardcoded-palette page hears it too. Advisory only; the
+        # update succeeded.
         if d.get("theme_contrast_warning"):
             print(
                 "Warning: content hardcodes colors with no theme variables — it "
@@ -409,7 +521,7 @@ def _artifact(args: argparse.Namespace) -> None:
 
     if action == "delete":
         slug = args.slug
-        d = _request("DELETE", f"/api/artifacts/{slug}")
+        d = _request("DELETE", f"/api/artifacts/{_slug_segment(slug)}")
         if d.get("error"):
             print(f"Error: {d['error']}", file=sys.stderr)
             sys.exit(1)
@@ -418,7 +530,7 @@ def _artifact(args: argparse.Namespace) -> None:
 
     if action == "versions":
         slug = args.slug
-        d = _request("GET", f"/api/artifacts/{slug}/versions")
+        d = _request("GET", f"/api/artifacts/{_slug_segment(slug)}/versions")
         if d.get("error"):
             print(f"Error: {d['error']}", file=sys.stderr)
             sys.exit(1)

@@ -262,40 +262,41 @@ function kasResources(files) {
 
 const KAS_RECORD = JSON.stringify({ node_bin: "node/node-v22.23.3-linux-x64/bin/node" });
 
-test("a staged KAS engine is exported as its arch root, read from BUNDLED-VERSION", () => {
+test("a staged KAS engine is exported as its one root, read from BUNDLED-VERSION", () => {
   // The shell carries no pin: the version it probes is whatever the build staged.
   const fs = kasResources({
-    "/res/backend-dist/kas-arm64/BUNDLED-VERSION": "0.66.33\n",
-    "/res/backend-dist/kas-arm64/0.66.33/install.json": KAS_RECORD,
-  });
-  const env = bundledKasEnvironment(fs, path.posix, "/res", { arch: "arm64" });
-  assert.deepStrictEqual(env, { KIROCREW_BUNDLED_KAS_DIR: "/res/backend-dist/kas-arm64" });
-});
-
-test("a single-arch build's unsuffixed KAS root is found after the arch-suffixed one", () => {
-  const fs = kasResources({
-    "/res/backend-dist/kas/BUNDLED-VERSION": "0.66.33",
+    "/res/backend-dist/kas/BUNDLED-VERSION": "0.66.33\n",
     "/res/backend-dist/kas/0.66.33/install.json": KAS_RECORD,
   });
-  const env = bundledKasEnvironment(fs, path.posix, "/res", { arch: "x64" });
+  const env = bundledKasEnvironment(fs, path.posix, "/res", {});
   assert.deepStrictEqual(env, { KIROCREW_BUNDLED_KAS_DIR: "/res/backend-dist/kas" });
 });
 
-test("a KAS root for another architecture is never exported", () => {
-  // A universal build that stages kas-x64 only is not a bundle for an arm64 shell:
-  // the wrong-arch Node must not be handed to the gateway.
+test("a universal build's one KAS root serves both architectures", () => {
+  // The universal Node holds both slices, so the arm64 and the x64 shell export
+  // the same root; arch-suffixed roots are not read.
   const fs = kasResources({
-    "/res/backend-dist/kas-x64/BUNDLED-VERSION": "0.66.33",
-    "/res/backend-dist/kas-x64/0.66.33/install.json": KAS_RECORD,
+    "/res/backend-dist/kas/BUNDLED-VERSION": "0.66.33",
+    "/res/backend-dist/kas/0.66.33/install.json": JSON.stringify({
+      node_bin: "node/node-v22.23.3-darwin-arm64/bin/node",
+      node_key: "darwin-universal",
+    }),
   });
-  assert.deepStrictEqual(bundledKasEnvironment(fs, path.posix, "/res", { arch: "arm64" }), {});
+  assert.deepStrictEqual(bundledKasEnvironment(fs, path.posix, "/res"), {
+    KIROCREW_BUNDLED_KAS_DIR: "/res/backend-dist/kas",
+  });
+  const suffixedOnly = kasResources({
+    "/res/backend-dist/kas-arm64/BUNDLED-VERSION": "0.66.33",
+    "/res/backend-dist/kas-arm64/0.66.33/install.json": KAS_RECORD,
+  });
+  assert.deepStrictEqual(bundledKasEnvironment(suffixedOnly, path.posix, "/res"), {});
 });
 
 test("no KAS payload, a source checkout, or a root without its record exports nothing", () => {
-  assert.deepStrictEqual(bundledKasEnvironment(kasResources({}), path.posix, "/res", { arch: "x64" }), {});
-  assert.deepStrictEqual(bundledKasEnvironment(kasResources({}), path.posix, undefined, { arch: "x64" }), {});
+  assert.deepStrictEqual(bundledKasEnvironment(kasResources({}), path.posix, "/res", {}), {});
+  assert.deepStrictEqual(bundledKasEnvironment(kasResources({}), path.posix, undefined, {}), {});
   const noRecord = kasResources({ "/res/backend-dist/kas/BUNDLED-VERSION": "0.66.33" });
-  assert.deepStrictEqual(bundledKasEnvironment(noRecord, path.posix, "/res", { arch: "x64" }), {});
+  assert.deepStrictEqual(bundledKasEnvironment(noRecord, path.posix, "/res", {}), {});
 });
 
 test("the staged Node is never run at boot, even when a spawnSync is handed in", () => {
@@ -307,7 +308,6 @@ test("the staged Node is never run at boot, even when a spawnSync is handed in",
     "/res/backend-dist/kas/0.66.33/install.json": KAS_RECORD,
   });
   const env = bundledKasEnvironment(fs, path.posix, "/res", {
-    arch: "x64",
     spawnSync: () => assert.fail("bundledKasEnvironment executed the staged Node"),
   });
   assert.deepStrictEqual(env, { KIROCREW_BUNDLED_KAS_DIR: "/res/backend-dist/kas" });
@@ -317,7 +317,7 @@ test("a staged record whose node_bin or version could leave the staged tree is n
   // The backend seals the staged root read-only for sandboxed children; this is the
   // shell's own fence over the same two fields, so a rewritten record cannot make
   // the (unsandboxed) gateway run a file outside what the build staged.
-  const probe = { arch: "x64", log: () => {} };
+  const probe = { log: () => {} };
   for (const nodeBin of ["../../../tmp/evil", "/tmp/evil", "C:\\evil\\node.exe", "node/./bin/node", "", "node//bin"]) {
     const fs = kasResources({
       "/res/backend-dist/kas/BUNDLED-VERSION": "0.66.33",
@@ -357,10 +357,98 @@ test("the one desktop gateway spawn uses the hardened environment builder", () =
   assert.equal(gatewaySpawns.length, 1, "expected one owned gateway spawn boundary");
   assert.match(
     supervisor,
-    /env:\s*buildGatewayEnvironment\(\{[\s\S]*?gatewayBytecodeEnvironment\([\s\S]*?\},\s*\{ bundled, platform: processObj\.platform \}\),/,
+    /env:\s*buildGatewayEnvironment\(\{[\s\S]*?gatewayBytecodeEnvironment\([\s\S]*?\},\s*\{ bundled, platform: processObj\.platform, discoverProxyEnv: discoverGatewayProxyEnv \}\),/,
     "the owned gateway spawn must pass every initial launch and liveness respawn " +
       "through buildGatewayEnvironment",
   );
+});
+
+test("the owned gateway spawn discovers the system proxy for GUI launches", () => {
+  // A GUI-launched macOS app inherits launchd's environment, not the shell's
+  // (issue #19821): the gateway — and every kiro-cli child — could run with
+  // no HTTP_PROXY/HTTPS_PROXY on a proxy-only network, failing every turn as
+  // a "transient 5xx" while the same machine's terminal kiro-cli worked. The
+  // spawn must therefore wire the system-store discovery into the builder;
+  // short-lived CLI helpers (`stop`, `gateway-pid`) stay undiscovered.
+  const supervisor = fs.readFileSync(
+    path.join(__dirname, "..", "gateway-supervisor.js"),
+    "utf8",
+  );
+  assert.match(supervisor, /require\("\.\/system-proxy-env"\)/);
+  assert.match(
+    supervisor,
+    /const discoverGatewayProxyEnv = \(\) =>\s*\n\s*readSystemProxyEnvironment\(\{ execFileSync, platform: processObj\.platform \}\);/,
+    "discovery must be built per spawn from the factory's execFileSync",
+  );
+});
+
+test("discovery is the gap-filler: it runs only when no proxy variable is inherited", () => {
+  // The system store must never override an operator's explicit environment,
+  // however it reached the app (launchd domain, GUI launcher, shell export on
+  // a dev checkout). The check is case-insensitive: on Windows the spellings
+  // are the same variable, and a lowercase export is just as explicit.
+  const DISCOVERED = {
+    HTTP_PROXY: "http://proxy.corp.example:7890",
+    HTTPS_PROXY: "http://proxy.corp.example:7890",
+    NO_PROXY: "localhost,127.0.0.1,::1",
+  };
+
+  // Nothing inherited: the gap gets filled.
+  const filled = buildGatewayEnvironment(
+    { PATH: "/usr/bin", PYTHONUTF8: "0" },
+    { discoverProxyEnv: () => ({ ...DISCOVERED }) },
+  );
+  assert.equal(filled.HTTP_PROXY, DISCOVERED.HTTP_PROXY);
+  assert.equal(filled.HTTPS_PROXY, DISCOVERED.HTTPS_PROXY);
+  assert.equal(filled.NO_PROXY, DISCOVERED.NO_PROXY);
+  assert.equal(filled.PATH, "/usr/bin");
+  assert.equal(filled.PYTHONUTF8, "1", "the UTF-8 contract is untouched");
+  assert.equal(
+    filled.no_proxy,
+    undefined,
+    "no lowercase twin, so an uppercase agent.env proxy fully replaces it",
+  );
+
+  // An uppercase inherited variable wins and discovery never runs.
+  let called = 0;
+  const counting = () => {
+    called += 1;
+    return { ...DISCOVERED };
+  };
+  const upper = buildGatewayEnvironment(
+    { HTTPS_PROXY: "http://operator.example:3128" },
+    { discoverProxyEnv: counting },
+  );
+  assert.equal(upper.HTTPS_PROXY, "http://operator.example:3128");
+  assert.equal(called, 0);
+
+  // A lowercase inherited variable is just as explicit.
+  buildGatewayEnvironment({ http_proxy: "http://operator.example:3128" }, { discoverProxyEnv: counting });
+  assert.equal(called, 0);
+
+  // A lone NO_PROXY is an operator statement too.
+  buildGatewayEnvironment({ NO_PROXY: "internal.example" }, { discoverProxyEnv: counting });
+  assert.equal(called, 0);
+
+  // Discovery finding nothing changes nothing.
+  const before = buildGatewayEnvironment({ PATH: "/usr/bin" });
+  const after = buildGatewayEnvironment({ PATH: "/usr/bin" }, { discoverProxyEnv: () => null });
+  assert.deepStrictEqual(after, before);
+
+  // The inherited environment is never mutated.
+  const inherited = { PATH: "/usr/bin" };
+  buildGatewayEnvironment(inherited, { discoverProxyEnv: () => ({ ...DISCOVERED }) });
+  assert.deepStrictEqual(inherited, { PATH: "/usr/bin" });
+});
+
+test("the proxy key contract covers the standard four, checked case-insensitively", () => {
+  for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]) {
+    const env = buildGatewayEnvironment(
+      { [key.toLowerCase()]: "x" },
+      { discoverProxyEnv: () => assert.fail("a mixed-case inherited key is still explicit") },
+    );
+    assert.equal(env[key.toLowerCase()], "x");
+  }
 });
 
 for (const platform of ["win32", "darwin", "linux"]) {

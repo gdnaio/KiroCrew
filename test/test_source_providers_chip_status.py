@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
-from source_providers_helpers import _clear_issue_cache  # noqa: F401
+from source_providers_helpers import _clear_shared_fetch_state  # noqa: F401
 from source_providers_helpers import _mock_source_sel_fixture  # noqa: F401
 from source_providers_helpers import _no_visibility_refresh_side_task  # noqa: F401
 from source_providers_helpers import _app
@@ -212,7 +212,7 @@ def test_status_from_full_payload_projects_lifecycle_and_ci() -> None:
     assert source.status_from_full_payload(
         {"state": "OPEN", "draft": True, "checks": [{"bucket": "pending"}, {"bucket": "passed"}]}
     ) == {"ci": "running", "state": "draft"}
-    # Any failure dominates the rollup.
+    # Any failure dominates; a payload naming no built-in provider gets no marker.
     assert source.status_from_full_payload(
         {"state": "MERGED", "checks": [{"bucket": "failed"}, {"bucket": "pending"}]}
     ) == {"ci": "failed", "state": "merged"}

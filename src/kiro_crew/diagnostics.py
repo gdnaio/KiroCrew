@@ -39,11 +39,13 @@ from urllib.parse import quote, urlencode
 from kiro_crew import __version__, agent_scratch, platform_compat, release_channel
 from kiro_crew.config.loader import config_dir
 from kiro_crew.kiro_cli import PATH_ONLY_INSTALL_NOTE, pin_kiro_cli
+from kiro_crew.platform import PlatformCompositionError, current_context, safe_context_call
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
     redact_exfiltration_urls,
 )
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.validation import strip_hidden_unicode
 
 logger = logging.getLogger(__name__)
@@ -1008,22 +1010,56 @@ def _kiro_cli_version() -> str:
     Everything is contained: diagnostics must work precisely when the rest of
     the system is broken, so a raising lookup degrades like a failed spawn.
     """
+    # Deferred: the bundle module brings the agent-SDK pin with it, which this
+    # module -- imported on the dashboard's boot path -- does not need until a
+    # bundle is collected.
+    from kiro_crew.agent_sdk import kas_bundle
+
     try:
         binary, unpinned_exists = pin_kiro_cli()
         if binary is None:
             if unpinned_exists:
                 return f"not pinned ({PATH_ONLY_INSTALL_NOTE})"
+            if kas_bundle.kas_bundle_route():
+                # Absent AND not part of this installation: the selected harness
+                # runs Crew's own engine (``kas_engine:`` beside this line). A bare
+                # ``unavailable`` would read as the gap it is on the relay route.
+                return "unavailable (not used: KAS runs Kiro Crew's own engine bundle)"
             return "unavailable"
         out = subprocess.run(
             [binary, "--version"],
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=5,
             check=False,
         )
         return (out.stdout or out.stderr).strip() or "unknown"
     except (OSError, subprocess.SubprocessError):
         return "unavailable"
+
+
+def _kas_engine_version() -> str:
+    """The engine line for ``versions.txt``: what the KAS bundle route runs, if selected.
+
+    ``not selected`` when the installation is on the relay route (or another
+    harness), so the kiro-cli line above it is the one that matters; on the bundle
+    route the installed engine with the release pin beside it, or ``not installed``
+    with the command, because a maintainer reading a bundle from such a host wants
+    the engine version where they would otherwise look for kiro-cli's. Contained
+    like the kiro-cli probe: a raising config read degrades to ``unknown``.
+    """
+    from kiro_crew.agent_sdk import kas_bundle
+
+    try:
+        if not kas_bundle.kas_bundle_route():
+            return "not selected"
+        engine = kas_bundle.installed_engine_label()
+        pin = kas_bundle.KAS_PIN_VERSION
+        if engine is None:
+            return f"not installed (release pins KAS {pin}; kirocrew kas install)"
+        return f"{engine} (release pins KAS {pin})"
+    except Exception:  # noqa: BLE001 - diagnostics must survive a broken setup
+        return "unknown"
 
 
 #: PEP 440 prerelease segment — see
@@ -1092,6 +1128,7 @@ def _versions_text(note: str, identity: release_channel.Provenance) -> str:
         f"channel: {identity.channel or 'unknown'}",
         f"channel_record: {identity.recorded or 'absent'}",
         f"kiro_cli_version: {_kiro_cli_version()}",
+        f"kas_engine: {_kas_engine_version()}",
         f"python: {platform.python_version()}",
         f"platform: {platform.platform()}",
         f"machine: {platform.machine()}",
@@ -1207,6 +1244,42 @@ def _issue_url(result: BundleResult, note: str, *, prefill: bool = True) -> str:
     return f"{_ISSUE_NEW_URL}?" + urlencode(params, quote_via=quote)
 
 
+def _tracker_issue_url(result: BundleResult, note: str, *, prefill: bool) -> str:
+    """The new-issue link for *result*: the edition's tracker, else the public one.
+
+    Reads the ``feedback`` CPP seam (``FeedbackTrackerProvider.report_issue_url``).
+    ``None`` -- the public Default -- keeps :func:`_issue_url`'s pre-filled GitHub
+    link byte-for-byte. A supplied URL REPLACES it rather than decorating it: the
+    public query string is GitHub's bug-report form and means nothing appended to
+    another tracker.
+
+    Fail-closed per the CPP contract: a ``PlatformCompositionError`` (a
+    non-standalone host whose companion does not compose) logs a warning and
+    returns an empty link, keeping the diagnostic bundle usable without a
+    standalone fallback. Any other adapter error, a non-string or an empty
+    string degrades to the public link through the normal fallback path.
+    """
+    try:
+        url = safe_context_call(
+            lambda: current_context().feedback.report_issue_url(result, note, prefill=prefill),
+            fallback=None,
+            log_message="edition feedback tracker unavailable; using the public tracker",
+        )
+    except PlatformCompositionError:
+        logger.warning("platform companion does not compose; skipping issue link")
+        return ""
+    if url is None:
+        return _issue_url(result, note, prefill=prefill)
+    if not isinstance(url, str) or not url.strip():
+        logger.warning(
+            "FeedbackTrackerProvider.report_issue_url() returned %s, expected a URL; "
+            "using the public tracker",
+            type(url).__name__,
+        )
+        return _issue_url(result, note, prefill=prefill)
+    return url
+
+
 def terminal_issue_url(result: BundleResult, note: str = "") -> str:
     """Issue link shaped for printing to a terminal rather than for a browser.
 
@@ -1215,9 +1288,10 @@ def terminal_issue_url(result: BundleResult, note: str = "") -> str:
     to stdout has no such guarantee — it gets selected into chat, captured from a
     shell tool, or relayed by an agent, and on those paths the pre-filled variant
     is replaced wholesale by ``[REDACTED: suspicious URL to github.com]``. This
-    variant trades the pre-filled body for a link that arrives intact.
+    variant trades the pre-filled body for a link that arrives intact. An edition
+    tracker gets the same ``prefill=False`` signal and owns keeping its query short.
     """
-    return _issue_url(result, note, prefill=False)
+    return _tracker_issue_url(result, note, prefill=False)
 
 
 def _prune_old_bundles(out_dir: Path, keep: int) -> None:
@@ -1395,6 +1469,6 @@ def collect_bundle(
         zf.writestr("manifest.json", json.dumps(manifest, indent=2))
         result.included.append("manifest.json")
 
-    result.github_issue_url = _issue_url(result, note)
+    result.github_issue_url = _tracker_issue_url(result, note, prefill=True)
     _prune_old_bundles(out_dir, _MAX_KEPT_BUNDLES)
     return result

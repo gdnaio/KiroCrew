@@ -239,14 +239,25 @@ def test_workflow_routes_every_scope_without_changing_local_defaults(jobs):
         assert all('-m "not ipv6_required"' in command for command in commands)
         assert jobs[name]["strategy"]["matrix"]["group"] == list(range(1, 9))
     hosted = jobs["backend-test-ipv6"]
-    assert hosted["needs"] == ["changes", "await-fast-gate"]
-    assert hosted["runs-on"] == "${{ matrix.os }}"
+    assert hosted["needs"] == ["changes", "await-fast-gate", "lint-gate"]
+    # Per leg, not `${{ matrix.os }}`: the Linux leg takes the organization's
+    # own larger-runner group in this repository and the standard image in a
+    # fork, which cannot reach that group, while the Windows leg keeps the
+    # runner matrix.os names. Pinning the whole expression is what catches a
+    # leg silently re-routed or a fork branch dropped.
+    assert hosted["runs-on"] == (
+        "${{ matrix.os == 'ubuntu-latest' && "
+        "(github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' "
+        "|| 'ubuntu-latest') || matrix.os }}"
+    )
     assert hosted["strategy"] == {
         "max-parallel": 4,
         "fail-fast": False,
         "matrix": {"os": ["ubuntu-latest", "windows-latest"]},
     }
-    assert "if" not in hosted and "continue-on-error" not in hosted
+    # Not diff-gated: its only condition is the lint gate's own success.
+    assert hosted["if"] == "${{ !cancelled() && needs.lint-gate.result == 'success' }}"
+    assert "continue-on-error" not in hosted
     assert hosted["defaults"]["run"]["shell"] == "bash"
     run = _step(jobs, "backend-test-ipv6", "Run required")["run"]
     assert "-m ipv6_required" in run and "--file-shard" not in run
@@ -290,7 +301,10 @@ def test_gate_executes_fail_closed_for_ipv6_in_every_scope(jobs, tmp_path, mode,
     env = dict(
         _env(tmp_path),
         IPV6=status,
-        KERNEL_LOCK_OWNER="success",
+        # kernel-lock-owner is skipped on a frontend-only diff; use the correct
+        # per-mode value so the gate is satisfied on the kernel-lock-owner check
+        # before it reaches the IPV6 check.
+        KERNEL_LOCK_OWNER="skipped" if mode == "frontend" else "success",
         BE="success",
         FE="success",
         FCM="success",

@@ -24,6 +24,7 @@ if TYPE_CHECKING:
         _CRON_TRANSIENT_RETRIES,
         SESSION_NOT_FOUND_GIVE_UP_TEXT,
         SESSION_NOT_FOUND_NOT_REPLAYED_TEXT,
+        UNATTENDED_MCP_WAIT_SECS,
         AcpError,
         AcpProcessDied,
         Any,
@@ -52,6 +53,7 @@ if TYPE_CHECKING:
         consume_reinjection,
         context_meter_reading,
         dataclass,
+        declared_mcp_not_ready_note,
         logger,
         persist_token_record_async,
         provider_fallback_active,
@@ -67,6 +69,7 @@ if TYPE_CHECKING:
         stop_reason_landed,
         transient_retry_delay,
         turn_stats_meta,
+        wait_for_declared_mcp,
     )
 
 
@@ -155,6 +158,9 @@ async def _cron_run_sequence(
             return None
 
     result_text = "_No response._"
+    # Each step's missing-server note, kept apart from result_text because the
+    # next step's reply replaces it; the stored result carries all of them.
+    _seq_mcp_notes: list[str] = []
     _seq_downgraded = False
     # Run-scoped: a sequence where one agent got a tool through has
     # done work, even if a later agent was blocked outright.
@@ -221,6 +227,10 @@ async def _cron_run_sequence(
                 # empty parent ("notification only (parent=)") unless an
                 # unrelated surface happened to be mid-turn.
                 await publish_turn_identity(self.sessions, agent_session_key)
+                if is_new:
+                    # Unattended: hold the first prompt (bounded) for the
+                    # agent spec's MCP servers, which nobody can reconnect.
+                    await wait_for_declared_mcp(client, UNATTENDED_MCP_WAIT_SECS)
                 # A compaction drops session-start context. Read-and-clear
                 # the one-shot flag so this turn re-injects it exactly
                 # once; the finally re-arms it if the turn never lands.
@@ -239,6 +249,7 @@ async def _cron_run_sequence(
                     resumed=_resumed,
                     needs_reinjection=_seq_reinjection,
                     minimal_context=job.minimal_context,
+                    request_prefix_context=cap.prior_result or None,
                 )
                 # Wall clock for the cron agent turn: acp never assigns
                 # TurnUsage.duration_ms, so the row falls back to this.
@@ -270,6 +281,9 @@ async def _cron_run_sequence(
                 if not result_text:
                     result_text = _gate.empty_reply_placeholder()
                 result_text = _annotate_model_fallback(result_text, client)
+                _seq_missing = declared_mcp_not_ready_note(client)
+                if _seq_missing:
+                    _seq_mcp_notes.append(f"⚠ {agent}: {_seq_missing}.")
                 logger.info("Cron '%s': agent '%s' completed", job.name, agent)
 
                 # ── Per-turn usage row: background spend. ──
@@ -370,7 +384,17 @@ async def _cron_run_sequence(
                             agent_session_key,
                         )
                     else:
-                        await self.sessions.reset(agent_session_key)
+                        # skip_if_busy: as in the single-agent finally, a tab
+                        # turn that took the key after the release above is
+                        # left running rather than killed.
+                        if not await self.sessions.reset(
+                            agent_session_key, skip_if_busy=True
+                        ) and self.sessions.is_busy(agent_session_key):
+                            logger.info(
+                                "Cron '%s': not resetting %s, another turn holds it",
+                                job.name,
+                                agent_session_key,
+                            )
                         if self.cron_svc is not None:
                             self.cron_svc.clear_active_session_key(job.id, agent_session_key)
             if not _seq_snf_retry:
@@ -399,7 +423,22 @@ async def _cron_run_sequence(
                     agent,
                 )
                 raise AcpError(f"{SESSION_NOT_FOUND_GIVE_UP_TEXT} {_seq_snf_err}")
-            await self.sessions.reset(agent_session_key)
+            # A turn that took the key after the finally's release (the
+            # job's dashboard tab shares it) is not torn down for the retry.
+            # A retry against the un-reset stale binding would
+            # only hit Session not found again, so give the step up.
+            if not await self.sessions.reset(
+                agent_session_key, skip_if_busy=True
+            ) and self.sessions.is_busy(agent_session_key):
+                logger.info(
+                    "Cron '%s': lost session of step %r but another turn "
+                    "holds it; not resetting and not retrying this step",
+                    job.name,
+                    agent,
+                )
+                raise AcpError(f"{SESSION_NOT_FOUND_GIVE_UP_TEXT} {_seq_snf_err}")
+    if _seq_mcp_notes:
+        result_text = "\n".join(_seq_mcp_notes) + "\n\n" + result_text
     if _seq_downgraded:
         result_text = _annotate_model_downgrade(job, result_text)
     result_text = _annotate_partial_block(result_text, _gate)
@@ -576,6 +615,10 @@ async def _cron_run_single(
         # single-agent cron turn must publish its pidfile mapping or
         # spawn_run's parent resolution has no source to walk to.
         await publish_turn_identity(self.sessions, session_key)
+        if is_new:
+            # Unattended: hold the first prompt (bounded) for the agent spec's
+            # MCP servers, which nobody can reconnect by hand in this run.
+            await wait_for_declared_mcp(client, UNATTENDED_MCP_WAIT_SECS)
         if job.acked_items:
             msg += (
                 "\n\n[User has seen and acknowledged ALL of the following — "
@@ -601,6 +644,8 @@ async def _cron_run_single(
             needs_reinjection=_needs_reinjection,
             provider_type=_provider,
             minimal_context=job.minimal_context,
+            # The previous run's result, framed as data, ahead of the request.
+            request_prefix_context=cap.prior_result or None,
         )
 
         # Wall clock for the cron agent turn — see the sequential site
@@ -642,6 +687,9 @@ async def _cron_run_single(
         if _model_downgraded:
             result_text = _annotate_model_downgrade(job, result_text)
         result_text = _annotate_model_fallback(result_text, client)
+        _missing = declared_mcp_not_ready_note(client)
+        if _missing:
+            result_text = f"⚠ {_missing}.\n\n{result_text}"
         # Before set_run_result and the dedup hash below, so the stored
         # result, the slot, the bell and every transport carry the
         # refusal, and a run that lost a call never hashes equal to
@@ -903,7 +951,19 @@ async def _cron_run_single(
                 # the reaper can still target the ephemeral key if the deferred
                 # reset hangs. _subagent_done will clear it after the real reset.
             else:
-                await self.sessions.reset(session_key)
-                # reset done → the reaper does not need this key.
+                # skip_if_busy: the job's dashboard tab runs on this same
+                # key, and a tab turn can take the session in the gap the
+                # release above opened. Declined, the reset leaves that
+                # turn running instead of killing it.
+                if not await self.sessions.reset(
+                    session_key, skip_if_busy=True
+                ) and self.sessions.is_busy(session_key):
+                    logger.info(
+                        "Cron '%s': not resetting %s, another turn holds it",
+                        job.name,
+                        session_key,
+                    )
+                # reset done, or declined for a turn that is not this
+                # run's → the reaper does not need this key.
                 if self.cron_svc is not None:
                     self.cron_svc.clear_active_session_key(job.id, session_key)

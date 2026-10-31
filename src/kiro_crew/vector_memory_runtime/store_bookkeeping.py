@@ -75,8 +75,6 @@ def _ineligible_ids(self: VectorMemoryStore, record_ids: list[str] | None = None
         rows = []
         for start in range(0, len(unique), _MAX_SQL_PARAMS):
             chunk = unique[start : start + _MAX_SQL_PARAMS]
-            if not chunk:
-                continue
             placeholders = ",".join("?" * len(chunk))
             rows.extend(
                 self._fetch_all_locked(
@@ -90,7 +88,22 @@ def _ineligible_ids(self: VectorMemoryStore, record_ids: list[str] | None = None
 
 
 def _eligible_rows(self: VectorMemoryStore, rows, kind: str) -> list:
-    blocked = self._ineligible_ids()
+    # Only these candidate rows are ever tested against ``blocked``, so scope
+    # the ineligibility lookup to their ids: it then goes through the
+    # record_id PRIMARY KEY instead of scanning all of memory_record_meta
+    # (which only grows). ``identity in blocked`` is unchanged because
+    # ``blocked`` is restricted to ids drawn from these same candidates.
+    identities = [
+        identity
+        for identity in (
+            record_meta.record_identity_or_none(
+                kind, row["id"] if kind == "episode" else row["key"]
+            )
+            for row in rows
+        )
+        if identity is not None
+    ]
+    blocked = self._ineligible_ids(identities)
     kept = []
     for row in rows:
         identity = record_meta.record_identity_or_none(
@@ -150,8 +163,8 @@ def _log_event(
     old_value: str | None,
     new_value: str | None,
     source: str,
-) -> None:
-    """Append to the audit trail."""
+) -> int | None:
+    """Append to the audit trail; return the new row's id, or None when it was not written."""
 
     from kiro_crew import vector_memory as vm  # circular import: the facade imports this module
 
@@ -162,14 +175,16 @@ def _log_event(
         # unlocked callers, so serialize on the (reentrant) _db_lock: an
         # unsynchronized INSERT races a concurrent writer's implicit BEGIN.
         with self._db_lock:
-            self.db.execute(
+            cursor = self.db.execute(
                 "INSERT INTO memory_events (event_type, memory_type, memory_key, "
                 "old_value, new_value, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (event_type, memory_type, key, old_value, new_value, source, _now_iso()),
             )
             self.db.commit()
+            return cursor.lastrowid
     except Exception:
         logger.debug("Failed to log memory event", exc_info=True)
+        return None
 
 
 def get_events(self: VectorMemoryStore, limit: int = 50, offset: int = 0) -> list[dict]:
@@ -233,13 +248,15 @@ def get_rejection_stats(self: VectorMemoryStore) -> dict[str, int]:
     writes. The other codes
     stay semantic-scoped: ``conflict_skip`` is also emitted for episodic
     FAISS dedup, so counting episodic there would conflate benign
-    deduplication with policy rejections.
+    deduplication with policy rejections. ``consolidation_value_size`` is
+    written by the consolidation pass, not by ``validate_semantic``.
     """
     rows = self._fetch_all_locked(
         "SELECT event_type, COUNT(*) as count FROM memory_events "
         "WHERE event_type = 'injection_blocked' "
         "OR (memory_type = 'semantic' AND event_type IN "
-        "('allowlist_reject', 'low_confidence', 'conflict_skip', 'value_empty')) "
+        "('allowlist_reject', 'low_confidence', 'conflict_skip', 'value_empty', 'work_state', "
+        "'consolidation_value_size')) "
         "GROUP BY event_type"
     )
     return {r["event_type"]: r["count"] for r in rows}

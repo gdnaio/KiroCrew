@@ -1,11 +1,12 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, ApiError } from '../api/client'
 import { apiErrorCode, isSlotCapError } from '../api/apiError'
 import { store, useAppDispatch } from '../store'
 import type { MuteFlag } from '../store/dashboardSlice'
-import { deleteSlot, switchSlot } from '../store/chatSlice'
+import { captureForkOrigin, deleteSlot, forkMayOpen, forkOpenSettled, forkOpenStarted, listForkedSlot, requestSlotFolderOpen, switchSlot } from '../store/chatSlice'
 import { updateSlotPin, updateSlotMuteFlag, setSlotMuteFlagError, markSlotRead, markSlotUnread, slotWriteStampOf } from '../store/dashboardSlice'
+import { slotLastTsOf } from '../store/slotLastTs'
 import { emitSlotRead } from '../lib/slotReadRelay'
 import { copySessionLink } from '../utils/shareUrl'
 import { useMoveSlotToFolder } from './useMoveSlotToFolder'
@@ -15,6 +16,7 @@ import { i18nT } from '../i18n/t'
 import { forkFailureNoticeOffsite } from '../utils/forkFailure'
 import type { ForkFailureNotice } from '../utils/forkFailure'
 import { errMessage } from '../utils/thunkError'
+import { sessionDisplayTitle } from '../utils/sessionDisplayTitle'
 import type { ChatSlot } from '../types'
 
 interface PinMutationEntry {
@@ -119,7 +121,15 @@ export interface SessionActions {
   close: (slotKey: string) => void
 }
 
-export function useSessionActions(mode?: string): SessionActions {
+export function useSessionActions(mode?: string, opts?: {
+  /** The host's "a session was opened from here" callback (ChatSidebar's
+   *  `onSelectSlot`). Duplicate reports the fork through it after switching, the
+   *  way a row click does, so ChatPage leaves Split View instead of keeping the
+   *  old panes over the newly active fork. */
+  onOpened?: (key: string) => void
+}): SessionActions {
+  const onOpenedRef = useRef(opts?.onOpened)
+  onOpenedRef.current = opts?.onOpened
   const dispatch = useAppDispatch()
   const queryClient = useQueryClient()
   const moveSlotToFolder = useMoveSlotToFolder()
@@ -229,15 +239,34 @@ export function useSessionActions(mode?: string): SessionActions {
   const [forkError, setForkError] = useState<(ForkFailureNotice & { slotKey: string }) | null>(
     null,
   )
+  // Sources with a fork in flight (see `duplicate`).
+  const forkingSlotsRef = useRef(new Set<string>())
   const forkMutation = useMutation({
     mutationFn: (slot: string) => api.forkChatSlot(slot),
-    onSuccess: (data) => {
+    // The fork is pending until onSettled, which runs after onSuccess has
+    // switched to the child, so the chat page does not open another session
+    // if its own leaves the list meanwhile.
+    onMutate: () => { dispatch(forkOpenStarted()); return { origin: captureForkOrigin(store.getState()) } },
+    onSuccess: (data, _slot, started) => {
       if (data?.ok && data.key) {
         // A refusal describes a condition that no longer holds: leaving it under the row
         // contradicts the tab this success just opened.
         setForkError(null)
         queryClient.invalidateQueries({ queryKey: ['slots'] })
-        dispatch(switchSlot(data.key))
+        // List the fork before activating it. The chat page clears an active
+        // session its slot list lacks and then auto-opens the remembered chat,
+        // so switching first lands the user in an unrelated chat.
+        dispatch(listForkedSlot(data))
+        // The user opened another session while the fork ran: the fork stays
+        // listed, and the view and its chrome (Split View) stay as they are.
+        if (!forkMayOpen(store.getState(), started.origin)) return
+        dispatch(switchSlot({ key: data.key, requestSeq: started.origin.seq }))
+        // The child inherits the source's folder, which can be collapsed (the
+        // source row sits in the pinned group or a board lane, or another tab
+        // collapsed the folder meanwhile): open that path so the active row shows.
+        dispatch(requestSlotFolderOpen({ key: data.key, folder_id: data.folder_id }))
+        // switchSlot.pending has already made the fork the active slot.
+        onOpenedRef.current?.(data.key)
       }
     },
     // Duplicate goes through this mutation with no per-call handler, so this is
@@ -272,7 +301,12 @@ export function useSessionActions(mode?: string): SessionActions {
           // Compact and named: the panel is the narrowest surface, and the notice renders at
           // its root rather than beside the pressed row, so the copy must say which session.
           true,
-          store.getState().dashboard.slots.find(s => s.key === slotKey)?.title || slotKey,
+          // A session missing from the slot list has an unknown title, not
+          // none: it keeps its key rather than reading "Untitled session".
+          (() => {
+            const forkSlot = store.getState().dashboard.slots.find(s => s.key === slotKey)
+            return forkSlot ? sessionDisplayTitle(forkSlot) : slotKey
+          })(),
         )
         setForkError({ ...notice, slotKey })
         return
@@ -287,6 +321,15 @@ export function useSessionActions(mode?: string): SessionActions {
         const reason = err.message.trim().replace(/[.。!！।]+$/u, '')
         alert(i18nT('hooks.useSessionActions.duplicate_failed_reason', { reason }))
       }
+    },
+    // Mutation-level, not a per-call `mutate` option: TanStack fires per-call
+    // callbacks only for the latest call, so a fork of A followed by a fork of B
+    // would leave A marked in flight for good. It also ends the fork's pending
+    // open (see onMutate). One callback: a second onSettled key would replace
+    // this one.
+    onSettled: (_data, _err, slotKey) => {
+      forkingSlotsRef.current.delete(slotKey)
+      dispatch(forkOpenSettled())
     },
   })
 
@@ -401,7 +444,17 @@ export function useSessionActions(mode?: string): SessionActions {
   const { mutate: muteFlagMutate } = muteFlagMutation
   const { mutate: reloadMutate } = reloadMutation
 
-  const duplicate = useCallback((slotKey: string) => { forkMutate(slotKey) }, [forkMutate])
+  // A second Fork of the same session while its first fork is in flight is
+  // dropped, so a double click makes one fork. The same rule as the header New
+  // button (`disabled={creatingSlot}`) and the Split View Fork, which disables
+  // itself while its fork is pending. A ref rather than `isPending`, because both
+  // clicks of a double click arrive before React re-renders with the new status.
+  // Keyed by source, so forking another session meanwhile still goes through.
+  const duplicate = useCallback((slotKey: string) => {
+    if (forkingSlotsRef.current.has(slotKey)) return
+    forkingSlotsRef.current.add(slotKey)
+    forkMutate(slotKey)
+  }, [forkMutate])
 
   const toggleRead = useCallback((slotKey: string) => {
     const isUnread = store.getState().dashboard.unreadSlots.includes(slotKey)
@@ -411,7 +464,7 @@ export function useSessionActions(mode?: string): SessionActions {
     // stays window-local — markSlotUnread's string form records the manual
     // sentinel, so no other window's relayed read can clear the reminder.
     if (isUnread) {
-      const slotTs = store.getState().dashboard.slots.find(s => s.key === slotKey)?.last_ts
+      const slotTs = slotLastTsOf(store.getState().dashboard, slotKey)
       emitSlotRead(slotKey, slotTs)
     }
   }, [dispatch])

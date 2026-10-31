@@ -17,6 +17,7 @@ import { APPROVAL_MODE_ADJUSTED_LS_KEY } from '../ApprovalModePicker'
 import type { SubagentActivity } from '../../types'
 import { i18nT } from '../../i18n/t'
 import { fmtTime } from '../../i18n/format'
+import { crewRootOf } from '../../lib/crewMode'
 
 /* The slot's approval chrome as state: the pending tool approval (its
    decision submit, the approval-mode discovery hint and nudge, the ghost
@@ -76,7 +77,10 @@ export function useToolApproval({ slotId, slotApprovalChrome, approvalMode, disp
   // signal; persisting it would fire the nudge on stale history.
   const approvalCountsRef = useRef<Record<string, number>>({})
   const [approvalNudgeSlot, setApprovalNudgeSlot] = useState<string | null>(null)
-  const approvalNudgeActive = !!approvalNudgeSlot && approvalNudgeSlot === slotId
+  // Not over a Crew Mode conductor's worker approval card: it sits above the
+  // composer, and the callout would cover its Approve / Reject.
+  const crewCardShown = useAppSelector(s => !!slotId && s.dashboard.slots.some(r => crewRootOf(r) === slotId && r.pending_approval))
+  const approvalNudgeActive = !!approvalNudgeSlot && approvalNudgeSlot === slotId && !crewCardShown
   // Permanent dismissal (buttons / menu open): the callout has delivered its
   // lesson, so the A1 hint retires with it — otherwise a "Got it" user keeps
   // seeing "Tired of confirming every step?" on every later approval.

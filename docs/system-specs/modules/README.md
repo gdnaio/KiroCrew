@@ -25,6 +25,7 @@ agent loads only the one it needs.
 | [session-summary.md](session-summary.md) | Intent-level session summaries: the sidecar cache, extraction, and the turn-end pass. |
 | [member-event-log.md](member-event-log.md) | Per-member append-only event log, its four projections, the whole-value push frames, and load-time closers behind the Members page. |
 | [session-work-ledger.md](session-work-ledger.md) | Per-session durable work state (goal, phase, tried, artifacts) on disk, its MCP tools, and monitor-loop snapshot injection. |
+| [shared-crew.md](shared-crew.md) | Multi-person Crews. So far: the `dashboard.shared_crew` config section and its defaults. |
 | [crew-log-core.md](crew-log-core.md) | Append-only per-crew and per-session crew logs: the wire format, type ownership and guest namespacing, the torn-tail rule, and the session-log compatibility rule. |
 | [crew-log-emitter.md](crew-log-emitter.md) | The flag-gated writer that turns the ACP turn lifecycle into an append-only per-session `log.jsonl`: which facts are recorded, from which call site, and which are deliberately not. |
 | [crew-log-projection.md](crew-log-projection.md) | The six session folds (`status`, `usage`, `timeline`, `tools`, `approvals`, `subagents`), their resumable checkpoints, the paged `crew-log` reads with refs resolved, and the `session_projection` push. |
@@ -101,7 +102,7 @@ agent loads only the one it needs.
 | [app-notifications.md](app-notifications.md) | How an app publishes a notification to the local bus, and the two shipped producers. |
 | [artifacts.md](artifacts.md) | Artifact identity, versioning, and the companion chat panel. |
 | [dashboard-templates.md](dashboard-templates.md) | A dashboard page shipped with its own typed contract, provider and parity gate: the three invariants, the fold menu the numbers come from, and why a publisher writes sentences and never numbers. |
-| [dashboard-instances.md](dashboard-instances.md) | One crewmate's own copy of a template: the registry it adopts from, why a rollback moves the version forward, the four states and why two of them are not one, and the history that is a crew-log fold. |
+| [dashboard-instances.md](dashboard-instances.md) | One mate's own copy of a template: the registry it adopts from, why a rollback moves the version forward, the four states and why two of them are not one, and the history that is a crew-log fold. |
 | [prompt-optimizer.md](prompt-optimizer.md) | Rewriting a draft prompt on demand, and the paste-forwarding surface. |
 | [steering-viewer.md](steering-viewer.md) | Reading, creating, editing and deleting the steering files a session loads, and the declared-`inclusion` reporting. |
 | [turn-stats-footer.md](turn-stats-footer.md) | The per-turn token and timing footer: capture, persistence, and the frontend render gates. |

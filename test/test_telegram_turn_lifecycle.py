@@ -22,6 +22,7 @@ from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, STOP_REASON_ST
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.telegram.renderer import TelegramApprovalDecider, TelegramRenderer
 from kiro_crew.telegram.transport_dispatch import _user_safe_failure_reason
+from kiro_crew.testing.wait import await_until
 
 
 class TestTelegramSessionPidPublish:
@@ -34,13 +35,22 @@ class TestTelegramSessionPidPublish:
     executor offload) are covered in test_messaging_identity.py.
     """
 
-    def test_telegram_turn_delegates_identity_publish(self) -> None:
+    def test_telegram_turn_delegates_identity_publish(self, tmp_path: Any, monkeypatch) -> None:
+        from kiro_crew.messaging.identity import publish_turn_identity
+        from kiro_crew.session_pid_sig import read_session_pid_mapping
+
+        monkeypatch.setattr("kiro_crew.session_pid_sig.config_dir", lambda: tmp_path)
         d, _cli, sess = _dispatcher({7})
         sess._pid = 4242  # SessionManager.get_pid -> kiro-cli host PID
 
-        async def _go() -> None:
-            with patch("kiro_crew.telegram.transport_dispatch.publish_turn_identity") as pub:
-                await d.handle_message(
+        # Wrapping the facade name keeps the real writer running while the
+        # composition contract still sees this seam as rebound on the facade.
+        with patch(
+            "kiro_crew.telegram.transport_dispatch.publish_turn_identity",
+            wraps=publish_turn_identity,
+        ):
+            asyncio.run(
+                d.handle_message(
                     InboundMessage(
                         channel_type="telegram",
                         user_id="7",
@@ -48,9 +58,10 @@ class TestTelegramSessionPidPublish:
                         text="hi",
                     )
                 )
-                pub.assert_awaited_once_with(sess, "telegram:kirocrew:direct:7")
+            )
 
-        asyncio.run(_go())
+        mapping = read_session_pid_mapping(4242, cfg=tmp_path)
+        assert mapping.session_key == "telegram:kirocrew:direct:7"
 
 
 class TestUserSafeFailureReason:
@@ -305,7 +316,7 @@ class TestTurnLifecycleCharacterization:
 
         async def _go() -> None:
             task = asyncio.create_task(d.handle_message(_dm("hi")))
-            await asyncio.wait_for(started.wait(), 5)
+            await await_until(started, timeout=5, what="the stream starting")
             assert isinstance(d._active_renderers.get(k), TelegramRenderer)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):

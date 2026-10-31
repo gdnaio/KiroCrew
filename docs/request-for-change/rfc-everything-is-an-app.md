@@ -110,14 +110,14 @@ definitions — returns eleven, at `e6b06685e`:
 |---|---|---|
 | `jobFamilies` | `src/kiro_crew/apps/manifest.py:1010` | Parsed, serialized, echoed to the client. No consumer. |
 | `sops` | `manifest.py:976` | `bridges.register_app` (`apps/bridges_register.py`) registers MCP servers, agents, skills, crons. There is no `_register_sops`. Declaring `sops` copies nothing. |
-| `backend.routes` | `manifest.py:386` | No reader. `apps/routes.py:2336` still carries a comment describing it. The prefix is hardcoded at `apps/route_registry.py:122`. |
+| `backend.routes` | `manifest.py:386` | No reader. `_resolve_app_backend_url` (`apps/routes_proxy.py`) still carries a comment describing it. The prefix is hardcoded at `apps/route_registry.py:122`. |
 | `permissions.mcpTools` | `manifest.py:442` | Declarative only. `check_tool_permission` (`apps/permissions.py:71`) has no non-test caller. |
 | `permissions.network` | `manifest.py:444` | Not enforced. An app makes outbound calls regardless. |
 | `permissions.memory` | `manifest.py:445` | Not enforced. There is no `ctx.memory` on `AppContext` (`apps/context.py:51-67`). |
 | `setup.configSchema` | `manifest.py:515` | Parsed, serialized, no reader. |
 | `platform.arch` | `manifest.py:712` | No reader. Only `os` is gated (`manifest.py:718-763`). |
 | `platform.clientInstall.postInstall` | `manifest.py:664` | Parsed, serialized, no reader. |
-| `ui.pages[].iconInactiveUrl` | `manifest.py:247` | No reader outside serialization. |
+| `ui.pages[].iconInactiveUrl` | `manifest.py:247` | No reader outside serialization. Since given one: the sidebar's not-selected icon (#21344), so Phase 1 no longer removes it. |
 | `ui.pages[].mountFunction` | `manifest.py:249` | No reader outside serialization. |
 
 The whole of `src/kiro_crew/apps/permissions.py` is dead in production:
@@ -358,7 +358,7 @@ if the tenet is declined, and the tenet stands on its own if these phases are.
 ### Phase 1 — subtract what nothing will read
 
 Remove `sops`, `backend.routes`, `setup.configSchema`, `platform.arch`,
-`platform.clientInstall.postInstall`, `ui.pages[].iconInactiveUrl`,
+`platform.clientInstall.postInstall`,
 `ui.pages[].mountFunction`, the dead `apps/permissions.py` module, and
 `governance.register_matcher` / `register_scope`. Give `lifecycle`, `resources`,
 `openCommand` and `heroImage*` real dataclass fields with validation, since they
@@ -417,7 +417,7 @@ than a failed install. Phase 2 changes where the overview renders and must keep
 One gap is worth naming because this RFC makes it load-bearing: the compatibility
 contract is one-directional. `minKiroCrewVersion` is a floor an app declares about
 the gateway, checked only at install and update (`_check_min_version` in `apps/manager_tree.py`,
-`apps/routes.py:503`, `install_from_registry` (`apps/registry_pipeline/install.py`)) and never at enable or boot, and it
+`handle_install_app` (`apps/routes.py`), `install_from_registry` (`apps/registry_pipeline/install.py`)) and never at enable or boot, and it
 fails **open** on a malformed value (`apps/version.py:32-33`). The platform
 declares no version for its own app-facing surface, so withdrawing a seam carries
 no signal in the other direction. Phase 1 removes seams. If that ordering feels

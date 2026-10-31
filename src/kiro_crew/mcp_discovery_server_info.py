@@ -110,7 +110,7 @@ def _extra_scope_sources() -> list[tuple[Path, str]]:
 # provider global) is NOT a core scope — it is contributed by the edition seam
 # and appended AFTER these by :func:`_scope_priority` (lowest priority), so a
 # companion's provider global only fills gaps and never outranks the Kiro
-# global. This matches ``rebuild_agent_config``'s merge order in agent.py
+# global. This matches ``rebuild_agent_config``'s merge order in agent_parts/spec_rebuild.py
 # (kirocrew > kiro-global > seam provider globals) — discovery, apply, and
 # rebuild all agree, so the dashboard never shows a spec the agent won't run.
 _CORE_SCOPE_ORDER: tuple[str, ...] = (SCOPE_KIROCREW, SCOPE_KIRO_GLOBAL)
@@ -299,6 +299,7 @@ class McpServerInfo:
     scopes: list[str] = field(default_factory=list)
     client_id: str = ""
     # unknown | ok | error | probing | outdated | disabled | needs_auth | registry
+    # | routed (a secret:// server the running gateway starts; not probed here)
     status: str = "unknown"
     tools: list[str] = field(default_factory=list)
     error: str = ""

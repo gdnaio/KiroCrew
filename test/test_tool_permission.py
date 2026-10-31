@@ -45,6 +45,7 @@ from kiro_crew.subagent import (
 )
 from kiro_crew.subagent_manager import run as run_mod
 from kiro_crew.task_models import Project, Task
+from kiro_crew.testing.wait import await_until
 from kiro_crew.tool_permission import (
     GATE_GRANT,
     NO_GATE,
@@ -667,6 +668,55 @@ async def test_a_refused_program_name_downgrades_to_the_next_stage(names):
     assert settled.by == "person"
 
 
+@pytest.fixture
+def fresh_decline_notices():
+    """The once-per-session ledger is process-global; start and end each test empty."""
+    name_grant._DECLINE_NOTICES.clear()
+    yield
+    name_grant._DECLINE_NOTICES.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_platform_scope_decline_is_narrated_once_per_session_but_audited_every_time(
+    names, fresh_decline_notices
+):
+    # A platform-scope refusal's text is one constant per session, so the
+    # narration (the surface's log line) is written once per session, as the
+    # dashboard and LLM surfaces already do. The audit row is per call.
+    names.verdicts["Run: ls -la"] = name_grant.Refusal(
+        code=name_grant.WINDOWS_UNMODELLED, detail="ls lookup is not modelled here"
+    )
+    log: list = []
+    policy = _policy(
+        log,
+        gate=Judges(log, Hit("hook_auto_approve", Evidence.NAME, vouch=True)),
+        grants=(GATE_GRANT,),
+    )
+    for session_key in ("k", "k", "other"):
+        await settle(Ask(_event(), RecordingWire(log), session_key), policy)
+    narrated = [e for e in log if e[:2] == ("narrate", "declined")]
+    audited = [e for e in log if e[:2] == ("audit", "declined")]
+    assert narrated == [("narrate", "declined", name_grant.WINDOWS_UNMODELLED)] * 2
+    assert len(audited) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_command_scope_decline_is_still_narrated_every_time(names, fresh_decline_notices):
+    # Command-scope refusals differ per invocation, so each one is narrated.
+    names.verdicts["Run: ls -la"] = _SHADOWED
+    log: list = []
+    policy = _policy(
+        log,
+        gate=Judges(log, Hit("hook_auto_approve", Evidence.NAME, vouch=True)),
+        grants=(GATE_GRANT,),
+    )
+    for _ in range(2):
+        await settle(Ask(_event(), RecordingWire(log), "k"), policy)
+    assert [e for e in log if e[:2] == ("narrate", "declined")] == [
+        ("narrate", "declined", "shadowed")
+    ] * 2
+
+
 @pytest.mark.asyncio
 async def test_only_a_name_grant_is_vouched_for(names):
     names.verdicts["Run: ls -la"] = _SHADOWED
@@ -942,7 +992,7 @@ async def test_a_cancel_mid_steer_still_answers_the_request():
     refusing = asyncio.ensure_future(
         wire.refuse(Ask(_event(), wire, "k"), Notice(DENY_CAUSE_POLICY, "denied"))
     )
-    await asyncio.wait_for(client.parked.wait(), 10)
+    await await_until(client.parked, what="the steer parking")
     refusing.cancel()
     with pytest.raises(asyncio.CancelledError):
         await refusing
@@ -1159,7 +1209,7 @@ async def test_a_cancelled_wait_closes_as_a_host_decline_and_leaves_the_wire_alo
     settling = asyncio.ensure_future(
         settle(Ask(_event(), wire, "k"), _policy(log, responders=(responder,)))
     )
-    await asyncio.wait_for(entered.wait(), 10)
+    await await_until(entered, what="the callback responder entering its wait")
     settling.cancel()
     with pytest.raises(asyncio.CancelledError):
         await settling

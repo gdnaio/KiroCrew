@@ -100,7 +100,6 @@ function mount(
     fields,
     agentic: extra.agentic ?? ['ci', 'for_you', 'verdict'],
     seq: extra.seq ?? 412,
-    stale: false,
     missing: [],
     written_at: extra.written_at ?? {},
     // The host sets this only when the reader has a non-English UI locale; an absent
@@ -180,10 +179,10 @@ describe('project-report: the page the gateway ships', () => {
       expect(text('.pr-vd-block')).toContain('A maintainer clears it')
     })
 
-    it('marks the line as the crewmate\'s own', () => {
+    it('marks the line as the mate\'s own', () => {
       // A reader deciding whether to act on a judgment is entitled to know it is one.
       mount(live, { written_at: { verdict: iso(1) } })
-      expect(text('.pr-vd-meta')).toContain('crewmate wrote this')
+      expect(text('.pr-vd-meta')).toContain('mate wrote this')
     })
 
     it.each([
@@ -347,7 +346,7 @@ describe('project-report: the page the gateway ships', () => {
   })
 
   // ----------------------------------------------------------------- change 3
-  describe('idle time and the stale band', () => {
+  describe('idle time, with no stale band', () => {
     const base = {
       omitted: 0,
       series: [],
@@ -421,17 +420,14 @@ describe('project-report: the page the gateway ships', () => {
       expect(quietOf()).toHaveLength(0)
     })
 
-    it('raises a band when the fold itself has stopped advancing', () => {
-      // The difference between "working" and "dead", which a page of intact numbers
-      // cannot otherwise show.
-      mount({ ...base, last_entry_at: iso(100), items: [board([task()])] })
-      expect(text('.pr-stale')).toContain('No new entry for 1h40m')
-      expect(text('.pr-stale')).toContain('last-known reading')
-    })
-
-    it('names the fold seq in the band, so the reading can be placed', () => {
+    it('raises no band when the fold itself has stopped advancing', () => {
+      // The person is shown no staleness message: a crewmate whose record stopped
+      // moving is its own news, told in its turn block, not a band on this page.
       mount({ ...base, last_entry_at: iso(100), items: [board([task()])] }, { seq: 412 })
-      expect(text('.pr-stale')).toContain('fold seq 412')
+      expect(document.querySelector('.pr-stale')).toBeNull()
+      expect(document.body.textContent ?? '').not.toContain('No new entry')
+      expect(document.body.textContent ?? '').not.toContain('last-known reading')
+      expect(document.body.textContent ?? '').not.toContain('fold seq')
     })
 
     it('raises no band while the fold is advancing', () => {
@@ -447,10 +443,9 @@ describe('project-report: the page the gateway ships', () => {
     })
   })
 
-  // The three bands are above the numbers they qualify, which is the only order that
-  // works: a reader who learns the page is dead should learn it before reading a
-  // number off it.
-  it('puts the stale band, the verdict and the lanes above the view', () => {
+  // The verdict and the lanes are above the numbers they qualify, and no stale band
+  // sits above them, even for a fold that has gone quiet.
+  it('puts the verdict and the lanes above the view, with no stale band', () => {
     mount({
       items: [board([task({ pr: '1', last_report_at: iso(5) })])],
       omitted: 0,
@@ -463,7 +458,7 @@ describe('project-report: the page the gateway ships', () => {
     const order = all('.pr-stale, .pr-vd, .pr-lanes, #pr-view').map((n) =>
       n.id === 'pr-view' ? 'view' : n.className,
     )
-    expect(order).toEqual(['pr-stale', 'pr-vd', 'pr-lanes', 'view'])
+    expect(order).toEqual(['pr-vd', 'pr-lanes', 'view'])
   })
   // ----------------------------------------------------------------- change 4
   describe('the task drawer', () => {
@@ -678,21 +673,24 @@ describe('project-report: the page the gateway ships', () => {
   })
 
   // ------------------------------------------------- live state, flash, and hold
-  describe('the live indicator', () => {
+  describe('no live indicator', () => {
     const base = { items: [board([task()])], omitted: 0, series: [], for_you: [] }
 
-    it('says Live and names when the page last read', () => {
-      mount({ ...base, last_entry_at: iso(2) })
-      expect(document.querySelector('.pr-live')?.getAttribute('data-live')).toBe('true')
-      expect(text('.pr-live')).toContain('Live')
-      expect(text('.pr-live')).toMatch(/Updated \d\d:\d\d/)
+    it('draws no Live dot or Updated time, fresh or quiet', () => {
+      // The person sees no freshness message in either direction.
+      for (const at of [iso(2), iso(100)]) {
+        mount({ ...base, last_entry_at: at })
+        expect(document.querySelector('.pr-live')).toBeNull()
+        expect(document.querySelector('.pr-stale')).toBeNull()
+        expect(document.body.textContent ?? '').not.toContain('No new entry')
+      }
     })
 
     it('reads one clock, so a committed screenshot is reproducible', () => {
       // The page must not mix `Date.now()` with `new Date()`. Both answer the same
       // thing in a browser and part company in the evidence harness, which pins
       // `Date.now` to its fixture's instant -- so a page mixing them renders a
-      // different "Updated" on every shoot and the committed images differ byte for
+      // different reading on every shoot and the committed images differ byte for
       // byte. Asserted on the SOURCE because a fake timer here patches both.
       // COMMENTS STRIPPED FIRST. The line above this one quotes the forbidden form
       // in order to explain it, and a scan counting that would report the page's own
@@ -703,20 +701,12 @@ describe('project-report: the page the gateway ships', () => {
         .join('\n')
       const bare = code.match(/new Date\(\s*\)/g) || []
       expect(bare, 'a bare `new Date()` reads the real clock past the pin').toEqual([])
-      // THE CONTROL. Without it an empty result also means the pattern is wrong, and
+      // THE CONTROL. Without it an empty result also means the scan read nothing, and
       // a scan that matches nothing anywhere passes this case forever.
-      expect(code.match(/new Date\(Date\.now\(\)\)/g) || [], 'the pattern matches nothing')
-        .toHaveLength(1)
+      expect(code.match(/Date\.now\(\)/g) || [], 'the page reads no clock at all')
+        .not.toHaveLength(0)
     })
 
-    it('stops claiming Live once nothing is arriving', () => {
-      // Read from the same stamp the stale band is raised from, so the dot and the
-      // band cannot disagree about whether the page is being fed.
-      mount({ ...base, last_entry_at: iso(100) })
-      expect(document.querySelector('.pr-live')?.getAttribute('data-live')).toBe('false')
-      expect(text('.pr-live')).toContain('No new entry')
-      expect(document.querySelector('.pr-stale')).toBeTruthy()
-    })
   })
 
   describe('the host writes the same elements this page does', () => {
@@ -834,15 +824,16 @@ describe('project-report: the page the gateway ships', () => {
     // and it is on screen the moment a fresh crewmate writes anything.
     it('says just now without a suffix', () => {
       mount({ items: [], last_entry_at: '2026-10-04T17:11:30Z' })
-      expect(text('.pr-live')).toContain('just now')
-      expect(text('.pr-live'), 'reads "just now ago"').not.toContain('just now ago')
+      const cell = '[data-dashboard-field="last_entry_at"]'
+      expect(text(cell)).toContain('just now')
+      expect(text(cell), 'reads "just now ago"').not.toContain('just now ago')
     })
 
     it('still says ago for a real length', () => {
       // The control: without it, deleting the suffix everywhere would pass the case
       // above while making every other reading tenseless.
       mount({ items: [], last_entry_at: '2026-10-04T16:00:00Z' })
-      expect(text('.pr-live')).toContain('1h12m ago')
+      expect(text('[data-dashboard-field="last_entry_at"]')).toContain('1h12m ago')
     })
 
     it('keeps the quiet chip a bare length', () => {
@@ -992,7 +983,7 @@ describe('project-report: the page the gateway ships', () => {
     })
   })
 
-  describe('a crewmate with no workstream', () => {
+  describe('a mate with no workstream', () => {
     // THE BUG the lead found on the pod: the header counted "1 needs you" while the
     // body under it said "No workstream yet. Nothing needs you". Two numbers from one
     // page disagreeing, and the one a reader can ACT on was the wrong one.
@@ -1196,7 +1187,7 @@ describe('project-report: the page the gateway ships', () => {
       expect(needsKpi()).toBe('0')
       expect(needsSub()).toBe('2 asked before you wrote in chat')
       mount(quiet, { written_at: { for_you: WROTE } })
-      expect(needsSub()).toBe('2 of them raised by the crewmate')
+      expect(needsSub()).toBe('2 of them raised by the mate')
     })
 
     it('takes them out of every Needs-you count, and only them', () => {
@@ -1207,7 +1198,7 @@ describe('project-report: the page the gateway ships', () => {
       expect(needsKpi()).toBe('1')
       expect(text('#pr-sentence')).toContain('1 needs you')
       // None of the one left was raised by the crewmate, and nothing is "not shown".
-      expect(text('.pr-kpis')).not.toContain('raised by the crewmate')
+      expect(text('.pr-kpis')).not.toContain('raised by the mate')
       expect(text('#pr-view')).not.toContain('more not shown')
     })
 
@@ -1228,7 +1219,7 @@ describe('project-report: the page the gateway ships', () => {
       expect(text('#pr-view')).toContain('2 more not shown (list truncated)')
     })
 
-    it('keeps asking when the crewmate wrote the list after the reply', () => {
+    it('keeps asking when the mate wrote the list after the reply', () => {
       mount(page(), { written_at: { for_you: iso(5) }, last_user_at: iso(10) })
       expect(openCards()).toEqual(['which base?', 'Fix the CLI bubble?', 'Fix skill_search?'])
       expect(folds()).toEqual([])
@@ -1256,7 +1247,7 @@ describe('project-report: the page the gateway ships', () => {
       }
     })
 
-    it('asks again once the crewmate writes the list after the reply', () => {
+    it('asks again once the mate writes the list after the reply', () => {
       mount(page(), replied)
       expect(openCards()).toHaveLength(1)
       refresh(page(), { written_at: { for_you: iso(1) } })
@@ -1379,7 +1370,7 @@ describe('project-report: the page the gateway ships', () => {
       expect(openCards()).toContain('Fix the CLI bubble?')
     })
 
-    it('folds every card on an unrelated reply the crewmate has not answered, each still on the page', () => {
+    it('folds every card on an unrelated reply the mate has not answered, each still on the page', () => {
       // The person writes about something else and the crewmate has not written the
       // list again yet: every card folds, and each stays drawn with its own text and its
       // own Show card button, so none of them leaves the page.
@@ -1432,18 +1423,18 @@ describe('project-report: the page the gateway ships', () => {
       expect(text('#pr-view')).not.toContain('Nothing needs you, and nothing has been spent')
     })
 
-    it('words the line in the crewmate\u2019s language, else in the reader\u2019s', () => {
+    it('words the line in the mate\u2019s language, else in the reader\u2019s', () => {
       mount(
         page({
           verdict: {
-            words: { replied: 'Saw your reply', reopen: 'Bring back', in_chat: 'With the crewmate', hide: 'Put away' },
+            words: { replied: 'Saw your reply', reopen: 'Bring back', in_chat: 'With the mate', hide: 'Put away' },
           },
         }),
         replied,
       )
       expect(sentLines()[0]).toContain('\u2192 Saw your reply')
       expect(text('.pr-todo-sent button')).toBe('Bring back')
-      expect(folds()).toEqual(['With the crewmate \u00b7 2'])
+      expect(folds()).toEqual(['With the mate \u00b7 2'])
       ;(all('.pr-todo-sent button')[0] as HTMLButtonElement).click()
       expect(all('.pr-todo-again button').map((b) => b.textContent)).toEqual(['Put away'])
       mount(page(), { ...replied, locale: 'zh-CN' })
@@ -1542,9 +1533,9 @@ describe('project-report: the page the gateway ships', () => {
       ])
     })
 
-    it('says the crewmate wrote it', () => {
+    it('says the mate wrote it', () => {
       mount({ items: [], published })
-      expect(text('#pr-published-host .pr-agent')).toBe('crewmate wrote this')
+      expect(text('#pr-published-host .pr-agent')).toBe('mate wrote this')
       expect(text('[data-dashboard-field="published"]')).toBe('a board')
     })
 
@@ -1556,7 +1547,7 @@ describe('project-report: the page the gateway ships', () => {
       expect(card()?.textContent).toContain('<img src=x')
     })
 
-    it('is hidden when the crewmate never published', () => {
+    it('is hidden when the mate never published', () => {
       for (const value of [undefined, {}, [], 'text']) {
         mount({ items: [], published: value })
         expect(card(), `a block was drawn for ${JSON.stringify(value)}`).toBeNull()
@@ -1599,7 +1590,7 @@ describe('project-report: the page the gateway ships', () => {
     })
 
     it('says once that only a publish is shown, with no zero counters above it', () => {
-      const HINT = 'Below is what this crewmate last published.'
+      const HINT = 'Below is what this mate last published.'
       mount({ items: [], published })
       expect(document.body.textContent).toContain(HINT)
       expect(document.body.textContent).not.toContain('No workstream yet.')

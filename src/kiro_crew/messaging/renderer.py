@@ -66,13 +66,14 @@ from kiro_crew.security import (
 TEXT_CHUNK = "text_chunk"
 THINKING = "thinking"
 TOOL_CALL = "tool_call"
+TOOL_RESULT = "tool_result"  # a tool call reached a terminal outcome (see tool_status)
 PROMPT_CHOICE = "prompt_choice"
 COMPACTION = "compaction"
 DONE = "done"
 STEER_CONSUMED = "steer_consumed"  # kiro-cli folded a mid-turn steer at a boundary
 
 OUTPUT_KINDS = frozenset(
-    {TEXT_CHUNK, THINKING, TOOL_CALL, PROMPT_CHOICE, COMPACTION, DONE, STEER_CONSUMED}
+    {TEXT_CHUNK, THINKING, TOOL_CALL, TOOL_RESULT, PROMPT_CHOICE, COMPACTION, DONE, STEER_CONSUMED}
 )
 
 
@@ -97,6 +98,12 @@ class OutputEvent:
     tool_name: str = ""
     tool_kind: str = ""  # tool_call (e.g. "read"/"execute" — drives phase emoji)
     tool_purpose: str = ""  # tool_call / prompt_choice (human-readable purpose)
+    # tool_result: the call's TERMINAL outcome as the ACP layer reported it, one
+    # of ``acp.types.TERMINAL_TOOL_STATUSES`` ("completed" / "failed" /
+    # "cancelled" / "canceled" / "refused"). A renderer reads it to finalize that
+    # call's card honestly instead of marking every call complete; anything other
+    # than "completed" is a call that did NOT succeed. Empty on every other kind.
+    tool_status: str = ""
     options: list[dict[str, Any]] = field(default_factory=list)  # prompt_choice
     request_id: str | int = ""  # prompt_choice correlation
     # prompt_choice: the tool's own arguments, redacted, so a renderer can show
@@ -110,6 +117,21 @@ class OutputEvent:
     # the sentence to post in place of a bare placeholder when the turn closed
     # with no assistant text, ``""`` when it produced text or was cancelled.
     notice: str = ""
+    # text_chunk: this text ENDS the text that came before the last tool call.
+    # The driver's stream redactor holds a trailing run until it can see what
+    # follows, so the last word before a call ("...writes the local overlay.")
+    # is released only with the first text after it. The driver splits that
+    # held run off into its own chunk with this flag, so a renderer that keeps
+    # each tool step's text apart can put it back where it was written. May be
+    # empty: the held run could not be told apart (a redaction reached across
+    # the join), and the earlier text simply ends where it already ended.
+    continues_segment: bool = False
+    # tool_call: the text before this call is not complete yet -- its last run
+    # is still held and arrives later as a ``continues_segment`` chunk.
+    text_held: bool = False
+    # tool_call: the whole (redacted) command when ``title`` is its raw
+    # fallback cut to one line, ``""`` when ``title`` is a derived action.
+    raw_title: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -119,12 +141,16 @@ class OutputEvent:
             "title": self.title,
             "tool_kind": self.tool_kind,
             "tool_purpose": self.tool_purpose,
+            "tool_status": self.tool_status,
             "options": [dict(o) for o in self.options],
             "tool_input": self.tool_input,
             "request_id": self.request_id,
             "context_usage_pct": self.context_usage_pct,
             "stop_reason": self.stop_reason,
             "notice": self.notice,
+            "continues_segment": self.continues_segment,
+            "text_held": self.text_held,
+            "raw_title": self.raw_title,
         }
 
 
@@ -284,7 +310,12 @@ def cap_choices(
     return choices[:n], choices[n:]
 
 
-def display_safe_for(text: str, capabilities: TransportCapabilities) -> str:
+def display_safe_for(
+    text: str,
+    capabilities: TransportCapabilities,
+    *,
+    redactor: Callable[[str], str] | None = None,
+) -> str:
     """:func:`display_safe`, with the mention defang applied only where it belongs.
 
     The channel-NEUTRAL proactive sinks (the dashboard's channel-addressed send and
@@ -303,9 +334,13 @@ def display_safe_for(text: str, capabilities: TransportCapabilities) -> str:
     Control-tag comments are stripped first, same as :func:`display_safe` —
     the deterministic backstop against a dashboard-authored control tag
     reaching channel users as literal text.
+
+    ``redactor`` defaults to ``_default_redactor``. A caller in a composed host
+    passes ``redact_via_context`` so companion credential patterns apply too, the
+    same reason :func:`chunk_for_transport` takes one.
     """
     text = strip_control_comments(text or "")
-    safe, _ = redact_for_display(text, _default_redactor)
+    safe, _ = redact_for_display(text, redactor or _default_redactor)
     if not capabilities.mention_grammars:
         return safe
     return safe.replace("@", "@\u200b").replace("<!", "<\u200b!")
@@ -820,6 +855,15 @@ class Renderer(ABC):
     #: reads this instead of matching the title. ``""`` when the transport sent
     #: no identity.
     current_tool_name: str = ""
+    #: Whether the text before the tool call ``on_tool_call`` is rendering is
+    #: still incomplete (``OutputEvent.text_held``), set by :meth:`dispatch`
+    #: before the hook runs. True means its last run arrives later through
+    #: :meth:`on_text_continuation`.
+    tool_text_held: bool = False
+    #: The whole command behind the raw-fallback title of the tool call
+    #: ``on_tool_call`` is rendering (``OutputEvent.raw_title``), set by
+    #: :meth:`dispatch` before the hook runs; ``""`` for a derived title.
+    current_tool_raw_title: str = ""
     #: The driver's empty-turn verdict for the turn being finalized
     #: (``OutputEvent.notice`` on ``DONE``), set by :meth:`dispatch` before
     #: ``on_done`` runs. Non-empty means the turn closed with no assistant text
@@ -942,6 +986,20 @@ class Renderer(ABC):
     async def on_text_chunk(self, text: str) -> None:
         """Render a streamed assistant text chunk."""
 
+    async def on_text_continuation(self, text: str) -> None:
+        """Render the held end of the text that came before the last tool call.
+
+        The default joins it to the stream like any other chunk, which is what
+        every renderer that lays a turn's text end to end wants: the text it
+        sees is byte for byte what it saw before the chunk was split off. A
+        renderer that keeps each tool step's text apart (Slack folds the text
+        before a call into that call's step) overrides this to add the run to
+        the step it belongs to. ``text`` may be empty: the earlier text is
+        complete as it stands.
+        """
+        if text:
+            await self.on_text_chunk(text)
+
     @abstractmethod
     async def on_thinking(self, text: str) -> None:
         """Render a reasoning/thinking update."""
@@ -955,6 +1013,22 @@ class Renderer(ABC):
         Mirrors the native uniform ``EVENT_TOOL_CALL`` semantics: each call
         marks the previous task complete and starts a new in-progress task.
         """
+
+    async def on_tool_result(self, tool_call_id: str, tool_status: str) -> None:
+        """Record a tool call's TERMINAL outcome, so its card is honest.
+
+        ``tool_status`` is one of ``acp.types.TERMINAL_TOOL_STATUSES``;
+        "completed" is success and anything else ("failed" / "cancelled" /
+        "canceled" / "refused") is a call that did not succeed. The default is a
+        no-op: ``on_tool_call`` already marks the PREVIOUS task complete when the
+        next call starts, so a renderer that does not distinguish outcomes keeps
+        its existing behaviour. A renderer that wants per-call accounting (a
+        failed card, an "N succeeded · M failed" summary) overrides this and
+        keys the open call's finalization on the status instead of marking every
+        card complete. Not abstract, for the same reason ``on_steer_consumed``
+        is not: a channel that has nowhere to show an outcome owes nothing here.
+        """
+        return None
 
     @abstractmethod
     async def on_prompt_choice(
@@ -1005,14 +1079,21 @@ class Renderer(ABC):
     async def dispatch(self, event: OutputEvent) -> None:
         """Route ``event`` to the matching ``on_*`` handler."""
         if event.kind == TEXT_CHUNK:
-            await self.on_text_chunk(event.text)
+            if event.continues_segment:
+                await self.on_text_continuation(event.text)
+            else:
+                await self.on_text_chunk(event.text)
         elif event.kind == THINKING:
             await self.on_thinking(event.text)
         elif event.kind == TOOL_CALL:
             self.current_tool_name = event.tool_name or ""
+            self.tool_text_held = event.text_held
+            self.current_tool_raw_title = event.raw_title
             await self.on_tool_call(
                 event.tool_call_id, event.title, event.tool_kind, event.tool_purpose
             )
+        elif event.kind == TOOL_RESULT:
+            await self.on_tool_result(event.tool_call_id, event.tool_status)
         elif event.kind == PROMPT_CHOICE:
             await self.on_prompt_choice(
                 event.options,

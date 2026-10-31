@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, fireEvent, waitFor, within } from '@testing-library/react'
+import { act, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import SchedulePage from '../pages/SchedulePage'
 import { SCHEDULE_PRESETS, PRESET_CATEGORIES } from '../utils/schedulePresets'
 import type { CronJob } from '../types'
+import { i18next } from '../i18n/all'
 
 // Covers the arm -> confirm -> delete -> revert state machine. This logic is on
 // a destructive, irreversible action and had two real bugs (premature button
@@ -157,7 +158,10 @@ describe('SchedulePage delete button state machine', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
     expect(await screen.findByRole('button', { name: 'Delete?' })).toBeInTheDocument()
 
-    await vi.advanceTimersByTimeAsync(3100)
+    // Inside act: the revert's setState fires from a fake timer, and outside act
+    // React renders it on a real scheduler task that can land after the advance
+    // returns. act flushes that render before the assertions read the DOM.
+    await act(async () => { await vi.advanceTimersByTimeAsync(3100) })
 
     // Back to the disarmed state: plain "Delete" label, armed label gone.
     expect(screen.getByRole('button', { name: 'Delete' })).toBeInTheDocument()
@@ -618,7 +622,7 @@ describe('SchedulePage job detail dialog', () => {
     expect(await screen.findByDisplayValue('Nightly report')).toBeInTheDocument()
   })
 
-  it('?job=<id> opens that job\'s detail once the list loads (the Crewmate Profile link)', async () => {
+  it('?job=<id> opens that job\'s detail once the list loads (the Mate Profile link)', async () => {
     const { api } = await import('../api/client')
     vi.mocked(api).crons.mockResolvedValue({ jobs: [mkJob({ id: 'job-7', name: 'Linked job' })] })
 
@@ -744,5 +748,62 @@ describe('SchedulePage failed-job error surface', () => {
     fireEvent.click(await screen.findByText('Nightly report'))
 
     expect(await screen.findByText('12 files copied')).toBeInTheDocument()
+  })
+})
+
+describe('SchedulePage translated labels', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  afterEach(async () => {
+    await i18next.changeLanguage('en')
+  })
+
+  it('names the job dialog tabs in the active language', async () => {
+    const { api } = await import('../api/client')
+    vi.mocked(api).crons.mockResolvedValue({ jobs: [mkJob()] })
+    await i18next.changeLanguage('de')
+
+    renderWithProviders(<SchedulePage />)
+    await waitFor(() => expect(screen.getByText('Nightly report')).toBeInTheDocument())
+    fireEvent.click(screen.getByText('Nightly report'))
+    const dialog = await screen.findByRole('dialog')
+
+    // The tab row may collapse to a menu at this width; open it if it did.
+    const toggle = within(dialog).queryByRole('button', { name: 'Details', expanded: false })
+    if (toggle) fireEvent.click(toggle)
+    expect(within(dialog).getByRole('radio', { name: 'Protokolle' })).toBeInTheDocument()
+    expect(within(dialog).queryByRole('radio', { name: 'Logs' })).not.toBeInTheDocument()
+  })
+
+  it.each([
+    [1, 'Delete 1 selected job'],
+    [2, 'Delete 2 selected jobs'],
+  ])('titles the bulk Delete button with a real plural for %i selected', async (n, title) => {
+    const { api } = await import('../api/client')
+    const jobs = [mkJob({ id: 'job-1', name: 'Nightly report' }), mkJob({ id: 'job-2', name: 'Weekly digest' })]
+    vi.mocked(api).crons.mockResolvedValue({ jobs })
+
+    renderWithProviders(<SchedulePage />)
+    await waitFor(() => expect(screen.getByText('Nightly report')).toBeInTheDocument())
+    for (const job of jobs.slice(0, n)) {
+      fireEvent.click(screen.getByRole('checkbox', { name: `Select ${job.name}` }))
+    }
+
+    expect(screen.getByTitle(title)).toBeInTheDocument()
+  })
+
+  it('titles the bulk Delete button in the active language', async () => {
+    const { api } = await import('../api/client')
+    vi.mocked(api).crons.mockResolvedValue({ jobs: [mkJob()] })
+    await i18next.changeLanguage('de')
+
+    renderWithProviders(<SchedulePage />)
+    await waitFor(() => expect(screen.getByText('Nightly report')).toBeInTheDocument())
+    const row = screen.getByText('Nightly report').closest('tr')!
+    fireEvent.click(within(row).getByRole('checkbox'))
+
+    expect(screen.getByTitle('1 ausgewählten Job löschen')).toBeInTheDocument()
   })
 })

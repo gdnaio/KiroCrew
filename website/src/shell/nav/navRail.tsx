@@ -1,8 +1,9 @@
 import { surfaceLabel } from '../../surfaces/registry'
 import { SortableAppNavRow, NavToggle } from './appRail'
+import { AppRailMenu } from './appRailMenu'
 import { railWidthFor } from '../../hooks/useRailWidth'
 import { FOCUS_INSET } from '../../hooks/useFocusMode'
-import { Code, Coins, Compass, LayoutGrid, SquareTerminal, Smartphone, Search as SearchIcon } from 'lucide-react'
+import { Coins, Compass, LayoutGrid, SquareTerminal, Smartphone, Search as SearchIcon } from 'lucide-react'
 import { motion } from 'framer-motion'
 import { DndContext, closestCenter, DragOverlay } from '@dnd-kit/core'
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable'
@@ -18,6 +19,7 @@ import { appPathname } from '../../lib/basePath'
 import { MOBILE_NAV_WIDTH, type AppShell } from '../appShell'
 import { NavItem, NavBadge } from './navRow'
 import { hiddenChromeProps } from '../focus/focusChrome'
+import { coversPaneProps } from '../../hooks/paneVisibility'
 
 /**
  * The main navigation: the desktop rail, and the phone nav drawer with its scrim,
@@ -28,11 +30,11 @@ export function ShellNavRail({ shell }: { shell: AppShell }) {
   const {
     updateAvailable, terminalEnabled, terminalPoppedOut, bottomTerminalOpen, mobileConnectOpen,
     setMobileConnectOpen, hasRenderableMobileConnect, activeSlotProject, navigate, branding, botName, avatar,
-    isMobile, focusActive, focusChromeInert, railPeek, railPeekSurface, mobileNavMounted, mobileNavX, mobileNavPanelRef,
+    isMobile, focusActive, focusChromeInert, railPeek, railPeekSurface, mobileNavMounted, mobileNavOpen, mobileNavX, mobileNavPanelRef,
     mobileNavScrimRef, mobileNavScrim, closeMobileNavDrawer, advertisedNavItems, sortedAppGroup,
     activeAppDragId, appDndSensors, handleAppDragStart, handleAppDragEnd, handleAppDragCancel, APPS_NAV_LIMIT,
     appsExpanded, toggleAppsExpanded, slotOwners, appBadges, discoverBadges, railAppBadges, railAppRunStates,
-    commandPalette, kiroUsageOpen, setKiroUsageOpen, kiroAccountEntry, devMode, devPageSeen,
+    commandPalette, kiroUsageOpen, setKiroUsageOpen, kiroAccountEntry,
     setReportProblemOpen, toggleNav, effectiveCollapsed, closeMobileNav, activePath, libraryNavActive,
     discoverNavActive, isChat, navRowActive,
   } = shell
@@ -229,15 +231,23 @@ export function ShellNavRail({ shell }: { shell: AppShell }) {
               const sortableRows = overflowing ? visible.slice(0, APPS_NAV_LIMIT) : visible
               const pulledInRows = overflowing ? visible.slice(APPS_NAV_LIMIT) : []
               const activeApp = activeAppDragId ? fullList.find(n => n.id === activeAppDragId) : null
+              const dragActive = activeAppDragId !== null
               return (<>
               <DndContext sensors={appDndSensors} collisionDetection={closestCenter} onDragStart={handleAppDragStart} onDragEnd={handleAppDragEnd} onDragCancel={handleAppDragCancel}>
                 <SortableContext items={sortableRows.map(n => n.id)} strategy={verticalListSortingStrategy}>
                   {sortableRows.map(n => (
-                    <SortableAppNavRow key={n.id} id={n.id}>{renderNavRow(n)}</SortableAppNavRow>
+                    <AppRailMenu key={n.id} row={n} dragActive={dragActive}>
+                      <div role="presentation"><SortableAppNavRow id={n.id}>{renderNavRow(n)}</SortableAppNavRow></div>
+                    </AppRailMenu>
                   ))}
                 </SortableContext>
                 {/* Pulled-in active overflow row(s): static, non-draggable. */}
-                {pulledInRows.map(n => <div key={n.id} role="presentation">{renderNavRow(n)}</div>)}
+                {pulledInRows.map(n => (
+                  <AppRailMenu key={n.id} row={n} dragActive={dragActive}>
+                    <div role="presentation">{renderNavRow(n)}</div>
+                  </AppRailMenu>
+                ))}
+                {/* The ghost has no menu because it is a second rendering of the dragged row. */}
                 <DragOverlay>{activeApp ? renderNavRow(activeApp) : null}</DragOverlay>
               </DndContext>
               {/* Show the toggle whenever the list is collapsible, NOT only when
@@ -258,32 +268,14 @@ export function ShellNavRail({ shell }: { shell: AppShell }) {
           </div>
         </div>
 
-        {/* Bottom-fixed: Agent Capabilities, Developer (only when dev mode is
-            enabled), Settings, and the community row. Pinned to the
-            rail's bottom edge — the Apps frame above absorbs the scroll. */}
+        {/* Bottom-fixed: Agent Capabilities, Settings, and the community row.
+            Pinned to the rail's bottom edge — the Apps frame above absorbs
+            the scroll. */}
         {(() => {
           const s = NAV_ITEMS.find(n => n.id === 'settings')!
           const cap = NAV_ITEMS.find(n => n.id === 'capabilities')!
-          const devPath = '/developer'
           return (
             <div className="shrink-0 grid gap-0.5 px-2 pt-1 pb-2">
-              {devMode && (() => {
-                const dotClass = effectiveCollapsed
-                  ? 'absolute top-1 right-1 w-2 h-2 bg-accent rounded-full z-10 animate-pulse'
-                  : 'absolute top-1/2 -translate-y-1/2 right-2 w-2 h-2 bg-accent rounded-full z-10 animate-pulse'
-                return (
-                <NavItem
-                  path={devPath}
-                  label={i18nT('app.developer')}
-                  icon={<Code size={16} />}
-                  active={activePath === devPath}
-                  collapsed={effectiveCollapsed}
-                  onClick={closeMobileNav}
-                  badge={!devPageSeen && activePath !== devPath ? <span className={`${dotClass} [animation-iteration-count:3]!`} /> : undefined}
-                  {...uiLocation('shell.developer')}
-                />
-                )
-              })()}
               {terminalEnabled && (
                 <NavItem
                   path="#"
@@ -400,6 +392,11 @@ export function ShellNavRail({ shell }: { shell: AppShell }) {
                 className="bg-bg-elevated border border-border rounded-xl flex flex-col mx-2 mt-2 mb-2 shadow-sm z-50 overflow-hidden fixed top-safe left-safe bottom-safe"
                 role="navigation"
                 aria-label={i18nT('app.main_navigation')}
+                // Drawn over the page with a scrim behind it: while OPEN a chat
+                // transcript under it is not on screen (see paneVisibility,
+                // #23564). It stays mounted through its slide-out, which no
+                // longer counts as covering.
+                {...(mobileNavOpen ? coversPaneProps : {})}
               >
                 {navBody}
               </motion.nav>

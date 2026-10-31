@@ -17,7 +17,7 @@ the store observe independently of where each rule lives:
   it through the owner module, so one patch of the owner reaches every caller;
 * the read-only source guards that scan ``vector_memory.py`` by name
   (``test_memory_lineage_drift``, ``test_memory_v2_schema``,
-  ``test_core_path_redact_before_bound``, ``test_cse_2026_08_05_fixes`` and the
+  ``test_core_path_redact_before_bound``, ``test_security_source_scan_invariants`` and the
   redaction-sink registry) are re-applied to the runtime modules with their own
   helpers, each with a planted violation proving the re-applied check can fail;
 * the optional FAISS accelerator's lifecycle and search tier, driven through a
@@ -77,6 +77,7 @@ RUNTIME_MODULES = frozenset(
         "retirement",
         "semantic",
         "store_bookkeeping",
+        "term_index",
         "text_scoring",
         "write_outcomes",
     }
@@ -213,9 +214,10 @@ _STORE_MEMBERS = {
     "static": """_cosine_sim _extract_value_from_text _fact_label _infer_semantic_key
         _lesson_keywords _matches_tags _parse_preference _stored_similarity_scorer""",
     "property": """algorithm_version db policy_revision space_generation""",
-    "method": """__init__ _any_lesson_overlap _append_history _backfill_lesson_embeddings
+    "method": """__init__ _any_lesson_overlap _append_history _apply_migration
+        _backfill_lesson_embeddings
         _backfill_rows _backfill_semantic_kv_embeddings _bind_lineage
-        _build_episodic_scoring_set _check_recall_query _decay_rate_for
+        _build_episodic_scoring_set _check_recall_query _crew_stamps_missing _decay_rate_for
         _delete_episodic_row _eligible_rows _embed_bulk_row _embedding_config_guard
         _embedding_current _embedding_token _enforce_episodic_cap _episodic_candidate
         _episodic_relevance_threshold _episodic_scoring_set _fact_identities
@@ -226,9 +228,10 @@ _STORE_MEMBERS = {
         _rank_from_scoring_set _rank_lessons _read_editable_history_for_day _read_meta
         _recall_once _reconcile_embedding_space_locked _record_mutation
         _release_store_use_lock _require_facets _restrict_memory_files
-        _retire_one_episodic _retire_stale_episodic _retire_stale_episodic_v1
+        _retire_one_episodic _retire_stale_episodic _retire_stale_episodic_v1 _schema_steps
         _search_episodic_v2 _secret_bearing_files _semantic_candidates_v1 _semantic_scoring_set
-        _semantic_candidates_v2 _sqlite_data_version _sqlite_vector_search _stamp_facets
+        _semantic_candidates_v2 _sqlite_data_version _sqlite_vector_search _stamp_crew_lineage
+        _stamp_facets
         _touch_last_accessed _try_embed _validate_key _vector_commit _write_history
         _write_meta _write_meta_in_transaction _write_semantic append_history
         apply_consolidation backfill_missing_embeddings begin_space_change
@@ -261,6 +264,7 @@ _STORE_SIGNATURES = {
     "__init__": "(self, db_path: 'Path | None' = None, confidence_threshold: 'float' = 0.8, extra_prefixes: 'list[str] | None' = None, dedup_threshold: 'float' = 0.88, episodic_max: 'int' = 10000, embedding_dim: 'int' = 1024, episodic_limit: 'int' = 8, decay_rates: 'dict[str, float] | None' = None, config: 'object | None' = None)",
     "_any_lesson_overlap": "(self, entries: 'list[tuple[dict, str]]', query_text: 'str') -> 'bool'",
     "_append_history": "(self, entry: 'str') -> 'None'",
+    "_apply_migration": "(self, ver: 'int', sql: 'str', fn: 'Callable[[sqlite3.Connection], None] | None', migrated: 'list[int]') -> 'None'",
     "_backfill_lesson_embeddings": "(self, progress: \"'Callable[[int, int], None] | None'\" = None, *, pace: 'bool' = True, max_rows: 'int | None' = None, should_stop: \"'Callable[[], bool] | None'\" = None) -> 'int'",
     "_backfill_rows": "(self, sql: 'str', *, kind: 'str', identity: 'str', limit: 'int | None') -> 'list[sqlite3.Row]'",
     "_backfill_semantic_kv_embeddings": "(self, progress: \"'Callable[[int, int], None] | None'\" = None, *, pace: 'bool' = True, max_rows: 'int | None' = None, should_stop: \"'Callable[[], bool] | None'\" = None) -> 'int'",
@@ -268,6 +272,7 @@ _STORE_SIGNATURES = {
     "_build_episodic_scoring_set": "(self, dim: 'int', version: 'int') -> '_EpisodicScoringSet | None'",
     "_check_recall_query": "(self, query: '_RecallQuery | None') -> 'None'",
     "_cosine_sim": "(a: 'list[float]', b: 'list[float]') -> 'float'",
+    "_crew_stamps_missing": "(self, named_store: 'str | None') -> 'bool'",
     "_decay_rate_for": "(self, raw_tags: 'str | list[str] | None') -> 'float'",
     "_delete_episodic_row": "(self, mem_id: 'str') -> 'None'",
     "_eligible_rows": "(self, rows, kind: 'str') -> 'list'",
@@ -295,7 +300,7 @@ _STORE_SIGNATURES = {
     "_invalidate_episodic_scoring": "(self) -> 'None'",
     "_invalidate_semantic_scoring": "(self) -> 'None'",
     "_lesson_keywords": "(text: 'str') -> 'set[str]'",
-    "_log_event": "(self, event_type: 'str', memory_type: 'str', key: 'str', old_value: 'str | None', new_value: 'str | None', source: 'str') -> 'None'",
+    "_log_event": "(self, event_type: 'str', memory_type: 'str', key: 'str', old_value: 'str | None', new_value: 'str | None', source: 'str') -> 'int | None'",
     "_matches_allowlist": "(self, key: 'str') -> 'bool'",
     "_matches_tags": "(mem: 'dict', tag_filter: 'list[str]') -> 'bool'",
     "_parse_preference": "(text: 'str') -> 'tuple[str, str] | None'",
@@ -312,6 +317,7 @@ _STORE_SIGNATURES = {
     "_retire_one_episodic": "(self, mem_id: 'str', text: 'str', superseded_by: 'str') -> 'None'",
     "_retire_stale_episodic": "(self, key: 'str', old_value: 'str', *, defer_embedding: 'bool' = False, query_embedding: 'list[float] | None' = None, embedding_resolved: 'bool' = False) -> 'None'",
     "_retire_stale_episodic_v1": "(self, key: 'str', old_value: 'str', *, defer_embedding: 'bool' = False, query_embedding: 'list[float] | None' = None, embedding_resolved: 'bool' = False) -> 'None'",
+    "_schema_steps": "(self, migrated: 'list[int]') -> 'list[Callable[[], object]]'",
     "_search_episodic_v2": "(self, query_embedding: 'list[float] | None', query_text: 'str', limit: 'int', mmr: 'bool', tag_filter: 'list[str] | None', relevance_filter: 'bool') -> 'list[dict]'",
     "_secret_bearing_files": "(self) -> 'tuple[Path, ...]'",
     "_semantic_candidates_v1": "(self, query_text: 'str', *, recall_query: '_RecallQuery | None' = None) -> 'list[dict]'",
@@ -319,6 +325,7 @@ _STORE_SIGNATURES = {
     "_semantic_scoring_set": "(self) -> '_SemanticScoringSet | None'",
     "_sqlite_data_version": "(self) -> 'int | None'",
     "_sqlite_vector_search": "(self, query_embedding: 'list[float]', query_text: 'str', limit: 'int', mmr: 'bool' = True, tag_filter: 'list[str] | None' = None, relevance_filter: 'bool' = False) -> 'list[dict]'",
+    "_stamp_crew_lineage": "(self, named_store: 'str | None') -> 'None'",
     "_stamp_facets": "(self, item_id: 'str', facets: \"'memory_schema.MemoryFacets | None'\") -> 'None'",
     "_stored_similarity_scorer": "(query_emb: 'list[float] | None') -> 'Callable[[dict], float]'",
     "_touch_last_accessed": "(self, mem_ids: 'list[str]') -> 'None'",
@@ -331,7 +338,7 @@ _STORE_SIGNATURES = {
     "_write_semantic": "(self, key: 'str', value_json: 'str', confidence: 'float', source: 'str', *, metadata: 'dict | None' = None, expected_revision: 'int | None' = None, correction: 'record_meta.CorrectionEvidence | None' = None, _consolidation: 'bool' = False, defer_embedding: 'bool' = False, embedding: 'list[float] | None' = None, embedding_resolved: 'bool' = False, embedding_generation: 'int | None' = None, retirement_embedding: 'list[float] | None' = None, retirement_embedding_resolved: 'bool' = False, retirement_value_json: 'str | None' = None) -> 'str | None'",
     "algorithm_version": "(self) -> 'str'",
     "append_history": "(self, entry: 'str') -> 'None'",
-    "apply_consolidation": "(self, *, source_id: 'str', session_key: 'str', source_total: 'int', result: 'dict', snapshot: 'dict', messages: 'list[dict]', facets: 'memory_schema.MemoryFacets | None' = None) -> 'dict'",
+    "apply_consolidation": "(self, *, source_id: 'str', session_key: 'str', source_total: 'int', result: 'dict', snapshot: 'dict', messages: 'list[dict]', facets: 'memory_schema.MemoryFacets | None' = None, kind_routing: 'KindRouting | None' = None) -> 'dict'",
     "backfill_missing_embeddings": "(self, progress: \"'Callable[[int, int], None] | None'\" = None, *, pace: 'bool' = True, max_rows_per_kind: 'int | None' = None, should_stop: \"'Callable[[], bool] | None'\" = None) -> 'int'",
     "begin_space_change": "(self) -> 'None'",
     "build_faiss_index": "(self) -> 'int'",
@@ -341,7 +348,7 @@ _STORE_SIGNATURES = {
     "count_lessons": "(self) -> 'int'",
     "db": "(self) -> 'sqlite3.Connection'",
     "delete_episodic": "(self, mem_id: 'str', source: 'str' = 'user_explicit') -> 'bool'",
-    "delete_lesson": "(self, rule_substring: 'str', repo_scope: 'str | None' = None, *, exact: 'bool' = False) -> 'bool'",
+    "delete_lesson": "(self, rule_substring: 'str', repo_scope: 'str | None' = None, *, exact: 'bool' = False, keep_one: 'bool' = False) -> 'bool'",
     "delete_semantic": "(self, key: 'str', source: 'str', *, expect_value_json: 'str | None' = None, superseded_by: 'str | None' = None, supersede_reason: 'str | None' = None) -> 'bool'",
     "embed_episodic": "(self, text: 'str') -> 'list[float] | None'",
     "embed_lesson": "(self, rule: 'str') -> 'list[float] | None'",
@@ -349,7 +356,7 @@ _STORE_SIGNATURES = {
     "embed_semantic_retirement": "(self, key: 'str', value_json: 'str') -> 'list[float] | None'",
     "embedding_repair_state": "(self, generation: 'str') -> 'tuple[bool, int]'",
     "find_contradiction_candidates": "(self, rule: 'str', threshold_low: 'float' = 0.4, threshold_high: 'float' = 0.85, rule_emb: 'list[float] | None' = None, repo_scope: 'str | None' = None) -> 'list[dict]'",
-    "get_all_semantic": "(self, limit: 'int | None' = None, offset: 'int' = 0, *, q: 'str' = '') -> 'list[dict]'",
+    "get_all_semantic": "(self, limit: 'int | None' = None, offset: 'int' = 0, *, q: 'str' = '', after_key: 'str | None' = None, exclude_lessons: 'bool' = False) -> 'list[dict]'",
     "get_context_preview": "(self, query_text: 'str' = '') -> 'dict'",
     "get_episodic_context": "(self, query_embedding: 'list[float] | None' = None, query_text: 'str' = '', cap: 'int' = 3000) -> 'str'",
     "get_episodic_list": "(self, limit: 'int' = 50, offset: 'int' = 0, tag_filter: 'list[str] | None' = None, *, q: 'str' = '') -> 'list[dict]'",
@@ -405,7 +412,7 @@ _STORE_SIGNATURES = {
     "with_record_metadata": "(self, rows: 'list[dict]') -> 'list[dict]'",
     "write_episodic": "(self, text: 'str', embedding: 'list[float] | None' = None, conversation_id: 'str' = '', tags: 'list[str] | None' = None, importance: 'float' = 0.5, source: 'str' = 'consolidation', *, preserve_existing: 'bool' = False, defer_embedding: 'bool' = False, embedding_resolved: 'bool' = False, embedding_generation: 'int | None' = None, facets: \"'memory_schema.MemoryFacets | None'\" = None, metadata: 'dict | None' = None) -> 'bool'",
     "write_episodic_outcome": "(self, text: 'str', embedding: 'list[float] | None' = None, conversation_id: 'str' = '', tags: 'list[str] | None' = None, importance: 'float' = 0.5, source: 'str' = 'consolidation', *, preserve_existing: 'bool' = False, defer_embedding: 'bool' = False, embedding_resolved: 'bool' = False, embedding_generation: 'int | None' = None, facets: \"'memory_schema.MemoryFacets | None'\" = None, metadata: 'dict | None' = None) -> \"'EpisodicWriteOutcome'\"",
-    "write_lesson": "(self, rule: 'str', category: 'str' = 'knowledge', negative: 'str | None' = None, source: 'str' = 'user_explicit', rule_emb: 'list[float] | None' = None, rule_emb_generation: 'int | None' = None, repo_scope: 'str | None' = None, *, applies: 'str | None' = None, rule_emb_resolved: 'bool' = False, defer_backfills: 'bool' = False, facets: \"'memory_schema.MemoryFacets | None'\" = None) -> 'LessonWriteResult'",
+    "write_lesson": "(self, rule: 'str', category: 'str' = 'knowledge', negative: 'str | None' = None, source: 'str' = 'user_explicit', rule_emb: 'list[float] | None' = None, rule_emb_generation: 'int | None' = None, repo_scope: 'str | None' = None, *, applies: 'str | None' = None, rule_emb_resolved: 'bool' = False, defer_backfills: 'bool' = False, facets: \"'memory_schema.MemoryFacets | None'\" = None, written_by: 'Mapping[str, str] | None' = None) -> 'LessonWriteResult'",
 }
 
 #: Every name ``kiro_crew.vector_memory`` itself bound (definitions, not imports),

@@ -98,6 +98,7 @@ from kiro_crew.messaging.turn_ceiling import ConversationTurnCeiling
 from kiro_crew.monitoring.models import MonitorDispatchResult
 from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.start_priority import StartPriority
+from kiro_crew.testing.wait import await_until
 
 DRIFTS = [
     pytest.param(frozenset(), id="default"),
@@ -190,6 +191,44 @@ class TestAnAnsweredTurn:
         assert renderer.closed == 1, "close should still be attempted"
         assert sessions.count("release") == 1
         assert outcome.verdict is Verdict.ANSWERED, "the failed close does not escape"
+
+    @pytest.mark.parametrize("drift", DRIFTS)
+    def test_release_still_runs_when_the_turn_is_cancelled_inside_renderer_close(
+        self, drift
+    ) -> None:
+        """Weixin answers on its poll task, and closing the channel cancels that task,
+        so the cancel can land while the turn is already closing its renderer. A
+        ``CancelledError`` is not an ``Exception``: it passes the close's guard, and
+        it must not take the release with it."""
+        sessions = FakeSessions()
+
+        async def scenario() -> tuple[asyncio.Future[Any], RecordingRenderer]:
+            closing = asyncio.Event()
+
+            class _MidCloseRenderer(RecordingRenderer):
+                async def close(self) -> None:
+                    await super().close()
+                    closing.set()
+                    await asyncio.Event().wait()  # its teardown request, still in flight
+
+            renderer = _MidCloseRenderer()
+            turn = asyncio.ensure_future(
+                _turns(sessions, drift=drift).answer(_asker(), "hi", renderer)
+            )
+            await await_until(closing, what="the renderer close")
+            turn.cancel()
+            await await_until(
+                asyncio.ensure_future(asyncio.gather(turn, return_exceptions=True)),
+                what="the cancelled turn to end",
+            )
+            return turn, renderer
+
+        turn, renderer = asyncio.run(scenario())
+
+        assert renderer.closed == 1
+        assert turn.cancelled(), "the cancellation still reaches whoever cancelled the turn"
+        assert sessions.count("release") == 1, "the conversation is left permanently busy"
+        assert sessions.held == 0
 
     @pytest.mark.parametrize("drift", DRIFTS)
     def test_nothing_is_released_when_nothing_was_acquired(self, drift) -> None:
@@ -528,6 +567,12 @@ class TestAToolLessGuestTurn:
 
     _KEY = f"weixin:{TOOLLESS_TURN_AGENT}:direct:peerB"
 
+    @pytest.fixture(autouse=True)
+    def _guest_spec_reads_tool_less(self, _floor_monkeypatch) -> None:
+        """The pre-spawn read of the guest spec on disk answers tool-less; the
+        provider's own confirmation (``ScriptedProvider(toolless=...)``) decides."""
+        _floor_monkeypatch.setattr(D, "_toolless_spec_before_spawn", lambda _key: True)
+
     def _guest(self, **kw: Any) -> Asker:
         return _asker(self._KEY, audience=Audience.GUEST, **kw)
 
@@ -591,6 +636,44 @@ class TestAToolLessGuestTurn:
         assert renderer.shown == [TOOLLESS_TURN_REFUSAL_NOTE] and renderer.closed == 1
         assert sessions.count("record_failure") == 0 and sessions.count("release") == 1
 
+    def test_a_spec_that_mounts_anything_refuses_the_turn_and_resets_the_session(self) -> None:
+        """The spec the harness loaded is read after the acquire: one that mounts
+        anything refuses the turn before the prompt, with the same note, and the
+        session is reset so its process is not reused."""
+        provider = ScriptedProvider(toolless=False)
+        sessions = FakeSessions(provider)
+        renderer = RecordingRenderer()
+
+        outcome = _answer(_turns(sessions), asker=self._guest(), renderer=renderer)
+
+        assert outcome.verdict is Verdict.TOOLLESS_REFUSED and provider.prompts == []
+        assert renderer.shown == [TOOLLESS_TURN_REFUSAL_NOTE]
+        assert sessions.count("reset") == 1 and sessions.count("release") == 1
+        assert sessions.count("record_failure") == 0
+        assert len(provider.spec_reads) == 1
+
+    def test_a_spec_the_pre_spawn_read_refuses_never_starts_a_session(self, monkeypatch) -> None:
+        """Starting the session would run what the spec names, so a failed
+        pre-spawn read refuses before ``get_or_create``."""
+        monkeypatch.setattr(D, "_toolless_spec_before_spawn", lambda _key: False)
+        provider = ScriptedProvider()
+        sessions = FakeSessions(provider)
+        renderer = RecordingRenderer()
+
+        outcome = _answer(_turns(sessions), asker=self._guest(), renderer=renderer)
+
+        assert outcome.verdict is Verdict.TOOLLESS_REFUSED
+        assert sessions.calls("get_or_create") == [] and provider.spec_reads == []
+        assert renderer.shown == [TOOLLESS_TURN_REFUSAL_NOTE]
+        assert sessions.count("release") == 0
+
+    def test_an_owner_turn_never_reads_the_guest_spec(self) -> None:
+        provider = ScriptedProvider(answer(), toolless=False)
+
+        outcome = _answer(_turns(FakeSessions(provider)))
+
+        assert outcome.verdict is Verdict.ANSWERED and provider.spec_reads == []
+
     @pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, None])
     def test_a_backend_that_reads_no_agent_spec_refuses_the_turn(self, backend) -> None:
         provider = ScriptedProvider(backend=backend)
@@ -630,7 +713,10 @@ class TestAToolLessGuestTurn:
     ("audience", "minimal"),
     [(Audience.OWNER, False), (Audience.SHARED, True), (Audience.GUEST, True)],
 )
-def test_the_audience_decides_what_context_the_prompt_carries(audience, minimal, tmp_path) -> None:
+def test_the_audience_decides_what_context_the_prompt_carries(
+    audience, minimal, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(D, "_toolless_spec_before_spawn", lambda _key: True)
     ctx = RecordingCtxBuilder()
     key = f"weixin:{TOOLLESS_TURN_AGENT}:direct:x" if audience is Audience.GUEST else KEY
     _answer(_turns(FakeSessions(), ctx=ctx), asker=_asker(key, audience=audience))

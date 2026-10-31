@@ -6,7 +6,7 @@
  * switch, the status strip and Check again are pinned in AgentBackendTab.test.tsx.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
 import React from 'react'
@@ -87,7 +87,7 @@ function mcp(
     mcp: {
       per_tool_deny: reach,
       // The server ships its classification beside the reach
-      // (`backend_mcp_ability.COSTS_WHOLE_SERVER`), so the fixture ships one too and
+      // (`registry.PerToolDeny.costs_whole_server`), so the fixture ships one too and
       // a test that states only a reach gets the payload the gateway would send.
       // Overridable, because the point of a server-side flag is that the two can be
       // stated independently — an unclassified reach, or one this frontend has never
@@ -171,9 +171,9 @@ describe('AgentBackendTab detail card', () => {
     )
     // The other harness's count is not on screen at the same time -- that is what
     // "exactly one card" means.
-    expect(screen.queryByText('KAS (kiro-agent) supports 2 of 2 features')).toBeNull()
-    highlight('KAS (kiro-agent)')
-    expect(screen.getByText('KAS (kiro-agent) supports 2 of 2 features')).toBeInTheDocument()
+    expect(screen.queryByText('Kiro Agent supports 2 of 2 features')).toBeNull()
+    highlight('Kiro Agent')
+    expect(screen.getByText('Kiro Agent supports 2 of 2 features')).toBeInTheDocument()
   })
 
   it('shows the capability list without needing a click', async () => {
@@ -210,7 +210,7 @@ describe('AgentBackendTab detail card', () => {
     await waitFor(() =>
       expect(screen.getByText('Kiro CLI supports 1 of 1 features')).toBeInTheDocument(),
     )
-    const saved = screen.getByText('Crewmates load their saved agent')
+    const saved = screen.getByText('Mates load their saved agent')
     const folded = saved.closest('details')
     expect(folded).not.toBeNull()
     expect(folded?.open).toBe(false)
@@ -407,7 +407,7 @@ describe('AgentBackendTab detail card', () => {
       ).toBeInTheDocument(),
     )
     expect(screen.getByText(/because Kiro Crew tells it to/).closest('details')).toBeNull()
-    highlight('KAS (kiro-agent)')
+    highlight('Kiro Agent')
     expect(screen.getByText(/cannot confirm it took effect/)).toBeInTheDocument()
   })
 
@@ -493,13 +493,13 @@ describe('AgentBackendTab detail card', () => {
     })
     schemaMock.mockReturnValue(schemaWith(['kiro']))
     wrap()
-    await waitFor(() => expect(row('deepseek')).toBeInTheDocument())
-    highlight('deepseek')
+    await waitFor(() => expect(row('DeepSeek Harness')).toBeInTheDocument())
+    highlight('DeepSeek Harness')
     expect(panel().getByText('This build does not offer this agent.')).toBeInTheDocument()
     // The reason, from the routing enum rather than from prose written per agent.
     expect(screen.getByText(/cannot confirm this agent asks/)).toBeInTheDocument()
     // Listed, never offered: a button whose PATCH the wire refuses is not a button.
-    expect(screen.queryByRole('button', { name: 'Use deepseek' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Use DeepSeek Harness' })).toBeNull()
   })
 
   it('still hides an agent the deployment denied, card or no card', async () => {
@@ -544,6 +544,23 @@ describe('AgentBackendTab MCP ability card', () => {
     const rule = await screen.findByText(/stops every tool on the same server/)
     expect(rule.closest('details')).toBeNull()
     expect(rule.textContent).toContain('Kiro CLI')
+  })
+
+  it('links the deny rule to the MCP Servers list, where the reader acts on it', async () => {
+    // #21303: the rule names a cost on whole servers; the link lands on the list of
+    // them, which the Connections page opens from its `?view=` param.
+    acpBackendsMock.mockResolvedValue({
+      backends: [probeRow('kiro', { ...card(), ...mcp({ per_tool_deny: 'whole-server' }) })],
+    })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={['/settings/agent']}><AgentBackendTab /></MemoryRouter>
+      </QueryClientProvider>,
+    )
+    const rule = await screen.findByText(/stops every tool on the same server/)
+    const link = within(rule).getByRole('link', { name: 'Open the MCP Servers list in Connections' })
+    expect(link).toHaveAttribute('href', '/capabilities?tab=mcp&view=mcp-servers')
   })
 
   it('marks the per-call exception as an exception, right under the rule', async () => {
@@ -670,9 +687,9 @@ describe('AgentBackendTab MCP ability card', () => {
     })
     schemaMock.mockReturnValue(schemaWith(['kiro', 'opencode']))
     wrap()
-    await waitFor(() => expect(row('opencode')).toBeInTheDocument())
+    await waitFor(() => expect(row('OpenCode')).toBeInTheDocument())
     expect(screen.queryByText(/stops every tool on the same server/)).toBeNull()
-    highlight('opencode')
+    highlight('OpenCode')
     await waitFor(() =>
       expect(panel().getByText(/stops every tool on the same server/)).toBeInTheDocument(),
     )
@@ -715,7 +732,7 @@ describe('AgentBackendTab standing caveats', () => {
     wrap()
     await waitFor(() => expect(row('Kiro CLI')).toBeInTheDocument())
     expect(screen.queryByText(/\.claude\/settings\.json/)).toBeNull()
-    highlight('KAS (kiro-agent)')
+    highlight('Kiro Agent')
     expect(screen.queryByText(/\.claude\/settings\.json/)).toBeNull()
   })
 
@@ -760,8 +777,8 @@ describe('AgentBackendTab standing caveats', () => {
     })
     schemaMock.mockReturnValue(schemaWith(['kiro', 'codex']))
     wrap()
-    await waitFor(() => expect(row('codex')).toBeInTheDocument())
-    highlight('codex')
+    await waitFor(() => expect(row('OpenAI Codex')).toBeInTheDocument())
+    highlight('OpenAI Codex')
     await waitFor(() => expect(screen.getByText('Run: codex login')).toBeInTheDocument())
   })
 
@@ -779,8 +796,8 @@ describe('AgentBackendTab standing caveats', () => {
     })
     schemaMock.mockReturnValue(schemaWith(['kiro', 'kas']))
     wrap()
-    await waitFor(() => expect(row('KAS (kiro-agent)')).toBeInTheDocument())
-    highlight('KAS (kiro-agent)')
+    await waitFor(() => expect(row('Kiro Agent')).toBeInTheDocument())
+    highlight('Kiro Agent')
     await waitFor(() => expect(detail().textContent).toContain('Default.'))
     expect(screen.queryByText('Run: kiro login')).toBeNull()
   })
@@ -792,9 +809,9 @@ describe('AgentBackendTab standing caveats', () => {
     })
     schemaMock.mockReturnValue(schemaWith(['kiro', 'codex']))
     wrap()
-    await waitFor(() => expect(row('codex')).toBeInTheDocument())
-    highlight('codex')
-    await waitFor(() => expect(useButton('codex')).toBeEnabled())
+    await waitFor(() => expect(row('OpenAI Codex')).toBeInTheDocument())
+    highlight('OpenAI Codex')
+    await waitFor(() => expect(useButton('OpenAI Codex')).toBeEnabled())
     expect(screen.queryByText(/Run:/)).toBeNull()
   })
 
@@ -810,7 +827,7 @@ describe('AgentBackendTab standing caveats', () => {
     })
     schemaMock.mockReturnValue(schemaWith(['kiro', 'codex']))
     wrap()
-    await waitFor(() => expect(row('codex')).toBeInTheDocument())
+    await waitFor(() => expect(row('OpenAI Codex')).toBeInTheDocument())
     // Kiro CLI is the open detail and carries no remedy.
     expect(screen.queryByText('Run: codex login')).toBeNull()
   })
@@ -822,10 +839,10 @@ describe('AgentBackendTab kiro sign-in', () => {
     // row whose harness uses it -- and in the in-detail form, not a card inside the
     // detail's own bordered panel.
     wrap()
-    await waitFor(() => expect(row('KAS (kiro-agent)')).toBeInTheDocument())
+    await waitFor(() => expect(row('Kiro Agent')).toBeInTheDocument())
     // Kiro CLI's detail is open: no sign-in there.
     expect(screen.queryByTestId('kiro-sign-in-card')).toBeNull()
-    highlight('KAS (kiro-agent)')
+    highlight('Kiro Agent')
     const signIn = screen.getByTestId('kiro-sign-in-card')
     expect(detail().contains(signIn)).toBe(true)
     expect(signIn).toHaveAttribute('data-compact', 'true')
@@ -838,8 +855,8 @@ describe('AgentBackendTab kiro sign-in', () => {
     // The route is in shadow testing, so its switch is not in plain view of every
     // KAS user: the KAS detail shows the sign-in and no engine card.
     wrap()
-    await waitFor(() => expect(row('KAS (kiro-agent)')).toBeInTheDocument())
-    highlight('KAS (kiro-agent)')
+    await waitFor(() => expect(row('Kiro Agent')).toBeInTheDocument())
+    highlight('Kiro Agent')
     expect(screen.getByTestId('kiro-sign-in-card')).toBeInTheDocument()
     expect(screen.queryByTestId('kas-bundle-card')).toBeNull()
   })
@@ -849,7 +866,7 @@ describe('AgentBackendTab kiro sign-in', () => {
     schemaMock.mockReturnValue(schemaWith(['kiro', 'claude']))
     wrap()
     await waitFor(() => expect(row('Kiro CLI')).toBeInTheDocument())
-    expect(screen.queryByRole('radio', { name: 'KAS (kiro-agent)' })).toBeNull()
+    expect(screen.queryByRole('radio', { name: 'Kiro Agent' })).toBeNull()
     expect(screen.queryByTestId('kiro-sign-in-card')).toBeNull()
     expect(screen.queryByTestId('kas-bundle-card')).toBeNull()
     highlight('Claude Code')
@@ -860,8 +877,8 @@ describe('AgentBackendTab kiro sign-in', () => {
     kirocrewConfigMock.mockResolvedValue({ agent: { acp_backend: 'kas' } })
     schemaMock.mockReturnValue(schemaWith(['kiro']))
     wrap()
-    await waitFor(() => expect(row('KAS (kiro-agent)')).toHaveAttribute('aria-current', 'true'))
-    expect(row('KAS (kiro-agent)')).toBeChecked()
+    await waitFor(() => expect(row('Kiro Agent')).toHaveAttribute('aria-current', 'true'))
+    expect(row('Kiro Agent')).toBeChecked()
     expect(screen.getByTestId('kiro-sign-in-card')).toBeInTheDocument()
   })
 
@@ -880,8 +897,8 @@ describe('AgentBackendTab kiro sign-in', () => {
     })
     schemaMock.mockReturnValue(schemaWith(['kiro']))
     wrap()
-    await waitFor(() => expect(row('KAS (kiro-agent)')).toBeInTheDocument())
-    highlight('KAS (kiro-agent)')
+    await waitFor(() => expect(row('Kiro Agent')).toBeInTheDocument())
+    highlight('Kiro Agent')
     expect(panel().getByText('This build does not offer this agent.')).toBeInTheDocument()
     expect(screen.queryByTestId('kiro-sign-in-card')).toBeNull()
   })
@@ -899,7 +916,7 @@ describe('AgentBackendTab kiro sign-in', () => {
         </MemoryRouter>
       </QueryClientProvider>,
     )
-    await waitFor(() => expect(row('KAS (kiro-agent)')).toBeChecked())
+    await waitFor(() => expect(row('Kiro Agent')).toBeChecked())
     expect(row('Kiro CLI')).not.toBeChecked()
     // Kiro CLI is still the one running: opening a detail switched nothing.
     expect(row('Kiro CLI')).toHaveAttribute('aria-current', 'true')
@@ -922,7 +939,7 @@ describe('AgentBackendTab kiro sign-in', () => {
       </QueryClientProvider>,
     )
     await waitFor(() => expect(row('Kiro CLI')).toBeChecked())
-    expect(row('KAS (kiro-agent)')).not.toBeChecked()
+    expect(row('Kiro Agent')).not.toBeChecked()
     expect(screen.queryByTestId('kiro-sign-in-card')).toBeNull()
   })
 })

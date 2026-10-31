@@ -292,7 +292,7 @@ retained `USER_STOP` record, a manual pause, an empty reason) refuses the arm; a
 row that is active, or that its own cycle cap, runtime budget, terminal subject,
 stop file or dropped sentinel deactivated, admits it, and the create-only and
 `replace_stopped` rules then decide as for any other arm. The self-arm tests in
-`test_autonudge_member_self_arm.py` and `test_monitor_directive_apply.py` pin
+`test_autonudge_member_self_arm.py` and `test_monitor_directive_apply_wake_authority.py` pin
 the four answers. When the wake carries a loop id, its `monitor_update`,
 `monitor_stop`, and `autonudge_stop` directives apply only while that id is the
 monitor currently bound to the session; a replacement monitor is never mutated
@@ -359,7 +359,11 @@ The reading itself:
 * `_collapse` folds duplicate rows to one per identity, newest by start time, and
   reports how many raw rows it folded. Rows land in the buckets `failing`, `pending`,
   `passing`, `noise` and `unknown`: an unknown conclusion is `unknown`, and a cancelled
-  or stale row is `noise`.
+  or stale row is `noise`. The fold only arbitrates correctly if BOTH attempts of a
+  re-run are in the payload, so the check-runs read passes `filter=all`: the endpoint
+  defaults to `filter=latest` (one row per name), which would drop the stale attempt
+  server-side before `_collapse` ever sees it, and a verdict that flipped on re-run
+  would then be read as whichever row the server happened to keep.
 * The identity a row folds under is its WORKFLOW, not the app that posted it. Every
   GitHub Actions row carries one app slug, so the slug cannot separate two workflow
   files that each define a job of the same name, and folding those lets one
@@ -377,10 +381,13 @@ The reading itself:
   conservative bucket is kept and the reading reports itself `partial` with a note
   naming the unresolved identity. A redundant look costs a turn, a dropped gate
   costs the merge.
-* A duplicate that cannot be ordered by time keeps the more conservative bucket.
-  Saying so is the READING's job rather than the row's: `partial` and its note are
-  what a consumer reads, and a per-row flag none of them opens would be a field
-  the reading cannot back.
+* A duplicate that cannot be ordered by time -- either row carries no start time --
+  keeps the more conservative bucket. Saying so is the READING's job rather than
+  the row's: where the two rows disagree, the reading reports itself `partial`
+  with a note naming each check whose bucket was chosen, and a per-row flag none
+  of the consumers opens would be a field the reading cannot back. Rows that agree
+  need no note, because nothing was chosen. `checks_complete` stays true: every
+  row was read, and what is short is the ordering, not the board.
 * Comments and reviews are carried WITH their bodies, clipped per item and in
   total, newest first, inside a fetch horizon. The bot's own comments are skipped,
   because otherwise the watch is a feedback loop. A remark whose timestamp cannot
@@ -451,13 +458,17 @@ above, so script-cron `Skip`/`Report`/`Done` delivery is not this watch's path.
 
 ## Non-goals
 
-The structured GitHub monitor digests PR-level comment bodies to detect that
-one changed, so an in-place edit whose `created_at` never moves still wakes the
-owner. It never interprets what a comment says or decides whether an advisory
-finding is valid, and it deliberately does not read inline review-thread bodies
-at all -- it reports only the count of unresolved, non-outdated threads there. It
-reports typed provider facts and leaves judgment, source inspection, and any
-reply to the reactivated babysit session.
+The structured monitor digests comment bodies to detect that one changed, so an
+in-place edit whose `created_at` never moves still wakes the owner. GitHub
+digests its PR-level issue comments; Azure DevOps digests the comments nested
+inside its PR threads, skipping the `system`-type lifecycle narration it posts on
+its own; both reduce each body to a fixed-width fingerprint and fail closed to an
+empty digest (no wake) on an incomplete read. It never interprets what a comment
+says or decides whether an advisory finding is valid, and on GitHub it
+deliberately does not read inline review-thread bodies at all -- it reports only
+the count of unresolved, non-outdated threads there. It reports typed provider
+facts and leaves judgment, source inspection, and any reply to the reactivated
+babysit session.
 `monitor_start` remains appropriate when each delivered cycle requires the agent
 to make progress, the objective requires untyped evidence, or the watched subject
 is unsupported by a structured provider.

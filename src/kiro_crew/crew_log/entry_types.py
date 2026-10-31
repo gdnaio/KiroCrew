@@ -98,11 +98,23 @@ from kiro_crew.crew_log.entry_types_ledgers import (  # noqa: F401
     RADAR_SKIP_SCOPES,
     RADAR_TERMINAL_PHASES,
     RADAR_TTL_ACTIVE_PHASES,
+    WORK_CHARGE_ENTRY_TYPE,
     WORK_ENTRY_TYPE,
 )
 from kiro_crew.crew_log.entry_types_lifecycle import ACTOR_VALUES  # noqa: F401
 from kiro_crew.crew_log.entry_types_surfaces import (  # noqa: F401
     CARD_FINISHED_STATUSES,
+    CREWMATE_OPTION_LIMIT,
+    CREWMATE_ROW_LIMIT,
+    CREWMATE_TEXT_LIMIT,
+    CREWMATE_WAITING_LIMIT,
+    CUSTOM_ENTRY_TYPE,
+    CUSTOM_FOLD_NAME,
+    CUSTOM_RECORD_BYTES,
+    CUSTOM_RECORD_DEPTH,
+    CUSTOM_TYPE_LIMIT,
+    CUSTOM_TYPE_NAME_LIMIT,
+    CUSTOM_WRITER_LIMIT,
     DASHBOARD_AGENTIC_ENTRY_TYPE,
     DASHBOARD_CODE_LIMIT,
     DASHBOARD_FIELD_LIMIT,
@@ -114,6 +126,8 @@ from kiro_crew.crew_log.entry_types_surfaces import (  # noqa: F401
     DASHBOARD_TYPE_LIMIT,
     DASHBOARD_VALUE_BYTES,
     DASHBOARD_VALUE_LIMIT,
+    GOAL_ENTRY_TYPE,
+    GOAL_FOLD_NAME,
     GUIDE_FINISHED_REASONS,
     GUIDE_FINISHED_STATUSES,
     MISTAKE_CORRECTED_CODE,
@@ -127,6 +141,8 @@ from kiro_crew.crew_log.entry_types_surfaces import (  # noqa: F401
     PANEL_OWNER_LIMIT,
     PANEL_TEMPLATE_LIMIT,
     PANEL_TITLE_LIMIT,
+    WAITING_ENTRY_TYPE,
+    WAITING_FOLD_NAME,
 )
 from kiro_crew.crew_log.errors import CODE_BAD_DATA_FIELD, CrewLogError
 from kiro_crew.crew_log.schema import KIND_CREW, KIND_SESSION

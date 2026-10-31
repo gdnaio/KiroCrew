@@ -7,7 +7,7 @@ Each function here whose first parameter is ``self`` is an ``AcpProvider`` metho
 class binds it by name, so it reads and writes the session's own state on the instance,
 and a patch of the method on the class or on an instance reaches every caller.
 
-Instance fields written: ``_compact_result``.
+Instance fields written: ``_compact_result``, ``_sign_in_ask``.
 
 Instance fields read: ``_client``, ``essential_delivery``.
 """
@@ -89,6 +89,14 @@ def _to_llm_event(e: Any) -> LLMEvent:
         mcp_identity_trusted=e.mcp_identity_trusted,
         mcp_identity_unreadable=e.mcp_identity_unreadable,
         kas_builtin_ids=e.kas_builtin_ids,
+        # Dropping this would leave every spec-granted KAS built-in prompting on
+        # this surface: the gate's spec-builtin-grant row reads it.
+        spec_granted_builtins=e.spec_granted_builtins,
+        # Same row: dropping this would leave every allowedCommands match prompting.
+        spec_granted_commands=e.spec_granted_commands,
+        # Dropping this would let a `denyByDefault` spec's unlisted command run on
+        # this surface: the gate's spec-shell-allowlist row reads it.
+        spec_shell_allowlist=e.spec_shell_allowlist,
         # Dropping this would refuse every deepseek read on a side turn.
         deepseek_tool_name=e.deepseek_tool_name,
         # Dropping this would let a READ_ONLY turn on an unproved dsh
@@ -132,6 +140,11 @@ def _to_llm_event(e: Any) -> LLMEvent:
         # it before the evidence text, and the sub-agent run loop yields
         # its lane slot (``waiting_input`` WaitRecord) on it.
         status=e.status,
+        # The MCP server's ask itself (mode, message, fields or URL). Dropping
+        # it hands the dashboard runner an EVENT_ELICITATION_REQUEST with
+        # nothing to render: an empty card the person cannot answer, while
+        # the engine holds the tool call open for the whole window.
+        elicitation=e.elicitation,
     )
 
 
@@ -155,10 +168,16 @@ async def _ready_confirmed_session(self: AcpProvider) -> None:
 async def stream(
     self: AcpProvider, message: str, timeout: float | None = None, *, allow_image: bool = True
 ) -> AsyncIterator[LLMEvent]:
+    ask, self._sign_in_ask = getattr(self, "_sign_in_ask", ""), ""
     # The direct client can respawn in ensure_ready; resolve that BEFORE
     # comparing receipts so a recycled conversation receives the full text.
     await self._ready_confirmed_session()
     send = self._client.stream_events
+    if ask:
+        from kiro_crew.acp.session_provider import AcpSessionProvider
+
+        if isinstance(self._client, AcpSessionProvider):
+            send = functools.partial(self._client.stream, sign_in_ask=ask)
     if not allow_image:
         send = functools.partial(send, allow_image=False)
     if timeout is not None:
@@ -171,6 +190,7 @@ async def stream(
 
 
 async def stream_command(self: AcpProvider, command: str) -> AsyncIterator[LLMEvent]:
+    _, self._sign_in_ask = getattr(self, "_sign_in_ask", ""), ""
     # _kiro.dev/commands/execute is a kiro extension, so only
     # ACP_BACKENDS_KIRO_SLASH_COMMANDS members can be sent it. Everyone else
     # routes through session/prompt, which an adapter interprets natively for
@@ -181,7 +201,8 @@ async def stream_command(self: AcpProvider, command: str) -> AsyncIterator[LLMEv
     #
     # Membership rather than "not claude": the RPC is the narrow capability
     # here, so a harness added later must opt in to it, not inherit it and
-    # hard-error on every slash command a user types.
+    # hard-error on every slash command a user types. KAS is the case in point:
+    # kiro-family, yet it answers the RPC with -32603.
     # /compact and /clear discard native history; invalidate before dispatch
     # so the next warm turn resends the complete snapshot even when the
     # status receipt is missing or arrives late.

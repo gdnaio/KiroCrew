@@ -1,6 +1,9 @@
 """Finalizing a dashboard turn's assistant text segment: redaction with its records, row meta,
 the variant stash, the [OPTIONS:] footer audit and the widget registration; a local command
-reply is persisted through the same redaction."""
+reply is persisted through the same redaction; and the settle of the turn's answer once the
+stream ends (``_turn_settle_answer``): the terminal directive, the final segment, the
+refusal-fallback hop and refusal card, the post-compaction continuation and the empty-response
+ladder."""
 
 from __future__ import annotations
 
@@ -9,38 +12,87 @@ import hashlib
 import json
 import re
 import uuid
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.constants import reflow_and_label_glued_option_marker
+from kiro_crew.dashboard.chat_utils import (
+    _ACTIVITY_NO_REPLY_CONTINUE_MSG,
+    _COMPACTION_CONTINUE_MSG,
+    _EMPTY_AUTO_CONTINUE_MSG,
+    BLOCKED_LINKS_ORDERED_KEY,
+    EMPTY_RUNG_CONTINUE,
+    EMPTY_RUNG_GIVE_UP,
+    EMPTY_RUNG_REPLAY,
+    EMPTY_TURN_NOTICE_KIND,
+    EmptyTurnActivity,
+    RecoveryPayload,
+    classify_empty_turn,
+    is_false_current_tool_blocker_near_miss,
+    normalize_stop_reason,
+    payload_for_replay,
+    should_continue_after_compaction,
+    tool_calls_are_read_only_preparation,
+    with_bounded_redaction_records,
+)
+from kiro_crew.dashboard.recovery_replays import replays_of
+from kiro_crew.dashboard.state import chat_message_note, row_mid
+from kiro_crew.messaging.empty_turn_copy import EMPTY_TURN_NOTICE, EMPTY_TURN_NOTICE_AFTER_WORK
+
 # Read when the module loads (the placeholder pattern), so imported plainly.
-from kiro_crew.security import EXFILTRATION_REDACTION_TAG_PREFIX
+from kiro_crew.security import EXFILTRATION_REDACTION_TAG_PREFIX, redact, redact_and_truncate
+from kiro_crew.security.credential_sources import credential_records
+from kiro_crew.security.redaction import redact_credentials_with_records
+from kiro_crew.sel import SecurityEvent
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
+        EMPTY_TURN_NOTICE_AFTER_RECOVERY,
         REDACTED_CREDENTIAL_TAG,
+        STOP_REASON_CANCELLED,
+        STOP_REASON_END_TURN,
+        STOP_REASON_REFUSAL,
+        SYNTHETIC_RECOVERY_KIND,
         DashboardState,
-        SecurityEvent,
+        ReplayFamily,
         _ChatSlot,
-        credential_records,
         crew_log_emit,
         effective_session_key,
         logger,
-        redact_and_truncate,
         redact_credentials,
-        redact_credentials_with_records,
         redact_exfiltration_urls,
         redact_exfiltration_urls_with_records,
-        reflow_and_label_glued_option_marker,
         register_images_off_loop,
         register_widgets_off_loop,
         sel,
         sel_is_warm,
         telemetry_channel_of,
-        with_bounded_redaction_records,
     )
     from kiro_crew.dashboard.chat_turn.decisions_hooks import _decisions_strip_meta
     from kiro_crew.dashboard.chat_turn.file_changes import _note_reply_row
+    from kiro_crew.dashboard.chat_turn.model_fallback import (
+        _configured_refusal_fallback,
+        _record_refused_cycle,
+        _refusal_fallback_retry,
+    )
+    from kiro_crew.dashboard.chat_turn.recovery import (
+        _answer_text_only,
+        _empty_auto_continue_enabled,
+        _empty_max_auto_continues,
+        _should_suppress_requeue,
+        refusal_card_text,
+    )
+    from kiro_crew.dashboard.chat_turn.regenerate_swap import (
+        is_regenerate_answer,
+        note_regenerate_reply,
+        owned_regenerate_target,
+    )
+    from kiro_crew.dashboard.chat_turn.steer_queue import _has_user_queued_followup
+    from kiro_crew.dashboard.chat_turn.turn_entry import _session_stop_generation, _stop_pressed
+    from kiro_crew.dashboard.chat_turn.turn_ledgers import _queue_recovery, _report_consumed
+    from kiro_crew.dashboard.chat_turn.turn_locals import _ChatTurn
+    from kiro_crew.dashboard.chat_turn.turn_reply_seams import _flush_text_stream
 
 #: Shapes that make glued footer text look like an instruction to a later
 #: reader. Used only to tag the audit event; the label is applied regardless.
@@ -99,8 +151,20 @@ def _log_glued_footer_text(slot: Any, glued: list[str]) -> None:
     )
 
 
+#: ``meta["notice"]`` on a Regenerate row whose text is only backend control
+#: notices (the claude adapter's ``Compacting...``). The row is tagged as a
+#: compaction notice so every Regenerate scan, here and in the frontend, skips
+#: it the way it skips every other system notice, also after a reload.
+REGENERATE_NOTICE_ONLY = "regenerate_notice_only"
+
+
 def _segment_row_meta(
-    slot: _ChatSlot, blocked_links: list[dict], redactions: list[dict] | None = None
+    slot: _ChatSlot,
+    blocked_links: list[dict],
+    redactions: list[dict] | None = None,
+    *,
+    links_ordered: bool = False,
+    text: str | None = None,
 ) -> dict | None:
     """The assistant row's ``meta``: the decision strip, redaction records and the
     segment's native message id, which this consumes.
@@ -109,19 +173,31 @@ def _segment_row_meta(
     dict -- that call broadcasts the live frame from inside itself, so a field
     written onto the row afterwards would persist but be missing from the frame
     an open tab renders. Returns None when there is nothing to carry, which is
-    what ``slot.append`` expects for a row with no meta.
+    what ``slot.append`` expects for a row with no meta. ``links_ordered`` is
+    ``_redact_segment``'s word that ``blocked_links`` are in reply order.
+
+    *text* is the row's saved body. When a Regenerate owns the turn and the
+    body is only control notices, the row is tagged a system notice
+    (:data:`REGENERATE_NOTICE_ONLY`): it answers nothing, so a later Regenerate
+    must not take it for the reply it re-runs.
     """
     meta = _decisions_strip_meta(slot)
     message_id = getattr(slot, "segment_message_id", "")
     if message_id:
         slot.segment_message_id = ""
-    if not blocked_links and not redactions and not message_id:
+    notice_only = text is not None and not is_regenerate_answer(slot, text)
+    if not blocked_links and not redactions and not message_id and not notice_only:
         return meta
     out = dict(meta) if meta else {}
+    if notice_only:
+        out["kind"] = "compaction"
+        out["notice"] = REGENERATE_NOTICE_ONLY
     if message_id:
         out["native_message_id"] = message_id
     if blocked_links:
         out["blocked_links"] = blocked_links
+        if links_ordered:
+            out[BLOCKED_LINKS_ORDERED_KEY] = True
     if redactions:
         out["redactions"] = redactions
     return out
@@ -145,6 +221,9 @@ _SEGMENT_UNCHECKED_TEXT = (
 #: the event loop, so a reply with tens of thousands of removed values must
 #: not stall it; past this the segment fails closed instead.
 _SEGMENT_CHECK_MAX_WORK = 400_000_000
+
+#: The refusal :func:`_whole_text_refusal` gives past that ceiling.
+_TOO_MANY_REMOVED = "too many removed values to check"
 
 
 def _reset_segment_copy(slot: _ChatSlot) -> None:
@@ -206,7 +285,109 @@ def _cleared_segment_text(slot: _ChatSlot) -> str:
     return ""
 
 
-def _redact_segment(slot: _ChatSlot, text: str) -> tuple[str, list[dict], list[dict]]:
+def _hold_segment_tail(slot: _ChatSlot, text: str, tail: str) -> str | None:
+    """Leave *tail* off the slot's raw segment copy and return *text* without it.
+
+    *tail* is raw text the live stream still withholds at a display boundary
+    inside the reply (a tool call, an approval prompt), and *text* is the
+    segment as it streamed. The cut keeps the copy the copy of the text it
+    returns, so the flush's checks hold for the shorter segment. None when the
+    copy and *text* do not both end with *tail* as it was written: the two
+    cannot then be cut at the same place, and the caller saves the segment
+    whole.
+    """
+    raw = slot.segment_raw_text
+    if not tail or raw is None or not raw.endswith(tail) or not text.endswith(tail):
+        return None
+    kept = text[: len(text) - len(tail)]
+    slot.segment_raw_text = raw[: len(raw) - len(tail)]
+    slot.segment_shown_sha = hashlib.sha256(kept.encode("utf-8", "surrogatepass"))
+    return kept
+
+
+def _open_segment_with(slot: _ChatSlot, text: str, head: str) -> str:
+    """Put *head* at the start of the slot's raw segment copy; return *text* with it in front.
+
+    *head* is raw text the live stream held at a display boundary that turned
+    out to be part of what followed it, and *text* the segment streamed since.
+    It goes through the per-delta removers like any streamed delta, so the
+    flush redacts the two as one text, as the live stream did.
+    """
+    shown, removed = _redact_delta(head)
+    text = shown + text
+    raw = slot.segment_raw_text
+    if raw is not None:
+        raw = head + raw
+        if len(raw) > _SEGMENT_RAW_MAX_CHARS:
+            slot.segment_raw_text = None
+            slot.segment_removed = {}
+        else:
+            slot.segment_raw_text = raw
+            for value, tag in removed:
+                slot.segment_removed.setdefault(value, tag)
+    slot.segment_shown_sha = hashlib.sha256(text.encode("utf-8", "surrogatepass"))
+    return text
+
+
+def _give_back_run(
+    state: DashboardState,
+    slot: _ChatSlot,
+    row: dict[str, Any],
+    text: str,
+    variant_idx: int | None,
+) -> None:
+    """Put *text* back at the end of *row*, the segment row it was held off, and tell open tabs.
+
+    *text* is what the live stream released for a run it held at a display
+    boundary, once the run proved to be a word of its own. *variant_idx* is the
+    row's variant when the run was cut off it: a row showing another variant
+    since is left as it is. The text is appended to the content the row holds
+    now, which a save may have rewritten in place (an inline image's path).
+
+    *text* is also queued on the slot's delivery queue as the ``chunk`` it was
+    held back from: the /api/chat SSE stream and the OpenAI-compatible replies
+    build the reply from the chunks they drain and never see a row patch. It
+    goes on the queue only, not in the window (the row already holds it) and
+    not on the WebSocket (open tabs take the patch below).
+
+    The rebuilt content gets the glued-footer repair the row's save made: a run
+    given back after an ``[OPTIONS:]`` footer is prose glued to it.
+    """
+    if not text:
+        return
+    slot.push_wire_frame("chunk", text)
+    if row.get("variant_idx") != variant_idx:
+        return
+    before = row.get("content") or ""
+    content = _reflow_label_and_audit(slot, before + text)
+    row["content"] = content
+    variants = row.get("variants")
+    if (
+        isinstance(variants, list)
+        and isinstance(variant_idx, int)
+        and 0 <= variant_idx < len(variants)
+        and isinstance(variants[variant_idx], dict)
+        and variants[variant_idx].get("content") == before
+    ):
+        variants[variant_idx]["content"] = content
+    slot._dirty = True
+    # In the form the row's own frame carried it (allowed links shown, display
+    # pass run), so an open tab and a reload agree on the row.
+    shown = chat_message_note(slot.key, row, workspace=getattr(slot, "workspace", None))
+    state.broadcast_ws(
+        "chat_message_update",
+        {
+            "slot": slot.key,
+            "ts": row.get("ts", ""),
+            "mid": row_mid(row),
+            "content": shown["content"],
+        },
+    )
+
+
+def _redact_segment(
+    slot: _ChatSlot, text: str, *, _ordered_out: list[bool] | None = None
+) -> tuple[str, list[dict], list[dict]]:
     """Redact one assistant segment as one text and describe every placeholder.
 
     ``text`` is the segment as it streamed: each delta redacted on its own.
@@ -244,15 +425,18 @@ def _redact_segment(slot: _ChatSlot, text: str) -> tuple[str, list[dict], list[d
     With no streamed deltas (an empty raw copy) there is nothing to cut, and
     ``text`` itself is redacted. ``text`` is reflowed and audited here
     (:func:`_reflow_label_and_audit`), so callers pass it as streamed.
-    Returns ``(text, blocked_links, redactions)``.
+    Returns ``(text, blocked_links, redactions)``; ``_ordered_out`` gets whether
+    the links are known to be in reply order (see ``restore_allowed_links``).
     """
+    if _ordered_out is not None:
+        _ordered_out[:] = [False]
     raw = slot.segment_raw_text
     shown_sha = slot.segment_shown_sha
     removed = slot.segment_removed
     _reset_segment_copy(slot)
     shown = _reflow_label_and_audit(slot, text)
     if raw == "":
-        return _redact_segment_text(slot, shown)
+        return _redact_segment_text(slot, shown, _ordered_out=_ordered_out)
     if not text:
         # Streamed deltas with no streamed text left: nothing was shown.
         return "", [], []
@@ -263,30 +447,65 @@ def _redact_segment(slot: _ChatSlot, text: str) -> tuple[str, list[dict], list[d
         reason = "raw copy does not match the streamed text"
     else:
         try:
-            saved = _redact_segment_text(slot, reflow_and_label_glued_option_marker(raw)[0])
+            whole = reflow_and_label_glued_option_marker(raw)[0]
+            order: list[bool] = []
+            saved = _redact_segment_text(slot, whole, _ordered_out=order)
             if removed:
                 per_delta, _, _ = _redact_segment_text(slot, shown)
                 # Never edit the raw copy to drop such a value: a mask changes
                 # what the next pass sees (a tag's space ends a link early).
                 # The saved text is one pass over what the model wrote, or the
                 # segment is withheld.
-                if len(removed) * (len(saved[0]) + len(per_delta)) > _SEGMENT_CHECK_MAX_WORK:
-                    reason = "too many removed values to check"
-                elif _kept_removed_values(saved[0], per_delta, removed):
-                    reason = "whole-text pass keeps a value a per-delta pass removed"
-                elif _saved_text_shows_more(saved[0], per_delta):
-                    reason = "whole-text pass keeps text the streamed redaction hid"
-                elif _records_hold_removed_credential(saved[1], removed, saved[2]):
-                    reason = "a saved record holds a value a per-delta pass removed"
+                reason = _whole_text_refusal(saved, per_delta, removed)
+                strict_order: list[bool] = []
+                # Past the work budget the retry would fail it again, and its
+                # digest-by-value scan is the cost the budget exists to bound.
+                if (
+                    reason
+                    and reason != _TOO_MANY_REMOVED
+                    and saved[0]
+                    != (
+                        strict := _redact_segment_text(
+                            slot, whole, tuple(removed), _ordered_out=strict_order
+                        )
+                    )[0]
+                ):
+                    # A delta boundary split an SRI value, so its delta redacted
+                    # the bare digest the whole text keeps. One pass with that
+                    # exemption off for each digest holding a removed value is
+                    # main's verdict on that digest, and keeps every digest no
+                    # delta cut; save it if it passes the same checks, rather
+                    # than withhold the reply.
+                    if not _whole_text_refusal(strict, per_delta, removed):
+                        saved, reason, order = strict, "", strict_order
         except Exception as exc:  # noqa: BLE001 -- any failure must fail closed
             # The type only: a message or traceback could quote the text.
             reason = f"redaction raised {type(exc).__name__}"
         if not reason:
+            if _ordered_out is not None:
+                # One pass wrote these records, and _links_main_shows only drops
+                # some (a count mismatch then keeps that host blocked).
+                _ordered_out[:] = order
             if not removed:
                 return saved
             return saved[0], _links_main_shows(saved[1], saved[0], per_delta, removed), saved[2]
     logger.warning("segment flush failed closed: %s", reason)
     return _SEGMENT_UNCHECKED_TEXT, [], []
+
+
+def _whole_text_refusal(
+    saved: tuple[str, list[dict], list[dict]], per_delta: str, removed: dict[str, str]
+) -> str:
+    """Why the whole-text ``saved`` may not be saved over ``per_delta``, or ``""``."""
+    if len(removed) * (len(saved[0]) + len(per_delta)) > _SEGMENT_CHECK_MAX_WORK:
+        return _TOO_MANY_REMOVED
+    if _kept_removed_values(saved[0], per_delta, removed):
+        return "whole-text pass keeps a value a per-delta pass removed"
+    if _saved_text_shows_more(saved[0], per_delta):
+        return "whole-text pass keeps text the streamed redaction hid"
+    if _records_hold_removed_credential(saved[1], removed, saved[2]):
+        return "a saved record holds a value a per-delta pass removed"
+    return ""
 
 
 def _kept_removed_values(saved: str, per_delta: str, removed: Iterable[str]) -> list[str]:
@@ -428,15 +647,39 @@ def _records_hold_removed_credential(
     )
 
 
-def _redact_segment_text(slot: _ChatSlot, text: str) -> tuple[str, list[dict], list[dict]]:
-    """Both removers over ``text``, with the records each placeholder needs."""
+def _redact_segment_text(
+    slot: _ChatSlot,
+    text: str,
+    judged_sri_values: Collection[str] = (),
+    *,
+    _ordered_out: list[bool] | None = None,
+) -> tuple[str, list[dict], list[dict]]:
+    """Both removers over ``text``, with the records each placeholder needs.
+
+    ``_ordered_out`` gets ``[True]``, or ``[False]`` when a record has no
+    placeholder of its own, so the records do not pair with them by order.
+    """
+    if _ordered_out is not None:
+        _ordered_out[:] = [True]
     # Never relaxed by the reader's allowed hosts: what is saved must not depend
     # on the allow-list, so an allowed link is kept as a placeholder with its
     # record and shown again at display time (chat_utils._prepare_messages).
-    redacted, exfil_warnings, blocked_links = redact_exfiltration_urls_with_records(text)
+    redacted, exfil_warnings, blocked_links = redact_exfiltration_urls_with_records(
+        text, _ordered_out=_ordered_out
+    )
     for w in exfil_warnings:
         logger.warning("Exfiltration URL redacted in chat segment: %s", w)
-    redacted, cred_warnings, matches = redact_credentials_with_records(redacted)
+    links_before = redacted.count(EXFILTRATION_REDACTION_TAG_PREFIX)
+    redacted, cred_warnings, matches = redact_credentials_with_records(
+        redacted, judged_sri_values=judged_sri_values
+    )
+    if (
+        _ordered_out is not None
+        and redacted.count(EXFILTRATION_REDACTION_TAG_PREFIX) != links_before
+    ):
+        # A credential span (a PEM block) swallowed a link's placeholder while its
+        # record stays, so the records do not pair with the placeholders by order.
+        _ordered_out[:] = [False]
     for w in cred_warnings:
         # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure -- the redactor's warning names the pattern class, never the matched value; moved verbatim
         logger.warning("Credential redacted in chat segment: %s", w)
@@ -459,13 +702,19 @@ def _append_command_reply(slot: _ChatSlot, text: str) -> None:
     message id and decision strip are left alone: they belong to the model's
     turn, not to a command answered without one.
     """
-    redacted, blocked_links, redactions = _redact_segment_text(slot, text)
+    ordered: list[bool] = []
+    redacted, blocked_links, redactions = _redact_segment_text(slot, text, _ordered_out=ordered)
     meta: dict[str, Any] = {}
     if blocked_links:
         meta["blocked_links"] = blocked_links
+        if ordered == [True]:
+            meta[BLOCKED_LINKS_ORDERED_KEY] = True
     if redactions:
         meta["redactions"] = redactions
-    slot.append("assistant", redacted, "msg msg-a", meta=meta or None)
+    row = slot.append("assistant", redacted, "msg msg-a", meta=meta or None)
+    # A Regenerate whose message is a command replaces its previous reply with
+    # this row at the turn's end, as it does with a model reply.
+    note_regenerate_reply(slot, row)
 
 
 #: Window rows a tool group puts between a segment's chunk rows: the call row,
@@ -481,8 +730,8 @@ def _flush_segment(
     broadcast: bool = True,
     quiet_persist: bool = False,
     interrupted: bool = False,
-) -> None:
-    """Finalize current text block as a segment and persist it.
+) -> dict[str, Any]:
+    """Finalize current text block as a segment, persist it, and return its row.
 
     ``quiet_persist`` additionally suppresses the per-message ``chat_message``
     broadcast that ``slot.append`` emits for the finalized assistant message.
@@ -502,6 +751,9 @@ def _flush_segment(
     turn, and the emitter records nothing, which is correct: a segment flushed
     outside a turn has no turn or model call to name.
     """
+    # This flush ends the segment a permission request owed a cut for; paying
+    # that cut on the append below would save the same text twice.
+    slot._owed_segment_cut = None
 
     # Remove trailing chunk messages (they belong to this segment).
     # Also pull aside any stop_event interleaved with this segment's chunks
@@ -570,7 +822,10 @@ def _flush_segment(
     # model that later re-reads the line must not take it for an instruction.
     # _redact_segment applies it (_reflow_label_and_audit) to both the streamed
     # text and the raw copy it saves.
-    redacted, blocked_links, redactions = _redact_segment(slot, assistant_text)
+    links_ordered: list[bool] = []
+    redacted, blocked_links, redactions = _redact_segment(
+        slot, assistant_text, _ordered_out=links_ordered
+    )
     # Persist as assistant message. Broadcast is kept enabled so that
     # other tabs viewing the same slot receive the finalized text.
     # The active tab already has this content from streaming chunks;
@@ -586,7 +841,13 @@ def _flush_segment(
             # from the redaction above. Passed here rather than written onto the row
             # afterwards so the frame this call broadcasts carries them too -- see
             # _decisions_strip_meta for why that matters.
-            meta=_segment_row_meta(slot, blocked_links, redactions),
+            meta=_segment_row_meta(
+                slot,
+                blocked_links,
+                redactions,
+                links_ordered=links_ordered == [True],
+                text=redacted,
+            ),
         ),
     )
     # The append-only log's copy of the same body. Written here rather than at the
@@ -603,31 +864,23 @@ def _flush_segment(
         interrupted=interrupted,
     )
     last_msg: dict = slot.messages[-1]
-    # If a regenerate is pending, attach the stashed variants to this fresh assistant message.
-    if slot._pending_variants:
-        pending_list = []
-        for v in slot._pending_variants:
-            if not isinstance(v, dict):
-                continue
-            # A stashed variant's text is ALREADY redacted, so its records are
-            # carried rather than derived: the URL they describe is gone from that
-            # text and a rescan of it would return nothing, which would destroy
-            # the only explanation the reader can switch back to. Records are
-            # derived exactly once, at the redaction that writes the placeholder.
-            # The removers still run -- they are idempotent, and a variant that
-            # reached here unredacted must not be stored that way.
-            v_text, _ = redact_exfiltration_urls(v.get("content", ""))
-            entry = with_bounded_redaction_records({**v, "content": redact_credentials(v_text)[0]})
-            pending_list.append(entry)
+    # Stashed variants outside a Regenerate turn attach to this fresh assistant
+    # message. A turn that owns a Regenerate target leaves them stashed: they hold
+    # the previous reply, and a dirty save of this row would persist it as a
+    # variant even when the swap is then declined (a refused or failed write, a
+    # reply trimmed into the frozen prefix, a restart). ``settle_regenerate``
+    # attaches them only once the replace write commits.
+    if slot._pending_variants and owned_regenerate_target(slot) is None:
         newest: dict = {"content": redacted, "ts": last_msg.get("ts", "")}
         if blocked_links:
             newest["blocked_links"] = blocked_links
+            if links_ordered == [True]:
+                newest[BLOCKED_LINKS_ORDERED_KEY] = True
         if redactions:
             newest["redactions"] = redactions
-        pending_list.append(newest)
+        pending_list = _adopt_pending_variants(slot, newest)
         last_msg["variants"] = pending_list
         last_msg["variant_idx"] = len(pending_list) - 1
-        slot._pending_variants = []
     # Re-append any stop_event that belongs to this segment's trailing run,
     # placed AFTER the finalized assistant message so the UI shows
     # prose → stop card.
@@ -650,6 +903,33 @@ def _flush_segment(
     # dashboard-surfaced copy of the widget, so it must not persist a credential
     # the segment redaction just stripped out of chat.
     _schedule_widget_registration(state, slot, redacted, str(last_msg.get("ts", "")))
+    return last_msg
+
+
+def _adopt_pending_variants(slot: _ChatSlot, newest: dict) -> list[dict]:
+    """The regenerate's stashed variants followed by ``newest``; empties the stash.
+
+    Shared by the first segment flush and the Regenerate settle step
+    (``regenerate_swap.settle_regenerate``), which adopts them for a reply that
+    no flush wrote (a partial reply, a local command's answer).
+    """
+    pending_list = []
+    for v in slot._pending_variants:
+        if not isinstance(v, dict):
+            continue
+        # A stashed variant's text is ALREADY redacted, so its records are
+        # carried rather than derived: the URL they describe is gone from that
+        # text and a rescan of it would return nothing, which would destroy
+        # the only explanation the reader can switch back to. Records are
+        # derived exactly once, at the redaction that writes the placeholder.
+        # The removers still run -- they are idempotent, and a variant that
+        # reached here unredacted must not be stored that way.
+        v_text, _ = redact_exfiltration_urls(v.get("content", ""))
+        entry = with_bounded_redaction_records({**v, "content": redact_credentials(v_text)[0]})
+        pending_list.append(entry)
+    pending_list.append(newest)
+    slot._pending_variants = []
+    return pending_list
 
 
 def _schedule_widget_registration(
@@ -711,3 +991,543 @@ def _schedule_widget_registration(
         image_task = asyncio.create_task(register_images_off_loop(text, message_ts, slot.key))
         state._background_tasks.add(image_task)
         image_task.add_done_callback(state._background_tasks.discard)
+
+
+async def _turn_settle_answer(turn: _ChatTurn) -> None:
+    """Settle the answer: terminal directive, final segment, refusal hop, continuation, empty ladder."""
+    _activity_after_terminal = turn._activity_after_terminal
+    _builtin_identity_trusted = turn._builtin_identity_trusted
+    _compaction_completed = turn._compaction_completed
+    _compaction_notice_chunks = turn._compaction_notice_chunks
+    _compaction_started = turn._compaction_started
+    _compaction_text_offset = turn._compaction_text_offset
+    _is_synthetic = turn._is_synthetic
+    _prompt_depth = turn._prompt_depth
+    _recovering_compaction = turn._recovering_compaction
+    _refusal_reasons = turn._refusal_reasons
+    _retrying_empty = turn._retrying_empty
+    _saw_terminal_event = turn._saw_terminal_event
+    _saw_text_chunk = turn._saw_text_chunk
+    _stop_reason = turn._stop_reason
+    _terminal_synthetic = turn._terminal_synthetic
+    _turn_billed = turn._turn_billed
+    _turn_credits = turn._turn_credits
+    _turn_flushed_visible_text = turn._turn_flushed_visible_text
+    _turn_refusal = turn._turn_refusal
+    _turn_successful_tool_call_ids = turn._turn_successful_tool_call_ids
+    _turn_thought = turn._turn_thought
+    _turn_tool_calls = turn._turn_tool_calls
+    _turn_tool_identities = turn._turn_tool_identities
+    first_word = turn.first_word
+    full_message = turn.full_message
+    is_new = turn.is_new
+    message = turn.message
+    resumed = turn.resumed
+    slot = turn.slot
+    state = turn.state
+    # What the turn produced OF ITS OWN: `assistant_text` minus any backend
+    # control notice that arrived as assistant text (the claude adapter's
+    # "Compacting..."). The notice stays in `assistant_text` — it is real
+    # output and must stream, flush and persist — but it is not an answer,
+    # and the branch below is what decides whether one was given.
+    #
+    # A run the live stream held at the turn's last tool call or approval
+    # prompt is settled first: nothing more will join it, and it either goes
+    # back on the row it was cut from or opens this segment's text.
+    if turn._held_runs:
+        _flush_text_stream(turn)
+    _answer_text = _answer_text_only(turn.assistant_text, _compaction_notice_chunks)
+    turn._answer_text = _answer_text
+    _continuation_answer_text = _answer_text_only(
+        turn.assistant_text[_compaction_text_offset:], _compaction_notice_chunks
+    )
+    # A refusal's explanation answers the turn wherever it streamed: one that
+    # arrived before a compaction still takes the streamed-explanation refusal
+    # path below, instead of the no-text refusal branch, which would retry the
+    # message on the fallback model and word its card as if nothing was said.
+    _branch_answer_text = (
+        _answer_text if _stop_reason == STOP_REASON_REFUSAL else _continuation_answer_text
+    )
+
+    # A turn with no answer after compaction still has to preserve every
+    # pre-compaction fragment and control notice, but it must not take the
+    # answer branch:
+    # the post-compaction continuation is an `elif` UNDER that branch, so
+    # entering it would shadow the continuation and leave the request
+    # unanswered, a hang. Flush here and fall
+    # through to the chain. (This is also why the notice cannot simply be
+    # kept out of `assistant_text`: the answer branch owns the only terminal
+    # `_flush_text_stream`, and the rolling redactor withholds the notice
+    # until something flushes it, so a skipped notice was emitted nowhere.)
+    if turn.assistant_text and not _branch_answer_text:
+        _flush_text_stream(turn)
+        _flush_segment(state, slot, turn.assistant_text, broadcast=False)
+        turn._reply_flushed = True
+
+    if turn._terminal_directive_applied and _activity_after_terminal:
+        # Turn-end contract: a terminal directive is the LAST thing in its
+        # turn. Text or a tool call after it is the model's violation, not
+        # the runner's — the turn still ends cleanly and recovery stays
+        # off (re-arming it would turn a quiet end into a notice card),
+        # so this is reported once and nowhere else. Late text was dropped
+        # at arrival (see _on_text_chunk in stream_chunks), so this count is the
+        # only trace it leaves. Counts only, by contract: no text, no tool
+        # names.
+        logger.warning(
+            "Turn-end contract violation for slot %s: %d model event(s) "
+            "(text chunks or tool calls) after the terminal directive %r applied.",
+            slot.key,
+            _activity_after_terminal,
+            turn._terminal_directive_kind,
+        )
+
+    if _branch_answer_text:
+        _flush_text_stream(turn)
+        _flush_segment(state, slot, turn.assistant_text, broadcast=False)
+        turn._reply_flushed = True
+        if _stop_reason == STOP_REASON_REFUSAL:
+            # The Kiro service's content filter STREAMS its canned
+            # explanation as assistant text and then ends the turn, so the
+            # refusal reaches this (answered) branch rather than the
+            # text-less one below. The text is kept -- it is what the
+            # provider said. When agent.refusal_fallback_model names a
+            # different model, this ONE message is retried on it (the
+            # notice card replaces the terminal card); otherwise the
+            # structured card follows the text so the user sees the
+            # category and knows a same-model retry will not help.
+            if await _refusal_fallback_retry(turn):
+                pass
+            else:
+                _record_refused_cycle(turn)
+                logger.warning(
+                    "Model refusal for slot %s (category=%s) after "
+                    "streamed explanation — not retrying",
+                    slot.key,
+                    (_turn_refusal.category or "-") if _turn_refusal else "-",
+                )
+                _refusal_card = refusal_card_text(
+                    _turn_refusal,
+                    streamed_text=turn.assistant_text,
+                    fallback_off=not _configured_refusal_fallback(),
+                )
+                if slot._refusal_fallback_attempted:
+                    # This refusal came from the retry turn itself: the
+                    # configured fallback also declined. Say so — the card
+                    # alone would read as though no retry ever ran — and
+                    # name the model, so the user knows what to reconfigure.
+                    # Same redaction + bound as the retry notice: the id
+                    # comes from config or the provider envelope.
+                    _fb = slot._refusal_fallback_candidate
+                    if _fb:
+                        _fb = redact(str(_fb))
+                        _fb = _fb[:120]
+                    _refusal_card += (
+                        f" The configured fallback model ('{_fb}') also declined this request."
+                        if _fb
+                        else " The configured fallback model also declined this request."
+                    )
+                slot.append(
+                    "error",
+                    _refusal_card,
+                    "msg msg-err",
+                )
+    elif _stop_reason == STOP_REASON_REFUSAL:
+        # Model-side content refusal with no accompanying text: Anthropic's
+        # bare `refusal` stop reason (passed through by every harness), or
+        # the Kiro service's filter when kiro-cli surfaced only the
+        # `_kiro.dev/metadata` envelope. The ACP layer folds both onto
+        # STOP_REASON_REFUSAL + `AcpEvent.refusal`. This is
+        # DETERMINISTIC FOR ONE MODEL — a blind same-model retry just
+        # re-hits the same refusal and burns credits — so either retry the
+        # message once on the configured refusal-fallback MODEL (a
+        # different family routinely accepts what another's filter
+        # declined), or surface a distinct, non-retried card. A refusal
+        # on turn 1 with zero tool calls and no visible output usually points
+        # at what we PREPENDED (persona / injected context / replay), not the
+        # user's text; log the turn shape at WARNING. The prompt text
+        # itself — even redacted and truncated — stays out of the service
+        # log: prompts can carry secrets, and the shape fields answer the
+        # prepended-vs-user-text question without the content.
+        if await _refusal_fallback_retry(turn):
+            pass
+        else:
+            _record_refused_cycle(turn)
+            logger.warning(
+                "Model refusal for slot %s (category=%s) — not retrying "
+                "[is_new=%s resumed=%s tool_calls=%d visible_output=%s "
+                "prompt_bytes=%d]",
+                slot.key,
+                (_turn_refusal.category or "-") if _turn_refusal else "-",
+                is_new,
+                resumed,
+                _turn_tool_calls,
+                turn._produced_visible_output,
+                len(full_message),
+            )
+            _refusal_card = refusal_card_text(
+                _turn_refusal, fallback_off=not _configured_refusal_fallback()
+            )
+            if slot._refusal_fallback_attempted:
+                # This refusal came from the retry turn itself: the
+                # configured fallback also declined. Say so — the card
+                # alone would read as though no retry ever ran — and
+                # name the model, so the user knows what to reconfigure.
+                # Same redaction + bound as the streamed-refusal branch:
+                # the id comes from config or the provider envelope.
+                _fb = slot._refusal_fallback_candidate
+                if _fb:
+                    _fb = redact(str(_fb))
+                    _fb = _fb[:120]
+                _refusal_card += (
+                    f" The configured fallback model ('{_fb}') also declined this request."
+                    if _fb
+                    else " The configured fallback model also declined this request."
+                )
+            slot.append(
+                "error",
+                _refusal_card,
+                "msg msg-err",
+            )
+    elif not turn._terminal_directive_applied and should_continue_after_compaction(
+        # A turn that ended on an applied terminal directive is answered by
+        # that directive, whatever compaction happened before it: the empty
+        # segment that the late-text drop in _on_text_chunk (stream_chunks) leaves is
+        # the quiet end, not an abandoned request, so no continuation — same guard as the
+        # empty-response arm below.
+        # The context window filled mid-turn, the backend summarized, and the
+        # turn then ended without finishing the request — the "hangs after
+        # Compacting..." symptom. kiro-cli self-heals (it re-sends the pending
+        # request once compaction settles, see `handle_compaction_loop_event`);
+        # the Claude backend does NOT, so the resume has to be injected here.
+        #
+        # Placed BEFORE the empty-response ladder below deliberately: that
+        # ladder's first rung silently replays the ORIGINAL prompt, which on a
+        # compaction-interrupted turn restarts work that already completed and
+        # is out of context now. This arm goes straight to a CONTINUATION
+        # payload instead, telling the model the summary above is authoritative.
+        compaction_started=_compaction_started,
+        # COMPLETED only, never merely "settled": a failed compaction also
+        # reaches a terminal, and continuing after one would tell the model a
+        # summary it can rely on exists when the context was never summarized.
+        compaction_settled=_compaction_completed,
+        # An explicit `/compact` IS the user's whole request; it ended exactly
+        # as asked, so there is nothing pending to continue.
+        user_requested_compaction=(first_word == "/compact"),
+        # The turn's own answer (see `_answer_text` above), not the raw
+        # segment: this gate must not mistake "the backend said it was
+        # compacting" for "the request was answered".
+        final_segment_text=_continuation_answer_text,
+        stop_reason=_stop_reason,
+        end_turn_reason=STOP_REASON_END_TURN,
+        prompt_depth=_prompt_depth,
+        compaction_continue_retries=slot._compaction_continue_retries,
+        is_cancelled=(_stop_reason == STOP_REASON_CANCELLED),
+        refusal_reasons=_refusal_reasons,
+        # Same user-intent gates as the promise-only arm in _turn_ending_chain,
+        # for the same reasons: a Stop pressed during compaction can surface here
+        # as a plain end_turn, and a user follow-up already queued must win over
+        # a synthetic continuation rather than be jumped ahead of.
+        stop_in_progress=_should_suppress_requeue(slot),
+        # The live Stop signal every end-of-turn gate shares: the slot's own
+        # counter AND the session-scoped one, so a stop issued on a linked
+        # channel surface is seen here too.
+        stop_generation_unchanged=not _stop_pressed(turn),
+        queue_empty=not _has_user_queued_followup(slot),
+        no_pending_steers=(not getattr(slot, "_pending_steers", None)),
+    ):
+        slot._compaction_continue_retries += 1
+        logger.info(
+            "Post-compaction stall for slot %s — context was summarized "
+            "mid-turn and the turn ended without finishing; injecting one "
+            "continuation (tool_calls=%d credits=%.4f)",
+            slot.key,
+            _turn_tool_calls,
+            _turn_credits,
+        )
+        from kiro_crew.dashboard import gateway_notice as gn
+
+        slot.append(
+            "notice",
+            "ℹ️ The context was compacted mid-turn and the response stopped "
+            "there — continuing automatically.",
+            "msg msg-info",
+            meta={
+                "kind": EMPTY_TURN_NOTICE_KIND,
+                **gn.gateway_notice_meta(gn.GATEWAY_NOTICE_COMPACTION_CONTINUING),
+            },
+        )
+        _queue_recovery(
+            turn,
+            0,
+            _COMPACTION_CONTINUE_MSG,
+            kind=SYNTHETIC_RECOVERY_KIND,
+            payload=RecoveryPayload.CONTINUATION,
+        )
+        # Snapshot for the dispatch-point purge, same as the promise-only arm
+        # in _turn_ending_chain: catches a Stop that pressed AND resolved back
+        # to idle while the continuation sat in the queue.
+        replays_of(slot).arm(
+            ReplayFamily.CONTINUATION,
+            entry_id="",
+            session_key=effective_session_key(slot),
+            stop_gen=getattr(slot, "_stop_generation", 0),
+            session_stop_gen=_session_stop_generation(turn),
+        )
+        _recovering_compaction = True
+        turn._recovering_compaction = _recovering_compaction
+    elif (
+        _stop_reason != STOP_REASON_CANCELLED
+        and not turn._produced_visible_output
+        and not turn._terminal_directive_applied
+        and not _refusal_reasons
+    ):
+        _had_empty_response_verdict = True
+        turn._had_empty_response_verdict = _had_empty_response_verdict
+        # Model returned an empty response — retry once, then notify user.
+        # Precedence: a turn that ended on a recoverable tool refusal also has
+        # empty assistant_text when the model went straight to the blocked
+        # tool with no preamble. That is NOT a blind-retry case — re-running
+        # the same message just re-hits the same gate. The `not _refusal_reasons`
+        # guard lets it fall through to _turn_stop_hook's refusal-recovery path,
+        # which hands the model the reason so it can adapt instead of looping.
+        #
+        # "Empty" here means only "the final assistant segment is empty", and
+        # that is NOT the same as "the turn did nothing". `assistant_text` is
+        # reset at every tool boundary, so a turn that answered and then called
+        # a tool arrives here with its answer already flushed, persisted and
+        # read — and `_produced_visible_output` does not cover that, by design
+        # (its narrow meaning is load-bearing for the promise-only guard).
+        # A tool-only turn arrives here too. The activity snapshot below is what
+        # separates those from a provider that genuinely returned nothing.
+        _empty_activity = EmptyTurnActivity(
+            saw_terminal=_saw_terminal_event,
+            terminal_synthetic=_terminal_synthetic,
+            stop_reason=normalize_stop_reason(_stop_reason),
+            saw_text=_saw_text_chunk,
+            flushed_visible=_turn_flushed_visible_text,
+            had_tools=_turn_tool_calls > 0,
+            had_thinking=_turn_thought,
+            billed=_turn_billed,
+        )
+        _empty_cause = classify_empty_turn(_empty_activity)
+        # Snapshot BEFORE the rungs, each of which may increment the counter.
+        # This is the ordinal of the turn just observed, which is what the
+        # predecessor warning reported.
+        _empty_attempt = slot._empty_response_retries + 1
+        from kiro_crew.dashboard import gateway_notice as gn
+
+        # THE load-bearing guard. A productive turn must never have its
+        # originating message replayed verbatim: rung 1 below re-queues
+        # `message` itself, which on such a turn re-runs tool calls that
+        # already completed (a second `send_message`, a second write, a second
+        # PR) and re-derives an answer the user has already read. A productive
+        # turn skips to the continuation rung, which tells the model the work
+        # above already happened.
+        _may_replay_verbatim = not _empty_activity.productive
+        if _prompt_depth == 0 and slot._empty_response_retries < 1 and _may_replay_verbatim:
+            _empty_rung = EMPTY_RUNG_REPLAY
+            # Seamless self-heal: silently re-queue on the first empty
+            # response. An ephemeral status indicator is not used here — it
+            # is emitted at turn-teardown and the frontend drops it once the
+            # streaming turn ends (so it never surfaces). Only the second
+            # consecutive empty surfaces a persisted notice card below.
+            slot._empty_response_retries += 1
+            # Retract BEFORE building the retry entry. The entry copies an
+            # unsettled consumption callback; copying while the preceding
+            # turn-complete report is still True would drop that callback
+            # and strand a durable producer after the replay succeeds.
+            await _report_consumed(turn, False)
+            _queue_recovery(
+                turn,
+                0,
+                message,
+                kind=SYNTHETIC_RECOVERY_KIND,
+                # Verbatim replay: ORIGINAL only if the incoming text was the
+                # user's. On a recovery turn it is the runner's continuation.
+                payload=payload_for_replay(_is_synthetic),
+            )
+            _retrying_empty = True
+            turn._retrying_empty = _retrying_empty
+        elif (
+            _prompt_depth == 0
+            and slot._empty_response_retries < 1 + _empty_max_auto_continues()
+            and not _should_suppress_requeue(slot)
+            and _empty_auto_continue_enabled()
+        ):
+            # Second consecutive empty: the silent SAME-message re-queue
+            # also produced nothing. Re-sending the identical prompt tends
+            # to reproduce the identical empty generation, but a DIFFERENT
+            # message reliably recovers (observed repeatedly in the field —
+            # the user typing "continue" broke the pattern every time). So
+            # auto-send a synthetic continue nudge on the same live
+            # session, with a transcript-visible notice so the recovery is
+            # never invisible. The budget is
+            # session.empty_response_max_continues (default 1 — one nudge,
+            # the original behavior); when it is spent, the give-up notice
+            # below fires — bounded, no loop.
+            # A productive turn skipped the verbatim-replay rung entirely,
+            # so its counter jumps past the replay slot (0 → 2) on its
+            # first continuation and counts normally from there. That
+            # keeps the give-up arithmetic uniform across both paths —
+            # replay-or-jump plus the continue budget — and at the default
+            # budget it is exactly the old jump-to-2: the single
+            # continuation consumes the remaining budget, so a counter
+            # left at 1 would run `_EMPTY_AUTO_CONTINUE_MSG` next,
+            # contradicting both the notice ("continuing once") and the
+            # side-effect boundary this branch protects.
+            _max_continues = _empty_max_auto_continues()
+            if _empty_activity.productive:
+                slot._empty_response_retries = max(slot._empty_response_retries + 1, 2)
+                # This turn's tools landed; later turns of the episode must know.
+                slot._empty_episode_productive = True
+            else:
+                slot._empty_response_retries += 1
+            # Ordinal of THIS continuation (1-based): the counter minus the
+            # replay slot. Shown in the notice when the budget exceeds one,
+            # so a user watching repeated recoveries sees the ladder
+            # advancing, not looping.
+            _continue_no = max(slot._empty_response_retries - 1, 1)
+            # The localized copy names the ordinal only when the budget exceeds one.
+            _continue_args: dict = (
+                {} if _max_continues == 1 else {"n": _continue_no, "max": _max_continues}
+            )
+            _empty_rung = EMPTY_RUNG_CONTINUE
+            if _empty_activity.productive or slot._empty_episode_productive:
+                # Same rung, different words, because the words are read by
+                # the MODEL and by the user. "returned nothing twice" is
+                # false for a turn that streamed an answer or ran tools, and
+                # telling a model its completed work produced no output is an
+                # invitation to redo it — the side-effect duplication this
+                # path exists to avoid. The split is per episode, like the
+                # give-up rung's: a continuation that streamed nothing still
+                # follows a turn that did work.
+                slot.append(
+                    "notice",
+                    (
+                        "ℹ️ The turn ended without a closing reply — continuing "
+                        "once from what already ran."
+                        if _max_continues == 1
+                        else "ℹ️ The turn ended without a closing reply — "
+                        "continuing from what already ran "
+                        f"(recovery {_continue_no} of {_max_continues})."
+                    ),
+                    "msg msg-info",
+                    meta={
+                        "kind": EMPTY_TURN_NOTICE_KIND,
+                        **gn.gateway_notice_meta(
+                            gn.GATEWAY_NOTICE_EMPTY_TURN_CONTINUING_AFTER_WORK, **_continue_args
+                        ),
+                    },
+                )
+                _empty_continue_msg = _ACTIVITY_NO_REPLY_CONTINUE_MSG
+            else:
+                slot.append(
+                    "notice",
+                    (
+                        "ℹ️ The model returned nothing twice — auto-continuing once."
+                        if _max_continues == 1
+                        else "ℹ️ The model returned nothing — auto-continuing "
+                        f"(recovery {_continue_no} of {_max_continues})."
+                    ),
+                    "msg msg-info",
+                    meta={
+                        "kind": EMPTY_TURN_NOTICE_KIND,
+                        **gn.gateway_notice_meta(
+                            gn.GATEWAY_NOTICE_EMPTY_TURN_CONTINUING, **_continue_args
+                        ),
+                    },
+                )
+                _empty_continue_msg = _EMPTY_AUTO_CONTINUE_MSG
+            _queue_recovery(
+                turn,
+                0,
+                _empty_continue_msg,
+                kind=SYNTHETIC_RECOVERY_KIND,
+                payload=RecoveryPayload.CONTINUATION,
+            )
+            _retrying_empty = True
+            turn._retrying_empty = _retrying_empty
+        else:
+            _empty_rung = EMPTY_RUNG_GIVE_UP
+            # Recoverable, usually-transient: surface a soft "notice" card
+            # (not a red "error" card) so a self-healing event doesn't read
+            # like a crash. Single emit (see the note in _on_process_died):
+            # slot.append persists + broadcasts one chat_message via
+            # _on_message; no explicit broadcast_ws. Same rung, different
+            # words, for the same reason as the continue rung above: the
+            # card is read by the MODEL (via the transcript) and by the
+            # user. "returned nothing" is false for a productive turn and
+            # invites a redo of work whose side effects already landed,
+            # and a recovery claim is false on the paths that reach
+            # give-up with the recovery counter still at zero (nested
+            # depth>0 turns; a gate-off zero-counter give-up is only
+            # reachable productive and takes the productive wording). The
+            # counter counts budget spent, not which rungs ran (flag-off
+            # reaches give-up at one with no auto-continue; a productive
+            # turn's continuation reaches it at two with no verbatim
+            # retry), so the non-zero clause claims only that automatic
+            # recovery was attempted. The sentences are the channel driver's
+            # empty-turn verdict too (``messaging.empty_turn_copy``), so a
+            # channel thread mirrored into this transcript reads one story.
+            if _empty_activity.productive or slot._empty_episode_productive:
+                _empty_msg = EMPTY_TURN_NOTICE_AFTER_WORK
+                _empty_notice = gn.GATEWAY_NOTICE_EMPTY_TURN_AFTER_WORK
+            elif slot._empty_response_retries > 0:
+                _empty_msg = EMPTY_TURN_NOTICE_AFTER_RECOVERY
+                _empty_notice = gn.GATEWAY_NOTICE_EMPTY_TURN_AFTER_RECOVERY
+            else:
+                _empty_msg = EMPTY_TURN_NOTICE
+                _empty_notice = gn.GATEWAY_NOTICE_EMPTY_TURN
+            slot.append(
+                "notice",
+                _empty_msg,
+                "msg msg-info",
+                meta={"kind": EMPTY_TURN_NOTICE_KIND, **gn.gateway_notice_meta(_empty_notice)},
+            )
+        # ONE warning per empty verdict, emitted AFTER the rung is chosen so
+        # the log line carries the decision rather than only the symptom. It
+        # must distinguish a provider that generated nothing from a turn
+        # whose answer a tool boundary flushed away, from a turn no terminal
+        # event ever closed — three different faults with three different
+        # owners, which can all occur in consecutive attempts of one turn.
+        # Every field here is a closed value or a bool by
+        # construction (see EmptyTurnActivity): no prompt, no response, no
+        # thinking, no tool arguments or results, no paths, no identities, no
+        # token counts and no costs.
+        logger.warning(
+            "Empty model response for slot %s (attempt %d) cause=%s rung=%s "
+            "stop_reason=%s terminal=%s synthetic=%s text=%s flushed_visible=%s "
+            "tools=%s thinking=%s billed=%s",
+            slot.key,
+            _empty_attempt,
+            _empty_cause,
+            _empty_rung,
+            _empty_activity.stop_reason,
+            _empty_activity.saw_terminal,
+            _empty_activity.terminal_synthetic,
+            _empty_activity.saw_text,
+            _empty_activity.flushed_visible,
+            _empty_activity.had_tools,
+            _empty_activity.had_thinking,
+            _empty_activity.billed,
+        )
+    # Diagnostic-only drift sensor: exact matching stays the replay authority,
+    # while a blocker-adjacent near miss after proven read-only Kiro work is
+    # observable for future grammar decisions. Never log the model text.
+    if (
+        _stop_reason == STOP_REASON_END_TURN
+        and not _refusal_reasons
+        and tool_calls_are_read_only_preparation(
+            _turn_tool_calls,
+            tuple(_turn_tool_identities),
+            frozenset(_turn_successful_tool_call_ids),
+            builtin_identity_trusted=_builtin_identity_trusted,
+        )
+        and is_false_current_tool_blocker_near_miss(turn.assistant_text)
+    ):
+        logger.warning(
+            "False tool-blocker wording drift after %d proven read-only call(s) "
+            "for slot %s; replay skipped",
+            _turn_tool_calls,
+            slot.key,
+        )

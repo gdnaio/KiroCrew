@@ -35,6 +35,7 @@ import { claimDashboardOnLoad } from './dashboardOnLoad'
 import { suggestPaneDraft } from '../../utils/chatPaneDrafts'
 import { revealComposer } from '../chat/composerFocus'
 import { sessionTitleRoster } from '../../utils/sessionRoster'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 import { AnimatePresence, motion } from 'framer-motion'
 import { isSidePanelHidden, shouldMountSidePanel, sidePanelDockMotion } from '../chat/sidePanelMount'
 import SidePanel, { SIDE_PANEL_MIN_W, type SidePanelLeadingTab, type SidePanelWithholdable } from '../chat/SidePanel'
@@ -44,12 +45,13 @@ import { usePanelTabDescriptors } from '../../hooks/panelTabRegistry'
 import { usePanelDocumentActions } from '../../hooks/usePanelDocumentActions'
 import { useMemberDocumentComments } from '../../hooks/useMemberDocumentComments'
 import { useRunInTerminalBridge, useRunInTerminalRefs } from '../../hooks/useRunInTerminalBridge'
+import { useSlotRunsHere } from '../../components/sessionEnvironmentHooks'
 import { lastActivityEpoch } from '../chat/sessionOrder'
 import { type ChatSlot } from '../../types'
 import { type MembersPageProfileFlight, type MembersPageProfileState } from './MembersPageProfile'
 import { type MembersPageRosterView } from './MembersPageRoster'
 import { type MembersPageThreadState } from './MembersPageThread'
-import { CREW_DASHBOARD_TAB_ID, CREW_PANEL_TAB_IDS, DRIVING_VISIBLE, MEMBERS_UNCONFIRMED_WITHHELD_VIEWS, MEMBERS_WITHHELD_VIEWS, PANEL_GAPS_W, type ProfileCardOpen } from './membersPageModel'
+import { CREW_DASHBOARD_TAB_ID, CREW_PANEL_TAB_IDS, MEMBERS_UNCONFIRMED_WITHHELD_VIEWS, MEMBERS_WITHHELD_VIEWS, PANEL_GAPS_W, type ProfileCardOpen } from './membersPageModel'
 import { type MembersPageDrawers } from './useMembersPageDrawers'
 import { type MembersPageLayout } from './useMembersPageLayout'
 import { type MembersPageNavigation } from './useMembersPageNavigation'
@@ -83,9 +85,9 @@ export function useMembersPageSidePanel({
   layout, profileCard, drawers, rosterView, thread, navigate, location, queryClient, activeName, searchParams,
   setSearchParams, profile, setProfile, liveSlots, slotsLoaded, active, activeMemberName,
 }: MembersPageSidePanelStateOptions) {
-  const { isMobile, winW, beside, setOverlayOpen, setDockedOpen, panelVisible } = layout
+  const { winW, beside, setOverlayOpen, setDockedOpen, panelVisible } = layout
   const { openProfile, schedGuardRef, schedAtStakeRef } = profileCard
-  const { sidePanelPhase } = drawers
+  const { sidePanelPhase, panelSlides } = drawers
   const { crewmateLabel } = rosterView
   const { activeSlot, confirmedSlot, connected } = thread
   // Crewmate-panel IA: the right column rests at 60% of the content row (the
@@ -114,8 +116,7 @@ export function useMembersPageSidePanel({
   // on every WS slots frame and `lastActivityEpoch` advances whenever a worker
   // does anything, so sorting per render moves rows under the cursor mid-click —
   // and each row is a jump into a session, so a shifted row navigates into the
-  // WRONG one. It also decides which rows sit behind the DRIVING_VISIBLE fold,
-  // so a live re-sort can pull a row out from under the pointer entirely.
+  // WRONG one.
   // Row CONTENT still updates from every frame (status dot, title, timestamp);
   // only the positions hold, until the driven set changes (a worker opens or
   // closes) or the member does, either of which re-sorts from scratch by
@@ -235,13 +236,6 @@ export function useMembersPageSidePanel({
     if (!unmountsCard || !schedAtStakeRef.current()) { focus(); return }
     void schedGuardRef.current().then((ok) => { if (ok) focus() })
   }, [tabsCtl, beside, setDockedOpen, profile, schedAtStakeRef, schedGuardRef, setOverlayOpen, setProfile])
-  // The spawn_run launch card's "Open Subagents panel" (the one tool row a
-  // crewmate's chat draws, #21138). On the chat page the card drives the chat
-  // store's panel; here the panel is this page's own tab model, so the card
-  // takes this opener — the same reveal-and-focus path the Workspace tile
-  // uses for Files — and never touches `chat.activeSlot`, which this page
-  // deliberately leaves alone.
-  const openSubagentsView = useCallback(() => openCrewView('subagents'), [openCrewView])
   // Session routing inside the DM transcript. A crewmate's prose names sessions
   // constantly -- "picked this up in `chat-2235-…`", a `/chat?sid=…` link to the
   // worker it dispatched -- and until now every one of those was inert here
@@ -254,7 +248,10 @@ export function useMembersPageSidePanel({
   // snapshot has arrived and the socket is up: absent means "this surface does
   // not know which sessions exist", which is the honest answer then, and it
   // leaves the link plain rather than live-looking and dead.
-  const sessionRoster = useMemo(() => sessionTitleRoster(liveSlots), [liveSlots])
+  // Rebuilt on a language switch too: the roster's "Untitled session" label is localized (#23059).
+  const languageGeneration = useLanguageGeneration()
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- languageGeneration is the trigger, not an input
+  const sessionRoster = useMemo(() => sessionTitleRoster(liveSlots), [liveSlots, languageGeneration])
   // A foreign slot is NOT hosted in this page's own pane -- it belongs to the
   // chat page, with its sidebar, its history paging and its composer. Same
   // primitive the Driving-sessions rows use.
@@ -341,11 +338,11 @@ export function useMembersPageSidePanel({
   const mountInput = { activityOpen: panelVisible, hasLiveAppTab, hasBrowserTab, hasTaskDashboard, searchOpen: false }
   const panelMounted = shouldMountSidePanel(mountInput)
   const panelHidden = isSidePanelHidden(mountInput)
-  // Phone: the slide owns the overlay's presence. It stays mounted and shown
-  // while a drag is revealing it or a close is still carrying it out, which
-  // the open flag alone cannot say.
-  const sidePanelOnScreen = isMobile ? panelMounted || sidePanelPhase !== 'closed' : panelMounted
-  const sidePanelHiddenNow = isMobile ? panelHidden && sidePanelPhase === 'closed' : panelHidden
+  // Phone, and a desktop trackpad drag: the slide owns the panel's presence.
+  // It stays mounted and shown while a drag is revealing it or a close is
+  // still carrying it out, which the open flag alone cannot say.
+  const sidePanelOnScreen = panelSlides ? panelMounted || sidePanelPhase !== 'closed' : panelMounted
+  const sidePanelHiddenNow = panelSlides ? panelHidden && sidePanelPhase === 'closed' : panelHidden
   // File / artifact / save for the panel's Files, Artifacts and document tabs —
   // the chat page's own implementation, not a copy. A failed read is reported
   // above the thread; an open reveals whichever placement is live, since the
@@ -392,11 +389,20 @@ export function useMembersPageSidePanel({
   const runInTerminalReadyRef = useRef(slotRecordPresent)
   runInTerminalReadyRef.current = slotRecordPresent
   const runInTerminalRefs = useRunInTerminalRefs()
+  // The member chat's placement, as on the chat page: no dock shell here for a
+  // chat that runs in a Session Environment workspace.
+  const runsHere = useSlotRunsHere(confirmedSlot)
+  const runsHereRef = useRef(runsHere)
+  runsHereRef.current = runsHere
+  const runInTerminalSlotRef = useRef(confirmedSlot)
+  runInTerminalSlotRef.current = confirmedSlot
   const runInTerminalScope = useRunInTerminalBridge({
     queryClient,
     showActionError,
     cwdRef: runInTerminalCwdRef,
     readyRef: runInTerminalReadyRef,
+    runsHereRef,
+    slotRef: runInTerminalSlotRef,
     ...runInTerminalRefs,
   })
   // Transcript file links focus a side-panel tab, but the schedule draft now
@@ -435,12 +441,6 @@ export function useMembersPageSidePanel({
     committedDrivingRef.current = { member: activeMemberKey, keys }
     return keys.map((k) => byKey.get(k)).filter((s): s is (typeof mine)[number] => !!s)
   }, [liveSlots, activeMemberKey])
-  // Collapsed past DRIVING_VISIBLE rows. Keyed to the member: the fold is a
-  // reading position in ONE member's list, so switching members starts the
-  // next list folded rather than inheriting the previous member's expansion.
-  const [drivingExpandedFor, setDrivingExpandedFor] = useState('')
-  const drivingExpanded = drivingExpandedFor === activeMemberKey
-  const visibleDriving = drivingExpanded ? drivingSessions : drivingSessions.slice(0, DRIVING_VISIBLE)
   // A PREVIEW LINK -- `?dashboard=preview`, the link `dashboard_preview` hands the
   // crewmate to show the person -- opens the side panel on the Dashboard tab, where
   // the staged page is drawn under its preview label. Once per crewmate and strip
@@ -488,13 +488,13 @@ export function useMembersPageSidePanel({
 
   return {
     panelDefaultW, profileCardW, activeMemberKey, tabsCtl, projectDir, hiddenViews, openMemberSideChat,
-    openCrewWorkLog, openCrewView, openSubagentsView, sessionRoster, retryThreadsFlag, threadsFlagFailed, threadsFlagRetrying,
+    openCrewWorkLog, openCrewView, sessionRoster, retryThreadsFlag, threadsFlagFailed, threadsFlagRetrying,
     threadsOn, openThreadMid, threadsQuery, closeReplyThread, threadHooks, setShownTabId, schedAtStake,
     setSchedAtStake, schedReleased, schedulesMountedRef, dashboardVisitedFor, closeOverlay, sidePanelOnScreen,
     sidePanelHiddenNow, actionError, setActionError, actionInfo, showActionError, revealPanelAfterOpen, openArtifact,
     openFile, openWorkingTreeDiff, saveFile, submitComments, runInTerminalScope, openFileGuarded, openArtifactGuarded,
-    openSessionGuarded, drivingSessions, setDrivingExpandedFor, drivingExpanded, visibleDriving,
-    dashboardPreviewLink, focusPanelTab, leaveDashboardPreview, requestCloseOverlay,
+    openSessionGuarded, drivingSessions,
+    dashboardPreviewLink, focusPanelTab, leaveDashboardPreview, requestCloseOverlay, activeTabId,
   }
 }
 
@@ -521,9 +521,13 @@ export function MembersPageSidePanel({
   activeSlug, activeMemberName,
 }: MembersPageSidePanelProps) {
   const { t } = useTranslation()
+  // Files is the mate's own directory here, which its profile card already
+  // calls Workspace; the strip uses the same word.
+  const workspaceLabel = t('pages.membersPage.profile_workspace')
+  const viewTitles = useMemo(() => ({ files: workspaceLabel }), [workspaceLabel])
   const { roster, isMobile, rosterShown, beside, panelFillWidth } = layout
   const { openProfile, schedGuardRef, schedAtStakeRef, closeDocked } = profileCard
-  const { sidePanelX, sidePanelSlideRef } = drawers
+  const { sidePanelX, sidePanelSlideRef, panelSlides } = drawers
   const { activeView, crewmateLabel } = rosterView
   const { activeSlot, activeThreadFailed, confirmedSlot, connected } = thread
   const {
@@ -619,6 +623,7 @@ export function MembersPageSidePanel({
     // another session, whose remembered size a drag here must not take.
     persistSlot: confirmedSlot,
     hiddenViews,
+    viewTitles,
     onActiveTabChange: setShownTabId,
     projectDir,
     onFileOpen: openFile,
@@ -656,12 +661,26 @@ export function MembersPageSidePanel({
   // which read as a rendering fault) and the inner slides the panel in
   // from the right edge. Both axes are named in every target — see
   // sidePanelDockMotion for why an axis left out of `animate` freezes.
-  const outerMotion = beside
-    ? dockMotion
-    : isMobile
-      // Phone: the inner slide is the whole motion and the panel fills
-      // the window, so the outer neither fades nor dims.
-      ? { initial: false as const, animate: { opacity: 1 }, exit: { opacity: 1 } }
+  // `panelSlides`: the phone, or a desktop trackpad drag in progress. While it
+  // holds, the panel is a sheet on the right edge driven by `sidePanelX` (the
+  // finger's, then the settle's), in either desktop placement; the column takes
+  // it back once the drag has settled open.
+  const deskSlides = panelSlides && !isMobile
+  // The render that hands a settled drag back to its placement must not run the
+  // column's 180ms width reveal: the chat's spacer already stands at that width,
+  // so an animated swap would be the very step the spacer removes.
+  const wasDeskSliding = useRef(false)
+  const instantPlacement = deskSlides || wasDeskSliding.current
+  useEffect(() => { wasDeskSliding.current = deskSlides })
+  const outerMotion = deskSlides
+    // Desktop drag: the docked column's reveal left a px width on this element,
+    // which would pin the sheet to the left edge. Fill the row at once instead.
+    ? { initial: false as const, animate: { opacity: 1, width: '100%', height: '100%' }, exit: { opacity: 1 } }
+    : panelSlides
+    // The inner slide is the whole motion, so the outer neither fades nor dims.
+    ? { initial: false as const, animate: { opacity: 1 }, exit: { opacity: 1 } }
+    : beside
+      ? dockMotion
       : {
         initial: { opacity: 0, width: 'auto', height: '100%' },
         animate: { opacity: 1, width: 'auto', height: '100%' },
@@ -679,8 +698,13 @@ export function MembersPageSidePanel({
                       initial={outerMotion.initial}
                       animate={outerMotion.animate}
                       exit={outerMotion.exit}
-                      transition={{ duration: 0.18, ease: [0.2, 0, 0, 1] }}
-                      className={beside
+                      transition={instantPlacement ? { duration: 0 } : { duration: 0.18, ease: [0.2, 0, 0, 1] }}
+                      className={panelSlides
+                        ? isMobile
+                          ? 'fixed top-safe-offset-[42px] bottom-safe left-safe right-safe z-40 flex justify-end'
+                          // Desktop drag: no scrim, and the uncovered chat keeps its pointer.
+                          : 'fixed top-safe-offset-[42px] bottom-safe left-safe right-safe z-40 flex justify-end pointer-events-none [&>*]:pointer-events-auto'
+                        : beside
                         ? 'h-full overflow-visible flex justify-end shrink-0'
                         /* Both placements are dismissable, and the overlay carries a
                            second dismiss on top of the strip's close: the scrim,
@@ -688,24 +712,31 @@ export function MembersPageSidePanel({
                            handed the window width (`fillWidth`) so it fills the
                            scrim; on a tablet-width window the panel keeps its own
                            (resizable, persisted) width against the dimmed chat. */
-                        : isMobile
-                          ? 'fixed top-safe-offset-[42px] bottom-safe left-safe right-safe z-40 flex justify-end'
-                          : 'fixed top-safe-offset-[42px] bottom-safe left-safe right-safe z-40 flex justify-end bg-bg/60 backdrop-blur-xs'}
+                        : 'fixed top-safe-offset-[42px] bottom-safe left-safe right-safe z-40 flex justify-end bg-bg/60 backdrop-blur-xs'}
                       style={sidePanelHiddenNow ? { display: 'none' } : undefined}
                       // The scrim dismisses only the side panel. The Profile card is a
                       // sibling and stays mounted, including any schedule draft it holds.
-                      onClick={beside ? undefined : (e) => { if (e.target === e.currentTarget) requestCloseOverlay() }}
+                      onClick={beside || (panelSlides && !isMobile) ? undefined : (e) => { if (e.target === e.currentTarget) requestCloseOverlay() }}
                       data-testid="member-side-panel"
                       data-placement={beside ? 'docked' : 'overlay'}
+                      data-sliding={panelSlides && !isMobile ? 'true' : undefined}
+                      // A native Browser view cannot follow a slide that only
+                      // moves the panel: hidden (kept) until it docks.
+                      data-native-overlay={panelSlides && !isMobile ? '' : undefined}
                     >
                       <motion.div
-                        // Phone: the offset is the finger's and the settle's
+                        // Always attached: a motion element binds its ref once, at
+                        // mount, so a ref handed over only when a drag starts on an
+                        // already-mounted overlay never lands, and the drag's travel
+                        // fell back to the window width.
+                        ref={sidePanelSlideRef}
+                        // Sliding: the offset is the finger's and the settle's
                         // (`sidePanelX`), so no enter/exit of its own competes.
-                        {...(isMobile
-                          ? { ref: sidePanelSlideRef, style: { x: sidePanelX } }
+                        {...(panelSlides
+                          ? { style: { x: sidePanelX } }
                           : { initial: innerMotion.initial, animate: innerMotion.animate, exit: innerMotion.exit })}
                         transition={{ duration: 0.18, ease: [0.2, 0, 0, 1] }}
-                        className={beside ? 'h-full flex justify-end relative' : 'h-full flex justify-end max-w-full relative'}
+                        className={beside && !panelSlides ? 'h-full flex justify-end relative' : 'h-full flex justify-end max-w-full relative'}
                         data-testid="member-side-panel-slide"
                       >
                         {/* The open reply thread covers the panel's tabs while it is on

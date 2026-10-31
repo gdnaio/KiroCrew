@@ -802,8 +802,10 @@ class TestWorkflowRunIntegration:
         with patch("kiro_crew.taskrunner.time.time_ns", return_value=123):
             first, second = await asyncio.gather(runner.plan("first"), runner.plan("second"))
 
-        assert first.task_id == "plan_123"
-        assert second.task_id == "plan_124"
+        # plan() awaits before it takes _start_lock, so either call may reach
+        # the id allocation first. Only distinctness is the contract here.
+        assert first.task_id != second.task_id
+        assert {first.task_id, second.task_id} == {"plan_123", "plan_124"}
         assert set(runner._runs) == {"plan_123", "plan_124"}
 
     @pytest.mark.asyncio
@@ -1172,14 +1174,12 @@ class TestRun:
         assert len(result.tasks) == 2  # 2 decomposed steps
         assert all(s.status == StepStatus.PASSED for s in result.tasks)
 
-        # Check progress file was written
         progress = tmp_path / PROGRESS_FILE
         assert progress.exists()
         content = progress.read_text(encoding="utf-8")
         assert "completed" in content
         assert "Create file" in content
 
-        # Check notifications were sent
         assert any("Task started" in t for t, _ in notifications)
         assert any("Task completed" in t for t, _ in notifications)
 
@@ -1237,10 +1237,20 @@ class TestRun:
 
 
 class TestCancel:
-    def test_cancel_not_running(self) -> None:
+    def test_cancel_not_running(self, tmp_path: Path) -> None:
         sessions = _make_mock_sessions()
-        runner = TaskRunner(sessions=sessions, auto_test=False)
-        runner.cancel()  # should not raise
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
+        runner.cancel()  # no runs: must not raise
+        for status in ("planned", "paused", "completed"):
+            runner._runs[status] = TaskRun(
+                task_id=status, spec_path="", spec_content="", status=status
+            )
+        runner.cancel()
+        assert {k: r.status for k, r in runner._runs.items()} == {
+            "planned": "planned",
+            "paused": "paused",
+            "completed": "completed",
+        }
 
     def test_running_property(self) -> None:
         sessions = _make_mock_sessions()

@@ -127,7 +127,7 @@ def test_every_crew_log_off_refusal_names_the_env_file_the_gateway_reads(
         "mcp_ledger": mcp_ledger,
     }[refusal]
     source = inspect.getsource(module)
-    if refusal == "crew_store":  # a mirror facade: its code is in the owners it lists
+    if refusal in ("crew_store", "work_ledger"):  # mirror facades: code is in their owners
         source += "".join(inspect.getsource(importlib.import_module(o)) for o in module._OWNERS)
     assert "~/.kiro/crew/.env" not in source
     assert "env_file_display()" in source
@@ -389,6 +389,11 @@ class TestTheDispatchFence:
         from kiro_crew.crew_log import read as crew_log_read
 
         crew_log_read._TREE._heads.clear()
+        # The first request seeded the session tree projection from the intact log;
+        # drop it so the second request reads the damaged store as a new process does.
+        from kiro_crew.crew_log import session_tree_projection
+
+        session_tree_projection.reset_for_tests()
 
         short = _as_conductor(
             f"/api/crew-log/units/{GRANDCHILD_UNIT}/page", match={"unit": GRANDCHILD_UNIT}

@@ -22,14 +22,23 @@ from aiohttp import web
 
 from kiro_crew import model_registry
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable, is_valid_timezone, parse_time_string
-from kiro_crew.dashboard.cron_inject import chat_folder_exists, move_cron_job_tab
+from kiro_crew.cron_service.model import validate_auto_pause_after_failures
+from kiro_crew.dashboard.cron_inject import (
+    chat_folder_exists,
+    chat_folder_move_refuses_store,
+    chat_folder_refuses_store,
+    move_cron_job_tab,
+)
+from kiro_crew.dashboard.cron_timeout_field import timeout_secs_from_body
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.dashboard.handlers.cron_shared import (
     _CRON_BUSY_BODY,
     _CRON_BUSY_STATUS,
+    _app_caller,
     _cron_unreadable_response,
     _invalid_path_id_response,
     _refuse_foreign_app_job,
+    _sel,
 )
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -343,6 +352,71 @@ def _unknown_chat_folder_response() -> web.Response:
     )
 
 
+def _refuse_mate_home_chat_folder(
+    request: web.Request,
+    state: DashboardState,
+    chat_folder_id: str,
+    memory_store: str,
+    operation: str,
+    current_chat_folder_id: str = "",
+) -> web.Response | None:
+    """A 403 ``mate_home_locked`` when the job's tab could never be filed in *chat_folder_id*.
+
+    A mate's home and the folders inside it hold only that mate's sessions, and a
+    job's tab runs on the job's memory store: a job on any other store would be
+    saved with a folder its runs are never placed in. *current_chat_folder_id*
+    is the folder an existing job is filed in: moving its tab out of a mate's
+    home its store may not write is refused the same way. Refused here, while a
+    person is present to be told, and recorded like the routes' other denials.
+    """
+    if not chat_folder_move_refuses_store(
+        state, current_chat_folder_id, chat_folder_id, memory_store
+    ):
+        return None
+    moving_out = not chat_folder_refuses_store(state, chat_folder_id, memory_store)
+    app = _app_caller(request)
+    resources = f"chat_folder_id={chat_folder_id}"
+    if moving_out:
+        resources += f",current_chat_folder_id={current_chat_folder_id}"
+    try:
+        _sel().log_api_access(
+            caller=f"app:{app}" if app else "dashboard",
+            operation=operation,
+            outcome="denied",
+            source="dashboard",
+            resources=resources,
+            error="mate_home_locked",
+        )
+    except Exception:  # pragma: no cover - audit must never change the outcome
+        logger.debug("SEL audit for %s failed", operation, exc_info=True)
+    error = (
+        "This schedule's runs are filed in a mate's folder, and only that mate can "
+        "move them out."
+        if moving_out
+        else "That chat folder belongs to a mate, so this schedule's runs cannot be "
+        "filed there. Pick another folder, or choose not to file runs."
+    )
+    return web.json_response({"error": error, "code": "mate_home_locked"}, status=403)
+
+
+def _member_store(member_id: str) -> str:
+    """The memory store a schedule bound to *member_id* runs on, or ``""``. Blocking.
+
+    ``""`` (the person's) also for a member that does not resolve: the create
+    refuses that member anyway, and ``""`` is kept out of every mate's home.
+    """
+    if not member_id:
+        return ""
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.execution_context import resolve_member_execution
+
+    try:
+        execution = resolve_member_execution(KiroCrewConfig.load(), member_id)
+    except Exception:
+        return ""
+    return execution.store.legacy_name
+
+
 class _ChatFolderGone(Exception):
     """The job's chat folder was deleted before the save could commit."""
 
@@ -382,7 +456,11 @@ async def api_crons_create(request: web.Request) -> web.Response:
     # declarable paths (see ``docs/app-kit/api-reference.md``). No
     # ``internal_auth`` clause: this route has no ``X-Internal-Secret`` caller,
     # and a clause naming one would exempt a future caller nobody reviewed.
-    if request.get("app") == "":
+    # The test is ``not app`` rather than ``app == ""``: an internal-secret
+    # request carries no ``app`` key at all, and must meet the owner gate too
+    # (same shape as the file and workflow routes) -- this and the sibling
+    # delete/batch-delete/update/enable gates below.
+    if not request.get("app"):
         # Body-scope import, like the sibling gates in this package
         # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
         # reaches back into sibling handler modules, so importing the helper at
@@ -444,6 +522,14 @@ async def api_crons_create(request: web.Request) -> web.Response:
         return web.json_response({"error": "invalid approval_mode"}, status=400)
     silent = body.get("silent", False)
     strict_schedule = body.get("strict_schedule", False)
+    # ``False`` creates the job already paused in the one locked write, so a
+    # caller that must never leave it running (an imported crewmate's cron)
+    # has no enabled-then-paused window. Only a real bool is honoured.
+    enabled = body.get("enabled", True)
+    if not isinstance(enabled, bool):
+        return web.json_response(
+            {"error": "enabled must be a boolean", "code": "invalid_enabled"}, status=400
+        )
     hide_in_chat = body.get("hide_in_chat", False)
     # A job created on a full context pays for memory, lessons, steering, skills
     # and prior history on every wake, whether or not the wake had anything to
@@ -456,6 +542,9 @@ async def api_crons_create(request: web.Request) -> web.Response:
     # here too, so a client that never sends the field keeps creating the same
     # persistent jobs it always did; only an explicit False opts a job out.
     persistent_session = body.get("persistent_session", True)
+    timeout_secs, timeout_err = timeout_secs_from_body(body)
+    if timeout_err is not None:
+        return timeout_err
     # Same folder_id contract as PATCH /api/crons/{id}: string or null → "",
     # anything else is a 400 so the two entry points cannot diverge.
     folder_id = body.get("folder_id", "")
@@ -509,6 +598,18 @@ async def api_crons_create(request: web.Request) -> web.Response:
     agent_id, member_id = await asyncio.to_thread(
         split_cron_agent_member, agent_id or "", member_id or ""
     )
+    # Kept out of a mate's home even as the person; the member is resolved only
+    # when the folder is in one.
+    if chat_folder_refuses_store(state, chat_folder_id, ""):
+        refused = _refuse_mate_home_chat_folder(
+            request,
+            state,
+            chat_folder_id,
+            await asyncio.to_thread(_member_store, member_id or ""),
+            "crons.create",
+        )
+        if refused is not None:
+            return refused
     add_kwargs: dict[str, Any] = {
         "channel": channel,
         "agent_id": (agent_id or ""),
@@ -532,6 +633,10 @@ async def api_crons_create(request: web.Request) -> web.Response:
     }
     if approval_mode:
         add_kwargs["approval_mode"] = approval_mode
+    if not enabled:
+        add_kwargs["enabled"] = False
+    if timeout_secs is not None:
+        add_kwargs["timeout_secs"] = timeout_secs
     # An app token's job is stamped as that app's, exactly as ``CronSDK`` stamps
     # it: without the stamp every later reader (the app's own PATCH/DELETE, the
     # cron session's scope, the disabled-app fire gate, uninstall cleanup) takes
@@ -590,12 +695,16 @@ async def api_crons_create(request: web.Request) -> web.Response:
             {"error": _redact_memory_field(str(exc)), "code": "invalid_cron"}, status=400
         )
     state.push_refresh("crons")
-    return web.json_response({"ok": True, "id": job.id})
+    from kiro_crew.dashboard.change_cards import cron_job_revision
+
+    # The fingerprint of the job as this write made it: a card step records it,
+    # so its Undo's baseline is what the card made, not a later edit.
+    return web.json_response({"ok": True, "id": job.id, "revision": cron_job_revision(job)})
 
 
 async def api_cron_delete(request: web.Request) -> web.Response:
     """DELETE /api/crons/{id} — remove a cron job."""
-    if request.get("app") == "":
+    if not request.get("app"):
         owner_denied = await require_owner_dashboard_request(request, "crons.delete")
         if owner_denied is not None:
             return owner_denied
@@ -661,7 +770,7 @@ async def api_cron_batch_delete(request: web.Request) -> web.Response:
     purged per successfully-removed job, mirroring the single-delete path, and a
     single ``crons`` refresh is pushed after the batch instead of one per id.
     """
-    if request.get("app") == "":
+    if not request.get("app"):
         owner_denied = await require_owner_dashboard_request(request, "crons.batch_delete")
         if owner_denied is not None:
             return owner_denied
@@ -712,7 +821,7 @@ async def api_cron_batch_delete(request: web.Request) -> web.Response:
 
 async def api_cron_update(request: web.Request) -> web.Response:
     """PATCH /api/crons/{id} — update a cron job (partial)."""
-    if request.get("app") == "":
+    if not request.get("app"):
         owner_denied = await require_owner_dashboard_request(request, "crons.update")
         if owner_denied is not None:
             return owner_denied
@@ -749,6 +858,11 @@ async def api_cron_update(request: web.Request) -> web.Response:
     ):
         if key in body:
             kwargs[key] = body[key]
+    timeout_secs, timeout_err = timeout_secs_from_body(body)
+    if timeout_err is not None:
+        return timeout_err
+    if timeout_secs is not None:
+        kwargs["timeout_secs"] = timeout_secs
     # name routes through the same validator as POST (type check +
     # sanitize_string + length cap) so the two REST surfaces cannot diverge:
     # without it PATCH would pass the value through unvalidated, letting a
@@ -788,6 +902,34 @@ async def api_cron_update(request: web.Request) -> web.Response:
         if chat_folder_err is not None:
             return chat_folder_err
         kwargs["chat_folder_id"] = resolved
+    # The folder the job's tab is moved to: an explicit one, or none when
+    # persistence is turned off (the store then clears a filed job's folder).
+    next_chat_folder: str | None = kwargs.get("chat_folder_id")
+    if next_chat_folder is None and "persistent_session" in kwargs:
+        next_chat_folder = "" if not kwargs["persistent_session"] else None
+    # Function-local: ``mate_folders`` reaches this module back through the folder records.
+    from kiro_crew.dashboard.mate_folders import is_mate_home
+
+    if next_chat_folder is not None and any(is_mate_home(folder) for folder in state._folders):
+        # The move may go into or out of a mate's home. A schedule's member, and so its store, is
+        # fixed once created, so the store the job already runs on decides.
+        existing = await state.crons.get_job_async(job_id)
+        # An unreadable store loads as no job, which would skip the refusal.
+        try:
+            state.crons.raise_if_store_unreadable()
+        except CronStoreUnreadable as exc:
+            return _cron_unreadable_response(exc)
+        if existing is not None:
+            refused = _refuse_mate_home_chat_folder(
+                request,
+                state,
+                next_chat_folder,
+                str(getattr(existing, "memory_store", "") or ""),
+                "crons.update",
+                current_chat_folder_id=str(getattr(existing, "chat_folder_id", "") or ""),
+            )
+            if refused is not None:
+                return refused
     if "chat_folder_id" in kwargs or "persistent_session" in kwargs:
         # Turning persistence off clears a filed job's folder in the store, so
         # that edit moves the tab through the same path an explicit clear does.
@@ -839,6 +981,32 @@ async def api_cron_update(request: web.Request) -> web.Response:
             safe_tz, _ = redact_credentials(redact_exfiltration_urls(tz_val)[0])
             return web.json_response({"error": f"invalid timezone: {safe_tz!r}"}, status=400)
         kwargs["timezone"] = tz_val
+    # Checked here, before the store is touched, so a bad value is a 400 the
+    # form can name rather than a ValueError from the write. ``null`` is refused
+    # too: the store reads ``None`` as "leave unchanged", which would turn a
+    # malformed request into a silent no-op.
+    if "auto_pause_after_failures" in body:
+        try:
+            kwargs["auto_pause_after_failures"] = validate_auto_pause_after_failures(
+                body["auto_pause_after_failures"]
+            )
+        except ValueError as exc:
+            return web.json_response(
+                {"error": str(exc), "code": "invalid_auto_pause_after_failures"}, status=400
+            )
+        # The store files the limit-change audit row under this name, so it
+        # names who made the write: an app token's write is filed under
+        # ``app:<name>``, the name ``_refuse_foreign_app_job`` records for the
+        # same request, and an owner write keeps the forwarded marker
+        # ``audit_actor`` adds. A fixed "dashboard" would file an app turning
+        # off its own job's breaker as the person's action.
+        # Function-local, as for ``_apply_security_headers`` in portability.py:
+        # ``audit_actor``'s module reads its helpers from ``dashboard.server``,
+        # which imports the handlers.
+        from kiro_crew.dashboard.server import audit_actor
+
+        app = _app_caller(request)
+        kwargs["audit_actor"] = f"app:{app}" if app else audit_actor(request, "dashboard")
     if not kwargs:
         return web.json_response({"error": "no fields to update"}, status=400)
     try:
@@ -876,7 +1044,7 @@ async def api_cron_update(request: web.Request) -> web.Response:
 
 async def api_cron_enable(request: web.Request) -> web.Response:
     """POST /api/crons/{id}/enable — toggle enable/disable."""
-    if request.get("app") == "":
+    if not request.get("app"):
         owner_denied = await require_owner_dashboard_request(request, "crons.enable")
         if owner_denied is not None:
             return owner_denied

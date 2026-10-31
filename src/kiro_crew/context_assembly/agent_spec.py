@@ -42,6 +42,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("kiro_crew.context")
 
+_WIDGET_TOKEN = "{{WIDGET_BLOCK}}"
+
+#: Built-in agents whose spec prompt asks for widgets (the conductor's
+#: introduction card and task board) and so get the per-surface widget pointer
+#: in their ``[AGENT SYSTEM PROMPT]`` block. ``kirocrew-ledger-conductor`` is the
+#: conductor's deprecated alias with the same body. ``kirocrew-worker`` is absent
+#: on purpose: it reports to the work ledger, not to a person.
+WIDGET_BLOCK_AGENTS = frozenset({"kirocrew-conductor", "kirocrew-ledger-conductor"})
+
 
 def steering_target_admissible(resolved: Path, base: Path | None = None) -> bool:
     """Admission gate for a steering document's RESOLVED path.
@@ -420,10 +429,10 @@ def _resolve_prompt_templates(
     the model can actually fan out to: ``cap_figure`` when the caller holds
     that session's reading, otherwise a live one. Resolved for every
     transport (not just dashboard), before the widget-block branch.
-    ``{{COMPUTER_USE_BLOCK}}`` is the full Computer Use section only when the
-    agent spec mounts ``kirocrew-computer`` (``computer_use`` when the caller
-    holds that session's reading, otherwise a live one), and a short pointer
-    to the setting when it does not. The section marked by ``{{BROWSER_BEGIN}}``
+    ``{{COMPUTER_USE_BLOCK}}`` is empty when the agent spec mounts
+    ``kirocrew-computer`` (``computer_use`` when the caller holds that session's
+    reading, otherwise a live one), because the server's MCP ``instructions``
+    carry its usage text, and a short pointer to the setting when it does not. The section marked by ``{{BROWSER_BEGIN}}``
     and ``{{BROWSER_END}}`` stays while browsing is set up on this host
     (``browser``, or a live reading), and becomes a short pointer while it is not.
     """
@@ -466,8 +475,18 @@ def _resolve_prompt_templates(
     return prompt.replace("{{WIDGET_BLOCK}}", _sections.widget_block(density))
 
 
-def _load_agent_prompt(agent: str, project: str | None = None, *, owner_template: str = "") -> str:
-    """Read the resolved execution prompt, excluding an owner source in essentials."""
+def _load_agent_prompt(
+    agent: str,
+    project: str | None = None,
+    *,
+    owner_template: str = "",
+    spec_path: Path | None = None,
+) -> str:
+    """Read the resolved execution prompt, excluding an owner source in essentials.
+
+    *spec_path* is the file a pinned session runs from (``skill_scope_pin``), read
+    by its path instead of resolving *agent* by name project-first.
+    """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
     from kiro_crew.agent_discovery import _read_agent_spec
     from kiro_crew.member_essential_context import (
@@ -476,7 +495,7 @@ def _load_agent_prompt(agent: str, project: str | None = None, *, owner_template
     )
 
     try:
-        path = resolve_template_path(agent, project)
+        path = spec_path or resolve_template_path(agent, project)
         if path is None:
             return ""
         data = _read_agent_spec(path, operation="agent_prompt", source="context")
@@ -515,6 +534,52 @@ def _load_agent_prompt(agent: str, project: str | None = None, *, owner_template
         return ""
 
 
+def _crewmate_worker_prompt(agent: str, base_prompt: str, session_key: str) -> str:
+    """*base_prompt*, or for a crewmate's worker session the prompt its worker runs.
+
+    *base_prompt* is the contract this block selected (the worker is a default-named
+    agent, so the default one). A worker session gets the worker's own principles
+    after it, in the shape ``service_agents._install_mate_worker_agent`` writes the
+    on-disk base, then its crewmate's addition, read through the one seam
+    (``mate_worker.worker_session_spec``, the session's execution record) that KAS's
+    wire spec and the mirrored hosts' MCP array read too. The addition is worked
+    out against the on-disk worker base, the literal base KAS hands the seam, so a
+    crewmate file whose prompt repeats that base adds nothing here either. Only a worker whose
+    backend gets its prompt from this block alone
+    (``ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT``: claude)
+    carries both here; KAS's wire spec already does, so its block keeps the base.
+    Any other agent, or no session, keeps the base too.
+    """
+    from kiro_crew.mate_worker import (
+        MATE_WORKER_AGENT,
+        MATE_WORKER_PROMPT,
+        WorkerKitUnreadable,
+        worker_prompt_in_context_block,
+        worker_session_spec,
+    )
+
+    if agent != MATE_WORKER_AGENT or not session_key or not base_prompt:
+        return base_prompt
+    if not worker_prompt_in_context_block(session_key):
+        return base_prompt
+    worker_base = f"{base_prompt.rstrip()}\n\n{MATE_WORKER_PROMPT}"
+    from kiro_crew.agent_sdk.agent_specs import AgentSpecUnreadable
+    from kiro_crew.mate_config_migration import _worker_base
+
+    try:
+        disk = _worker_base().get("prompt")
+        disk_prompt = disk if isinstance(disk, str) else ""
+        merged = worker_session_spec({"prompt": disk_prompt}, session_key).get("prompt")
+    except (WorkerKitUnreadable, AgentSpecUnreadable):
+        # The session itself is refused where its spec is projected; the
+        # contract keeps the worker's base rather than failing the turn's assembly.
+        logger.warning("worker session %s: crewmate prompt unreadable", session_key)
+        return worker_base
+    merged = merged if isinstance(merged, str) else ""
+    addition = merged[len(disk_prompt) :].strip() if merged.startswith(disk_prompt) else ""
+    return f"{worker_base}\n\n{addition}" if addition else worker_base
+
+
 def _resolve_agent_prompt(
     self,
     agent: str | None,
@@ -534,8 +599,9 @@ def _resolve_agent_prompt(
     that restores the block reuses the session's own.
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
+    from kiro_crew.agent_files import is_kirocrew_default_agent
 
-    is_custom = bool(agent) and agent != "kirocrew"
+    is_custom = bool(agent) and not is_kirocrew_default_agent(agent)
     agent_prompt: str
     if is_cc and not is_custom:
         # CC gets the same Kiro Crew persona prompt as kiro — including
@@ -554,12 +620,25 @@ def _resolve_agent_prompt(
             agent_prompt = ""
     elif is_custom:
         agent_prompt = self._load_agent_prompt(
-            agent or "", project, owner_template=(agent or "") if private_owner else ""
+            agent or "",
+            project,
+            owner_template=(agent or "") if private_owner else "",
+            spec_path=ctx.pinned_session_skill_spec(session_key),
         )
     else:
         pp = ctx._prompt_path()
         logger.debug("Prompt selection: mode=%r → %s", mode, pp)
         agent_prompt = _read_prompt_file(pp)
+    # After every branch: the worker is a default-named agent, so it takes the
+    # default contract above, and its crewmate's prompt follows that base.
+    agent_prompt = _crewmate_worker_prompt(agent or "", agent_prompt, session_key or "")
+    # A built-in spec whose own prompt asks for widgets gets the widget pointer
+    # here rather than as a token in its spec: kiro-cli loads that spec prompt
+    # natively and a crewmate's essentials deliver it verbatim, and neither path
+    # resolves a token. This block is the one copy that is resolved per surface,
+    # and the only one a private crewmate gets, so it may hold just the pointer.
+    if agent in WIDGET_BLOCK_AGENTS and _WIDGET_TOKEN not in agent_prompt:
+        agent_prompt = f"{agent_prompt}\n\n{_WIDGET_TOKEN}" if agent_prompt else _WIDGET_TOKEN
     if not agent_prompt:
         return ""
     # Any host-derived token in this prompt must be snapshotted per session:
@@ -591,4 +670,8 @@ def _resolve_agent_prompt(
     agent_prompt = self._resolve_prompt_templates(
         agent_prompt, session_key or "", cap_figure, computer_use=computer_use, browser=browser
     )
+    # Off the dashboard the pointer resolves to nothing, which leaves a prompt
+    # that held only the pointer empty: no block rather than a blank one.
+    if not agent_prompt.strip():
+        return ""
     return self._substitute_bot_name(agent_prompt)

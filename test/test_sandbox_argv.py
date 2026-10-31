@@ -13,7 +13,6 @@ from __future__ import annotations
 import os
 import sys
 import threading
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,6 +20,7 @@ import sandbox_argv_helpers
 
 import kiro_crew.sandbox as sandbox_mod
 from kiro_crew.sandbox import sandbox_exec_argv, wrap_argv
+from kiro_crew.testing.wait import wait_until
 
 # Several tests spawn real child interpreters (subprocess.run([sys.executable, ...]));
 # pin the module to a dedicated xdist worker so concurrent cold-starts under -n auto
@@ -139,8 +139,10 @@ class TestKiroInternalSandboxExclusion:
                 return_value=(["sandbox-exec", "python3"], "/tmp/p.sb"),
             ) as mock_sb,
         ):
-            wrap_argv(["python3", "-m", "worker"], mode="auto")
+            result = wrap_argv(["python3", "-m", "worker"], mode="auto")
         mock_sb.assert_called_once()
+        assert mock_sb.call_args.args[0] == ["python3", "-m", "worker"]
+        assert result == (["sandbox-exec", "python3"], "/tmp/p.sb")
 
     def test_darwin_kiro_disabled_stays_wrapped(self, tmp_path, monkeypatch):
         """kiro sandbox OFF -> KiroCrew's seatbelt ON (the inverse rule)."""
@@ -153,8 +155,10 @@ class TestKiroInternalSandboxExclusion:
                 return_value=(["sandbox-exec", "kiro-cli"], "/tmp/p.sb"),
             ) as mock_sb,
         ):
-            wrap_argv(["kiro-cli", "acp"], mode="auto")
+            result = wrap_argv(["kiro-cli", "acp"], mode="auto")
         mock_sb.assert_called_once()
+        assert mock_sb.call_args.args[0] == ["kiro-cli", "acp"]
+        assert result == (["sandbox-exec", "kiro-cli"], "/tmp/p.sb")
 
     def test_linux_unaffected(self, tmp_path, monkeypatch):
         """Mutual exclusion is macOS-only — Linux namespace path unchanged."""
@@ -172,8 +176,11 @@ class TestKiroInternalSandboxExclusion:
                 ],
             ) as mock_ns,
         ):
-            wrap_argv(["kiro-cli", "acp"], mode="auto")
+            argv, cleanup = wrap_argv(["kiro-cli", "acp"], mode="auto")
         mock_ns.assert_called_once()
+        assert mock_ns.call_args.args[0] == ["kiro-cli", "acp"]
+        assert argv == mock_ns.return_value
+        assert cleanup == "/tmp/launcher.py"
 
     def test_windows_explicit_kiro_backend_delegates_before_backend_probe(self, monkeypatch):
         """Fresh Windows installs use the positively identified Kiro sandbox."""
@@ -415,6 +422,9 @@ class TestMacOsNestingDetection:
         # unconditionally — that would brick in-sandbox spawns wherever the probe
         # is unavailable.
         monkeypatch.setenv("KIROCREW_SANDBOX_ACTIVE", "1")
+        # Unknown outer tier, so a `strict` request proves no downgrade and the argv
+        # passes through unchanged; a host `standard` would add the env-scrub wrap.
+        monkeypatch.delenv("KIROCREW_SANDBOX_LEVEL", raising=False)
         monkeypatch.setattr(sandbox_mod, "_macos_sandbox_state", lambda: None)
         with patch("kiro_crew.sel.sel"):
             result, _ = wrap_argv(["kiro-cli", "acp"], mode="strict")
@@ -465,8 +475,10 @@ class TestMacOsNestingDetection:
         monkeypatch.setattr(sandbox_mod, "_macos_sandbox_state", lambda: True)
         with patch("kiro_crew.sandbox.sandbox_exec_argv") as mock_sb:
             mock_sb.return_value = (["sandbox-exec", "-f", "/tmp/p.sb", "git"], "/tmp/p.sb")
-            wrap_argv(["git", "status"], mode="standard")
+            result = wrap_argv(["git", "status"], mode="standard")
         mock_sb.assert_called_once()
+        assert mock_sb.call_args.args[0] == ["git", "status"]
+        assert result == (["sandbox-exec", "-f", "/tmp/p.sb", "git"], "/tmp/p.sb")
 
     def test_kernel_state_is_none_off_darwin(self, monkeypatch):
         # Linux namespace isolation must be unaffected by the macOS-only probe,
@@ -551,11 +563,7 @@ class TestAgentSliceMemoryHigh:
                 # live config after the first releases it.
                 sb._reconcile_slice_memory_high_off_thread()
                 release.set()
-                for _ in range(200):
-                    if len(calls) == 2:
-                        break
-                    time.sleep(0.01)
-            assert len(calls) == 2
+                wait_until(lambda: len(calls) == 2, describe=lambda: f"reconcile calls: {calls}")
         finally:
             self._restore()
 
@@ -873,7 +881,7 @@ class TestAgentSliceMemoryHigh:
     def test_slice_memory_events_high_reads_counter(self, tmp_path):
         import kiro_crew.sandbox as sb
 
-        evt = tmp_path / "memory.events"
+        evt = tmp_path / "memory.events.local"
         evt.write_text("low 0\nhigh 42\nmax 1\noom 0\noom_kill 0\n", encoding="utf-8")
         with patch("kiro_crew.sandbox._agents_slice_cgroup_dir", return_value=tmp_path):
             assert sb._slice_memory_events_high() == 42
@@ -891,14 +899,14 @@ class TestAgentSliceMemoryHigh:
     def test_slice_memory_events_high_resolves_dash_hierarchy(self, tmp_path):
         """Regression: on the standard systemd layout the agents slice nests
         under kirocrew.slice (dash-hierarchy), NOT directly under
-        user@<uid>.service. The reader must find memory.events through the
+        user@<uid>.service. The reader must find memory.events.local through the
         real resolver on that layout — a hardcoded flat path would miss it,
         silently disabling the throttle warning."""
         import kiro_crew.sandbox as sb
 
         nested = tmp_path / "kirocrew.slice" / sb._CGROUP_AGENTS_SLICE
         nested.mkdir(parents=True)
-        (nested / "memory.events").write_text(
+        (nested / "memory.events.local").write_text(
             "low 0\nhigh 7\nmax 0\noom 0\noom_kill 0\n", encoding="utf-8"
         )
         with patch.object(sb, "_USER_MANAGER_CGROUP_BASE", str(tmp_path)):

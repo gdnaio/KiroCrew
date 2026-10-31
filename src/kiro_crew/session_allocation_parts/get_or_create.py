@@ -34,6 +34,7 @@ from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from kiro_crew.agent_sdk.kas_floor_wait import await_kas_floor_verdict
 from kiro_crew.aws_project_profiles import (
     AWS_PROFILE_ENV,
     bound_profile_env,
@@ -63,6 +64,18 @@ from kiro_crew.start_priority import (
 
 if TYPE_CHECKING:
     from kiro_crew.session_allocation import LLMProvider, ProviderFactory, SessionAllocationService
+
+
+async def _session_runs_remotely(session_key: str) -> bool:
+    """Whether this session is bound to a remote session environment.
+
+    Fails closed: an unreadable choice record answers True, so the session
+    cold-starts and the runtime seam reports the error instead of a warm local
+    engine quietly serving it.
+    """
+    from kiro_crew.session_environment import session_runs_remotely
+
+    return await asyncio.to_thread(session_runs_remotely, session_key)
 
 
 async def _reacquire_and_validate(
@@ -115,14 +128,20 @@ async def _reacquire_and_validate(
 
 
 def _release_reacquired(self: SessionAllocationService, key: str, session: Any) -> None:
-    """Give back the permit :meth:`_reacquire_and_validate` took, unless a reset already did.
+    """Give back the permit :meth:`_reacquire_and_validate` took, unless a teardown already did.
 
-    A reset that pops the session while this task waits for the lock records
+    A teardown that pops the session while this task waits for the lock records
     this task as the permit's holder and releases the permit to wake the
-    claimants parked on it (``session_lifecycle._wake_turn_waiters``), so a
+    claimants parked on it (``session_lifecycle.retire_turn_permit``), so a
     second release here would over-release it. Only a popped session can
     carry that record, so a session still registered is always released.
     """
+    # The holding ends here whichever branch gives the permit back, so the record
+    # goes first: a teardown that pops the session later must not name this task
+    # as the holder of a permit it has given back (or one already handed to the
+    # next claimant), or it would release that permit a second time.
+    if session.turn_owner is asyncio.current_task():
+        session.turn_owner = None
     if self._sessions.get(key) is not session and self._owner.absorb_orphaned_release(key):
         return
     session.semaphore.release()
@@ -136,6 +155,10 @@ async def _evict_stale_session(self: SessionAllocationService, key: str, session
             del self._sessions[key]
             self.advance_ownership_generation(key)
             dead = session.provider
+            # Same lock hold as the removal, before any await: a turn still
+            # holding this permit is recorded and its parked claimants woken,
+            # exactly as every lifecycle teardown verb does.
+            self._owner.retire_turn_permit(key, session)
             # Same tick as the removal. Left unrecorded, the start crumb
             # survives and the next boot calls this a crash.
             await record_session_ended(key, end_reason=END_REASON_EVICTED)
@@ -421,6 +444,14 @@ async def _get_or_create_impl(
     # no provider factory is handed a key it does not know; each retry below
     # hands it back.
     app_name = str(extra_factory_kwargs.pop("app_name", "") or "")
+    # The app whose governance profile the session runs under, for a caller
+    # (a subagent's spawn) that must carry an app's governance without taking
+    # its model. Defaults to ``app_name``: an app slot's own session is both.
+    owning_app = str(extra_factory_kwargs.pop("owning_app", "") or "") or app_name
+    # The app launch copy kiro-cli is asked for in place of ``agent``
+    # (``apps.agent_launch``); ``agent`` stays the session's identity. Stamped
+    # on the cold-started provider below, never handed to a factory.
+    app_launch_agent = str(extra_factory_kwargs.pop("app_launch_agent", "") or "")
     from kiro_crew.execution_context import read_session_execution
 
     execution = await asyncio.to_thread(read_session_execution, key)
@@ -467,6 +498,11 @@ async def _get_or_create_impl(
                         stale_session = session
                         del self._sessions[key]
                         self.advance_ownership_generation(key)
+                        # Same lock hold as the removal, before any await: a
+                        # turn still holding the dead session's permit is
+                        # recorded and its parked claimants woken, as in
+                        # ``_evict_stale_session``.
+                        owner.retire_turn_permit(key, session)
                         # Same tick as the removal. Left unrecorded, the
                         # start crumb survives and the next boot calls this
                         # a crash rather than an eviction.
@@ -551,6 +587,8 @@ async def _get_or_create_impl(
             _won_race_retries=_won_race_retries + 1,
             start_priority=start_priority,
             app_name=app_name,
+            app_launch_agent=app_launch_agent,
+            owning_app=owning_app,
             **extra_factory_kwargs,
         )
 
@@ -652,14 +690,19 @@ async def _get_or_create_impl(
         pool_decision = "bypass_resume"
     elif is_stateless:
         pool_decision = "bypass_stateless"
-    elif self._is_member_key(key):
+    elif self._is_member_key(key) or _is_crewmate_worker_key(key):
         # A pooled child was spawned with no session key, so it runs the
         # factory's DEFAULT backend and none of the member construction
         # route (per-session dispatch-tool mount, member backend). A warm
         # hit would silently hand a member DM a session that cannot mount
         # its tools; cold-starting through the factory is what makes the
-        # member route real. String check — as cheap as the arms above.
+        # member route real. String check — as cheap as the arms above. A
+        # crewmate's own worker takes the member backend too, so it bypasses
+        # for the same reason (an in-memory set lookup).
         pool_decision = "bypass_member"
+    elif app_launch_agent:
+        # A pooled child was spawned as the pool's agent, never as this copy.
+        pool_decision = "bypass_app_launch"
     elif memory_mode != "persistent":
         pool_decision = "bypass_restricted_context"
     elif member_context:
@@ -684,6 +727,9 @@ async def _get_or_create_impl(
         # ``""`` is a Kiro request, and under a non-Kiro default the pooled
         # child is on the wrong backend for it too.
         pool_decision = "bypass_backend_override"
+    elif await _session_runs_remotely(key):
+        # A pooled child is a LOCAL engine: claiming it would run a remote session here.
+        pool_decision = "bypass_remote_environment"
     elif await self._crew_pins_effort(agent, extra_factory_kwargs.get("crew_agent")):
         # A CREW's pinned effort is fixed at spawn time and the warm-pool
         # claim path never re-pushes it, so a warm hit would silently run
@@ -719,6 +765,8 @@ async def _get_or_create_impl(
         cast(Any, provider).memory_mode = memory_mode
         if self._deps.is_acp_provider(provider):
             cast(Any, provider).member_context = member_context
+            # Trusted: the caller's slot app, never transcript metadata.
+            cast(Any, provider).owning_app = owning_app
         try:
             if self._deps.is_acp_provider(provider):
                 claim_kwarg = extra_factory_kwargs.get("crew_agent")
@@ -851,6 +899,13 @@ async def _get_or_create_impl(
             owner._dispatch_hard_kill(provider)
             raise
     else:
+        # A defaulted KAS waits (bounded) for the kiro-cli floor's verdict, so
+        # the factory below picks the backend the verdict decided.
+        await await_kas_floor_verdict(member=_is_member_key(key))
+        # The verdict can install a new factory before it releases this wait (a
+        # confirmed v3 reloads the live config), so a waiting spawn takes the
+        # factory in force now, not the one it copied before waiting.
+        factory = owner._provider_factory or factory
         provider = factory(
             key,
             agent=agent,
@@ -863,6 +918,9 @@ async def _get_or_create_impl(
         cast(Any, provider).memory_mode = memory_mode
         if self._deps.is_acp_provider(provider):
             cast(Any, provider).member_context = member_context
+            cast(Any, provider).app_launch_agent = app_launch_agent
+            # Trusted: the caller's slot app, never transcript metadata.
+            cast(Any, provider).owning_app = owning_app
         if memory_mode != "persistent":
             resume_sid = None
         provider_switched = False
@@ -922,6 +980,30 @@ async def _get_or_create_impl(
                     if provider.process_instance:
                         raise CapabilityStartupError("capability_runtime_not_fresh")
                     await asyncio.to_thread(verify_saved, preparation, provider.cwd)
+                # A crewmate's worker runs with its per-session spec, or not at
+                # all, under the member chat's two codes (H6 opt-in): a backend
+                # that cannot carry that spec (``ACP_BACKENDS_MATE_WORKER_KIT``),
+                # and, for a crewmate whose file turns off single tools, one that
+                # cannot honour them for a worker (``ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS``:
+                # KAS carries them as the worker spec's ``excludedTools``).
+                from kiro_crew.members import is_crewmate_worker_session
+
+                if is_crewmate_worker_session(key):
+                    from kiro_crew.session_capabilities import CapabilityStartupError
+
+                    if provider.mate_worker_kit_supported is not True:
+                        raise CapabilityStartupError("capability_harness_unsupported")
+                    # The prompt channel is this provider's, fixed for the session.
+                    from kiro_crew.members import note_crewmate_worker_prompt_channel
+
+                    note_crewmate_worker_prompt_channel(
+                        key, provider.mate_worker_prompt_in_context is True
+                    )
+                    # A fast path: the projection refuses on the spec it builds too.
+                    if provider.mate_worker_tool_limits_supported is not True:
+                        limited = await asyncio.to_thread(_worker_tool_limited_servers, key)
+                        if limited:
+                            raise CapabilityStartupError("capability_tool_limits_unsupported")
                 # The key may have been fenced while this call waited for the
                 # semaphore or the reads above: refuse before a process is
                 # spawned that the registration door would only refuse later.
@@ -1065,6 +1147,7 @@ async def _get_or_create_impl(
                 # what keeps the id sent and the id read identical.
                 session.requested_model = model or ""
                 session.backend_override = extra_factory_kwargs.get("backend_override")
+                session.app_launch_agent = app_launch_agent
                 session.extra_env = dict(caller_env) if caller_env else None
                 session.reasoning_effort_override = extra_factory_kwargs.get(
                     "reasoning_effort_override"
@@ -1094,7 +1177,7 @@ async def _get_or_create_impl(
                 # earlier cleanup path may kill unconditionally.
                 await acquire_session_lease(provider)
                 try:
-                    await record_session_started(key)
+                    await record_session_started(key, provider)
                 except BaseException:
                     # See open_task_session: a cancellation here would leave a
                     # registered session whose provider the caller is about to
@@ -1225,7 +1308,26 @@ async def _get_or_create_impl(
             _won_race_retries=_won_race_retries + 1,
             start_priority=start_priority,
             app_name=app_name,
+            app_launch_agent=app_launch_agent,
+            owning_app=owning_app,
             **extra_factory_kwargs,
         )
 
     return result
+
+
+def _worker_tool_limited_servers(key: str) -> tuple[str, ...]:
+    """The servers whose single tools worker *key*'s crewmate file turns off. Blocking."""
+    from kiro_crew.execution_context import read_session_execution
+    from kiro_crew.mate_worker import crewmate_tool_limited_servers
+
+    execution = read_session_execution(key)
+    member_id = str(getattr(execution, "member_id", "") or "") if execution is not None else ""
+    return crewmate_tool_limited_servers(member_id)
+
+
+def _is_crewmate_worker_key(key: str) -> bool:
+    """Whether *key* is a crewmate's own worker session (``members.is_crewmate_worker_session``)."""
+    from kiro_crew.members import is_crewmate_worker_session
+
+    return is_crewmate_worker_session(key)

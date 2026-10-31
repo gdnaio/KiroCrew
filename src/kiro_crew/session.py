@@ -676,6 +676,7 @@ class SessionManager:
     _mark_identity_epoch = _runtimes._mark_identity_epoch
     drain_warm_pool = _runtimes.drain_warm_pool
     warm_providers = _runtimes.warm_providers
+    mark_mcp_config_changed = _runtimes.mark_mcp_config_changed
     # -- Context budget, compaction and owed history (session_parts.turn_context).
     compact_wait_budget_secs = _turn_context.compact_wait_budget_secs
     check_context_usage = _turn_context.check_context_usage
@@ -775,6 +776,7 @@ class SessionManager:
     close_all = _teardown.close_all
     absorb_orphaned_release = _teardown.absorb_orphaned_release
     adopt_turn = _teardown.adopt_turn
+    retire_turn_permit = _teardown.retire_turn_permit
     cancel_current = _teardown.cancel_current
     cancel_owned_turn = _teardown.cancel_owned_turn
     stop_turn = _teardown.stop_turn
@@ -892,6 +894,10 @@ class SessionManager:
         # surface that can reach the user (a dashboard notification, a Slack DM)
         # decides what to do with it. Args: (session_key, parked_secs).
         self.on_stuck_turn: Callable[[str, float], None] | None = None
+        # Fired after a turn lease is released (``release``), with the folded
+        # key. Also a seam: the dashboard uses it to land a model pick at a
+        # channel turn's end, which no dashboard turn boundary sees.
+        self.on_session_released: Callable[[str], None] | None = None
 
         self._compaction = CompactionCoordinator(
             self,

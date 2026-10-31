@@ -369,6 +369,23 @@ class CardStore:
             out.append(self.public(rec))
         return out
 
+    def last_finished_at(self, slot_key: str, statuses: "frozenset[str]") -> float:
+        """When a card of *slot_key* last finished in one of *statuses*, else ``0.0``.
+
+        Read over every stored card, a dismissed one and one past its display TTL
+        included: :meth:`pending` hides both, but a press still answered the question
+        it was raised for.
+        """
+        self._ensure_loaded()
+        newest = 0.0
+        for rec in self._cards.values():
+            if rec["slot_key"] != slot_key or rec.get("status") not in statuses:
+                continue
+            finished = rec.get("finished_at")
+            if isinstance(finished, (int, float)):
+                newest = max(newest, float(finished))
+        return newest
+
     def status_for_caller(self, slot_key: str, card_id: str | None) -> dict[str, Any]:
         self._ensure_loaded()
         if card_id:
@@ -570,6 +587,14 @@ class CardStore:
         )
         if live >= MAX_LIVE_CARDS_PER_SLOT:
             raise CardError(429, "too_many_cards", "this conversation has too many open cards")
+        same = self._open_duplicate(slot_key, kind, params)
+        if same is not None:
+            raise CardError(
+                409,
+                "duplicate_card",
+                f"the same change is already on card {same['id']}, waiting for the person: "
+                "this one would only repeat it",
+            )
         if len(self._cards) >= MAX_STORED_CARDS and not any(
             self._evictable(r) for r in self._cards.values()
         ):
@@ -603,6 +628,26 @@ class CardStore:
         self._dirty()
         self.sweep()
         return rec
+
+    def _open_duplicate(
+        self, slot_key: str, kind: str, params: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """A card in *slot_key* still waiting on the person that proposes exactly this.
+
+        A second identical card only doubles what the person has to press, and the
+        two then race each other's apply. An edited, finished or expired card is not
+        one: the same proposal after any of those is a new question.
+        """
+        for rec in self._cards.values():
+            if (
+                rec["slot_key"] == slot_key
+                and rec["kind"] == kind
+                and rec["status"] in (STATUS_PENDING, STATUS_APPLYING)
+                and rec["expires_at"] > self._clock()
+                and rec["params"] == params
+            ):
+                return rec
+        return None
 
     def _apply_preview(
         self,
@@ -906,11 +951,11 @@ def _coerce_int(value: object) -> object:
 
 def _write_locked(path: Path, payload: str) -> None:
     from kiro_crew.atomic_write import atomic_write
-    from kiro_crew.platform_compat import file_lock
+    from kiro_crew.platform_compat import file_lock, open_create_or_existing
 
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    fd = open_create_or_existing(str(lock_path), os.O_RDWR, 0o600)
     try:
         with file_lock(fd, exclusive=True):
             atomic_write(path, payload, restrict_to_owner=True)
@@ -934,11 +979,15 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _CARD_CAPABILITY_SECTIONS,
         _CREWMATE_SPEC_FIELDS,
         _CRON_CONFIG_FIELDS,
+        _HUNK_HEADER_RE,
         _MCP_SCOPE_UNREADABLE,
         KR_RECORDS_KEY,
+        WORKFLOW_DIFF_MAX,
+        WORKFLOW_DIFF_SEPARATOR,
         _capability_service,
         _capability_state,
         _connection_grant_fingerprint,
+        _crewmate_identity,
         _crewmate_key,
         _crewmate_label,
         _crewmate_revision,
@@ -946,18 +995,31 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _cron_job_revision,
         _folder,
         _goal_state,
+        _hunk_separator,
+        _import_after_is_written,
+        _import_rules_digest,
+        _import_state,
         _mcp_detail,
         _mcp_exists,
         _mcp_global_entry,
         _mcp_scopes,
         _mcp_undo_names,
         _mcp_value_key,
+        _page_offer_context,
+        _page_offer_snapshot,
         _revision_digest,
         _secret_revision,
         _server_reach,
         _sync_read_state,
+        _template_server_state,
         _template_state_with_skills,
+        _unified_hunks,
+        _unified_range,
         _valid_refs,
+        _workflow_context,
+        _workflow_diff,
+        _workflow_service,
+        _workflow_state,
         after_shows_the_write,
         build,
         capability_ref_hint,
@@ -992,6 +1054,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _DIAGNOSE_VALUE_MAX,
         _FIND_LIMIT,
         _FIND_LIST_ITEMS,
+        _FIND_STOPWORDS,
+        _FIND_TAILS,
         _FINDING_RANK,
         _KIROCREW_STORE,
         _REGISTRY_PATH,
@@ -1006,16 +1070,19 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _dashboard_target,
         _editable_config,
         _finding_hits,
+        _fit,
         _flatten_like,
         _help_text,
         _key_withheld,
         _kirocrew_target,
         _ranked,
+        _reaches,
         _registry_by_config_key,
         _registry_entry,
         _row_hits,
         _scrub,
         _stem,
+        _stems,
         _token_hits,
         _topic_tokens,
         _value_withheld,

@@ -39,6 +39,7 @@ import kiro_crew.subagent as subagent_mod
 import kiro_crew.subagent_wait_reasons as wait_reasons
 from kiro_crew import platform_compat
 from kiro_crew.subagent import SubagentManager
+from kiro_crew.testing.wait import async_wait_until
 
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
@@ -57,6 +58,7 @@ _POLICY_REFUSALS = frozenset(
     {
         "rejected_empty_task",
         "rejected_invalid_cwd",
+        "rejected_depth_cap",  # the child would sit past _MAX_SPAWN_DEPTH
         "denied",  # governance, and the parent spec's availableAgents
         "rejected",  # the spawn-approval prompt said no, or had no surface
         "rejected_spawn",
@@ -142,6 +144,8 @@ _REFUSAL_TEXTS = frozenset(
         "memory_unavailable: the parent's memory mode could not be established",
         "memory_unavailable: {}",
         "spawn refused: {}",  # the cwd allowlist, and the parent spec's allowlist
+        "spawn refused: a sub-agent at depth {} would exceed the nesting cap of {}; "
+        "do this work in the current run instead of delegating it further",
         "spawn refused by governance: {}",
         "spawn denied by governance",
         "<gov_spawn_err>",
@@ -292,11 +296,7 @@ async def _teardown(mgr: SubagentManager) -> None:
 
 
 async def _until(pred, what: str) -> None:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + _WAIT_SECS
-    while not pred():
-        assert loop.time() < deadline, what
-        await asyncio.sleep(0.01)
+    await async_wait_until(pred, timeout=_WAIT_SECS, describe=lambda: what)
 
 
 async def _verdict(mgr: SubagentManager, started: list[str], task: str = "census", **kw):

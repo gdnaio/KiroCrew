@@ -20,6 +20,7 @@ from browser_cli_install_helpers import isolated_browser_cache_fixture  # noqa: 
 from browser_cli_install_helpers import _wire
 
 from kiro_crew.browser_cli import install as mod
+from kiro_crew.testing.wait import wait_until
 
 
 def test_the_standalone_command_writes_no_fixed_name_into_the_working_directory(
@@ -140,28 +141,65 @@ class TestInstallStages:
         assert mod.install(on_stage=events.append)["ok"] is False
         assert events == ["installing_cli", "downloading_browser"]
 
+    @pytest.mark.skipif(os.name == "nt", reason="the managed launcher is POSIX only")
+    def test_install_writes_the_managed_launcher(self, monkeypatch, tmp_path):
+        """npm and the Node staging are faked to leave what they really leave (the
+        package entrypoint and ``gateway-node``); the launcher write is real."""
+        from kiro_crew.browser_cli import managed_launcher
+
+        _wire(monkeypatch, {"npm": "/n/npm", "playwright-cli": "/n/pw"})
+        crew = tmp_path / "crew"
+        root = crew / "playwright-cli"
+        entry = root / "lib" / "node_modules" / "@playwright" / "cli" / "playwright-cli.js"
+        entry.parent.mkdir(parents=True)
+        entry.write_text("// cli\n", encoding="utf-8")
+        monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
+        monkeypatch.setattr(mod, "config_dir", lambda: crew)
+
+        def stage(source: str) -> Path:
+            staged = root / "gateway-node"
+            staged.write_bytes(b"node")
+            return staged
+
+        monkeypatch.setattr(mod, "_stage_managed_node", stage)
+
+        assert mod.install()["ok"] is True
+
+        resolved = root.resolve()
+        launcher = resolved / "managed-bin" / "playwright-cli"
+        assert launcher.read_text(encoding="utf-8") == managed_launcher._render_posix_launcher(
+            str(resolved / "gateway-node"),
+            str(resolved / "lib" / "node_modules" / "@playwright" / "cli" / "playwright-cli.js"),
+            str(resolved / managed_launcher.GUARD_NAME),
+        )
+        assert (resolved / managed_launcher.GUARD_NAME).read_text(
+            encoding="utf-8"
+        ) == managed_launcher.ATTACH_GUARD_JS
+
 
 _POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
 
 
-def _pid_gone(pid: int, deadline_s: float = 5.0) -> bool:
-    """Whether *pid* has exited (a zombie awaiting its reaper counts as exited)."""
-    import time
-
-    # flake-ok: pre-existing real-time exit poll under the caller's deadline, moved verbatim; tracked for a de-flake pass
-    end = time.monotonic() + deadline_s
-    while time.monotonic() < end:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+def _exited(pid: int) -> bool:
+    """Whether *pid* has exited right now (a zombie awaiting its reaper counts)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    with contextlib.suppress(OSError):
+        stat_line = Path(f"/proc/{pid}/stat").read_text()
+        if stat_line.rsplit(")", 1)[1].split()[0] == "Z":
             return True
-        with contextlib.suppress(OSError):
-            stat_line = Path(f"/proc/{pid}/stat").read_text()
-            if stat_line.rsplit(")", 1)[1].split()[0] == "Z":
-                return True
-        # flake-ok: pre-existing 50 ms poll interval of a deadline loop, moved verbatim; tracked for a de-flake pass
-        time.sleep(0.05)
     return False
+
+
+def _pid_gone(pid: int, deadline_s: float = 5.0) -> bool:
+    """Whether *pid* exits within *deadline_s*; False, not a raise, so a teardown can call it."""
+    try:
+        wait_until(lambda: _exited(pid), timeout=deadline_s)
+    except AssertionError:
+        return False
+    return True
 
 
 def _tree_script(pid_file: Path) -> list[str]:
@@ -248,11 +286,7 @@ class TestInstallerChildrenAreTerminable:
         started = time.monotonic()
         try:
             worker.start()
-            # flake-ok: pre-existing real-time pid-file poll under a 10 s deadline, moved verbatim; tracked for a de-flake pass
-            while not pid_file.exists() and time.monotonic() - started < 10:
-                # flake-ok: pre-existing 50 ms poll interval of a deadline loop, moved verbatim; tracked for a de-flake pass
-                time.sleep(0.05)
-            assert pid_file.exists(), "child never started"
+            wait_until(pid_file.exists, timeout=10, describe=lambda: "child never started")
             pid, start_id = _read_pid_identity(pid_file)
 
             assert scope.terminate() == 1

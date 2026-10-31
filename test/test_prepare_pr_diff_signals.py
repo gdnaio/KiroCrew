@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from git_maintenance_helpers import git_maintenance_off_entries
 from skill_script_helpers import load_skill_script
 
 from kiro_crew.platform.update_governance import _GIT_LOCATION_VARS
@@ -50,7 +51,7 @@ ds = load_skill_script("prepare_pr_diff_signals_under_test", SCRIPT)
     ],
 )
 def test_area_of_mirrors_the_pr_scope_unit(path: str, area: str) -> None:
-    """Same split as the awk in ``.github/workflows/pr-scope.yml``: three levels
+    """Same split as the awk in the PR Scope step of ``.github/workflows/pr-policy.yml``: three levels
     under the two source roots, the top-level component everywhere else."""
     assert ds.area_of(path) == area
 
@@ -60,9 +61,9 @@ def test_area_of_agrees_with_the_pr_scope_awk_program() -> None:
     """The workflow and the script each spell the area unit; run the workflow's own
     awk on a corpus and require the same answers, so a change to one spelling
     fails here instead of diverging silently."""
-    workflow = (ROOT / ".github" / "workflows" / "pr-scope.yml").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "pr-policy.yml").read_text(encoding="utf-8")
     m = re.search(r"awk -F/ '(.*?)'\s*\|", workflow, re.DOTALL)
-    assert m, "pr-scope.yml no longer carries the area awk program"
+    assert m, "pr-policy.yml no longer carries the PR Scope area awk program"
     program = m.group(1)
     corpus = [
         "src/kiro_crew/dashboard/handlers/x.py",
@@ -308,6 +309,8 @@ def _git_env() -> dict[str, str]:
             "GIT_CONFIG_VALUE_0": "",
         }
     )
+    # Last, so the entries land after the GIT_CONFIG_COUNT this helper set.
+    env.update(git_maintenance_off_entries(env))
     return env
 
 
@@ -411,7 +414,8 @@ def _flat(path: Path) -> str:
 
 
 def test_skill_wires_the_check_at_every_body_write_and_gates_both_checks() -> None:
-    flat = _flat(SKILL)
+    # The contract's section 3 and 4 text lives in a reference SKILL.md points to.
+    flat = _flat(SKILL) + " " + _flat(PREPARE_PR / "references" / "pr-description-contract.md")
     # Phase 1.5, Phase 2 amend, Phase 3 publish -- each names the flag.
     assert flat.count("diff_signals.py --check-body") >= 3
     assert "<body-file>" not in flat

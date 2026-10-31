@@ -49,7 +49,6 @@ from kiro_crew.llm_helpers import (
     unfinished_turn_error,
 )
 from kiro_crew.messaging.renderer import count_redaction_tags, redaction_notice
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.trust_patterns import extract_bash_command
 
 logger = logging.getLogger(__name__)
@@ -175,6 +174,9 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     # Changing a session's model decides what the user's next turn there runs
     # on and spends; same containment reason as stop.
     "session_set_model",
+    # Recoloring a session acts on a session the channel agent would name from
+    # thread text other people wrote; same containment reason as stop.
+    "session_set_color",
     # Reload relaunches another session's agent process; same containment
     # reason as stop.
     "session_reload",
@@ -190,7 +192,7 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     # blocked for the same exfiltration reason.
     "session_summary",
     # The fan-out verb, blocked for the reason `session_send` is and then some: one
-    # call reaches every session the caller created, so a channel agent acting on
+    # call with `all: true` reaches every session the caller created, so a channel agent acting on
     # words from a thread other people are in would relay them into the user's
     # whole worker fleet at once.
     "session_broadcast",
@@ -200,6 +202,9 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     # blocked for, one step shallower.
     "session_status",
     "session_create",
+    # Creates, opens, binds and seeds a worker in one call: session_create's and
+    # session_send's containment reasons together.
+    "work_dispatch",
     "session_fork",
     "session_close",
     # The tree verbs, blocked on the containment reason the rest share: a channel
@@ -208,6 +213,8 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     # whole subtree under another one.
     "session_adopt",
     "session_release",
+    # Moves who may drive a session, decided from thread text other people wrote.
+    "session_handoff",
     # Pinning belongs with the tree verbs: it moves another session to or from
     # the top of the person's sidebar, and a channel agent names that session
     # from thread text other people wrote. This entry covers the permission
@@ -1087,9 +1094,29 @@ async def run_channel_agent(
                     agent.state = "failed"
                     break
                 client = replacement
-            fault = await _stream_task(
-                agent, channel, client, prompt, thread_id=tid, is_yolo=is_yolo
+            # Shared Crew fair admission for each turn: a person's message is
+            # charged to the bounded Unknown bucket (a channel message names no
+            # principal), agent-to-agent routing to Crew automation.
+            from kiro_crew.shared_crew.admission import OperationKind
+            from kiro_crew.shared_crew.turn_gate import capacity_note, run_admitted
+
+            refusal: list[object] = []
+            fault = await run_admitted(
+                _stream_task(agent, channel, client, prompt, thread_id=tid, is_yolo=is_yolo),
+                session_key=agent.session_key,
+                text=prompt,
+                automation=msg.from_id != "human",
+                operation=OperationKind.CHANNEL_TURN,
+                refused=refusal.append,
             )
+            if refusal:
+                await channel.post(
+                    agent.id,
+                    capacity_note(refusal[0]),
+                    from_role=agent.role,
+                    msg_type="system",
+                    thread_id=tid,
+                )
             if fault:
                 # This loop owns the SessionManager, so it is the only place that
                 # can clear a wedge or a lost session: replace the session and
@@ -1407,8 +1434,9 @@ async def _stream_task(
                 tool_seen = True
                 # Don't post messages — broadcast status like chat page footer
                 tool_name = event.text or ""
-                tool_name, _ = redact_exfiltration_urls(tool_name)
-                tool_name, _ = redact_credentials(tool_name)
+                from kiro_crew.security import redact
+
+                tool_name = redact(tool_name)
                 channel._broadcast(
                     "channel_agent_status",
                     {
@@ -1616,8 +1644,9 @@ async def _stream_task(
                 # authority. ``tool_input_redacted`` is transport provenance:
                 # re-running the scanners cannot reveal bytes an ACP transport
                 # already removed. Either signal makes the command display-only.
-                _safe_cmd, _cmd_credential_redacted = redact_credentials(_cmd)
-                _safe_cmd, _cmd_url_redacted = redact_exfiltration_urls(_safe_cmd)
+                from kiro_crew.security import redact_with_findings
+
+                _safe_cmd, _cmd_credential_redacted, _cmd_url_redacted = redact_with_findings(_cmd)
                 _command_grantable = bool(_cmd) and not (
                     bool(getattr(event, "tool_input_redacted", False))
                     or _cmd_credential_redacted
@@ -1654,8 +1683,9 @@ async def _stream_task(
                     )
                 else:
                     _card_name = event.text or event.title or ""
-                sanitized_name, _ = redact_exfiltration_urls(_card_name)
-                sanitized_name, _ = redact_credentials(sanitized_name)
+                from kiro_crew.security import redact
+
+                sanitized_name = redact(_card_name)
                 if len(sanitized_name) > _APPROVAL_FIELD_MAX_CHARS:
                     # Fail closed. Cutting the title would put a live Approve
                     # button beside a command the reader cannot read in full
@@ -1872,8 +1902,9 @@ async def _stream_task(
     if not full_text:
         return _STREAM_OK
     # Sanitize LLM output before posting
-    full_text, _ = redact_exfiltration_urls(full_text)
-    full_text, _ = redact_credentials(full_text)
+    from kiro_crew.security import redact
+
+    full_text = redact(full_text)
     # Extract @mentions from agent's response
     mention_ids = [
         m.id for m in channel.members.values() if m.id != agent.id and f"@{m.role}" in full_text

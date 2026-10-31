@@ -8,6 +8,7 @@ import { SETTINGS_REGISTRY } from '../../components/commandPalette/settingsRegis
 import { localizedSettingLabel } from '../../components/commandPalette/settingsSearchCore'
 import { settingsSubtitle, settingsTabLabel } from '../../components/commandPalette/settingsTabLabel'
 import CommandBarOverlay from './CommandBarOverlay'
+import { crewModePreviewOn } from '../../test/crewModePreview'
 
 /**
  * Row-level behaviour of the launcher: what a row DOES when activated, and what the
@@ -27,7 +28,7 @@ const enterInsertOrNewSession = vi.fn()
 /** Live store the overlay reads for the attention section. Mutated per test. */
 const storeState: {
   dashboard: { slots: Record<string, unknown>[]; unreadSlots: string[] }
-  chat: { slotStatusDetail: Record<string, unknown>; activeSlot: string | null }
+  chat: { slotStatusDetail: Record<string, unknown>; activeSlot: string | null; lastCreatedActivation?: { slot: string; requestId: string } | null }
 } = {
   dashboard: { slots: [], unreadSlots: [] },
   chat: { slotStatusDetail: {}, activeSlot: null },
@@ -179,14 +180,56 @@ describe('CommandBarOverlay rows', () => {
     expect(screen.getByRole('alert').textContent).toMatch(/Enter/)
   })
 
+  it('starts from the type-ahead the host caught, and Enter acts on it', async () => {
+    // Keys typed while the chunk loaded arrive as `initialQuery`. Without them the
+    // first render is the idle root, and Enter opens the newest Recent session.
+    resolvingDispatch()
+    const onClose = vi.fn()
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open onClose={onClose} initialQuery="New session" />
+      </QueryClientProvider>,
+    )
+    const input = screen.getByRole('combobox') as HTMLInputElement
+    expect(input.value).toBe('New session')
+    // The caret sits after the caught text, so the next key extends it.
+    expect(input.selectionStart).toBe('New session'.length)
+    expect(screen.getAllByRole('option')[0].textContent).toContain('New Session')
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(onClose).toHaveBeenCalled())
+    expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: undefined })
+  })
+
+  /** A create the store opened: the reducer records it under its requestId. */
+  const openingDispatch = (activation: { slot: string; requestId: string }) => {
+    dispatch.mockReturnValue({ requestId: 'req-1', unwrap: () => Promise.resolve({ key: 'slot-1' }) })
+    storeState.chat = { ...storeState.chat, activeSlot: activation.slot, lastCreatedActivation: activation }
+  }
+
   it('navigates to the new session so a success is visible off the chat page', async () => {
     // Created from Settings or Task Runner without this, the session lands off-screen
     // and the success reads as a failure -- the user runs it again into a duplicate.
-    resolvingDispatch()
+    window.history.replaceState(null, '', '/settings')
+    try {
+      openingDispatch({ slot: 'slot-1', requestId: 'req-1' })
+      const onClose = mount()
+      fireEvent.mouseDown(rowByText('New Session'))
+      await waitFor(() => expect(navigate).toHaveBeenCalledWith('/chat'))
+      await waitFor(() => expect(onClose).toHaveBeenCalled())
+    } finally {
+      window.history.replaceState(null, '', '/')
+    }
+  })
+
+  it('stays put when the user opened another session during the create', async () => {
+    // The store left the view on the session the user picked, so the activation
+    // names no request of this row's.
+    openingDispatch({ slot: 'slot-b', requestId: 'req-other' })
     const onClose = mount()
     fireEvent.mouseDown(rowByText('New Session'))
-    await waitFor(() => expect(navigate).toHaveBeenCalledWith('/chat'))
     await waitFor(() => expect(onClose).toHaveBeenCalled())
+    expect(navigate).not.toHaveBeenCalled()
   })
 
   it('clears a stale failure once the user types again', async () => {
@@ -428,7 +471,7 @@ describe('CommandBarOverlay rows', () => {
     // constructed inert and activated by entering the scope, and the assertion is on
     // the call site because the leak was the construction, not the search.
     const src = overlaySource()
-    expect(src).toContain("useSessionsProvider({ active: scope === 'sessions' })")
+    expect(src).toMatch(/useSessionsProvider\(\{ active: scope === 'sessions'(, openSessionKeys)? \}\)/)
     expect(src).not.toMatch(/useSessionsProvider\(\{\s*\}\)/)
   })
 
@@ -847,10 +890,14 @@ describe('CommandBarOverlay rows', () => {
     const input = screen.getByRole('combobox')
     const footer = () =>
       (document.querySelector('[role="dialog"]') as HTMLElement).textContent ?? ''
+    let px = 0
     const selectRow = (title: string) => {
       const target = screen.getAllByRole('option').findIndex(o => o.textContent?.includes(title))
       expect(target).toBeGreaterThanOrEqual(0)
-      fireEvent.mouseEnter(screen.getAllByRole('option')[target])
+      // Hover selects on real pointer motion, so the pointer has to move across the row.
+      const row = screen.getAllByRole('option')[target]
+      fireEvent.mouseMove(row, { clientX: ++px, clientY: px })
+      fireEvent.mouseMove(row, { clientX: ++px, clientY: px })
     }
     selectRow('New Session')
     expect(footer()).toContain('Run')
@@ -858,6 +905,55 @@ describe('CommandBarOverlay rows', () => {
     selectRow('Search Sessions')
     expect(footer()).toContain('Open View')
     expect(input.getAttribute('aria-activedescendant')).toBeTruthy()
+  })
+
+  it('keeps the selection when rows re-render under a pointer that has not moved', () => {
+    // Re-ranking moves rows under a resting pointer, and the browser answers with
+    // mouseover, mouseenter and a mousemove at the same coordinates. None of that is
+    // the reader pointing at a row, so Enter must still act on the top match.
+    mount()
+    const input = screen.getByRole('combobox')
+    const active = () => input.getAttribute('aria-activedescendant')
+    const restOn = (row: HTMLElement) => {
+      fireEvent.mouseOver(row, { clientX: 700, clientY: 260 })
+      fireEvent.mouseEnter(row, { clientX: 700, clientY: 260 })
+      fireEvent.mouseMove(row, { clientX: 700, clientY: 260 })
+    }
+    restOn(screen.getAllByRole('option')[2])
+    fireEvent.change(input, { target: { value: 'new sess' } })
+    restOn(screen.getAllByRole('option')[1])
+    fireEvent.change(input, { target: { value: 'new session' } })
+    restOn(screen.getAllByRole('option')[1])
+    expect(active()).toBe('command-bar-row-0')
+    // Real motion across a row still selects it, which is what hover is for.
+    fireEvent.mouseMove(screen.getAllByRole('option')[1], { clientX: 704, clientY: 262 })
+    expect(active()).toBe('command-bar-row-1')
+  })
+
+  it.each([
+    ['a group header', () => screen.getAllByRole('option')[0].previousElementSibling as HTMLElement],
+    ['the backdrop', () => document.querySelector('[role="presentation"]') as HTMLElement],
+  ])('keeps the selection when the pointer stops on %s and the list re-ranks', (_, restTarget) => {
+    // The pointer crosses rows, then comes to rest somewhere that is not a row. The
+    // re-ranked list then puts a row under it, and the browser fires a mousemove there
+    // at the resting coordinates. Compared against the last ROW position, that would
+    // read as motion and select the row, so Enter would act on it instead of the top match.
+    mount()
+    const input = screen.getByRole('combobox')
+    const active = () => input.getAttribute('aria-activedescendant')
+    const rest = restTarget()
+    expect(rest).toBeTruthy()
+    fireEvent.mouseMove(screen.getAllByRole('option')[2], { clientX: 600, clientY: 300 })
+    fireEvent.mouseMove(screen.getAllByRole('option')[2], { clientX: 602, clientY: 302 })
+    expect(active()).toBe('command-bar-row-2')
+    fireEvent.mouseMove(rest, { clientX: 650, clientY: 340 })
+    fireEvent.change(input, { target: { value: 'new session' } })
+    expect(active()).toBe('command-bar-row-0')
+    const rows = screen.getAllByRole('option')
+    fireEvent.mouseOver(rows[1], { clientX: 650, clientY: 340 })
+    fireEvent.mouseEnter(rows[1], { clientX: 650, clientY: 340 })
+    fireEvent.mouseMove(rows[1], { clientX: 650, clientY: 340 })
+    expect(active()).toBe('command-bar-row-0')
   })
 
   it('shows the hidden alias that matched so no listed row is unexplained', () => {
@@ -921,7 +1017,7 @@ describe('CommandBarOverlay rows', () => {
     // so the mock answers with the thunk's shape.
     resolvingDispatch()
     fireEvent.mouseDown(rows[0])
-    expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'slot-a', announceOnMissing: true })
+    expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'slot-a', announceOnMissing: true, gesture: true })
   })
 
   it('never drops a blocked session: past the cap a final row counts the rest and reveals them', () => {
@@ -994,6 +1090,7 @@ describe('CommandBarOverlay rows', () => {
       type: 'switchSlot',
       key: 'slot-new',
       announceOnMissing: true,
+      gesture: true,
     })
   })
 
@@ -1057,7 +1154,7 @@ describe('CommandBarOverlay rows', () => {
     // Activation still targets the session's own key.
     resolvingDispatch()
     fireEvent.mouseDown(untitled)
-    expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'chat-4-1785440411', announceOnMissing: true })
+    expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'chat-4-1785440411', announceOnMissing: true, gesture: true })
   })
 
   it('labels an untitled recent row "Untitled session", not its key (#20910)', () => {
@@ -1073,7 +1170,7 @@ describe('CommandBarOverlay rows', () => {
     expect(rows[1].textContent).toContain('Named thread')
     resolvingDispatch()
     fireEvent.mouseDown(rows[0])
-    expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'chat-5-1785440411', announceOnMissing: true })
+    expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'chat-5-1785440411', announceOnMissing: true, gesture: true })
   })
 
   it('still finds an untitled session row by its key once the key is no longer shown', () => {
@@ -1087,7 +1184,7 @@ describe('CommandBarOverlay rows', () => {
     expect(hit).toBeTruthy()
     resolvingDispatch()
     fireEvent.mouseDown(hit!)
-    expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'chat-5-1785440411', announceOnMissing: true })
+    expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'chat-5-1785440411', announceOnMissing: true, gesture: true })
   })
 
   it('always gives the typed text a way to reach an agent', async () => {
@@ -1405,3 +1502,66 @@ describe('CommandBarOverlay root ordering under a query', () => {
     expect(renderedHeaders()).toContain('Commands')
   })
 })
+
+describe('Crew Mode workers stay out of the Command Bar (edge review R1 X3)', () => {
+  it('lists neither a waiting nor a recent worker, only the root and plain chats', () => {
+    // A worker is its conductor's to show: the person's lists, this one included,
+    // leave it out even while it waits on a question or was visited last.
+    storeState.dashboard = {
+      slots: [
+        { key: 'root', title: 'Ship the review', crew_mode_root: true, messages: 3 },
+        { key: 'w-ask', title: 'Approval: list empty workspace', crew_root: 'root', needs_input: true, messages: 2 },
+        { key: 'w-done', title: 'Done: answer cat', crew_root: 'root', messages: 4, last_activity_ts: 9_000 },
+        { key: 'plain', title: 'Fleet notes', pending_approval: true, messages: 2 },
+      ],
+      unreadSlots: ['w-done'],
+    }
+    mount()
+    const text = screen.getAllByRole('option').map(r => r.textContent ?? '').join('\n')
+    expect(text).toContain('Fleet notes')
+    expect(text).toContain('Ship the review')
+    expect(text).not.toContain('Approval: list empty workspace')
+    expect(text).not.toContain('Done: answer cat')
+  })
+
+  it("lifts a root into Needs You with the Approve pill when one of its hidden workers waits on a tool approval", () => {
+    // The worker is not a row, so what it owes the person rides on its root: the
+    // same count the fleet page uses (`crewWaitingApprovals`). Red without the
+    // root-row lift: an idle root has no pill of its own.
+    storeState.dashboard = {
+      slots: [
+        { key: 'root', title: 'Ship the review', crew_mode_root: true, messages: 3 },
+        { key: 'w-tool', title: 'Worker on a tool', crew_root: 'root', pending_approval: true, messages: 2 },
+        { key: 'w-tool-2', title: 'Second worker', crew_root: 'root', pending_approval: true, messages: 2 },
+        { key: 'quiet-root', title: 'Quiet crew', crew_mode_root: true, messages: 1 },
+        { key: 'w-idle', title: 'Idle worker', crew_root: 'quiet-root', messages: 1 },
+      ],
+      unreadSlots: [],
+    }
+    mount()
+    const options = screen.getAllByRole('option')
+    const lifted = options.find(o => o.getAttribute('data-row-id') === 'attention:root' || o.id === 'attention:root' || (o.textContent ?? '').includes('Ship the review'))
+    expect(lifted?.textContent).toContain('Approve')
+    expect(lifted?.textContent).toContain('Crew members waiting for a tool decision: 2')
+    const quiet = options.find(o => (o.textContent ?? '').includes('Quiet crew'))
+    expect(quiet?.textContent ?? '').not.toContain('Approve')
+    expect(options.map(o => o.textContent ?? '').join('\n')).not.toContain('Worker on a tool')
+  })
+
+  it('keeps a closed root\'s worker in Needs You with its own Approve pill', () => {
+    // The root was closed, so no row carries the count and no Crew panel lists the
+    // worker: the worker is a row again, and its approval still reaches the person.
+    storeState.dashboard = {
+      slots: [
+        { key: 'w-orphan', title: 'Worker of a closed crew', crew_root: 'closed-root', pending_approval: true, messages: 2 },
+      ],
+      unreadSlots: [],
+    }
+    mount()
+    const row = screen.getAllByRole('option').find(o => (o.textContent ?? '').includes('Worker of a closed crew'))
+    expect(row?.textContent).toContain('Approve')
+  })
+})
+
+// Last, after the file's own hooks that clear localStorage: Crew Mode is a feature preview.
+crewModePreviewOn()

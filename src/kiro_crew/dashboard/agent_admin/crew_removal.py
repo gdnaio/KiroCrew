@@ -206,6 +206,17 @@ def _reclaim_deleted_member_dashboard_lock(name: str, cfg: KiroCrewConfig) -> No
         return
     if removed:
         logger.info("crew delete: removed the dashboard lock of %r", slug)
+    try:
+        from kiro_crew.dashboard import page_offer
+
+        # The asked-once page offer sits beside the lock in ``crew-panels``: kept, a
+        # later crewmate on the same slug would never be offered its own page.
+        if not _member_slug_is_claimed(slug):
+            page_offer.forget_asked(slug)
+    except Exception:
+        logger.warning(
+            "crew delete: could not remove the page offer record of %r", name, exc_info=True
+        )
 
 
 def _prune_private_copy_of_deleted_crew(crew: str, bound_template: str) -> bool:
@@ -430,12 +441,21 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
                 from kiro_crew.dashboard.handlers._shared import release_markdown_memory_store
 
                 await release_markdown_memory_store(state, retired_store)
+            from kiro_crew.dashboard.mate_folders import hand_back_home
+
+            await hand_back_home(request.app.get("state"), retired_store)
         # The crew is gone; its uploaded picture must not outlive it. Inside
         # the same lock so the cleanup cannot run AFTER a concurrent
         # same-name recreation has already uploaded and committed a new
         # picture under the same digest stem.
         await _drained_to_thread(_remove_avatar_files, name)
         await _remove_goal_check_ins(request, name, cfg)
+        # The git worktrees the crewmate's workers ran in go with it; one with
+        # uncommitted changes is kept, and its branches and the repositories'
+        # own checkouts are never touched.
+        from kiro_crew.crewmate_worktree import remove_for_member
+
+        await _drained_to_thread(remove_for_member, name, cfg)
         # Likewise the crew's private template copy: a copy the sidecar marks
         # private to THIS crew, and that the crew was bound to, has no reader
         # left once the record is gone — kept, it lists in the Agent Templates

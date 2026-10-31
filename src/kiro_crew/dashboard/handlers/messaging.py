@@ -49,6 +49,7 @@ from kiro_crew.config.loader import (  # noqa: F401
 )
 from kiro_crew.constants import CHANNEL_SEND_NAMESPACES, SUBAGENT_COMPLETION_META_KEY  # noqa: F401
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable  # noqa: F401
+from kiro_crew.dashboard.body_numbers import body_int  # noqa: F401
 from kiro_crew.dashboard.channel_folders import (  # noqa: F401
     CHANNEL_CONFIG_SECTIONS,
     channel_restart_required,
@@ -69,19 +70,24 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: F401
     remember_slack_options,
     run_to_completion,
     slack_options_owner_key,
+    slot_history_key,
     subagent_event_slot,
 )
-from kiro_crew.dashboard.cron_inject import queue_cron_notification
 from kiro_crew.dashboard.handlers._shared import (  # noqa: F401
     _pip_install_channel_available,
+    body_not_object_error,
     guard_owner_surface_routes,
     internal_memory_scope,
     pip_extra_install_command,
     read_bounded_json,
     spawn_parent_claim,
+    string_field_error,
 )
 from kiro_crew.dashboard.handlers.browser_view_relay import ROUTE_PREFIX  # noqa: F401
 from kiro_crew.dashboard.handlers.core import _hot_apply_after_write  # noqa: F401
+from kiro_crew.dashboard.kiro_relay.caller import is_relay_teammate  # noqa: F401
+from kiro_crew.dashboard.kiro_relay.ingress import refuse_relayed  # noqa: F401
+from kiro_crew.dashboard.kiro_relay.limits import APPS_OFF_FOR_TEAMMATES  # noqa: F401
 from kiro_crew.dashboard.messaging_api import agent_push as _owner_agent_push
 from kiro_crew.dashboard.messaging_api import browser_routes as _owner_browser_routes
 from kiro_crew.dashboard.messaging_api import channel_config_writes as _owner_channel_config_writes
@@ -170,6 +176,8 @@ from kiro_crew.dashboard.messaging_api.imessage_settings import (  # noqa: F401
     api_imessage_config_get,
 )
 from kiro_crew.dashboard.messaging_api.notifications import (  # noqa: F401
+    _is_app_note,
+    _refuse_hidden_note,
     api_notification_ack,
     api_notification_channel_settings,
     api_notification_channels,
@@ -186,6 +194,7 @@ from kiro_crew.dashboard.messaging_api.proactive_send import (  # noqa: F401
     _deliver_send_message_fallback,
     _post_send_message_to_slack,
     _proactive_source_line,
+    _publishing_session_meta,
     _read_send_message,
     _redact_all,
     _resolve_session_link_url,
@@ -233,6 +242,7 @@ from kiro_crew.dashboard.messaging_api.slack_settings import (  # noqa: F401
     _validate_slack_token,
     api_slack_config_get,
     api_slack_config_save,
+    api_slack_manifest_status,
 )
 from kiro_crew.dashboard.messaging_api.slack_workspace import (  # noqa: F401
     _missing_scope_message,
@@ -242,12 +252,14 @@ from kiro_crew.dashboard.messaging_api.slack_workspace import (  # noqa: F401
     api_slack_reactions,
 )
 from kiro_crew.dashboard.messaging_api.spawn import (  # noqa: F401
+    STOPPED_BEFORE_START_CODE,
     _continue_on_loop,
     _qualified_model_refusal,
     _requested_backend,
     _slot_for_parent,
     _spawn_on_loop,
     _spawn_request_memory_mode,
+    _stopped_before_start,
     api_spawn,
     api_spawn_continue,
 )
@@ -295,6 +307,9 @@ from kiro_crew.dashboard.token_auth import (  # noqa: F401
 from kiro_crew.dashboard.ws_event_scope import (  # noqa: F401
     _audit_allow,
     _audit_deny,
+    audit_teammate_withheld,
+    is_app_channel,
+    notification_source_app,
     persisted_replay_denial_reason,
     persisted_snapshot_denial_reason,
     slot_owner_snapshot,
@@ -315,10 +330,12 @@ from kiro_crew.messaging.transport import (  # noqa: F401
     delivery_confirmed,
     sole_direct_target,
 )
+from kiro_crew.milestones import record_when as record_milestone_when  # noqa: F401
 from kiro_crew.notifications.bus import (  # noqa: F401
     NotificationPayload,
     NotificationValidationError,
 )
+from kiro_crew.platform.context import redact_via_context  # noqa: F401
 from kiro_crew.platform.governance_profiles import HOST_SESSION_KEY  # noqa: F401
 from kiro_crew.platform_compat import IS_MACOS  # noqa: F401
 from kiro_crew.security import (  # noqa: F401
@@ -339,10 +356,12 @@ from kiro_crew.slack.outbound import OPTIONS_FALLBACK_TEXT, PostedOptions  # noq
 from kiro_crew.spawn_warm import warm_project_agents_for_spawn  # noqa: F401
 from kiro_crew.subagent import (  # noqa: F401
     DEFERRED_QUEUED_REASONS,
+    PINNED_RUNTIME_NOTE,
     SUCCESSOR_UNKNOWN,
     effort_applied_note,
     effort_drop_reason,
     effort_pending_note,
+    parent_project_dirs,
     parent_template_allowlists,
 )
 from kiro_crew.subagent_manager.admission.types import (  # noqa: F401
@@ -361,6 +380,7 @@ from kiro_crew.subagent_persistence import (  # noqa: F401
     read_tombstone,
     record_panel_dismissal_outcome,
 )
+from kiro_crew.subagent_wait_reasons import stopped_before_start  # noqa: F401
 from kiro_crew.validation import (  # noqa: F401
     _EMOJI_NAME_RE,
     CHANNEL_ID_RE,
@@ -789,55 +809,21 @@ async def api_send_message(request: web.Request) -> web.Response:
                     # Text wrapper kept for LLM context and queue detection;
                     # cronLabel in cls JSON provides structured data for frontend.
                     wrapped = f'{CRON_NOTIFY_PREFIX}"{label}"]\n{text}\n{CRON_NOTIFY_END}'
-                    inject_cls = json.dumps({"cronLabel": label})
-                    # Queue while a turn is live -- same predicate the user-typed
-                    # path uses (chat_handlers._api_chat).
-                    if slot.running:
-                        from kiro_crew.dashboard.slot_queue_repository import MAX_LIVE_QUEUE_ENTRIES
+                    # The session decides idle (a cron row and a turn) vs running (a
+                    # queued card, dropping the oldest entry when the live queue is full).
+                    from kiro_crew.dashboard import session_deliver
 
-                        if len(slot._queue) >= MAX_LIVE_QUEUE_ENTRIES:
-                            evicted = slot.queue_pop(0)
-                            logger.warning(
-                                "Queue full for slot %s — evicting oldest message", slot_key
-                            )
-                            _remove_queued_by_id(slot.messages, evicted["id"])
-                        queue_cron_notification(slot, wrapped, label)
-                        state.push_slots_update()
-                    else:
-                        # circular import: chat_runner imports from
-                        # kiro_crew.dashboard.handlers (for MAX_PROMPT_BYTES,
-                        # _find_prompt, _list_aim_prompts), so we can't import
-                        # it at module top-level without a cycle.
-                        from kiro_crew.dashboard.chat_runner import _run_chat
-                        from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
-
-                        # `cls` is not persisted for role `inject`, so the label
-                        # must also ride in `meta`, which is — otherwise the row
-                        # loses its identity on the next rehydrate.
-                        slot.append(
-                            "inject",
-                            wrapped,
-                            inject_cls,
-                            meta={"injectKind": "cron", "cronLabel": label},
-                        )
-                        task = spawn_guarded_turn(
-                            state,
-                            slot,
-                            _run_chat(
-                                state,
-                                slot,
-                                wrapped,
-                                _directive_user_origin=False,
-                                # Structural provenance for the session ledger:
-                                # the queued twin above carries
-                                # CRON_NOTIFICATION_KIND, and this branch is the
-                                # same injector dispatching directly.
-                                _turn_actor="cron",
-                            ),
-                        )
-                        slot.task = task
-                        state.push_slots_update()
-                    sent_session = True
+                    delivery = await session_deliver.deliver(
+                        state, slot, wrapped, session_deliver.cron(label), evict_oldest=True
+                    )
+                    state.push_slots_update()
+                    # A full queue with nothing that may give way, or a session
+                    # that closed meanwhile, wrote nothing, so the message takes
+                    # the fallback below instead.
+                    sent_session = delivery not in (
+                        session_deliver.QUEUE_FULL,
+                        session_deliver.NOT_DELIVERED,
+                    )
         # Fall back to normal delivery if no session target or session is gone
         if not sent_session:
             await _deliver_send_message_fallback(
@@ -951,8 +937,9 @@ async def api_teams_activity(request: web.Request) -> web.Response:
 
     The route is registered at app-build time (aiohttp freezes routes at
     startup), but the handler that validates the JWT + drives the turn is the
-    ``TeamsClient.on_activity`` built by ``maybe_start_teams`` once credentials
-    are present. Until then (channel disabled/uncredentialed) we return 503.
+    ``TeamsClient.on_activity`` of the client the gateway host accepted as the
+    live Teams handle (``channel_lifecycle._publish_teams_webhook``). Until then
+    (channel disabled, uncredentialed, or still connecting) we return 503.
 
     This route is exempt from the dashboard cookie gate and from the CSRF Origin
     check, for POST only (``token_auth._BYPASS_EXACT_METHODS`` /

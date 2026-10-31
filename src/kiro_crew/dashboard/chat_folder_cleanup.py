@@ -12,6 +12,8 @@ A folder is removable when nothing that still runs would notice it going:
 * no LIVE session is filed in it or anywhere below it, and no saved cron job
   files its tab into it or anywhere below it (the job keeps the folder's id,
   so recreating the folder by name would not bring the filing back),
+* it is not, and does not hold, the folder Settings files new chats into
+  (``dashboard.default_session_folder``), which is kept by id the same way,
 * none of its rows carries a setting the person chose (project directory,
   default agent, steering directories, tags, color, icon), and
 * it is not a channel folder: neither one stamped for a channel nor one whose
@@ -19,6 +21,8 @@ A folder is removable when nothing that still runs would notice it going:
   are filed by looking that name up, and only a settings save creates the
   folder again, so deleting it would leave every later channel session
   unfiled.
+* it is not a mate's home folder or a folder inside one. Those belong to the
+  mate, and only deleting the mate releases them (``mate_folders``).
 
 Archived sessions do not keep a folder. Deleting the folder leaves them in
 Older Sessions, unfiled, the same as the single-folder delete does: a
@@ -50,6 +54,7 @@ from kiro_crew.dashboard.chat_folders import (
     _refuse_unattributable_caller,
 )
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
+from kiro_crew.dashboard.mate_folders import mate_home_subtree_ids
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.dashboard.token_auth import MEMBER_CHAT_PRINCIPAL_KEY
 from kiro_crew.executors import subprocess_executor
@@ -60,7 +65,15 @@ logger = logging.getLogger(__name__)
 #: Folder fields that mean the person configured the folder on purpose. A row
 #: carrying any of them is kept even when it is empty: deleting it would throw
 #: the setting away along with the row.
-_KEEP_FIELDS = ("project_dir", "default_agent", "steering_dirs", "tags", "color", "icon")
+_KEEP_FIELDS = (
+    "project_dir",
+    "default_agent",
+    "default_destination_crew",
+    "steering_dirs",
+    "tags",
+    "color",
+    "icon",
+)
 
 
 def _order_key(folder: dict[str, Any]) -> int:
@@ -115,6 +128,25 @@ def channel_folder_names() -> set[str]:
     return names
 
 
+def default_session_folder_ids() -> set[str]:
+    """The folder new chats are filed into (``dashboard.default_session_folder``).
+
+    An empty folder the person picked as their default is still in use: deleting
+    it would leave every later New chat unfiled. It is kept like a folder a live
+    session sits in, so its ancestors stay too.
+
+    Raises, like :func:`channel_folder_names`, when the dashboard section or the
+    whole document loaded degraded, since a default then reads as unset rather
+    than unknown. Blocking (config I/O).
+    """
+    cfg = KiroCrewConfig.load()
+    degraded = cfg.degraded_sections
+    if DEGRADED_WHOLE_CONFIG in degraded or "dashboard" in degraded:
+        raise _ConfigUnreadable(f"degraded config sections: {sorted(degraded)}")
+    configured = getattr(cfg.dashboard, "default_session_folder", "")
+    return {configured} if isinstance(configured, str) and configured else set()
+
+
 def _keeps_itself(
     folder: dict[str, Any], kept_names: set[str] | frozenset[str] = frozenset()
 ) -> bool:
@@ -135,7 +167,8 @@ def removable_folder_ids(
 
     *occupied* is the set of folder ids a live session is filed in.
     *kept_names* are folder names a channel files into (see
-    :func:`channel_folder_names`); a folder with one of them keeps itself. A folder is
+    :func:`channel_folder_names`); a folder with one of them keeps itself, and
+    so does a mate's home folder and every folder inside one. A folder is
     removable when it is not occupied, does not keep itself, and every child is
     removable too, so a whole empty branch goes at once and a branch with one
     live session somewhere inside keeps every ancestor of that session.
@@ -159,6 +192,8 @@ def removable_folder_ids(
             occupied_ids.add(str(folder.get("id")))
             occupied_ids.add(str(folder.get("parent_id") or ""))
     occupied_ids.discard("")
+    # A mate's home and its subtree keep themselves, empty or not.
+    mate_owned = mate_home_subtree_ids(folders)
     by_id = {str(f.get("id") or ""): f for f in folders if f.get("id")}
     children: dict[str, list[str]] = {}
     for fid, folder in by_id.items():
@@ -176,7 +211,7 @@ def removable_folder_ids(
             return False
         visiting.add(fid)
         folder = by_id[fid]
-        ok = fid not in occupied_ids and not _keeps_itself(folder, kept)
+        ok = fid not in occupied_ids and fid not in mate_owned and not _keeps_itself(folder, kept)
         for child in children.get(fid, []):
             # Evaluate every child even after one fails, so each child gets its
             # own verdict: a kept sibling must not hide an empty one.
@@ -347,9 +382,11 @@ async def api_chat_folders_cleanup(request: web.Request) -> web.Response:
             raise _CronUnreadable() from exc
         try:
             names = await asyncio.to_thread(channel_folder_names)
+            default_ids = await asyncio.to_thread(default_session_folder_ids)
         except Exception as exc:  # noqa: BLE001 - fail closed, delete nothing
             raise _ConfigUnreadable() from exc
-        return jobs, names
+        # The default folder is kept the way a job's folder is: as occupied.
+        return jobs | default_ids, names
 
     if dry_run:
         # A preview only: the delete below re-reads everything under the lock.

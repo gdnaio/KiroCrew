@@ -355,7 +355,7 @@ session's space both unreclaimable *and* invisible; the fix is that uids stop be
 display text, not that rows disappear.
 
 `dashboard/handlers/session_storage.py` is registered in `_REDACTION_SINKS`
-(`security_posture.py`). The registry is a ratchet — adding a redactor call without
+(`security_posture_sinks_gateway.py`). The registry is a ratchet — adding a redactor call without
 registering the module fails
 `test_every_redactor_call_site_is_a_registered_sink_or_allowlisted`.
 `TestTranscriptContentIsRedacted` covers both surfaces, and
@@ -839,7 +839,7 @@ restorable; reporting a success that did not happen is what `ignore_errors=True`
 
 "Nothing but the manifest" includes LINKS, which these two paths refuse rather than remove even
 though the delete path removes scanned ones. A link holds no data of its own, but it is the only
-entry a removal can take by NAME: `_unlink_verified` compares the scanned inode and then unlinks,
+entry a removal can take by NAME: `pinned_fs.unlink_verified` compares the scanned inode and then unlinks,
 and POSIX has no atomic "unlink if this inode", so admitting a link admits that two-syscall
 window - plant one, let the approval pass it, put a file at that name in between, and the removal
 deletes the file. Neither of these removals was asked for, so they refuse; `empty_trash` still

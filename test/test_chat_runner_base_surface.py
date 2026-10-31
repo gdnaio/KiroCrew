@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import pkgutil
+import re
 
 import pytest
 from test_chat_runner_composition_contract import (
@@ -398,7 +399,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_attach_turn_stats",
             "function",
-            "(slot: \"'_ChatSlot'\", elapsed_ms: 'int', credits: 'float', cost_usd: 'float', turn_boundary: 'int' = 0, model: 'str' = '', ttft_ms: 'int' = 0) -> 'bool'",
+            "(slot: \"'_ChatSlot'\", elapsed_ms: 'int', credits: 'float', cost_usd: 'float', turn_boundary: 'int' = 0, model: 'str' = '', ttft_ms: 'int' = 0, turn_start_mid: 'str | None' = None, retries: 'int' = 0) -> 'bool'",
         ),
         (
             "_context_usage_payload",
@@ -418,7 +419,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_emit_turn_metric",
             "function",
-            "(duration_ms: 'int | float | None', stop_reason: 'str | None', slot_key: 'str', *, elapsed_ms: 'int | float | None' = None, exhausted: 'bool' = False, usage: 'object' = None, model: 'str' = '', provider: 'str' = '') -> 'None'",
+            "(duration_ms: 'int | float | None', stop_reason: 'str | None', slot_key: 'str', *, elapsed_ms: 'int | float | None' = None, exhausted: 'bool' = False, usage: 'object' = None, model: 'str' = '', provider: 'str' = '', harness: 'str' = 'unknown') -> 'None'",
         ),
         (
             "_emit_recovery_outcome",
@@ -431,8 +432,19 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "(elapsed_ms: 'int', credits: 'float', cost_usd: 'float', model: 'str' = '') -> 'dict[str, Any] | None'",
         ),
         ("_MAX_MODEL_ID_LEN", "value", "int"),
+        (
+            "_emit_ttft_metric",
+            "function",
+            "(t0: 'float', session_key: 'str', *, is_new: 'bool', resumed: 'bool') -> 'None'",
+        ),
+        ("_AbnormalTurnEvent", "class", ""),
+        (
+            "_persist_abnormal_turn_usage",
+            "async function",
+            "(slot: \"'_ChatSlot'\", client: 'object', session_key: 'str', *, elapsed_ms: 'int', stop_reason: 'str', since: 'object' = <object object>, usage: 'TurnUsage | None' = None) -> 'bool'",
+        ),
     ),
-    "acp_recovery": (
+    "turn_failures": (
         ("_POISON_CANARY_PROMPT", "value", "str"),
         ("_POISON_CANARY_TIMEOUT_SECS", "value", "float"),
     ),
@@ -516,7 +528,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_native_subagent_close_all",
             "function",
-            "(state, slot, tracker, card_output=None) -> 'None'",
+            "(state, slot, tracker, card_output=None, error: 'str | None' = None) -> 'None'",
         ),
         (
             "_retain_terminal_native",
@@ -725,6 +737,26 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "function",
             "(message: 'str', state: 'DashboardState', slot: '_ChatSlot', session_key: 'str', project: 'str') -> 'tuple[str, int]'",
         ),
+        (
+            "_expand_prompt_mention_off_loop",
+            "async function",
+            "(message: 'str', state: 'DashboardState', slot: '_ChatSlot', *, project: 'str | None' = None) -> 'tuple[str, str]'",
+        ),
+        (
+            "_prewarm_startup_query",
+            "async function",
+            "(state: \"'DashboardState'\", slot: \"'_ChatSlot'\", text: 'str', *, memory_store: 'str | None', execution_context: 'Any', prefetch_memory: 'bool' = False) -> 'None'",
+        ),
+        (
+            "_prefetch_session_memory_off_loop",
+            "async function",
+            "(builder: 'Any', text: 'str', *, workspace: 'str | None', memory_store: 'str | None') -> 'None'",
+        ),
+        (
+            "_embed_startup_query_off_loop",
+            "async function",
+            "(builder: 'Any', text: 'str', *, workspace: 'str | None', memory_store: 'str | None') -> 'None'",
+        ),
     ),
     "segment_flush": (
         ("_DIRECTIVE_SHAPED_RE", "value", "Pattern"),
@@ -733,7 +765,9 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_segment_row_meta",
             "function",
-            "(slot: '_ChatSlot', blocked_links: 'list[dict]', redactions: 'list[dict] | None' = None) -> 'dict | None'",
+            # links_ordered and text: keyword-only and defaulted, so every old caller keeps its shape.
+            "(slot: '_ChatSlot', blocked_links: 'list[dict]', redactions: 'list[dict] | None' = None,"
+            " *, links_ordered: 'bool' = False, text: 'str | None' = None) -> 'dict | None'",
         ),
         ("_SEGMENT_RAW_MAX_CHARS", "value", "int"),
         (
@@ -744,19 +778,24 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_redact_segment",
             "function",
-            "(slot: '_ChatSlot', text: 'str') -> 'tuple[str, list[dict], list[dict]]'",
+            # _ordered_out: keyword-only and defaulted, so every old caller keeps its shape.
+            "(slot: '_ChatSlot', text: 'str', *, _ordered_out: 'list[bool] | None' = None)"
+            " -> 'tuple[str, list[dict], list[dict]]'",
         ),
         (
             "_redact_segment_text",
             "function",
-            "(slot: '_ChatSlot', text: 'str') -> 'tuple[str, list[dict], list[dict]]'",
+            # judged_sri_values: defaulted, so every old caller keeps its shape.
+            # _ordered_out: keyword-only and defaulted, likewise.
+            "(slot: '_ChatSlot', text: 'str', judged_sri_values: 'Collection[str]' = (),"
+            " *, _ordered_out: 'list[bool] | None' = None) -> 'tuple[str, list[dict], list[dict]]'",
         ),
         ("_append_command_reply", "function", "(slot: '_ChatSlot', text: 'str') -> 'None'"),
         ("_TOOL_GROUP_ROLES", "value", "frozenset"),
         (
             "_flush_segment",
             "function",
-            "(state: 'DashboardState', slot: '_ChatSlot', assistant_text: 'str', *, broadcast: 'bool' = True, quiet_persist: 'bool' = False, interrupted: 'bool' = False) -> 'None'",
+            "(state: 'DashboardState', slot: '_ChatSlot', assistant_text: 'str', *, broadcast: 'bool' = True, quiet_persist: 'bool' = False, interrupted: 'bool' = False) -> 'dict[str, Any]'",
         ),
         (
             "_schedule_widget_registration",
@@ -788,7 +827,8 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_answer_slash_without_channel",
             "async function",
-            "(state: 'DashboardState', slot: '_ChatSlot', session_key: 'str', command: 'str') -> 'str'",
+            "(state: 'DashboardState', slot: '_ChatSlot', session_key: 'str', command: 'str', "
+            "message: 'str' = '') -> 'str'",
         ),
         (
             "_handle_workflow_command",
@@ -809,11 +849,6 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
     "app_agent_binding": (
         ("app_agent_binding_applies", "function", "(slot: \"'_ChatSlot'\") -> 'bool'"),
         (
-            "_app_agent_start_dirs",
-            "function",
-            "(state: \"'DashboardState'\", session_key: 'str', project: 'str | None') -> 'tuple[str | None, ...]'",
-        ),
-        (
             "_retire_app_agent_session",
             "async function",
             "(state: \"'DashboardState'\", slot: \"'_ChatSlot'\", session_key: 'str') -> 'None'",
@@ -825,9 +860,9 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         ),
         ("_app_agent_host_allowed", "function", "(provider: 'Any') -> 'bool'"),
         (
-            "_app_agent_turn_host_allowed",
+            "_app_agent_turn_backend",
             "async function",
-            "(state: \"'DashboardState'\", session_key: 'str', cfg: \"'KiroCrewConfig | None'\") -> 'bool'",
+            "(state: \"'DashboardState'\", session_key: 'str', cfg: \"'KiroCrewConfig | None'\") -> 'str | None'",
         ),
     ),
     "queue_cycle": (
@@ -919,6 +954,11 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         ),
         ("_REPLAYS_COMPLETION_KEY", "value", "str"),
         (
+            "idle_slot_admits_drain",
+            "function",
+            "(state: 'DashboardState', slot: '_ChatSlot') -> 'bool'",
+        ),
+        (
             "subagents_hold_user_messages",
             "function",
             "(state: 'DashboardState', session_key: 'str') -> 'bool'",
@@ -929,7 +969,27 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "(state: 'DashboardState', slot: '_ChatSlot', *, allow_user_during_subagents: 'bool' = False, required_queue_id: 'str | None' = None, predecessor_actor: 'str' = '', predecessor_turn_id: 'str' = '', end_batch: 'bool' = False) -> 'bool'",
         ),
     ),
+    "turn_entry": (
+        (
+            "_turn_start_priority",
+            "function",
+            "(*, user_origin: 'bool', crew_log_actor: 'str', provenance_restored: 'bool') -> 'StartPriority'",
+        ),
+    ),
+    "turn_reply_seams": (
+        ("_turn_reply_segments", "function", "(turn: \"'_ChatTurn'\") -> 'list[str]'"),
+        ("_turn_full_reply_text", "function", "(turn: \"'_ChatTurn'\") -> 'tuple[str, str]'"),
+    ),
 }
+
+
+#: A default object's address in its repr: lowercase on POSIX, zero-padded uppercase on Windows.
+_ADDRESS = re.compile(r" at 0x[0-9A-Fa-f]+>")
+
+
+def _without_address(shown: str) -> str:
+    """*shown* with a default object's address dropped: it differs per process."""
+    return _ADDRESS.sub(">", shown)
 
 
 def test_the_owner_set_is_the_package() -> None:
@@ -962,8 +1022,17 @@ def test_a_moved_name_keeps_its_base_shape_and_owner(
     if kind == "value":
         assert type(obj).__name__ == signature
     elif kind != "class":
-        assert str(inspect.signature(obj)) == signature  # type: ignore[arg-type]
+        # A sentinel default shows its address, which differs per process.
+        shown = str(inspect.signature(obj))  # type: ignore[arg-type]
+        assert _without_address(shown) == signature
     assert getattr(_owner(owner), name) is obj
+
+
+def test_a_default_objects_address_is_dropped_in_either_spelling() -> None:
+    """The check above reads a signature the same way on POSIX and on Windows."""
+    for address in ("0x7f8d7451b2d0", "0x000001A9BFA701B0"):
+        shown = f"(since: object = <object object at {address}>)"
+        assert _without_address(shown) == "(since: object = <object object>)"
 
 
 def test_the_owners_define_functions_for_the_sweeps_to_check() -> None:

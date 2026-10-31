@@ -125,7 +125,8 @@ def _list_tools() -> list[dict[str, Any]]:
                         "type": "string",
                         "description": "Human time string for one-shot job, parsed server-side. "
                         "Examples: '5pm', '17:00', 'tomorrow 9:30am', 'in 2 hours', "
-                        "'2026-03-28 14:00'. A clock time is read in 'timezone' when given, "
+                        "'in 3 days', '2026-03-28 14:00'. A clock time, and a relative "
+                        "day or week count, is read in 'timezone' when given, "
                         "else the global config timezone, then UTC. "
                         "Prefer this over 'at' for absolute times.",
                     },
@@ -145,7 +146,9 @@ def _list_tools() -> list[dict[str, Any]]:
                     "agent": {
                         "type": "string",
                         "description": "Agent name for this job (e.g. 'customer360-code-agent'). "
-                        "Empty or omitted uses the default kirocrew agent.",
+                        "Empty or omitted uses agent.default_agent, or the kirocrew "
+                        "agent when that is unset or not eligible (e.g. a default "
+                        "that restricts subagents).",
                     },
                     "member_id": {
                         "type": "string",
@@ -162,8 +165,9 @@ def _list_tools() -> list[dict[str, Any]]:
                         "type": "string",
                         "enum": ["", "auto"],
                         "description": "Tool approval mode for this job. "
-                        "'auto' auto-approves all tools without prompting. "
-                        "Empty or omitted uses default hook-based approval.",
+                        "Empty or omitted uses default hook-based approval. "
+                        "'auto' (auto-approve all tools) is refused here: only the "
+                        "owner can turn it on, on the Schedule page.",
                     },
                     "model": {
                         "type": "string",
@@ -310,7 +314,8 @@ def _list_tools() -> list[dict[str, Any]]:
                     "approval_mode": {
                         "type": "string",
                         "enum": ["", "auto"],
-                        "description": "New tool approval mode",
+                        "description": "New tool approval mode. '' turns auto-approve "
+                        "off; 'auto' is refused here (owner-only, Schedule page).",
                     },
                     "silent": {"type": "boolean", "description": "Whether the job runs silently"},
                     "skip_dates": {

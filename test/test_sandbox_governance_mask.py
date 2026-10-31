@@ -183,12 +183,6 @@ class TestKeystonesAreSealedInEveryMode:
         # provider. Same class: the seal is what makes "the owner consents to
         # the egress, never the agent" true.
         "decisions_consent.json",
-        # Recorded consent to deliver a scanner-flagged file. Sealing it
-        # is the load-bearing half of the whole design: the deny-list tiers can
-        # be evaded by runtime path construction, so only a kernel write denial
-        # makes "the owner consents, never the agent" true rather than merely
-        # intended.
-        "file_delivery_consent.json",
         # Gateway-executed browser launcher. Agent shells must read and run it,
         # but a write would choose the binary the unsandboxed gateway executes.
         "playwright-cli",
@@ -387,6 +381,9 @@ class TestSecretsAreMaskedInEveryMode:
         # Same model as ledger, two parties: the worker agent carries the full file
         # toolset, so an unmasked work-ledger lets it reach any conductor's records.
         "work-ledger",
+        # Each crewmate's rules, goals and DM binding: written by the gateway on a
+        # person's action and read by nothing in a sandbox.
+        "member-records",
         "backup",
         "browser-cookies.txt",
         "playwright-storage-state.json",
@@ -727,11 +724,8 @@ class TestAppBackendOwnedLeaves:
     targets, on both platform builders, and that a default build keeps the mask.
     """
 
-    LEAVES = (
-        "workspace/md-notebook/pat",
-        "workspace/md-notebook/vaults.json",
-        "workspace/md-notebook/settings.json",
-    )
+    #: The Notes backend owns one masked DIRECTORY, which holds all three state files.
+    LEAVES = ("md-notebook-staging",)
 
     def test_the_helper_resolves_both_home_spellings(self) -> None:
         targets = sandbox.app_backend_visible_targets("md-notebook")
@@ -845,7 +839,7 @@ class TestForeignMaskShadowGuard:
         spawn and is dropped from a strict one."""
         monkeypatch.setattr(sandbox.Path, "home", staticmethod(lambda: tmp_path))
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / ".aws" / "relocated-crew"))
-        reloc = str(tmp_path / ".aws" / "relocated-crew" / "workspace" / "md-notebook" / "pat")
+        reloc = str(tmp_path / ".aws" / "relocated-crew" / "md-notebook-staging")
 
         assert reloc in sandbox.app_backend_visible_targets("md-notebook")
         assert reloc not in sandbox.app_backend_visible_targets("md-notebook", mode="strict")
@@ -1078,10 +1072,8 @@ class TestForeignMaskShadowGuard:
         # Positive first, so the absence loop below cannot pass vacuously: the
         # relocated spelling really is minted by the resolver and really does
         # trip the guard.
-        shadowed_leaf = str(
-            tmp_path / ".gnupg" / "relocated-crew" / "workspace" / "md-notebook" / "pat"
-        )
-        assert shadowed_leaf in sandbox._relocated_crew_targets(("workspace/md-notebook/pat",))
+        shadowed_leaf = str(tmp_path / ".gnupg" / "relocated-crew" / "md-notebook-staging")
+        assert shadowed_leaf in sandbox._relocated_crew_targets(("md-notebook-staging",))
         assert sandbox.carveout_shadowed_by_foreign_mask(shadowed_leaf)
 
         targets = sandbox.app_backend_visible_targets("md-notebook")
@@ -1091,7 +1083,7 @@ class TestForeignMaskShadowGuard:
         for target in targets:
             assert not target.startswith(shadowed_root), f"{target} would unmask ~/.gnupg"
         # The refusal is per-spelling: the default-home entries are still carved.
-        assert os.path.join(str(tmp_path), ".kiro/crew/workspace/md-notebook/pat") in targets
+        assert os.path.join(str(tmp_path), ".kiro/crew/md-notebook-staging") in targets
 
     def test_the_cache_site_guards_its_carveout(self) -> None:
         """`apps/backend.py` must thread the cache path through the shadow guard.

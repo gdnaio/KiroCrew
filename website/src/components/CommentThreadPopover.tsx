@@ -4,6 +4,10 @@ import type { ArtifactComment } from '../types'
 import { CommentDraftReportProvider, CommentRow } from './CommentsSidebar'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { useAutoGrowTextarea } from '../hooks/useAutoGrowTextarea'
+import { codeAnchorElement, onCodeAnchorsChange } from './codeComments'
+import { CommentVoiceButton } from './CommentVoiceButton'
+import ErrorNotice from './ErrorNotice'
+import { spliceDictationText } from '../lib/dictationText'
 
 import { i18nT } from '../i18n/t'
 /**
@@ -21,6 +25,15 @@ import { i18nT } from '../i18n/t'
 
 const CARD_W = 360
 const GAP = 8
+/** Effective card width: the fixed 360px card shrinks on viewports too narrow
+ * to hold it (e.g. 320px phones), so the close/reply controls stay reachable
+ * for BOTH prose and code threads — the popover is shared by both surfaces. */
+const cardW = (vw: number) => Math.min(CARD_W, vw - GAP * 2)
+
+/** A prose thread's light-DOM highlight, else a code thread's chip (or the
+ *  code block that owns it): both are read live, so the card follows them. */
+const anchorElement = (rootId: string): HTMLElement | null =>
+  (document.querySelector(`[data-mc-cid="${CSS.escape(rootId)}"]`) as HTMLElement | null) ?? codeAnchorElement(rootId)
 
 interface Props {
   comments: ArtifactComment[]
@@ -50,6 +63,10 @@ export function CommentThreadPopover({
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
   const [reply, setReply] = useState('')
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [voiceError, setVoiceError] = useState<string | null>(null)
+  // A notice about another thread's dictation does not belong here.
+  const [errorRoot, setErrorRoot] = useState(rootId)
+  if (errorRoot !== rootId) { setErrorRoot(rootId); setVoiceError(null) }
   const ime = useImeGuard()
   useAutoGrowTextarea(composerRef, reply, 160)
 
@@ -79,8 +96,8 @@ export function CommentThreadPopover({
     if (rect) {
       aTop = rect.y; aBottom = rect.y + rect.h; aLeft = rect.x
     } else {
-      const el = document.querySelector(`[data-mc-cid="${CSS.escape(rootId)}"]`) as HTMLElement | null
-      if (!el) { setPos({ top: Math.max(GAP, (vh - cardH) / 2), left: Math.max(GAP, vw - CARD_W - 24) }); return }
+      const el = anchorElement(rootId)
+      if (!el) { setPos({ top: Math.max(GAP, (vh - cardH) / 2), left: Math.max(GAP, vw - cardW(vw) - 24) }); return }
       const r = el.getBoundingClientRect()
       aTop = r.top; aBottom = r.bottom; aLeft = r.left
     }
@@ -89,23 +106,28 @@ export function CommentThreadPopover({
       const above = aTop - cardH - GAP
       top = above >= GAP ? above : Math.max(GAP, vh - cardH - GAP)
     }
-    const left = Math.min(Math.max(GAP, aLeft), vw - CARD_W - GAP)
+    const left = Math.min(Math.max(GAP, aLeft), Math.max(GAP, vw - cardW(vw) - GAP))
     setPos({ top, left })
   }, [rect, rootId])
+
+  // A voice notice changes the card height without moving its anchor.
+  useLayoutEffect(() => { reposition() }, [voiceError, reposition])
 
   useLayoutEffect(() => {
     // Bring the markdown anchor into view before positioning.
     if (!rect) {
-      const el = document.querySelector(`[data-mc-cid="${CSS.escape(rootId)}"]`) as HTMLElement | null
+      const el = anchorElement(rootId)
       el?.scrollIntoView({ block: 'center', behavior: 'smooth' })
     }
     reposition()
     const onMove = () => reposition()
     window.addEventListener('scroll', onMove, true)
     window.addEventListener('resize', onMove)
+    const offAnchors = rect ? undefined : onCodeAnchorsChange(onMove)
     return () => {
       window.removeEventListener('scroll', onMove, true)
       window.removeEventListener('resize', onMove)
+      offAnchors?.()
     }
   }, [rootId, rect, reposition])
 
@@ -133,6 +155,11 @@ export function CommentThreadPopover({
       const t = e.target as Element | null
       if (cardRef.current?.contains(t as Node)) return
       if (t?.closest?.('.mc-cmt-bubble, .mc-cmt-rect, iframe, [role="menu"], [role="dialog"], [role="alertdialog"], [data-ui-location="artifacts.detail.more"]')) return
+      // A code-block thread chip is the code twin of `.mc-cmt-bubble`, but it
+      // lives in Pierre's shadow DOM, where `e.target` is retargeted to the
+      // host and `closest` cannot see it: read the composed path instead, so a
+      // chip click switches threads like a bubble click does, not a close.
+      if (e.composedPath?.().some(n => n instanceof Element && n.hasAttribute('data-mc-code-chip'))) return
       onClose()
     }
     document.addEventListener('keydown', onKey)
@@ -153,7 +180,7 @@ export function CommentThreadPopover({
     <CommentDraftReportProvider value={reportDraft}>
       <div
         ref={cardRef}
-        className="fixed z-[1000] w-[360px] max-h-[70vh] flex flex-col rounded-xl border-2 border-border-strong bg-bg-elevated shadow-2xl ring-1 ring-accent/30 overflow-hidden"
+        className="fixed z-[1000] w-[360px] max-w-[calc(100vw-16px)] max-h-[70vh] flex flex-col rounded-xl border-2 border-border-strong bg-bg-elevated shadow-2xl ring-1 ring-accent/30 overflow-hidden"
         style={{ top: pos?.top ?? -9999, left: pos?.left ?? -9999 }}
         role="dialog"
         aria-label={i18nT('components.commentThreadPopover.comment_thread')}
@@ -201,6 +228,12 @@ export function CommentThreadPopover({
           ))}
         </div>
         <div className="border-t border-border p-2 shrink-0">
+          {/* No hand-off: the reply draft here is unsaved, and the agent
+              hand-off navigates to the chat, which would discard it. Pressing
+              the mic again is the retry. */}
+          {voiceError && (
+            <ErrorNotice variant="inline" className="mb-1" message={voiceError} onDismiss={() => setVoiceError(null)} />
+          )}
           <textarea
             ref={composerRef}
             value={reply}
@@ -215,7 +248,13 @@ export function CommentThreadPopover({
             }}
             className="w-full bg-bg-elevated border border-border rounded-md px-2 py-1.5 text-text text-[13px] font-body outline-hidden resize-none focus-ring leading-[18px]"
           />
-          <div className="flex justify-end mt-1">
+          <div className="flex items-center justify-end gap-1 mt-1">
+            {/* Keyed by thread: a dictation never lands in another thread's reply. */}
+            <CommentVoiceButton
+              key={rootId}
+              onError={setVoiceError}
+              onText={t => { setReply(prev => spliceDictationText(prev, t.trim(), null).value); composerRef.current?.focus() }}
+            />
             <button
               type="button"
               disabled={!reply.trim()}

@@ -21,10 +21,9 @@ if TYPE_CHECKING:
         _sel,
         binary_content_is_flagged,
         config_loader,
+        platform_compat,
         read_bounded_json,
         redact,
-        redact_credentials,
-        redact_exfiltration_urls,
         redact_for_display,
         safe_read_file_bytes,
         upload_destination,
@@ -98,9 +97,29 @@ def _gate_upload_file(
             None,
             None,
         )
-    resolved = Path(file_path).resolve()
-    allowed_outbox = config_loader.outbox_dir().resolve()
-    allowed_workspace = config_loader.workspace_root().resolve()
+    fold = platform_compat.strip_extended_length_prefix
+    unfolded = Path(file_path).resolve()
+    # The folded path is the one read, so a name only the ``\\?\`` spelling
+    # reaches (a trailing dot, a DOS device) is refused: its plain spelling
+    # names a different file.
+    if platform_compat.names_a_verbatim_only_file(unfolded):
+        _audit_denial(f"verbatim_only_name: {file_path}")
+        return (
+            web.json_response(
+                {
+                    "error": "file_path names a file reachable only by its extended-length path",
+                    "code": "path_not_allowed",
+                },
+                status=403,
+            ),
+            None,
+            None,
+        )
+    # Windows' ``\\?\`` prefix folded off all three (lexically), so one resolve
+    # keeping it is not read as an escape.
+    resolved = fold(unfolded)
+    allowed_outbox = fold(config_loader.outbox_dir().resolve())
+    allowed_workspace = fold(config_loader.workspace_root().resolve())
     if not (resolved.is_relative_to(allowed_outbox) or resolved.is_relative_to(allowed_workspace)):
         _audit_denial(f"path_not_allowed: {file_path}")
         return (
@@ -209,10 +228,12 @@ def _gate_upload_file(
                     None,
                 )
         except Exception as redact_err:
-            _audit_denial(f"redaction_failed: {redact_err}", outcome="error")
+            # A stable message: the raw exception text is neither returned nor
+            # logged, only its type (the handlers below show only redacted text).
+            _audit_denial(f"redaction_failed: {type(redact_err).__name__}", outcome="error")
             return (
                 web.json_response(
-                    {"error": f"Redaction failed: {redact_err}", "code": "redaction_failed"},
+                    {"error": "Redaction failed", "code": "redaction_failed"},
                     status=500,
                 ),
                 None,
@@ -314,8 +335,9 @@ async def api_slack_upload_file(request: web.Request) -> web.Response:
         # A Slack SDK / network exception can carry file paths, host and URL
         # fragments, or credentials embedded in a URL. Sanitize before it
         # reaches the client or the audit record (see api_slack_pins).
-        safe_error, _ = redact_credentials(str(e))
-        safe_error, _ = redact_exfiltration_urls(safe_error)
+        from kiro_crew.security import redact as redact_composed
+
+        safe_error = redact_composed(str(e))
         _audit_file_send(leg="slack", outcome="error", downstream="slack", error=safe_error)
         return web.json_response({"error": safe_error}, status=500)
 
@@ -401,8 +423,9 @@ async def api_channel_upload_file(request: web.Request) -> web.Response:
         # A transport / network exception can carry file paths, host and URL
         # fragments, or credentials embedded in a URL. Sanitize before it
         # reaches the client or the audit record (see api_slack_upload_file).
-        safe_error, _ = redact_credentials(str(e))
-        safe_error, _ = redact_exfiltration_urls(safe_error)
+        from kiro_crew.security import redact as redact_composed
+
+        safe_error = redact_composed(str(e))
         _audit_file_send(
             leg="channel",
             outcome="error",

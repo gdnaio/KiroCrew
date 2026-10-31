@@ -575,7 +575,14 @@ async def test_create_revalidates_the_source_identity_under_the_lock(agents_dir,
     monkeypatch.setattr(agents_handlers, "_spec_stem_on_disk", _second_claimant_then_check)
     resp = await api_agent_template_create(_request("POST", body={"name": "mine", "from": "atlas"}))
     assert resp.status == 409, resp.text
-    assert (await _body(resp))["code"] == "ambiguous_template_name"
+    payload = await _body(resp)
+    assert payload["code"] == "ambiguous_template_name"
+    # The locked re-check names what it found, the late claimant included.
+    assert payload["error"] == (
+        "'atlas' matches more than one template file in ~/.kiro/agents/ "
+        "(SomePkg-atlas.json, atlas.json); rename one first."
+    )
+    assert str(agents_dir) not in payload["error"]
     assert not (agents_dir / "mine.json").exists()
 
 
@@ -601,7 +608,10 @@ async def test_create_refuses_a_source_replaced_by_another_file_under_the_lock(
     monkeypatch.setattr(agents_handlers, "_spec_stem_on_disk", _replace_source_then_check)
     resp = await api_agent_template_create(_request("POST", body={"name": "mine", "from": "atlas"}))
     assert resp.status == 409, resp.text
-    assert (await _body(resp))["code"] == "ambiguous_template_name"
+    payload = await _body(resp)
+    assert payload["code"] == "ambiguous_template_name"
+    # One file answers now, so there is no "more than one" list to give.
+    assert payload["error"] == "'atlas' matches more than one template file; rename one first."
     assert not (agents_dir / "mine.json").exists()
 
 
@@ -651,7 +661,13 @@ async def test_create_from_an_ambiguous_name_is_a_409_not_a_500(agents_dir):
     _seed_config()
     resp = await api_agent_template_create(_request("POST", body={"name": "mine", "from": "atlas"}))
     assert resp.status == 409, resp.text
-    assert (await _body(resp))["code"] == "ambiguous_template_name"
+    payload = await _body(resp)
+    assert payload["code"] == "ambiguous_template_name"
+    assert payload["error"] == (
+        "'atlas' matches more than one template file in ~/.kiro/agents/ "
+        "(SomePkg-atlas.json, atlas.json); rename one first."
+    )
+    assert str(agents_dir) not in payload["error"]
     assert not (agents_dir / "mine.json").exists()
 
 
@@ -1136,6 +1152,49 @@ async def test_delete_never_unlinks_a_row_whose_filename_is_not_a_spec_beneath_a
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("on_disk", [True, False], ids=["deleted", "missing"])
+async def test_delete_checks_the_spec_path_off_the_event_loop_thread(
+    agents_dir, monkeypatch, on_disk
+):
+    """``_spec_file_beneath`` resolves the agents directory and stats the spec;
+    on a mount that stopped answering those block for as long as the kernel
+    does, so the handler never calls it on the loop thread -- and its answer
+    (a deletable file, or ``None`` for a row naming nothing on disk) still
+    decides the response exactly as before."""
+    import threading
+
+    from kiro_crew.agent_discovery import AgentInfo
+    from kiro_crew.dashboard.handlers import agent_templates as module
+
+    if on_disk:
+        _write(agents_dir, "scratch.json", name="scratch")
+    _seed_config()
+    rows = [AgentInfo(name="scratch", filename="scratch.json", description="", model="")]
+    monkeypatch.setattr(module, "_find_infos", lambda _name: rows)
+    loop_thread = threading.get_ident()
+    calls: list[tuple[int, Path | None]] = []
+    real = module._spec_file_beneath
+
+    def tracked(agents_dir_arg, filename):
+        result = real(agents_dir_arg, filename)
+        calls.append((threading.get_ident(), result))
+        return result
+
+    monkeypatch.setattr(module, "_spec_file_beneath", tracked)
+    resp = await api_agent_template_delete(_request("DELETE", "scratch"))
+    if on_disk:
+        assert resp.status == 200, resp.text
+        assert not (agents_dir / "scratch.json").exists()
+        # The pre-lock check and the re-check under the spec lock both ran.
+        assert [result for _thread, result in calls] == [agents_dir / "scratch.json"] * 2
+    else:
+        assert resp.status == 404, resp.text
+        assert (await _body(resp))["code"] == "template_not_found"
+        assert [result for _thread, result in calls] == [None]
+    assert all(thread != loop_thread for thread, _result in calls), calls
+
+
+@pytest.mark.asyncio
 async def test_delete_never_unlinks_a_file_that_does_not_answer_to_the_requested_name(
     agents_dir, monkeypatch
 ):
@@ -1199,7 +1258,13 @@ async def test_delete_refuses_a_name_that_reaches_two_files(agents_dir):
     _seed_config({"pr-bot": "kirocrew"}, default="pr-bot")
     resp = await api_agent_template_delete(_request("DELETE", "bar"))
     assert resp.status == 409, resp.text
-    assert (await _body(resp))["code"] == "ambiguous_template_name"
+    payload = await _body(resp)
+    assert payload["code"] == "ambiguous_template_name"
+    assert payload["error"] == (
+        "'bar' matches more than one template file in ~/.kiro/agents/ "
+        "(bar.json, foo.json); rename one first."
+    )
+    assert str(agents_dir) not in payload["error"]
     assert (agents_dir / "bar.json").exists() and (agents_dir / "foo.json").exists()
 
 
@@ -1237,7 +1302,13 @@ async def test_delete_revalidates_ambiguity_under_the_spec_lock(agents_dir, monk
     monkeypatch.setattr(module, "_find_infos", _probe_then_install)
     resp = await api_agent_template_delete(_request("DELETE", "bar"))
     assert resp.status == 409, resp.text
-    assert (await _body(resp))["code"] == "ambiguous_template_name"
+    payload = await _body(resp)
+    assert payload["code"] == "ambiguous_template_name"
+    assert payload["error"] == (
+        "'bar' matches more than one template file in ~/.kiro/agents/ "
+        "(Pkg-bar.json, bar.json); rename one first."
+    )
+    assert str(agents_dir) not in payload["error"]
     assert (agents_dir / "bar.json").exists() and (agents_dir / "Pkg-bar.json").exists()
 
 

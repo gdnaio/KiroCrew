@@ -8,8 +8,10 @@ One command is the whole offline browser gate. It boots a real gateway wired to 
 packaged fake model backend, then shells the in-tree Playwright suite at it. No
 model, no credentials, no network, no cost.
 
-The main browser job is Linux-only: it uses the CodeBuild fleet where eligible
-and otherwise falls back to `ubuntu-latest`. It cannot rely on an unprivileged
+The main browser job is Linux-only: it uses the CodeBuild fleet where eligible,
+otherwise the `kirocrew-runners` larger-runner group when the run executes in
+this repository, and `ubuntu-latest` in a fork running its own CI. It cannot
+rely on an unprivileged
 user namespace (CodeBuild refuses `unshare(CLONE_NEWUSER)`, and this job does not
 alter the hosted runner's namespace policy). Its disposable fake-backend gateway
 alone seeds `agent.sandbox_allow_unsandboxed_exec=true`; authenticated browser setup
@@ -328,10 +330,10 @@ supplies these recordings; source authoring alone is not rendered evidence.
 Its retention is seven days, and it does not fail when setup produced no images.
 
 `website/playwright/dashboard-preview-link.spec.ts` opens the link
-`dashboard_preview` hands a crewmate and asserts that it resolves: the Members page
+`dashboard_preview` hands a mate and asserts that it resolves: the Members page
 draws the staged page under its **Preview, not applied** label, and the dashboard read accepts the
-crewmate the link names. Before the browser starts, the harness
-(`test_playwright_e2e._stage_dashboard_preview`) seeds one crewmate in the disposable
+mate the link names. Before the browser starts, the harness
+(`test_playwright_e2e._stage_dashboard_preview`) seeds one mate in the disposable
 config, stages the `standup` template for it with the production store, and passes
 the link that store's `wire()` returns in `KIROCREW_E2E_DASHBOARD_PREVIEW`. The spec
 never builds the link itself. `standup` is not the default page, so a tab still
@@ -485,7 +487,7 @@ Two legs cover it, and neither costs a PR any minutes: both live in
 | Leg | Job | Script | What only a real install shows |
 | --- | --- | --- | --- |
 | Linux | `build-desktop.yml` -> `Smoke-install Linux packages (deb + rpm)` | `scripts/smoke-linux-packages.sh` | dependency names resolve in Ubuntu 24.04 and Amazon Linux 2023, the `.desktop` entry's `StartupWMClass` equals Electron's app_id, the maintainer scripts place and remove `/usr/bin/<exe>`, and the beacon stamp names THIS format |
-| Windows | `build-windows.yml` -> `Smoke-install Windows installer (x64)` | `scripts/smoke-windows-install.ps1` | the uninstall registration and the `InstallLocation` in its paired install-info key (`<hive>\Software\<GUID>`, where electron-builder writes it), the install-root ownership boundary, where the Start Menu shortcut POINTS, that the bundled CLI runs, that the installed gateway answers `/api/health`, and that a silent uninstall removes the registration, the install-info key and the tree |
+| Windows | `build-windows.yml` -> `Smoke-install Windows installer (x64)` | `scripts/smoke-windows-install.ps1` | the uninstall registration and the `InstallLocation` in its paired install-info key (`<hive>\Software\<GUID>`, where electron-builder writes it), the install-root ownership boundary, where the Start Menu shortcut POINTS, that the bundled CLI runs, that the staged KAS engine root is in the installed tree and the installed `kirocrew kas status` reports it `(built into the app)` when `KIROCREW_BUNDLED_KAS_DIR` names it, that the installed gateway answers `/api/health`, and that a silent uninstall removes the registration, the install-info key and the tree |
 
 The Windows leg is gated on the build job's `artifact_uploaded` output rather
 than on `needs` alone: publish runs build Windows under `continue-on-error`
@@ -582,14 +584,14 @@ The browser and private-namespace lanes above are Linux-only.
 `test/e2e/test_gateway_boot_matrix.py` is the one asset that boots a real gateway
 on **macOS and Windows too**, and `ci.yml`'s
 `e2e-boot-matrix` job is what runs it: `fail-fast: false`,
-`needs: [changes, await-fast-gate]`, 20 minutes. `strategy.matrix.os` has three
+`needs: [changes, await-fast-gate, lint-gate]`, 20 minutes. `strategy.matrix.os` has three
 states:
 
 | Event | OS legs | `needs` |
 |---|---|---|
-| `pull_request`, `merge_group` | `ubuntu-latest`, `windows-latest` | must succeed |
-| push to `main`, `MERGE_QUEUE_ENABLED == 'true'` | `macos-15` alone | skipped; the condition admits the push |
-| push to `main`, variable not `'true'` | `ubuntu-latest`, `macos-15`, `windows-latest` | must succeed |
+| `pull_request`, `merge_group` | `ubuntu-latest`, `windows-latest` | must succeed (`lint-gate` too) |
+| push to `main`, `MERGE_QUEUE_ENABLED == 'true'` | `macos-15` alone | skipped (including `lint-gate`); the condition admits the push |
+| push to `main`, variable not `'true'` | `ubuntu-latest`, `macos-15`, `windows-latest` | must succeed (`lint-gate` too) |
 
 The mac leg is event-conditional for the queue, not the runtime: a `macos-15`
 runner waits about 200 minutes, so a mac leg on every pull request would hold

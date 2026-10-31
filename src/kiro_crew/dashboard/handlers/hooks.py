@@ -34,7 +34,13 @@ from kiro_crew.agent import (  # noqa: F401
     unsent_kiro_hook_rows,
 )
 from kiro_crew.agent_capabilities import CapabilityError
-from kiro_crew.agent_sdk.mcp_problems import session_mcp_problems
+from kiro_crew.agent_sdk.mcp_problems import (
+    UNATTENDED_MCP_WAIT_SECS,
+    declared_mcp_missing,
+    missing_mcp_notice,
+    session_mcp_problems,
+    wait_for_declared_mcp,
+)
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.constants import (
     DENY_CAUSE_AUDIT_UNAVAILABLE,
@@ -42,6 +48,7 @@ from kiro_crew.constants import (
     DENY_CAUSE_POLICY,
     DENY_CAUSE_SURFACE_POLICY,
 )
+from kiro_crew.dashboard.body_numbers import body_int
 from kiro_crew.dashboard.handlers.hooks_scripts import _sel
 from kiro_crew.dashboard.handlers.hooks_webhook_intake import (
     _HOOK_BODY_MAX_BYTES,
@@ -70,6 +77,8 @@ from kiro_crew.permission_floor import (
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.session_capabilities import CapabilityStartupError
+from kiro_crew.shared_crew.admission import OperationKind
+from kiro_crew.shared_crew.turn_gate import TurnRefused, run_admitted_or_raise
 from kiro_crew.tool_gate_busy import hook_gate_busy
 
 logger = logging.getLogger(__name__)
@@ -134,18 +143,26 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
             status=503,
         )
     if not switch_on:
+        from kiro_crew.webhook_sources import SOURCE_AGENT, source_refusal
+
+        # A policy refusal reads as a switched-off store; say which one refused.
+        by_policy = await asyncio.to_thread(source_refusal, SOURCE_AGENT)
         _sel().log_api_access(
             caller=request.remote or "unknown",
             operation="hooks.agent",
             outcome="denied",
             source="webhook",
-            error="webhooks disabled by operator",
+            error=by_policy or "webhooks disabled by operator",
         )
         await asyncio.to_thread(
             webhooks.run_store().record,
             outcome=webhooks.OUTCOME_DISABLED,
             name="Rejected",
-            detail="Inbound webhooks are switched off in the dashboard",
+            detail=(
+                f"Inbound webhooks: {by_policy}"
+                if by_policy
+                else "Inbound webhooks are switched off in the dashboard"
+            ),
         )
         return web.json_response(
             {"error": "inbound webhooks are disabled", "code": "webhooks_disabled"}, status=503
@@ -396,10 +413,9 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
     try:
         timeout_secs = max(
             60,
-            min(int(body.get("timeoutSeconds", _HOOK_TIMEOUT_DEFAULT)), _HOOK_TIMEOUT_MAX),
+            min(body_int(body.get("timeoutSeconds", _HOOK_TIMEOUT_DEFAULT)), _HOOK_TIMEOUT_MAX),
         )
-    # OverflowError: json.loads reads 1e999 as inf, and int(inf) raises it.
-    except (ValueError, TypeError, OverflowError):
+    except (ValueError, TypeError):
         webhooks.count_request(webhooks.METRIC_OUTCOME_REJECTED_BODY)
         return web.json_response(
             {"error": "timeoutSeconds must be an integer", "code": "timeout_not_an_integer"},
@@ -736,6 +752,10 @@ async def _run_hook_inner(
     client, is_new, resumed = await state.sessions.get_or_create(session_key, agent=agent)
     if on_client is not None:
         on_client(client)
+    if is_new:
+        # Nobody can reconnect a slow MCP server by hand in this run, so the
+        # first prompt waits (bounded) for the agent spec's servers to report.
+        await wait_for_declared_mcp(client, UNATTENDED_MCP_WAIT_SECS)
     full_message = message
     # The ContextBuilder prompt is the only text on this path that legitimately
     # MINTS structural boundary markers, so it is the one text the scrub below
@@ -751,9 +771,14 @@ async def _run_hook_inner(
             session_key,
             agent=agent,
             resumed=resumed,
+            # Fallback label only: with the session's provider passed below,
+            # build_message builds on the SERVED harness label (`kas` on KAS),
+            # the same rule chat, cron, task and subagent turns follow, so the
+            # skill directory matches what skill_search can load.
             provider_type=KiroCrewConfig.load().agent.provider,
             memory_store=memory_store,
             execution_context=execution,
+            context_provider=client,
         )
         trusted_prompt = full_message
     if full_message is not trusted_prompt:
@@ -993,6 +1018,8 @@ async def _run_hook_agent(
     detail = ""
     clients: list[Any] = []
     mcp_problems = ""
+    mcp_missing: tuple[str, ...] = ()
+    mcp_never_reported = ""
     try:
         # Loading the persisted context (written by the register_hook MCP tool)
         # is INSIDE the try because the caller's permit and the in-flight claim
@@ -1028,17 +1055,30 @@ async def _run_hook_agent(
         # instead of failing on its first read.
         await wait_for_memory_preparation(getattr(state, "memory_startup_task", None))
 
+        # Shared Crew fair admission, charged to Crew automation (a webhook
+        # caller has no principal); a refusal raises ``TurnRefused``.
         result_text = await asyncio.wait_for(
-            _run_hook_inner(
-                state,
-                session_key,
-                message,
-                agent,
-                execution_context=execution_context,
-                on_client=clients.append,
+            run_admitted_or_raise(
+                _run_hook_inner(
+                    state,
+                    session_key,
+                    message,
+                    agent,
+                    execution_context=execution_context,
+                    on_client=clients.append,
+                ),
+                session_key=session_key,
+                text=message,
+                automation=True,
+                operation=OperationKind.BACKGROUND,
             ),
             timeout=timeout_secs,
         )
+    except TurnRefused as exc:
+        outcome = "error"
+        result_text = str(exc)
+        detail = result_text
+        logger.info("Hook agent %s did not start: %s", session_key, result_text)
     except asyncio.TimeoutError:
         outcome = "timeout"
         result_text = f"Hook agent timed out after {timeout_secs}s"
@@ -1074,6 +1114,8 @@ async def _run_hook_agent(
         # down. Here rather than in the inner turn so a timeout or crash still
         # says which servers never started.
         mcp_problems = session_mcp_problems(clients[0] if clients else None)
+        mcp_missing = declared_mcp_missing(clients[0] if clients else None)
+        mcp_never_reported = missing_mcp_notice(clients[0] if clients else None)
         if mcp_problems:
             logger.warning(
                 "Hook agent %s: MCP servers unusable in this run — %s",
@@ -1114,6 +1156,12 @@ async def _run_hook_agent(
     # received nothing.
     destinations: list[str] = []
     mcp_notice = f"MCP servers unusable in this run: {mcp_problems}" if mcp_problems else ""
+    if mcp_missing and outcome == webhooks.OUTCOME_COMPLETED:
+        # A turn that ran without a declared server is not a clean completion:
+        # a distinct outcome lets the operator retry it instead of trusting it.
+        outcome = webhooks.OUTCOME_DEGRADED
+    if mcp_never_reported:
+        mcp_notice = f"{mcp_never_reported}. {mcp_notice}" if mcp_notice else mcp_never_reported
     if mcp_notice:
         result_text = f"{result_text}\n\n{mcp_notice}" if result_text else mcp_notice
     if result_text:
@@ -1147,7 +1195,7 @@ async def _run_hook_agent(
                     logger.exception("Hook agent: Slack delivery failed")
 
     delivered = bool(destinations)
-    if outcome == "completed" and not detail:
+    if outcome in (webhooks.OUTCOME_COMPLETED, webhooks.OUTCOME_DEGRADED) and not detail:
         if not deliver or not result_text:
             detail = "No result to deliver"
         elif destinations:

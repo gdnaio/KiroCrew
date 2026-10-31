@@ -75,7 +75,7 @@ CHILD_PERMISSION_ROUTED = "kirocrew.acp.child_permission.routed"
 DROPPED_FRAMES = "kirocrew.acp.dropped_frames"
 
 #: One point per ``session/set_mode`` that did not land on the freshly prepared
-#: skill-view alias on the first try (``acp/runtime.py::_activate_mode_bracketed``).
+#: skill-view alias on the first try (``acp/runtime_mode_activation.py::_activate_mode_bracketed``).
 #: ``outcome`` is the closed enum ``loaded_after_retry`` (the host loaded it after a
 #: forced reload) / ``refused_unloaded`` (it never did; the session start failed) /
 #: ``refused_unprepared`` (no view could be prepared; the start failed) /
@@ -94,6 +94,9 @@ TURN_TIMEOUT_CAUSE = "kirocrew.turn.timeout.cause"
 #: Idle-sweep expiries — ``turn_active=True`` means the sweep killed a
 #: runtime mid-turn, the teardown signature of the original incidents.
 SESSION_IDLE_EXPIRED = "kirocrew.session.idle_expired"
+
+#: One runtime-reconcile pass: its reading's counts, emitted every pass.
+SESSION_RUNTIME_RECONCILE = "kirocrew.session.runtime_reconcile"
 
 
 # ---------------------------------------------------------------------------

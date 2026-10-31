@@ -4,13 +4,14 @@ import { RefreshCw, Plug, AlertTriangle, Check, ChevronRight, Zap, X, Download, 
 import { motion, AnimatePresence } from 'framer-motion'
 import { Trans } from 'react-i18next'
 import { Link } from 'react-router-dom'
-import { configuredAcpBackend, mcpWholeServerDeny, type AcpBackendConfig } from '../../api/acpBackend'
+import { configuredAcpBackend, mcpServerDeny, type AcpBackendConfig } from '../../api/acpBackend'
 import { api } from '../../api/client'
 import type { AcpBackendProbe } from '../../api/client'
 import { Card, Btn, Badge, SearchInput, ContentSkeleton } from '../../components/ui'
 import InfoTip from '../../components/InfoTip'
 import ErrorNotice from '../../components/ErrorNotice'
 import AgentSpecNotRewrittenNotice from '../../components/AgentSpecNotRewrittenNotice'
+import McpShareRefusedNotice from './McpShareRefusedNotice'
 import { useProvider } from '../../providers'
 import McpBrowserModal from '../../components/McpBrowserModal'
 import McpCustomServerModal from '../../components/McpCustomServerModal'
@@ -291,6 +292,11 @@ function mcpStatusLabel(status: string, auth: McpAuthState): string {
     // the gateway cannot read, so there is nothing local to verify.
     case 'registry':
       return i18nT('pages.overview.mcpTab.not_verified')
+    // A `secret://` server the running gateway starts: it runs there, where the
+    // reference resolves, and the dashboard does not probe it, so the label
+    // says where it runs and makes no health claim.
+    case 'routed':
+      return i18nT('pages.overview.mcpTab.routed')
     default:
       return i18nT('pages.overview.mcpTab.unknown')
   }
@@ -365,6 +371,9 @@ function mcpStatusVariant(status: string, auth: McpAuthState): 'ok' | 'err' | 'w
   // Muted, not amber: no local action changes a registry row, and on a governed
   // host every governed server would otherwise sit in the "act now" colour.
   if (status === 'registry') return 'muted'
+  // Muted for the same reason: routing is already on, so there is nothing to
+  // act on, and green would claim a health check that did not run.
+  if (status === 'routed') return 'muted'
   return auth === 'signed_in' ? 'muted' : 'warn'
 }
 
@@ -419,6 +428,7 @@ function mcpStatusHint(
     return probeFailing || reasonOnRow ? undefined : i18nT('pages.overview.mcpTab.outdated_help')
   }
   if (status === 'registry') return i18nT('pages.overview.mcpTab.registry_help', { provider: serverName })
+  if (status === 'routed') return i18nT('pages.overview.mcpTab.routed_help')
   if (status !== 'needs_auth') return undefined
   if (auth === 'sign_in_required') return i18nT('pages.overview.mcpTab.sign_in_required_next')
   if (auth === 'signed_in') return i18nT('pages.overview.mcpTab.signed_in_help', { provider: serverName })
@@ -427,6 +437,17 @@ function mcpStatusHint(
 
 interface McpTabProps {
   onManagedProviderClick?: (slug: string) => void
+}
+
+/** The cost of one tool-off on this server, or nothing where none holds. */
+function McpDenyReach({ reach }: { reach: { rule: string; exception: string } }) {
+  if (!reach.rule && !reach.exception) return null
+  return (
+    <div className="mb-1 max-w-prose text-[12px] leading-relaxed" data-testid="mcp-deny-reach">
+      {reach.rule && <p className="m-0 text-text-strong">{reach.rule}</p>}
+      {reach.exception && <p className="m-0 text-muted">{reach.exception}</p>}
+    </div>
+  )
 }
 
 export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
@@ -501,10 +522,10 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
     queryFn: () => api.acpBackends(),
     retry: false,
   })
-  const denyReach = useMemo(() => {
-    if (!harnessCfg || !harnessProbe) return { rule: '', exception: '' }
+  const denyProbe = useMemo(() => {
+    if (!harnessCfg || !harnessProbe) return undefined
     const active = configuredAcpBackend(harnessCfg)
-    return mcpWholeServerDeny(harnessProbe.backends?.find(b => b.id === active))
+    return harnessProbe.backends?.find(b => b.id === active)
   }, [harnessCfg, harnessProbe])
 
   const pendingCount = useMemo(() => {
@@ -702,6 +723,9 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
       {/* No hand-off while changes are staged: opening the chat unmounts this tab
           and drops the pending MCP changes it holds. */}
       {specNotRewritten && <AgentSpecNotRewrittenNotice className="mb-3" askAgent={pendingCount === 0} />}
+      {/* Staged changes live only in this tab: with any pending, the notice keeps
+          its chat hand-off off and opens MCP Management in a new tab. */}
+      <McpShareRefusedNotice className="mb-3" stagedChanges={pendingCount > 0} />
 
       {/* Pending-changes banner */}
       {pendingCount > 0 && (
@@ -941,8 +965,16 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                         {/* The label tells the two off states apart in words: a
                             deliberate disable reads "Disabled", a non-boolean value
                             reads "Invalid value" -- colour and the chip are not the
-                            only distinction. */}
-                        {invalidValue ? i18nT('pages.overview.mcpTab.status_invalid_value') : mcpStatusLabel(s.status, mcpAuthState(s))}
+                            only distinction. A row that was not probed reads "Not
+                            probed", not the "Outdated" its status carries: beside a
+                            reason line saying no probe ran, "Outdated" names an aged
+                            result a refresh would fix, and a refresh repeats the
+                            refusal (#20376). The tone stays the status's own warn. */}
+                        {invalidValue
+                          ? i18nT('pages.overview.mcpTab.status_invalid_value')
+                          : notProbedReason
+                            ? i18nT('pages.overview.mcpTab.not_probed')
+                            : mcpStatusLabel(s.status, mcpAuthState(s))}
                       </Badge>
                       {(() => {
                         const hint = mcpStatusHint(s.status, s.name, mcpAuthState(s), s.probeFailing === true, notProbedReason)
@@ -1098,13 +1130,10 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                     {/* The cost of a tool-off, above the tools and before any click,
                         at the card's weight: the rule strong, its exception muted
                         right under it. Shown whenever the list is open on a harness
-                        whose reach can cost a whole server; nothing otherwise. */}
-                    {(denyReach.rule || denyReach.exception) && (
-                      <div className="mb-1 max-w-prose text-[12px] leading-relaxed" data-testid="mcp-deny-reach">
-                        {denyReach.rule && <p className="m-0 text-text-strong">{denyReach.rule}</p>}
-                        {denyReach.exception && <p className="m-0 text-muted">{denyReach.exception}</p>}
-                      </div>
-                    )}
+                        whose reach can cost a whole server; nothing otherwise.
+                        Worded for THIS server: a server the reach spares shows
+                        only that fact. */}
+                    <McpDenyReach reach={mcpServerDeny(denyProbe, s.name)} />
                     <div className="space-y-0.5">{s.tools.map(t => {
                       const currentlyDisabled = (s.disabledTools || []).includes(t)
                       const toolOverride = pendingTools[s.name]?.[t]

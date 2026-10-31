@@ -1,4 +1,6 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import type { ReactElement } from 'react'
+import { Provider } from 'react-redux'
+import { fireEvent, render as rtlRender, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import type { Slot } from './types'
 import type { LaneSignals } from './board'
@@ -9,6 +11,10 @@ vi.mock('../../chat-core/transport/sendTurn', () => ({ sendTurn }))
 
 import BroadcastPanel from './BroadcastPanel'
 import { fmtRelative } from '../../i18n/format'
+import { store } from '../../store'
+
+/** The panel reads the live message-recency overlay from the store. */
+const render = (ui: ReactElement) => rtlRender(<Provider store={store}>{ui}</Provider>)
 
 const slots: Slot[] = [
   { key: 'loop-busy', title: 'Babysit', running: true },
@@ -36,7 +42,7 @@ beforeEach(() => {
 afterEach(() => { vi.clearAllMocks() })
 
 describe('BroadcastPanel', () => {
-  it('defaults to looping sessions with crewmates excluded', () => {
+  it('defaults to looping sessions with mates excluded', () => {
     setup()
     expect(screen.getByTestId('broadcast-crew-exclude').getAttribute('aria-pressed')).toBe('true')
     expect(screen.getByTestId('broadcast-row-loop-busy')).toBeTruthy()
@@ -52,7 +58,7 @@ describe('BroadcastPanel', () => {
     expect(screen.getByTestId('broadcast-row-loop-idle').textContent).toContain('Starts new turn')
   })
 
-  it('brings crewmates in when included', () => {
+  it('brings mates in when included', () => {
     setup()
     fireEvent.click(screen.getByTestId('broadcast-crew-include'))
     expect(screen.getByTestId('broadcast-row-crew-loop')).toBeTruthy()

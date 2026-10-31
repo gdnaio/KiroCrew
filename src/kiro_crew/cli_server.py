@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, NoReturn
 
 import kiro_crew._facade_mirror as _facade_mirror
 from kiro_crew import __version__, dep_sync, platform_compat
-from kiro_crew.app_lifecycle_client import _deadline_expired
 from kiro_crew.beacon import distribution, is_default_home
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
@@ -123,83 +122,14 @@ from kiro_crew.vector_memory import VectorMemoryStore
 # (no-new-work-on-gateway-boot-path).
 
 
-def _file_delivery_approve() -> None:
-    """Approve a flagged-file delivery consent armed from the dashboard.
-
-    Same step-up shape as :func:`_update_approve`: the proof of host identity is
-    READING THE NONCE FILE, which lives on the keystone floor with owner-only
-    permissions, so presenting its nonce back to the gateway demonstrates
-    filesystem access as the gateway's own user -- the step an owner-authenticated
-    but agent-DRIVEN browser cannot perform, which is the hole this closes. The
-    gateway records the grant only after the nonce validates.
-    """
-    from kiro_crew.file_delivery_consent import read_pending_grant
-
-    print("👻 Approving the pending flagged-file delivery consent…\n")
-    pending = read_pending_grant()
-    if pending is None:
-        print("❌ No armed grant request (it may have expired).")
-        print("   Confirm from the dashboard's Security panel first, then re-run this.")
-        sys.exit(1)
-    print(f"  📦 {pending.destination_class}, expires in {pending.expires_in}s")
-
-    port = resolve_client_port(None)
-    url = f"http://127.0.0.1:{port}/api/file-delivery/consent/approve"
-    payload = json.dumps({"nonce": pending.nonce}).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    # Same local-secret / unix-socket authentication as _update_approve: reading
-    # the secret is itself host-local evidence, and an absent secret still works
-    # on a default loopback install where no token auth runs.
-    secret = read_local_secret(port, dial_host="127.0.0.1")
-    if secret:
-        headers["X-Internal-Secret"] = secret
-    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-    try:
-        from kiro_crew.dashboard.urls import (  # noqa: F811 - header import serves owners
-            dashboard_socket_path,
-        )
-
-        socket_path: str | None = str(dashboard_socket_path(port))
-    except Exception:
-        socket_path = None
-    try:
-        # NOT `loopback_urlopen`: this request carries the single-use nonce AND
-        # the local secret, and that opener's own contract says a caller whose
-        # request carries a credential another process could capture on the port
-        # wants `unix_socket_urlopen` instead. Its TCP fallback fires on a STALE
-        # socket -- exactly the dead-gateway case in which a foreign process may
-        # hold the loopback port -- so falling back would hand both credentials
-        # to whatever answers. A gateway that is gone is reported as not running
-        # rather than retried on a port nothing trustworthy is holding.
-        #
-        # TCP stays the transport only where there is no unix socket to prefer
-        # (native Windows has no `AF_UNIX`): there the port IS the only local
-        # transport, so no fallback decision exists to get wrong.
-        if socket_path is not None and hasattr(socket, "AF_UNIX"):
-            approve_resp = unix_socket_urlopen(req, 15, socket_path=socket_path)
-        else:
-            approve_resp = loopback_urlopen(req, timeout=15)
-        with approve_resp as resp:
-            body = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        try:
-            detail = json.loads(e.read()).get("error", "")
-        except Exception:
-            detail = ""
-        print(
-            f"❌ Gateway refused the approval (HTTP {e.code})" + (f": {detail}" if detail else "")
-        )
-        sys.exit(1)
-    except (urllib.error.URLError, OSError):
-        print("❌ Gateway is not running — start it, then re-run: kirocrew file-delivery approve")
-        sys.exit(1)
-    grant = body.get("grant") if isinstance(body, dict) else None
-    dest = grant.get("destination_class") if isinstance(grant, dict) else pending.destination_class
-    print(f"\n✅ Confirmed delivery to {dest}. The dashboard now shows it as confirmed.")
-
-
 def _status(args: argparse.Namespace) -> None:
-    """Query the running gateway for stats, or print offline message."""
+    """Query the running gateway for stats, or print offline message.
+
+    Exits 1 when nothing answers the resolved port (a refused connection), so a
+    script can gate on the exit code instead of parsing stdout. Every state in
+    which a gateway answers -- stats, token auth, an HTTP error, a busy timeout
+    or an unexpected body -- exits 0.
+    """
     port = resolve_client_port(getattr(args, "port", None))
     url = f"http://127.0.0.1:{port}/api/status"
     try:
@@ -212,9 +142,21 @@ def _status(args: argparse.Namespace) -> None:
         else:
             print(f"Kiro Crew gateway is running but returned HTTP {e.code}.")
         return
-    except (urllib.error.URLError, OSError):
-        print("Kiro Crew gateway is not running.")
-        print("  Start it with: kirocrew gateway")
+    except (urllib.error.URLError, OSError) as e:
+        # A timeout means something took the request, so a gateway IS listening
+        # -- it is up but busy (a loop thread starved of the GIL), not gone.
+        # Saying "not running" here would send the operator to restart a
+        # healthy gateway. Imported in-function: a module-scope import would
+        # surface on this split module's star-import facade.
+        from kiro_crew.loopback_http import deadline_expired
+
+        if deadline_expired(e):
+            print(f"Kiro Crew gateway is running on port {port} but is busy (did not answer).")
+            print("  It may be under load; try again in a moment.")
+        else:
+            print("Kiro Crew gateway is not running.")
+            print("  Start it with: kirocrew gateway")
+            sys.exit(1)
         return
     except Exception:
         print("Kiro Crew gateway is running but returned an unexpected response.")
@@ -354,6 +296,14 @@ async def _gateway(
 
     if not config_path().exists():
         cfg = KiroCrewConfig()
+        # Boot has installed the context, so an edition's default STT provider is
+        # known here; seeding the field default would persist ``local`` as a choice.
+        from kiro_crew import speech_providers
+
+        if speech_providers.edition_default_stt() is not None:
+            from kiro_crew.config.sections_stt import default_stt_provider
+
+            cfg.stt.provider = default_stt_provider()
         # _gateway is a coroutine, so this runs on the event loop: save() takes
         # the sidecar advisory flock and a contended wait (another
         # process writing config at boot) must block a worker thread, not the
@@ -385,6 +335,12 @@ async def _run_task(args: argparse.Namespace) -> None:
         print(f"❌ Spec file not found: {spec_path}", file=sys.stderr)
         sys.exit(1)
 
+    # A stored Kiro CLI pick runs on KAS where kiro-cli offers v3; this process
+    # never ran the gateway's KAS floor, so establish that evidence before the
+    # load reads the pick. Probes only for a Kiro CLI pick; off the event loop.
+    from kiro_crew.agent_sdk.backends import ensure_kiro_cli_kas_verdict
+
+    await asyncio.to_thread(ensure_kiro_cli_kas_verdict)
     cfg = KiroCrewConfig.load()
     factory = build_provider_factory(cfg)
     sessions = SessionManager(cfg, provider_factory=factory)  # type: ignore[arg-type]
@@ -617,7 +573,7 @@ def _logs_cmd(args: argparse.Namespace) -> None:
       4. ``~/.kiro/crew/gateway.log`` (foreground gateway)
     """
     follow = bool(getattr(args, "follow", False))
-    lines = int(getattr(args, "lines", 100) or 100)
+    lines = int(getattr(args, "lines", 100))
     plat = current_platform()
     unit = f"{SERVICE_NAME}.service"
 
@@ -787,7 +743,7 @@ def _tail_log_file(path: Path, lines: int, follow: bool) -> None:
 
 
 # ── The split-out owners ──
-# This module keeps the file-delivery approval, status, gateway, run, service, sandbox and logs
+# This module keeps the status, gateway, run, service, sandbox and logs
 # commands; the gateway peer proof, the token, logout and update-approve requests, ``stop``,
 # ``restart`` and ``update`` live in the owners below. Every name an owner defines still resolves as
 # ``kiro_crew.cli_server.<name>``, and a write through this module (``monkeypatch.setattr``,
@@ -819,6 +775,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _audit_peer_allowed,
         _audit_peer_denied,
         _connected_peer_verdict,
+        _connected_tcp_peer_pid,
         _connected_unix_peer_is_recorded_gateway,
         _ConnectedPeerVerdict,
         _existing_dashboard_socket,
@@ -828,11 +785,13 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
     from kiro_crew.cli_server_requests import (  # noqa: F401
         _GATEWAY_NOT_LISTENING_HINT,
+        _TOKEN_REFUSAL_REMEDIES,
         _TOKEN_REQUEST_TIMEOUT,
         _emit_session_urls,
         _logout,
         _probe_dashboard_health,
         _token,
+        _token_refusal_message,
         _update_approve,
     )
     from kiro_crew.cli_server_restart import (  # noqa: F401
@@ -852,6 +811,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _RESTART_STOP_TIMEOUT,
         _RESTART_TOKEN_TTL,
         _RESTART_TOKEN_WAIT,
+        _died_replacement_message,
         _gateway_log_lines_since,
         _gateway_log_mark,
         _GatewayLogMark,
@@ -864,6 +824,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _replacement_is_serving,
         _resolve_restart_ready_timeout,
         _restart,
+        _signing_key_refusal_lines,
         _spawn_detached_gateway,
         _wait_for_pids_exit,
         _wait_gateway_ready,
@@ -872,9 +833,14 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.cli_server_stop import (  # noqa: F401
         _MAX_ECHOED_NAME_LEN,
         _SHUTDOWN_RESPONSE_MAX_BYTES,
+        _SUPERVISOR_SEARCH_DEPTH,
+        _config_dir_owner,
+        _desktop_supervisor_pid,
         _gateway_pid,
         _manual_stop_command,
         _pid_exited,
+        _process_path,
+        _refuse_desktop_supervised,
         _refuse_if_lock_held,
         _refuse_lock_holder,
         _refuse_service_alias,
@@ -885,6 +851,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _stop_mcp_gateway_daemon,
         _terminal_safe_name,
         _verified_loopback_gateway_pids,
+        desktop_app_supervisor,
     )
     from kiro_crew.cli_server_update import (  # noqa: F401
         _refresh_agent_config,
@@ -894,3 +861,4 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _update_managed_venv,
         _update_wheel,
     )
+    from kiro_crew.dashboard.tailnet import POLICY_OFF_DETAIL, policy_off  # noqa: F401

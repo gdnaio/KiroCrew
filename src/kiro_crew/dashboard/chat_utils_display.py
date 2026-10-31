@@ -68,6 +68,12 @@ REDACTION_RECORD_FIELDS: dict[str, tuple[Callable[[object], list[dict]], tuple[s
     "redactions": (bounded_credential_records, tuple(CREDENTIAL_REDACTION_TAGS)),
 }
 
+#: Set (True) beside ``blocked_links`` when the writer vouches they are in reply
+#: order, which is what lets ``restore_allowed_links`` pair several different
+#: addresses on one host. Rows written before it existed may be out of order, so
+#: its absence keeps the older rule. It travels with its records, never alone.
+BLOCKED_LINKS_ORDERED_KEY = "blocked_links_ordered"
+
 
 def variant_from_row(row: dict) -> dict:
     """Stash a row as a variant, taking its redaction records with it.
@@ -89,6 +95,8 @@ def variant_from_row(row: dict) -> dict:
             records = bound(meta.get(key))
             if records:
                 entry[key] = records
+        if entry.get("blocked_links") and meta.get(BLOCKED_LINKS_ORDERED_KEY) is True:
+            entry[BLOCKED_LINKS_ORDERED_KEY] = True
     return entry
 
 
@@ -135,7 +143,10 @@ def _variant_for_emit(variant: dict) -> dict:
     text = bounded.get("content", "")
     if isinstance(text, str) and "blocked_links" in bounded:
         text, left = restore_allowed_links(
-            text, bounded["blocked_links"], current_scoped_exempt_hosts()
+            text,
+            bounded["blocked_links"],
+            current_scoped_exempt_hosts(),
+            ordered=bounded.get(BLOCKED_LINKS_ORDERED_KEY) is True,
         )
         bounded = {**bounded, "content": text}
         if left:
@@ -169,6 +180,11 @@ def adopt_variant_text(row: dict, variant: dict) -> None:
             meta[key] = records
         elif isinstance(meta, dict):
             meta.pop(key, None)
+    if isinstance(meta, dict):
+        # The marker describes the records just moved, so it moves with them.
+        meta.pop(BLOCKED_LINKS_ORDERED_KEY, None)
+        if meta.get("blocked_links") and variant.get(BLOCKED_LINKS_ORDERED_KEY) is True:
+            meta[BLOCKED_LINKS_ORDERED_KEY] = True
     if isinstance(meta, dict) and not meta:
         row.pop("meta", None)
 
@@ -321,9 +337,13 @@ _NO_BASE = object()
 
 
 def _display_redaction_cache_key(
-    text: str, base: object = _NO_BASE
+    text: str, base: object = _NO_BASE, exempt_hosts: frozenset[str] | None = None
 ) -> tuple[_DisplayRedactionKey, int]:
     """Digest the exact string entering the battery together with the exempt sets it reads.
+
+    ``exempt_hosts`` is the caller's one read of the platform set and the scoped
+    override, the same snapshot it hands the battery, so the key names the set
+    the output is computed under. ``None`` reads the set here.
 
     The key is fixed-size: a 32-byte digest and the input byte length. The host set
     is sorted and folded into the MAC input behind a NUL separator (a host never
@@ -336,9 +356,9 @@ def _display_redaction_cache_key(
     hash per lookup, so the cache stays cheaper than the battery it fronts.
     """
     raw = text.encode("utf-8", errors="surrogatepass")
-    hosts = "\0".join(sorted(_exempt_exact_hosts() | current_scoped_exempt_hosts())).encode(
-        "utf-8", errors="surrogatepass"
-    )
+    if exempt_hosts is None:
+        exempt_hosts = _exempt_exact_hosts() | current_scoped_exempt_hosts()
+    hosts = "\0".join(sorted(exempt_hosts)).encode("utf-8", errors="surrogatepass")
     prefixes = _token_param_exempt_prefixes()
     tail = hosts
     if prefixes:
@@ -467,10 +487,16 @@ def _redact_for_display(text: str) -> str:
     Inside a scope that changes the battery's answer
     (:func:`_display_scope_changes_battery`) the battery runs uncached: no cache
     and no stored verdict is read or written.
+
+    The exempt-host set is read ONCE and that snapshot feeds both the key and
+    the battery. A second read inside the battery could see another set (the
+    platform read moves mid-process and degrades a failure to the empty set),
+    and the cache would store one set's output under another set's key.
     """
     scoped = _display_scope_changes_battery()
     stored, base = (None, None) if scoped else _display_verdicts.active()
-    key, input_bytes = _display_redaction_cache_key(text, base)
+    hosts = _exempt_exact_hosts() | current_scoped_exempt_hosts()
+    key, input_bytes = _display_redaction_cache_key(text, base, hosts)
     ck = _clean_verdict_key(key)
     tag = key[0]
     if not scoped:
@@ -499,7 +525,7 @@ def _redact_for_display(text: str) -> str:
             _remember_redacted(key, input_bytes, verdict)
             return verdict
 
-    redacted = display_battery(text)
+    redacted = display_battery(text, exempt_hosts=hosts)
     if scoped:
         return redacted
     if redacted == text:
@@ -944,7 +970,12 @@ def with_allowed_links_restored(m: dict) -> dict:
     if not isinstance(text, str) or not isinstance(meta, dict) or "blocked_links" not in meta:
         return m
     records = bounded_blocked_links(meta.get("blocked_links"))
-    new_text, left = restore_allowed_links(text, records, current_scoped_exempt_hosts())
+    new_text, left = restore_allowed_links(
+        text,
+        records,
+        current_scoped_exempt_hosts(),
+        ordered=meta.get(BLOCKED_LINKS_ORDERED_KEY) is True,
+    )
     if new_text == text:
         return m
     new_meta = dict(meta)
@@ -1018,12 +1049,14 @@ def _prepare_messages_scoped(messages: list[dict], running: bool, *, live_child:
         if meta is not None:
             # cls replaces meta, but a permission row's delivery id (`meta.mid`,
             # stamped by _ChatSlot.append) is not in cls, and its approval is
-            # bound to that id (register_approval). Keep it for permission rows
-            # only, so every other row's wire meta stays exactly as before.
+            # bound to that id (register_approval). Keep it for permission and
+            # elicitation rows only (the two the approval registry binds, and
+            # the two whose resolution frame names a `mid`), so every other
+            # row's wire meta stays exactly as before.
             stored = m.get("meta")
             stored_mid = stored.get("mid") if isinstance(stored, dict) else None
             keep_mid = isinstance(stored_mid, str) and stored_mid and "mid" not in meta
-            if role == "permission" and keep_mid:
+            if role in ("permission", "elicitation") and keep_mid:
                 meta = {**meta, "mid": stored_mid}
             msg_out["meta"] = _expire_dead_child_oauth_meta(
                 role, _redact_meta_for_role(role, meta), live_child

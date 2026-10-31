@@ -178,7 +178,7 @@ class TestConductorInstaller:
         Pinned as literal names rather than by importing the tuple: the point is
         that WIDENING the tuple fails a test, which a tautological assertion
         against the tuple itself could never catch. Each withheld verb below is
-        withheld for a reason recorded next to it in ``agent.py``:
+        withheld for a reason recorded next to it in ``agent_parts/spec_grants.py``:
         ``chat_folder_move_session`` PATCHes another session's ``folder_id``
         (target comes from the arguments, not the caller), ``session_send`` runs
         text as a peer's turn, ``session_stop`` discards a peer's in-flight work,
@@ -634,7 +634,7 @@ class TestConductorInstaller:
         ``action=close`` so ending the item and ending its session are one step.
         """
         prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
-        assert "`session_close` (close a child once its item is terminal)" in prompt
+        assert "`session_close` (close a child once its item is terminal;" in prompt
         body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
         assert "Closing the item and closing its session happen together" in body
         assert "`session_close` archives (reopenable); it never deletes" in body
@@ -1063,10 +1063,10 @@ class TestConductorInstaller:
     def test_pr_checks_seed_may_name_the_prepare_pr_skill_by_path(self):
         """A ``pr_checks`` seed can point the worker at kirocrew-prepare-pr's SKILL.md.
 
-        ``kirocrew-worker`` is a custom agent: ``_skills_injection_plan`` gives it
-        no catalog and no trigger matching, so however a seed is worded nothing
-        auto-loads ``kirocrew-prepare-pr`` in the worker session. The conductor naming the
-        file is the only route. Pinned as an OPTIONAL hint, not a mandate: a user
+        ``kirocrew-worker`` gets no per-message trigger matching (``build_message`` gates
+        it on ``not is_custom``), so however a seed is worded nothing auto-loads
+        ``kirocrew-prepare-pr`` in the worker session. The conductor naming the file is
+        what makes the worker follow it. Pinned as an OPTIONAL hint, not a mandate: a user
         who does not want kirocrew-prepare-pr must not have it forced on every worker.
         """
         text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
@@ -1107,11 +1107,10 @@ def _load_evaluator():
 class TestAcceptEvaluatorInvariant:
     """No model-authored argv may reach subprocess.
 
-    This is the property three review rounds converged on: constraining a
-    spec-supplied argv (allowlist, basename check) never closes the class,
-    because the script runs as an approved wrapper and Kiro Crew's
-    denied-command floor cannot see the argv it receives on stdin. The fix was
-    to stop accepting one at all.
+    Constraining a spec-supplied argv (allowlist, basename check) never closes
+    the class, because the script runs as an approved wrapper and Kiro Crew's
+    denied-command floor cannot see the argv it receives on stdin. So the
+    evaluator accepts no argv at all.
     """
 
     def test_pr_checks_builds_its_own_argv(self):

@@ -24,6 +24,7 @@ from kiro_crew.dashboard.handlers._shared import _is_restricted_session
 from kiro_crew.dashboard.handlers.artifacts_parts.record_serialization import _redact_text
 from kiro_crew.dashboard.handlers.artifacts_parts.route_plumbing import (
     _REMOTE_PROVIDER_TIMEOUT_S,
+    _anchor_int_error,
     _audit,
     _err,
     _event_session_id,
@@ -214,7 +215,6 @@ async def api_artifact_post_comment(request: web.Request) -> web.Response:
     except ArtifactNotFoundError as exc:
         return _err(str(exc), status=404)
 
-    # Build anchor if provided
     anchor_data = body.get("anchor")
     anchor_quote = None
     anchor_prefix = None
@@ -233,6 +233,10 @@ async def api_artifact_post_comment(request: web.Request) -> web.Response:
             if not isinstance(v, str) or not v:
                 return None
             return _redact_text(v)[:2000]
+
+        anchor_int_error = _anchor_int_error(anchor_data)
+        if anchor_int_error is not None:
+            return _err(anchor_int_error)
 
         anchor_quote = await asyncio.to_thread(_anchor_str, anchor_data.get("quote"))
         anchor_prefix = await asyncio.to_thread(_anchor_str, anchor_data.get("prefix"))
@@ -291,7 +295,13 @@ async def api_artifact_post_comment(request: web.Request) -> web.Response:
     # must be denied too. Denial keeps the comment LOCAL (local_only) rather than
     # 403-ing — the local comment store is unaffected.
     gov_denied = (
-        _publish_governance_denied(request, comment.target_provider or DEFAULT_PROVIDER)
+        (
+            await _run_off_loop(
+                lambda: _publish_governance_denied(
+                    request, comment.target_provider or DEFAULT_PROVIDER
+                )
+            )
+        )
         if scope == "shared" and comment.target_external_id
         else "not shared"
     )
@@ -430,7 +440,14 @@ async def api_artifact_reply_comment(request: web.Request) -> web.Response:
         parent.origin
         and parent.origin != "local"
         and reply.target_external_id
-        and _publish_governance_denied(request, reply.target_provider or DEFAULT_PROVIDER) is None
+        and (
+            await _run_off_loop(
+                lambda: _publish_governance_denied(
+                    request, reply.target_provider or DEFAULT_PROVIDER
+                )
+            )
+        )
+        is None
     ):
         try:
 
@@ -501,7 +518,14 @@ async def api_artifact_mark_review(request: web.Request) -> web.Response:
         target.origin
         and target.origin != "local"
         and target.target_external_id
-        and _publish_governance_denied(request, target.target_provider or DEFAULT_PROVIDER) is None
+        and (
+            await _run_off_loop(
+                lambda: _publish_governance_denied(
+                    request, target.target_provider or DEFAULT_PROVIDER
+                )
+            )
+        )
+        is None
     ):
         try:
 
@@ -725,7 +749,14 @@ async def api_artifact_delete_comment(request: web.Request) -> web.Response:
         target
         and is_provider_origin
         and target.target_external_id
-        and _publish_governance_denied(request, target.target_provider or DEFAULT_PROVIDER) is None
+        and (
+            await _run_off_loop(
+                lambda: _publish_governance_denied(
+                    request, target.target_provider or DEFAULT_PROVIDER
+                )
+            )
+        )
+        is None
     ):
         try:
 
@@ -842,7 +873,14 @@ async def api_artifact_edit_comment(request: web.Request) -> web.Response:
         target.origin
         and target.origin != "local"
         and target.target_external_id
-        and _publish_governance_denied(request, target.target_provider or DEFAULT_PROVIDER) is None
+        and (
+            await _run_off_loop(
+                lambda: _publish_governance_denied(
+                    request, target.target_provider or DEFAULT_PROVIDER
+                )
+            )
+        )
+        is None
     ):
         try:
             provider = get_provider(target.target_provider or DEFAULT_PROVIDER)

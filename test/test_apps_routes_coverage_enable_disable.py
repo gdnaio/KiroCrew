@@ -29,6 +29,7 @@ from apps_routes_coverage_helpers import (
 
 import kiro_crew.apps.routes as routes_mod
 from kiro_crew.apps.manager import AppResult, disable_app, enable_app, register_external_app
+from kiro_crew.testing.wait import await_until
 
 # ---------------------------------------------------------------------------
 # Enable / disable warning + rollback branches
@@ -482,14 +483,16 @@ class TestRepeatedToggleIsIdempotent:
         from kiro_crew.apps import teardown as teardown_mod
 
         both_read = asyncio.Event()
+        loop = asyncio.get_running_loop()
         real_get_app = routes_mod.get_app
-        reads = 0
+        reads: list[str] = []
 
         def _get_app(name: str) -> Any:
-            nonlocal reads
-            reads += 1
-            if reads == 2:
-                both_read.set()
+            # The route reads the record on a worker thread: append is atomic, and
+            # the event is set from the loop's own thread.
+            reads.append(name)
+            if len(reads) >= 2:
+                loop.call_soon_threadsafe(both_read.set)
             return real_get_app(name)
 
         scripts: list[str] = []
@@ -497,8 +500,7 @@ class TestRepeatedToggleIsIdempotent:
         async def _script(*args: Any, **kwargs: Any) -> dict[str, Any]:
             scripts.append("onDisable")
             # Hold the lock until the second request has read its pre-lock metadata.
-            # flake-ok: pre-existing 5 s bounded wait for the second request's pre-lock read -- moved verbatim; tracked for a de-flake pass
-            await asyncio.wait_for(both_read.wait(), timeout=5)
+            await await_until(both_read, what="the second request's pre-lock read")
             return {"output": "", "failed": False}
 
         monkeypatch.setattr(routes_mod, "get_app", _get_app)
@@ -582,3 +584,90 @@ async def test_enable_does_not_re_register_after_the_backend_starts(
         assert resp.status == 200
 
     assert called == [], "enable re-registered after start; the adoption path owns that"
+
+
+class TestRecordWritersRunOffTheLoop:
+    """The enable and disable routes write the record from a worker thread.
+
+    The record lock is single-shot on the event-loop thread, so a writer called
+    there would fail on ordinary contention with another writer of the app.
+    """
+
+    @pytest.mark.asyncio
+    async def test_enable_and_disable_write_off_the_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        on_loop: list[tuple[str, bool]] = []
+        real_enable, real_disable = routes_mod.enable_app, routes_mod.disable_app
+
+        def _running_on_loop() -> bool:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return False
+            return True
+
+        def _enable(*args: Any, **kwargs: Any) -> AppResult:
+            on_loop.append(("enable", _running_on_loop()))
+            return real_enable(*args, **kwargs)
+
+        def _disable(*args: Any, **kwargs: Any) -> AppResult:
+            on_loop.append(("disable", _running_on_loop()))
+            return real_disable(*args, **kwargs)
+
+        monkeypatch.setattr(routes_mod, "enable_app", _enable)
+        monkeypatch.setattr(routes_mod, "disable_app", _disable)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            assert (await client.post(f"/api/apps/{APP}/enable")).status == 200
+            assert (await client.post(f"/api/apps/{APP}/disable")).status == 200
+        assert on_loop == [("enable", False), ("disable", False)]
+
+
+class TestRecordReadsRunOffTheLoop:
+    """The enable, disable and open routes read the app record from a worker thread.
+
+    ``get_app`` reads installed.json and parses app.json, and ``app_enabled_state``
+    stats and reads installed.json. Called on the event loop, either read stalls
+    every gateway task until the disk answers.
+    """
+
+    @pytest.mark.asyncio
+    async def test_enable_disable_and_open_read_the_record_off_the_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
+        reads: list[tuple[str, bool]] = []
+
+        def _running_on_loop() -> bool:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return False
+            return True
+
+        def _spy(attr: str) -> Any:
+            real = getattr(routes_mod, attr)
+
+            def _read(name: str) -> Any:
+                reads.append((attr, _running_on_loop()))
+                return real(name)
+
+            return _read
+
+        for attr in ("get_app", "app_enabled_state"):
+            monkeypatch.setattr(routes_mod, attr, _spy(attr))
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            assert (await client.post(f"/api/apps/{APP}/enable")).status == 200
+            enable_reads, reads[:] = list(reads), []
+            # No openCommand: the route answers 400 after its record read.
+            assert (await client.post(f"/api/apps/{APP}/open")).status == 400
+            open_reads, reads[:] = list(reads), []
+            assert (await client.post(f"/api/apps/{APP}/disable")).status == 200
+            disable_reads = list(reads)
+        assert enable_reads == [("get_app", False), ("app_enabled_state", False)]
+        assert open_reads == [("get_app", False)]
+        assert disable_reads == [("get_app", False), ("app_enabled_state", False)]

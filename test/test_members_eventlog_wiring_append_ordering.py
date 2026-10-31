@@ -14,6 +14,7 @@ import time
 from members_eventlog_wiring_helpers import _fresh_eventlog  # noqa: F401
 
 from kiro_crew import eventlog_hooks
+from kiro_crew.testing.wait import default_timeout
 
 
 class TestMemberEventLogAppendsAreOrdered:
@@ -49,7 +50,7 @@ class TestMemberEventLogAppendsAreOrdered:
             seen.append(n)
 
         for f in [ex.submit(_job, n) for n in range(4)]:
-            f.result(timeout=5)
+            f.result(timeout=default_timeout())
         assert seen == [0, 1, 2, 3], f"appends completed out of order: {seen}"
 
     def test_no_offloaded_event_log_append_uses_the_default_pool(self):
@@ -160,7 +161,11 @@ class TestQueuedAppendsSurviveShutdown:
         monkeypatch.setattr(
             eventlog_hooks, "io_executor", lambda: (_ for _ in ()).throw(RuntimeError("no pool"))
         )
-        eventlog_hooks.submit(lambda: None)  # must not raise
+        ran: list[str] = []
+        assert (
+            eventlog_hooks.submit(lambda: ran.append("ran")) is False
+        ), "a refused append must be reported so the caller does not advance its checkpoint"
+        assert ran == []
 
 
 def _gateway_source() -> str:

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
     from typing import Any
 
+    from kiro_crew.agent_sdk.spec_hooks import PostToolIdentity
     from kiro_crew.dashboard.chat_runner import (
         DashboardState,
         MonitorCompletionHook,
@@ -80,8 +81,11 @@ class _ChatTurn:
     _directive_self_wake: "bool"
     _directive_loop_id: "str"
     _directive_loop_gen: "int"
+    _skill_trigger_text: "str | None"
     _directive_channel_origin: "bool"
+    _directive_owner_origin: "bool"
     _commands_off: "bool"
+    _recovery_echo_owed: "bool"
     _turn_actor: "str"
     regenerate_hint: "str"
     _on_consumed: "Callable[[bool], None] | None"
@@ -91,16 +95,23 @@ class _ChatTurn:
 
     # State those functions write, or read after the turn rebinds it.
     _acquired: "bool"
+    # The embed-pool admission reservation _turn_build_prompt opened for the
+    # context build, settled in _turn_settle_debts. None until (and unless) the
+    # context-builder branch takes one; set in __init__ so every exit can read it.
+    _admission_slot: "Any"
     _activity_after_terminal: "int"
     _allocation_kwargs: "dict[str, Any]"
+    _answer_text: "str"
     _auth_required: "bool"
     _batch_cascade_steered: "bool"
     _builtin_identity_trusted: "bool"
+    _child_lf_warning: "str"
     _compact_after_turn_noticed: "bool"
     _compaction_completed: "bool"
     _compaction_dropped_leak: "bool"
     _compaction_notice_chunks: "list[str]"
     _compaction_started: "bool"
+    _compaction_text_offset: "int"
     _consumed_reported: "bool"
     _context_is_new: "bool"
     _crew_log_actor: "str"
@@ -112,6 +123,7 @@ class _ChatTurn:
     _crew_log_turn_no: "int"
     _crew_log_turn_open: "bool"
     _current_replay_message: "dict[Any, Any] | None"
+    _declined_grant_notices: "dict[str, str]"
     _deferred_cut_text: "str"
     _deferred_options_expiry: "bool"
     _dir_consumed_out: "dict[str, str]"
@@ -121,6 +133,7 @@ class _ChatTurn:
     _failed_write_calls: "set[str]"
     _first_turn_history_assembled: "bool"
     _had_empty_response_verdict: "bool"
+    _held_runs: "list[tuple[dict[str, Any], str, int | None, int]]"
     _incoming_message: "str"
     _interrupted_turn_preamble: "str"
     _irreversible_consumption_reported: "bool"
@@ -141,18 +154,24 @@ class _ChatTurn:
     _mirror_stream_ts: "str"
     _mirror_task_counter: "int"
     _mirror_thread: "str | None"
+    _mirror_stream_tried: "bool"
+    _mirror_thinking_ts: "str"
+    _mirror_echo_posted: "bool"
+    _msg: "str"
     _native_card_output: "dict[str, list[str]]"
     _native_card_output_len: "dict[str, int]"
+    _native_child_tc: "set[str]"
     _native_result_seen: "set[str]"
     _native_tc_card: "dict[str, str]"
     _native_tracker: "dict[str, dict[Any, Any]]"
     _needs_reinjection: "bool"
     _noticed_leak: "bool"
+    _owner_backend: "str | None"
     _owner_host_allowed: "bool"
-    _owner_project: "Any | None"
     _pending_dir_for_digest: "dict[str, str]"
     _pending_dir_tool: "dict[str, str]"
     _pending_input_digest: "dict[str, str]"
+    _pending_tool_ids: "dict[str, PostToolIdentity]"
     _pending_tools: "dict[str, str]"
     _person_steered_turn: "bool"
     _produced_visible_output: "bool"
@@ -168,6 +187,7 @@ class _ChatTurn:
     _replay_accepted_this_turn: "bool"
     _replay_pending: "bool"
     _reply_flushed: "bool"
+    _reply_mids_snapshot: "list[str] | None"
     _request_prefix_context: "str"
     _responsive_owner: "Task[Any] | None"
     _responsive_recovery: "list[dict[str, str]]"
@@ -177,10 +197,13 @@ class _ChatTurn:
     _saw_terminal_event: "bool"
     _saw_text_chunk: "bool"
     _seen_tool_identity: "dict[str, tuple[str, str]]"
+    #: Built on the turn's first tool call (the provider is known by then).
+    _undelivered_watch: "Any"
     _session_stop_gen_at_entry: "int"
     _shell_tool_calls: "set[str]"
     _span_base_len: "int"
     _span_probe: "str"
+    _prompt_segments: "tuple[Any, ...]"
     _spec_hooks: "list[Any]"
     _spec_hooks_cwd: "str | None"
     _spec_hooks_unreadable: "bool"
@@ -197,6 +220,7 @@ class _ChatTurn:
     _tcid_first_source: "dict[str, str]"
     _terminal_directive_applied: "bool"
     _terminal_directive_kind: "str"
+    _terminal_directive_text: "str"
     _terminal_directive_tcids: "set[str]"
     _terminal_synthetic: "bool"
     _thinkred: "StreamRedactor"
@@ -214,6 +238,7 @@ class _ChatTurn:
     _turn_elapsed_ms: "int"
     _turn_emitted: "bool"
     _turn_flushed_visible_text: "bool"
+    _turn_footer_attached: "bool"
     _turn_is_completion: "bool"
     _turn_landed: "bool"
     _turn_model: "str"
@@ -269,6 +294,7 @@ class _ChatTurn:
     sessions: "Any | None"
     slot_ctx_blocks: "dict[str, int]"
     slot_ctx_omitted: "dict[str, dict[str, Any]]"
+    slot_ctx_receipts: "dict[str, dict[str, Any]]"
     slot_ctx_phase: "str"
     user_typed_len: "int"
     user_typed_message: "str"
@@ -295,8 +321,11 @@ class _ChatTurn:
         _directive_self_wake: "bool",
         _directive_loop_id: "str",
         _directive_loop_gen: "int",
+        _skill_trigger_text: "str | None",
         _directive_channel_origin: "bool",
+        _directive_owner_origin: "bool",
         _commands_off: "bool",
+        _recovery_echo_owed: "bool",
         _turn_actor: "str",
         regenerate_hint: "str",
         _on_consumed: "Callable[[bool], None] | None",
@@ -323,14 +352,19 @@ class _ChatTurn:
         self._directive_self_wake = _directive_self_wake
         self._directive_loop_id = _directive_loop_id
         self._directive_loop_gen = _directive_loop_gen
+        self._skill_trigger_text = _skill_trigger_text
         self._directive_channel_origin = _directive_channel_origin
+        self._directive_owner_origin = _directive_owner_origin
         self._commands_off = _commands_off
+        self._recovery_echo_owed = _recovery_echo_owed
         self._turn_actor = _turn_actor
         self.regenerate_hint = regenerate_hint
         self._on_consumed = _on_consumed
         self._on_irreversibly_consumed = _on_irreversibly_consumed
         self.monitor_completion = monitor_completion
         self._current_message = _current_message
+        # No admission reservation until the context-builder branch opens one.
+        self._admission_slot = None
 
     if not TYPE_CHECKING:
 

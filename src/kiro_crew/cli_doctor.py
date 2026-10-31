@@ -55,7 +55,10 @@ from kiro_crew import (  # noqa: F401
     agent_state,
     dep_sync,
     diagnostics,
+    gateway_lock,
+    host_task_sizing,
     platform_compat,
+    resource_status,
     sandbox,
     session_pid,
     stdlib_shadow,
@@ -86,7 +89,8 @@ from kiro_crew.agent_discovery import (
     project_agent_files,
     project_agent_name,
 )
-from kiro_crew.agent_sdk import kas_engine_gap
+from kiro_crew.agent_sdk import kas_bundle, kas_engine_gap
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_KIRO
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.agent_spec_format import (  # noqa: F401
     NATIVE_SKILL_ALIAS_PREFIX,
@@ -113,8 +117,13 @@ from kiro_crew.cli_doctor_parts.host_probes import (
 from kiro_crew.cli_doctor_parts.kas_relay import (
     _doctor_kas,
     _kas_relay_help,
+    _kiro_cli_selected,
+    _kiro_pick_runs_on_kas,
+    _report_bundle_kiro_cli_refusal,
     _report_kas_backend,
     _report_kas_bundle,
+    _report_kas_bundle_pin,
+    _report_kas_bundle_spec_permissions,
     _report_kas_spec_permissions,
     _report_kas_tool_vocabulary,
 )
@@ -199,6 +208,7 @@ from kiro_crew.kiro_cli import (
     SPEC_PERMISSIONS_MIN_VERSION,
     installed_kiro_cli_version,
     kas_relay_help,
+    kiro_cli_installed,
     mcp_governance_may_apply,
     resolve_kiro_cli,
     spec_permissions_supported,
@@ -229,6 +239,7 @@ from kiro_crew.platform.tool_names import (
     kas_verified_releases,
     kas_vocabulary_drift,
 )
+from kiro_crew.platform.update_capability import MANAGED_BY_GIT, derive_capability
 from kiro_crew.sandbox import _MOUNT_SOURCE_PREFIX, warm_backend  # noqa: F401
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
@@ -305,6 +316,7 @@ if TYPE_CHECKING:  # served by ``__getattr__`` at runtime; named here for mypy
         _STRICT_IDENTITY_SERVERS,
         _doctor_backend_ability_cards,
         _doctor_mcp_gateway_daemon,
+        _doctor_mcp_share_refused,
         _doctor_selected_backend_projection,
         _doctor_strict_identity,
         _doctor_unresolved_mcp_refs,
@@ -329,10 +341,12 @@ if TYPE_CHECKING:  # served by ``__getattr__`` at runtime; named here for mypy
         _doctor_run_dirs,
         _doctor_runtime_tmpfs,
         _doctor_skill_view_census,
+        _doctor_temp_directories,
         _gateway_memory_lines,
         _runtime_tmpfs_roots,
         _scan_cli_installer_residue,
         _swap_total_kib,
+        _tmpfiles_ages,
         _tmpfs_usage,
     )
     from kiro_crew.doctor_checks.services import (  # noqa: F401
@@ -426,6 +440,32 @@ def _doctor_model_url_reachable(issues: list[str]) -> None:
 _AWS_PROBE_TIMEOUT_SECS = 10
 
 
+def _no_gateway_running() -> bool:
+    """True only when the lock probe positively says nobody holds the gateway lock."""
+    try:
+        return gateway_lock.lock_holder(config_dir()).pid is None
+    except Exception:
+        return False
+
+
+def _doctor_enterprise_sign_in(issues: list[str]) -> None:
+    """Enterprise build only: the one sign-in the start check and rules fetch read (RFC D4).
+
+    Prints nothing in an ``oss`` build. A plain read of both stores (no refresh, no
+    network); a refusal is a blocking issue, because the build will not start on it.
+    """
+    from kiro_crew import edition
+
+    if not edition.is_enterprise():
+        return
+    from kiro_crew import enterprise_sign_in
+
+    line = enterprise_sign_in.describe()
+    print(f"  sign-in:     {line}")
+    if line.startswith("❌"):
+        issues.append(f"enterprise sign-in: {line[2:].strip()}")
+
+
 def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False) -> None:
     """Verify KiroCrew setup — check dependencies, config, credentials, connectivity.
 
@@ -471,8 +511,12 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
         )
         if result.skipped:
             print(f"     skipped (not found): {', '.join(result.skipped)}")
-        print("\n  Open a GitHub issue (then drag the zip in):")
-        print(f"  {diagnostics.terminal_issue_url(result)}")
+        issue_url = diagnostics.terminal_issue_url(result)
+        if issue_url:
+            print("\n  Open a GitHub issue (then drag the zip in):")
+            print(f"  {issue_url}")
+        else:
+            print("\n  Issue link skipped: the platform companion does not compose.")
         return
 
     from kiro_crew.doctor_checks import (
@@ -494,6 +538,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # blocking issue with the remediation hint rather than letting it abort the
     # whole CLI before the doctor can run.
     print("Platform")
+    _doctor_enterprise_sign_in(issues)
     if platform_boot_error is not None:
         print(f"  edition:     ❌ composition failed: {platform_boot_error}")
         issues.append(f"platform composition failed: {platform_boot_error}")
@@ -547,9 +592,19 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # this row names the binary a session actually spawns. ``shutil.which`` would
     # name the user's own install on a bundled app, which is not the one running.
     kiro = resolve_kiro_cli()
+    # Decided once here and threaded to the Connectivity row below, so the two
+    # kiro-cli rows of one report cannot read the config at different moments.
+    bundle_route = kas_bundle.kas_bundle_route()
     if kiro:
         print(f"  kiro-cli:    ✅ {kiro}")
         services._doctor_headless_auth(issues)
+    elif bundle_route:
+        # Not a gap: the selected backend runs Crew's own installed engine (the
+        # KAS backend section reports it), so an install hint here would send the
+        # operator to fetch a binary nothing on this host would spawn.
+        print(
+            "  kiro-cli:    ⏭  not installed; not needed (KAS runs Kiro Crew's own engine bundle)"
+        )
     else:
         print("  kiro-cli:    ⏭  not found (the default agent backend)")
         print("               Install kiro-cli per its docs, then: kiro-cli login")
@@ -563,9 +618,12 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     git = shutil.which("git")
     if git:
         print(f"  git:         ✅ {git}")
-    else:
+    elif derive_capability().managed_by == MANAGED_BY_GIT:
+        # Only a git checkout updates through git; a wheel re-runs its installer.
         print("  git:         ❌ not found (needed for kirocrew update)")
         issues.append("git")
+    else:
+        print("  git:         ⏭  not found (not needed: this install updates without git)")
 
     _report_node(issues)
     install._doctor_browser_bootstrap()
@@ -591,7 +649,11 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     agent_path = _agents_dir() / AGENT_FILENAME
     if agent_path.exists():
         print(f"  config:      ✅ {agent_path}")
+    elif _no_gateway_running():
+        print("  config:      ⏭  not created yet (kirocrew gateway creates it on start)")
     else:
+        # A running gateway writes this spec at start, so missing here is a fault;
+        # a lock probe that cannot answer is treated the same way.
         print("  config:      ❌ not found (run kirocrew setup)")
         issues.append("agent config")
 
@@ -645,7 +707,9 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     access._doctor_name_grant_platform_scope()
     mcp._doctor_strict_identity(cfg)
     mcp._doctor_mcp_gateway_daemon(issues)
+    mcp._doctor_mcp_share_refused(cfg, issues)
     mcp._doctor_unresolved_mcp_refs()
+    mcp._doctor_template_mcp_additions()
     mcp._doctor_backend_ability_cards(cfg)
     mcp._doctor_selected_backend_projection(cfg)
 
@@ -682,8 +746,14 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── ACP runtimes: live count, owner and backend CPU (advisory; Linux) ──
     resources._doctor_acp_runtimes(issues)
 
+    # ── Task ceilings: slice and scope TasksMax, thread pools (Linux) ──
+    resources._doctor_task_ceilings(issues)
+
     # ── Runtime tmpfs headroom (sandbox mount-source roots; Linux only) ──
     resources._doctor_runtime_tmpfs(issues)
+
+    # ── Temp directory in use (filesystem / tmpfs-no-swap / age-cleaned; advisory) ──
+    resources._doctor_temp_directories(issues)
 
     # ── kiro-cli installer residue (silent unless residue is on disk) ──
     resources._doctor_cli_installer_residue(issues)
@@ -744,6 +814,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             py_result.check_returncode()
             ver = py_result.stdout.strip()
             print(f"  python:      ✅ {venv_py} ({ver})")
+            print(f"  kiro_crew:   ✅ {_mc_version}")
         except Exception as exc:
             print(f"  python:      ❌ venv python broken: {exc}")
             issues.append("venv python")
@@ -809,7 +880,17 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
 
     # ── Connectivity ──
     print("\nConnectivity")
-    if kiro:
+    if bundle_route:
+        # The engine this host runs, where the kiro-cli version row goes on the
+        # relay route: a ``--version`` spawn of a binary the route never runs
+        # would report the wrong program, and on a host without one would read as
+        # a gap. The install verdict itself is the KAS backend section's.
+        engine = kas_bundle.installed_engine_label()
+        if engine:
+            print(f"  engine:      ✅ {engine} (Kiro Crew's own bundle; kiro-cli not used)")
+        else:
+            print("  engine:      ⏭  no KAS bundle installed (see the KAS backend section)")
+    elif kiro:
         kiro_result = subprocess.run(
             [kiro, "--version"],
             capture_output=True,
@@ -825,6 +906,28 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             print("  kiro-cli:    ⚠️  exits with error (optional backend)")
     else:
         print("  kiro-cli:    ⏭  skipped (not installed)")
+    # The launcher answers ``--version`` itself; this row asks the chat binary
+    # every session actually execs, which is what a stale install breaks. It is
+    # fatal only when a harness that spawns kiro-cli is selected for either role:
+    # the Kiro CLI backend, or KAS served through kiro-cli's relay, as the main
+    # backend or as the crewmate backend. Both fields arrive already resolved by
+    # the loader's selection gate, so an unservable crewmate pick reads here as
+    # the Kiro CLI floor it actually runs on. Positive tests, so a harness added
+    # later does not inherit a fatal row for a binary it never runs.
+    # When Crew's vault signs relay KAS in, its spawn enters through the
+    # launcher's sibling chat binary instead (``services.kas_relay_entry``), so
+    # that binary is probed for the relay role while the launcher's delegate
+    # is still probed for a selected Kiro CLI role.
+    selected = (cfg.agent.acp_backend, cfg.agent.member_acp_backend)
+    kiro_role = ACP_BACKEND_KIRO in selected
+    relay_kas_role = not cfg.agent.kas_bundle and ACP_BACKEND_KAS in selected
+    services._doctor_kiro_chat_delegate(
+        kiro,
+        issues,
+        required=kiro_role or relay_kas_role,
+        relay_entry=services.kas_relay_entry(kiro) if relay_kas_role else None,
+        kiro_role=kiro_role,
+    )
     services._doctor_gateway_reachability(dashboard, issues)
 
     # ── Summary ──
@@ -887,6 +990,7 @@ _EXPORTS: dict[str, str] = {
             "_STRICT_IDENTITY_SERVERS",
             "_doctor_backend_ability_cards",
             "_doctor_mcp_gateway_daemon",
+            "_doctor_mcp_share_refused",
             "_doctor_selected_backend_projection",
             "_doctor_strict_identity",
             "_doctor_unresolved_mcp_refs",
@@ -954,10 +1058,12 @@ _EXPORTS: dict[str, str] = {
             "_doctor_run_dirs",
             "_doctor_runtime_tmpfs",
             "_doctor_skill_view_census",
+            "_doctor_temp_directories",
             "_gateway_memory_lines",
             "_runtime_tmpfs_roots",
             "_scan_cli_installer_residue",
             "_swap_total_kib",
+            "_tmpfiles_ages",
             "_tmpfs_usage",
         ),
         "kiro_crew.doctor_checks.resources",

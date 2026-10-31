@@ -14,7 +14,7 @@ from __future__ import annotations
 import dataclasses
 import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from kiro_crew.publish_provider import PublishProvider
@@ -24,16 +24,20 @@ if TYPE_CHECKING:
         McpScope,
         MemoryRoots,
         SessionPrincipal,
+        SttProvider,
+        TtsProvider,
         WorkloadIdentity,
     )
     from kiro_crew.security import DeniedCommandRule
     from kiro_crew.skill_providers.base import SkillProvider
     from kiro_crew.tips_pool import TipsPool
+    from kiro_crew.diagnostics import BundleResult
 
 from kiro_crew import security, sso_status
 from kiro_crew.platform.interfaces import (
     BUILTIN_PROVISIONER_ID,
     CapabilityResult,
+    CloudInstancePolicy,
     InterceptDecision,
     MobileConnectMethod,
     OtlpDestination,
@@ -751,6 +755,47 @@ MICROVM_REMOTE_PROVISIONER = RemoteProvisioner(
         ("connect", "Add the crew to your Instances list"),
     ),
 )
+
+
+class DefaultFeedbackTrackerProvider:
+    """No edition tracker: Report a Problem links to the public repository.
+
+    ``None`` is the "public link unchanged" answer, so the standalone edition is
+    behaviourally identical to before the seam existed.
+    """
+
+    def report_issue_url(
+        self, bundle: "BundleResult", note: str, *, prefill: bool
+    ) -> Optional[str]:
+        return None
+
+
+class DefaultSpeechProviderRegistry:
+    """No edition speech providers: only the built-in STT and TTS sets exist.
+
+    Empty tuples and ``None`` defaults, so the valid ``stt.provider`` and
+    ``voice_reply.provider`` sets, their defaults and their warning text are
+    exactly what they were before the seam existed.
+    """
+
+    def stt_providers(self) -> "Tuple[SttProvider, ...]":
+        return ()
+
+    def tts_providers(self) -> "Tuple[TtsProvider, ...]":
+        return ()
+
+    def default_stt(self) -> Optional[str]:
+        return None
+
+    def default_tts(self) -> Optional[str]:
+        return None
+
+
+class DefaultCloudInstancePolicyProvider:
+    """Nothing added: an EC2 crew's role carries Session Manager's policy only."""
+
+    def instance_policy(self) -> CloudInstancePolicy:
+        return CloudInstancePolicy()
 
 
 class DefaultRemoteProvisionerProvider:

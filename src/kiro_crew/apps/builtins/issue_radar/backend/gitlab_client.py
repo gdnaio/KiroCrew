@@ -58,7 +58,10 @@ from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.github_runner import apply_session_bus_address
 from kiro_crew.sel import sel
 
+from . import comment_batch
+from . import gitlab_comments as _comments
 from . import gitlab_normalization as _normalization
+from . import gitlab_timeline as _timeline
 from . import gitlab_transport as _transport
 from .errors import (
     ProviderCliError,
@@ -72,6 +75,8 @@ from .errors import RepoUrlError as RepoUrlError  # noqa: F401 — public re-exp
 from .errors import (
     sanitize_cli_stderr,
 )
+from .gitlab_comments import post_comment_batch, reply_to_comment_thread  # noqa: F401 — public API
+from .gitlab_links import list_issue_links as list_issue_links  # noqa: F401 — public re-export
 
 # Historical aliases, mirroring github_client so provider-agnostic callers can
 # use either module interchangeably (see errors.py for why these are aliases).
@@ -788,10 +793,9 @@ def _assemble_timeline(
 ) -> tuple[list[dict], list[dict]]:
     """Merge notes + label events + state events into one sorted timeline.
 
-    ``kind`` is ``"issues"`` or ``"merge_requests"``. A failure on a SECONDARY
-    stream (label/state events) degrades to omitting those entries rather than
-    failing the whole pane: the comments are the substance, and an older GitLab
-    may not serve the resource-event endpoints at all.
+    ``kind`` is ``"issues"`` or ``"merge_requests"``. The SECONDARY streams
+    (label/state events) are read by ``gitlab_timeline.resource_events``, which
+    degrades a failure to omitting those entries rather than failing the pane.
 
     Returns ``(events, notes)`` — the sorted timeline AND the raw ``notes`` it
     fetched. The MR timeline needs those same notes a second time to promote
@@ -800,23 +804,9 @@ def _assemble_timeline(
     fetch. The issue timeline ignores the second element.
     """
     base = f"projects/{project_path(owner, repo)}/{kind}/{int(number)}"
-    notes = _rows(_glab_api(f"{base}/notes?order_by=created_at&sort=asc", host=host, timeout=timeout, paginate=True))
+    notes = _comments.discussion_notes(_glab_api, base, host=host, timeout=timeout)
     events: list[dict] = [e for e in (_norm_note(n) for n in notes) if e is not None]
-
-    try:
-        labels_by_name = {lab["name"]: lab for lab in list_repo_labels(owner, repo, host=host, timeout=timeout)}
-    except ProviderCliError:
-        labels_by_name = {}
-    for path, normalizer in (
-        (f"{base}/resource_label_events", lambda e: _norm_label_event(e, labels_by_name)),
-        (f"{base}/resource_state_events", _norm_state_event),
-    ):
-        try:
-            raw = _rows(_glab_api(path, host=host, timeout=timeout, paginate=True))
-        except ProviderCliError:
-            continue
-        events.extend(e for e in (normalizer(item) for item in raw) if e is not None)
-
+    events.extend(_timeline.resource_events(owner, repo, base, host=host, timeout=timeout))
     events.sort(key=lambda e: e.get("created_at") or "")
     return events, notes
 
@@ -857,6 +847,7 @@ def list_pr_timeline(
         inline.append(
             {
                 "kind": "review_comment",
+                "id": note.get("id"),
                 "actor": _username(note.get("author")),
                 "created_at": note.get("created_at"),
                 "body": body,
@@ -864,6 +855,7 @@ def list_pr_timeline(
                 "path": position.get("new_path") or position.get("old_path"),
                 "line": position.get("new_line") or position.get("old_line"),
                 "url": None,
+                "thread_id": comment_batch.thread_id_or_none(note.get("discussion_id")),
             }
         )
     # A positioned note was already emitted as a plain "comment" by the shared

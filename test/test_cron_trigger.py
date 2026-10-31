@@ -94,6 +94,20 @@ class TestTriggerCronJob:
         assert ok is False
         assert "cannot reach gateway" in msg
 
+    def test_slow_gateway_reports_busy(self, tmp_path):
+        """A read timeout means the gateway took the trigger but is slow: busy, not unreachable."""
+        secret_path = tmp_path / ".local_secret"
+        secret_path.write_text("fake")
+        with patch(
+            "kiro_crew.cron_trigger.loopback_urlopen",
+            side_effect=TimeoutError("timed out"),
+        ):
+            ok, msg = trigger_cron_job("abc12345", 19999, secret_path)
+        assert ok is False
+        assert "busy" in msg
+        assert "the trigger may have run" in msg
+        assert "cannot reach gateway" not in msg
+
     def test_sends_secret_header(self, mock_dashboard):
         port, cfg_dir = mock_dashboard
         trigger_cron_job("abc12345", port, cfg_dir / ".local_secret")
@@ -288,7 +302,7 @@ class TestCronTriggerMCP:
 class TestCronTriggerCLI:
     """Tests for the CLI cron trigger subcommand."""
 
-    def test_cli_subcommand_registered(self, tmp_path):
+    def test_cli_subcommand_registered(self, tmp_path, capsys):
         """kirocrew cron trigger is a recognized subcommand with job_id argument."""
         import argparse
 
@@ -302,8 +316,8 @@ class TestCronTriggerCLI:
             return_value=(True, "Triggered job: test-job (abc12345)"),
         ) as mock_trigger:
             _cron(args)
-        mock_trigger.assert_called_once()
         assert mock_trigger.call_args[0][0] == "abc12345"
+        assert capsys.readouterr().out.strip() == "Triggered job: test-job (abc12345)"
 
     def test_cli_trigger_success(self, mock_dashboard, capsys):
         """CLI trigger prints success message."""

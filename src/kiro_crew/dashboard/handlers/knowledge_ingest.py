@@ -67,6 +67,10 @@ async def ingest_text(request: web.Request) -> web.Response:
         text = body.get("text", "")
         if not text:
             return web.json_response({"error": "no text provided"}, status=400)
+        if not isinstance(text, str):
+            return web.json_response(
+                {"error": "text must be a string", "code": "invalid_field_type"}, status=400
+            )
         redacted = _redact(text)
         text = redacted if redacted is not None else text
         name = body.get("name", source["name"])
@@ -422,6 +426,9 @@ async def ingest_file(request: web.Request) -> web.Response:
 
 async def get_job(request: web.Request) -> web.Response:
     """GET /api/knowledge/jobs/{id}."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.job.read")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     row = await asyncio.to_thread(
         lambda: store.db.execute(

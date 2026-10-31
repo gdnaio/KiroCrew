@@ -34,7 +34,7 @@ export interface AgentItem {
    *  (see `rowMemoryTag`); never rendered. */
   memory_store?: string
   /** Set by `useAgents` when this markdown-only agent cannot run on the
-   *  harness this chat uses; the row wears the "KAS only" pill. */
+   *  harness this chat uses; the row wears the "Kiro Agent only" pill. */
   markdown_block?: MarkdownBlock
 }
 
@@ -73,7 +73,10 @@ function AgentButton({ a, active, isDefault, memoryTag, showSource, activeRef, o
       role="option"
       aria-selected={active}
       tabIndex={-1}
-      className={`w-full text-left px-2.5 py-2 flex flex-col gap-0.5 rounded-md transition-all cursor-pointer
+      // The row is flush with the host's `overflow-y-auto` listbox, so the global
+      // outset focus ring is clipped at the scroller's edge; the inset ring is
+      // drawn inside the row and stays whole on the first and last rows.
+      className={`w-full text-left px-2.5 py-2 flex flex-col gap-0.5 rounded-md transition-all cursor-pointer focus-ring-accent-inset
         ${active ? 'list-selected bg-accent-subtle' : 'hover:bg-bg-hover'}
       `}
       // A name-only row keeps the one-argument call its callers were written for.

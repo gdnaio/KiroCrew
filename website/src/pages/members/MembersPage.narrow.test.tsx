@@ -32,7 +32,6 @@ vi.mock('../../api/client', () => ({
     // The warm greeting's read of the crewmate's work ledger. No ledger is the
     // state every case not about the greeting wants: the chat opens bare.
     crewBoard: vi.fn(() => Promise.reject(Object.assign(new Error('no_ledger'), { status: 404 }))),
-    memberRecap: vi.fn(() => Promise.reject(new Error('no recap in this test'))),
     memberThread: vi.fn(),
     // Mate's first greeting: the server decides, so the page only asks.
     memberGreet: vi.fn(() => Promise.resolve({ outcome: 'started' })),
@@ -219,7 +218,6 @@ vi.mock('../../utils/terminalRegistry', () => ({
   useTerminalEnabled: () => true,
   useTerminalTitle: () => 'Terminal',
 }))
-vi.mock('../../hooks/useDevMode', () => ({ useDevMode: () => false }))
 
 // The profile settings write the live slot; the stub shows which slot the page
 // handed it, so a refused thread is proven to get none.
@@ -236,13 +234,12 @@ const CrewComposerRef = vi.hoisted(() => ({ current: null as unknown }))
 const chatPaneMounts = vi.hoisted(() => ({ count: 0 }))
 vi.mock('../../components/ChatPane', async () => {
   const { useEffect } = await import('react')
-  function ChatPaneStub({ slotKey, agentLocked, followContentWidth, busyMode, topInset, composerInput, crewmateGreeting, ...rest }: { slotKey: string; agentLocked?: boolean; followContentWidth?: boolean; busyMode?: string; topInset?: number; composerInput?: unknown; crewmateGreeting?: import('react').ReactNode } & Record<string, unknown>) {
+  function ChatPaneStub({ slotKey, agentLocked, followContentWidth, busyMode, topInset, composerInput, ...rest }: { slotKey: string; agentLocked?: boolean; followContentWidth?: boolean; busyMode?: string; topInset?: number; composerInput?: unknown } & Record<string, unknown>) {
     // Mount count: the New crewmate card must HIDE the pane, never unmount it.
     useEffect(() => { chatPaneMounts.count += 1 }, [])
     return (
       <div data-testid="chat-pane-stub" data-agent-locked={agentLocked ? '1' : '0'} data-follow-content-width={followContentWidth ? '1' : '0'} data-busy-mode={busyMode ?? 'split'} data-top-inset={topInset ?? ''} data-crew-composer={composerInput === CrewComposerRef.current ? '1' : '0'}>
         {slotKey}
-        {crewmateGreeting}
         {/* A static opening card is gone: no host may pass one. */}
         {'assistantWelcome' in rest && <div data-testid="assistant-welcome-stub" />}
         {/* Stands in for rendered transcript links (markdown anchors). */}
@@ -320,9 +317,6 @@ beforeEach(() => {
   resetFirstGreetingRequests()
   // The remembered member must not leak between cases.
   localStorage.clear()
-  // The page is reached only with the Crewmates preview on; the cases that
-  // pin what happens with it off turn it off themselves.
-  localStorage.setItem('mc-preview-crew', '1')
   // Nor the crewmate-created receipts (browser-session record).
   sessionStorage.clear()
   chatPaneMounts.count = 0
@@ -414,7 +408,7 @@ describe('MembersPage default member, memory and URL', () => {
       await waitFor(() => expect(screen.queryByTestId('member-side-panel')).toBeNull(), { timeout: 3000 })
     })
 
-    it('lands on the remembered crewmate like a wide window, with the roster waiting in a closed drawer', async () => {
+    it('lands on the remembered mate like a wide window, with the roster waiting in a closed drawer', async () => {
       localStorage.setItem(LAST_MEMBER_KEY, 'beta')
       await renderPage(alphaBeta())
       expect(await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)).toHaveTextContent('member-beta')
@@ -430,7 +424,7 @@ describe('MembersPage default member, memory and URL', () => {
       expect(toggle.querySelector('.pi-pane')).not.toBeNull()
       expect(toggle.querySelector('.lucide-arrow-left')).toBeNull()
       // A screen reader hears a toggle too, not "Back", in either state.
-      expect(toggle).toHaveAccessibleName('Toggle crewmates')
+      expect(toggle).toHaveAccessibleName('Toggle mates')
       expect(toggle).toHaveAttribute('aria-expanded', 'false')
       fireEvent.click(toggle)
       await screen.findByTestId('roster-drawer')
@@ -492,7 +486,7 @@ describe('MembersPage default member, memory and URL', () => {
       expect(localStorage.getItem(LAST_MEMBER_KEY)).toBe('beta')
     })
 
-    it('Back with the drawer open closes it and stays on the crewmate; one more Back leaves the page', async () => {
+    it('Back with the drawer open closes it and stays on the mate; one more Back leaves the page', async () => {
       ;(api.members as ReturnType<typeof vi.fn>).mockResolvedValue({ members: alphaBeta(), default_agent: 'kirocrew' })
       ;(api.memberThread as ReturnType<typeof vi.fn>).mockImplementation(echoThread)
       function Elsewhere() {
@@ -572,7 +566,7 @@ describe('MembersPage default member, memory and URL', () => {
       await waitFor(() => expect(scopeOpen('members.roster-phone')).toBe(true))
     })
 
-    it('a New crewmate card takes the whole screen below md and its close returns to the originating chat', async () => {
+    it('a New mate card takes the whole screen below md and its close returns to the originating chat', async () => {
       await renderPage([row({ name: 'alpha', slug: 'alpha' }), defaultRow()], 'kirocrew', { route: '/members?member=alpha' })
       expect(await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)).toHaveTextContent('member-alpha')
       // The roster's "+" lives in the drawer below md.
@@ -654,7 +648,15 @@ describe('MembersPage default member, memory and URL', () => {
       expect(currentUrl()).toBe('/members?member=alpha')
     })
 
-    it('the first crewmate created from an empty roster opens on a replace, so one Back still leaves the page', async () => {
+    it('the empty roster offers Import from file, so the first mate can be a shared one', async () => {
+      const membersMock = api.members as ReturnType<typeof vi.fn>
+      membersMock.mockResolvedValue({ members: [defaultRow()], default_agent: 'kirocrew' })
+      renderFromElsewhere({ to: '/members' })
+      fireEvent.click((await screen.findAllByTestId('crewmate-empty-import'))[0])
+      expect(await screen.findByTestId('crewmate-import-dialog')).toBeTruthy()
+    })
+
+    it('the first mate created from an empty roster opens on a replace, so one Back still leaves the page', async () => {
       // A pushed open would leave a bare /members under the chat, and the phone
       // lands a bare /members on a crewmate by itself: Back would bounce back in.
       const membersMock = api.members as ReturnType<typeof vi.fn>
@@ -680,7 +682,7 @@ describe('MembersPage default member, memory and URL', () => {
       expect(screen.queryByTestId('member-gone-roster-notice')).toBeNull()
     })
 
-    it('switching from the drawer with Profile open does not carry the card to the next crewmate', async () => {
+    it('switching from the drawer with Profile open does not carry the card to the next mate', async () => {
       await renderPage(alphaBeta(), 'kirocrew', { route: '/members?member=alpha' })
       await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
       fireEvent.click(await screen.findByTestId('member-identity-pill'))
@@ -712,6 +714,28 @@ describe('MembersPage default member, memory and URL', () => {
       }
     })
 
+    it('wears the Sessions bar\'s bare drawer toggle and a bare panel toggle in the shell bar, not Glass chips', async () => {
+      const slot = document.createElement('div')
+      slot.id = 'mobile-topbar-slot'
+      document.body.appendChild(slot)
+      try {
+        await renderPage(alphaBeta(), 'kirocrew', { route: '/members?member=alpha' })
+        await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
+        const back = await within(slot).findByTestId('member-back')
+        const panel = within(slot).getByTestId('member-panel-toggle')
+        for (const control of [back, panel]) {
+          expect(control.tagName).toBe('BUTTON')
+          expect(control.className).not.toMatch(/glass/)
+          expect(control.className).toMatch(/(^|\s)p-2(\s|$)/)
+        }
+        // The Sessions toggle's glyph at its bar size, and its pressed state.
+        expect(back.querySelector('svg')).toHaveAttribute('width', '18')
+        expect(back).toHaveAttribute('aria-expanded', 'false')
+      } finally {
+        slot.remove()
+      }
+    })
+
     it('tells the shell which bar it needs: open for a landing, roster only when it can open no one and on unmount', async () => {
       const opening = vi.fn()
       const first = await renderPage(alphaBeta(), 'kirocrew', { reportRosterBar: opening })
@@ -737,7 +761,7 @@ describe('MembersPage default member, memory and URL', () => {
       await waitFor(() => expect(report).toHaveBeenLastCalledWith('roster'), PANE_READY)
     })
 
-    it('looks the shell bar slot up only once a crewmate is open, so a bar swapped during a slow read is not kept', async () => {
+    it('looks the shell bar slot up only once a mate is open, so a bar swapped during a slow read is not kept', async () => {
       // The shell may re-render its bar while the roster read is pending,
       // replacing its slot; the crewmate's header must land in the slot that is
       // there once it opens. A slot latched while pending would be the detached

@@ -1040,7 +1040,7 @@ class TestModelProseCannotForgeTheStateItIsJudgedBy:
 # --------------------------------------------------------------------------- #
 
 _FOLDS = ("clean", "regression", "redacted", "unscrubbable", "error", "no-report")
-_MODELS = ("PASS", "CONCERNS", "BLOCK", "UNKNOWN")
+_MODELS = ("PASS", "BLOCK", "UNKNOWN")
 _BOOLS = (False, True)
 
 #: Blocking severity -- `pass` softest, the two reds hardest. Bound to the ONE
@@ -1102,10 +1102,20 @@ class TestConcludeStricterGapResolution:
         )
         assert conclusion == "block"
 
-    def test_script_gap_blocks_and_no_gap_is_advisory(self) -> None:
+    def test_script_gap_blocks_and_no_gap_reads_as_pass(self) -> None:
         base = dict(fold="clean", model="BLOCK", marker_present=True, nothing_new=False)
         assert scope.conclude_lane(gap_script=True, gap_model=False, **base)[0] == "block"
-        assert scope.conclude_lane(gap_script=False, gap_model=False, **base)[0] == "concerns"
+        # A BLOCK that names no confirmed regression and no demonstrated gap is
+        # unsubstantiated, and an unsubstantiated BLOCK is a PASS.
+        assert scope.conclude_lane(gap_script=False, gap_model=False, **base)[0] == "pass"
+
+    def test_the_retired_concerns_word_is_not_a_verdict(self) -> None:
+        # CONCERNS is not a Scope-Verdict any more: it folds to UNKNOWN, which the
+        # table treats as unsettled (the lane fails closed on a verdict it cannot
+        # parse), not as a soft pass.
+        assert scope._normalize_model("CONCERNS") == "UNKNOWN"
+        assert scope._normalize_model("pass") == "PASS"
+        assert scope._normalize_model("block") == "BLOCK"
 
     def test_the_model_gap_can_only_tighten_never_soften(self) -> None:
         # The untrusted signal is honoured ONLY where it makes the verdict
@@ -1278,6 +1288,64 @@ class TestConcludeNamesTheValidateRefusalCause:
             assert not re.search(r"\d{12}", why + remedy), refusal
 
 
+class TestConcludeNamesAnUnresolvedScope:
+    """A `generate` job that died before it resolved the review scope leaves an
+    unmeasured run. It stays red; the table only names why, instead of the generic
+    "no leg reported" sentence that points at the author's diff.
+    """
+
+    @staticmethod
+    def _no_report(**over):
+        kwargs = dict(
+            fold="no-report",
+            model="UNKNOWN",
+            marker_present=False,
+            nothing_new=False,
+            gap_script=False,
+            gap_model=False,
+        )
+        kwargs.update(over)
+        return scope.conclude_lane(**kwargs)
+
+    def test_an_unresolved_scope_is_unsettled_and_names_its_cause(self) -> None:
+        conclusion, why = self._no_report(scope_unresolved=True)
+        assert conclusion == scope._UNSETTLED_CONCLUSION
+        assert why == scope._SCOPE_UNRESOLVED_WHY
+        assert "no leg reported" not in why
+
+    def test_a_resolved_scope_with_no_leg_still_reads_the_generic_unsettled_row(self) -> None:
+        conclusion, why = self._no_report(scope_unresolved=False)
+        assert conclusion == scope._UNSETTLED_CONCLUSION
+        assert why == "no leg reported, and this was not the nothing-to-adjudicate short circuit"
+
+    def test_an_unresolved_scope_outranks_the_green_nothing_new_row(self) -> None:
+        conclusion, why = self._no_report(
+            scope_unresolved=True, nothing_new=True, marker_present=True
+        )
+        assert conclusion == scope._UNSETTLED_CONCLUSION
+        assert why == scope._SCOPE_UNRESOLVED_WHY
+
+    def test_naming_an_unresolved_scope_never_softens_any_verdict(self) -> None:
+        for kwargs in _all_inputs():
+            without = scope.conclude_lane(**kwargs)[0]
+            with_ = scope.conclude_lane(**kwargs, scope_unresolved=True)[0]
+            assert _SEVERITY[with_] >= _SEVERITY[without], (kwargs, without, with_)
+
+    def test_the_why_fits_a_check_run_title(self) -> None:
+        prefix = TestConcludeNamesTheValidateRefusalCause._TITLE_PREFIX
+        why = scope._SCOPE_UNRESOLVED_WHY
+        assert "\n" not in why
+        assert len(prefix) + len(why) <= TestConcludeNamesTheValidateRefusalCause._TITLE_CAP
+
+    def test_the_cli_carries_the_flag(self, capsys) -> None:
+        rc = scope.main(["conclude", "--fold", "no-report", "--scope-unresolved", "true"])
+        assert rc == 0
+        out = capsys.readouterr().out.splitlines()
+        assert f"conclusion={scope._UNSETTLED_CONCLUSION}" in out, out
+        assert f"why={scope._SCOPE_UNRESOLVED_WHY}" in out, out
+        assert "settled=no" in out, out
+
+
 class TestConcludeCli:
     def test_cli_prints_github_output_lines_and_exits_zero(self, capsys) -> None:
         rc = scope.main(
@@ -1311,15 +1379,15 @@ class TestConcludeCli:
 
         The fork lane decides whether to stamp its check-run unsettled from this
         `settled=` line. Deriving it from the token spelling instead would break
-        that contract silently: flipped to `"concerns"`, an unsettled run would
+        that contract silently: flipped to `"nothing-new"`, an unsettled run would
         arrive as a token every caller treats as settled, and a flake would floor
         the head again with no other edit in sight. So the answer is computed
         against the constant.
         """
-        monkeypatch.setattr(scope, "_UNSETTLED_CONCLUSION", "concerns")
+        monkeypatch.setattr(scope, "_UNSETTLED_CONCLUSION", "nothing-new")
         scope.main(["conclude", "--fold", "error", "--marker", "present"])
         out = capsys.readouterr().out.splitlines()
-        assert "conclusion=concerns" in out, out
+        assert "conclusion=nothing-new" in out, out
         assert "settled=no" in out, out
 
     def test_cli_lowercases_and_normalizes_the_header(self, capsys) -> None:

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Lock, RotateCw } from 'lucide-react'
 import { api, type DashboardManifest } from '../../api/client'
@@ -8,39 +8,19 @@ import { Badge, Btn } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useTheme } from '../../hooks/useTheme'
 import { useSandboxDoc } from '../../hooks/useSandboxDoc'
-import { useFrameOpenLink } from '../../hooks/useFrameOpenLink'
+import { useFrameLinkBridge } from '../../hooks/useFrameLinkBridge'
 import { buildSrcdoc, readThemeVars } from '../../lib/widgetSrcdoc'
 import { startDashboardLoadTiming, type DashboardLoadTiming } from '../../lib/dashboardTiming'
 import { i18nT } from '../../i18n/t'
 import { useLanguage } from '../../i18n/LanguageProvider'
 import { MEMBER_DASHBOARD_QUERY_PREFIX, SESSION_DASHBOARD_QUERY_PREFIX, subscribeDashboardFields } from '../../hooks/useWebSocket'
 import CrewDashboardEmpty from './CrewDashboardEmpty'
+import CrewDashboardBehindBand from './CrewDashboardBehindBand'
+import { CREW_DASHBOARD_SANDBOX } from '../../lib/crewDashboardSandbox'
 
-/**
- * The sandbox grants for a crewmate's dynamic dashboard, and the ONE line of
- * this file that is a security boundary rather than a layout choice.
- *
- * `allow-scripts` alone, which contract v3 requires (`html` MAY run JS: a chart
- * is script or it is nothing) and nothing more. Every other grant is withheld:
- *
- * - No `allow-same-origin`, so the document lands on a null (opaque) origin and
- *   cannot read the dashboard's cookies or localStorage, or touch the parent DOM.
- * - No `allow-popups`. A template is loaded at run time, including one a user
- *   imported from a shared file, and a window it could open is a capability
- *   nothing about a status page needs. The one way out is the host's own
- *   `kirocrew-dashboard:open` bridge (`useFrameOpenLink`): a GitHub pull-request
- *   URL, from this frame, right after a user gesture, opened by the host.
- * - No `allow-top-navigation`, `allow-forms`, or `allow-modals`.
- *
- * Egress is closed by the document CSP (`connect-src 'none'`), which the gateway
- * injects inside the composed document AND `buildSrcdoc` injects outside it.
- * Policies combine by intersection, so the stricter wins on every directive.
- *
- * Same value as the published-panel frame deliberately: these are two documents
- * on one surface, and a reader comparing them should not have to wonder whether
- * one of them is more trusted.
- */
-export const CREW_DASHBOARD_SANDBOX = 'allow-scripts'
+// The grant set lives in lib/crewDashboardSandbox.ts so the artifact viewer can
+// open a crewmate's report in the same sandbox without loading this page.
+export { CREW_DASHBOARD_SANDBOX }
 
 /**
  * The grant set for a page the server says may NOT run script: empty, which is
@@ -58,8 +38,7 @@ export const CREW_DASHBOARD_SANDBOX = 'allow-scripts'
  * own bootstrap, which does not run here -- so when the server withholds script
  * it writes each bound cell's text itself, HTML-escaped
  * (`dashboard_frame.fill_bindings_as_text`). Without that the page drew every
- * bound cell empty with its stale band still hidden, which reads as a current
- * page showing nothing.
+ * bound cell empty, which reads as a current page showing nothing.
  */
 export const CREW_DASHBOARD_SANDBOX_STATIC = ''
 
@@ -127,6 +106,10 @@ const READY_TIMEOUT_MS = 6000
  * every case anybody writes.
  */
 export const DASHBOARD_FALLBACK_REFETCH_MS = 60_000
+
+/** Past this age with no fresh read, the host bands the page as maybe behind: two
+ *  fallback intervals missed means something stopped the read. */
+export const DASHBOARD_BEHIND_AFTER_MS = 2 * DASHBOARD_FALLBACK_REFETCH_MS
 
 /** The preview read's own "nothing staged" answer: 404 `no_preview`. Only that one.
  *  The same route answers 404 `member_not_found` for a crewmate that is gone, and
@@ -211,8 +194,8 @@ interface Loaded {
  * It renders the INSTANCE -- the crewmate's own copy of a template -- which the
  * registry serves from `GET /api/members/{slug}/dashboard`. The gateway composes
  * the document: it fills every `data-dashboard-field` element from the folded
- * values, sets `window.kirocrew`, marks the agentic cells and raises its own stale
- * band. This component's jobs are the three the document cannot do for itself:
+ * values, sets `window.kirocrew`, and marks the agentic and missing cells. This
+ * component's jobs are the three the document cannot do for itself:
  * mint it into a sandbox, keep the last page that successfully loaded, and offer a
  * way out when nothing loads at all.
  *
@@ -243,8 +226,12 @@ export function dashboardQueryKey(target: DashboardTarget): readonly string[] {
     : [SESSION_DASHBOARD_QUERY_PREFIX, target.slot]
 }
 
-export default function CrewDynamicDashboard({ target, displayName, avatar, onAct, preview = false, onPreviewGone, onPreviewLoaded, onOpenProfileTab, dashboardSlug = '' }: {
+export default function CrewDynamicDashboard({ target, displayName, avatar, onAct, preview = false, onPreviewGone, onPreviewLoaded, onOpenProfileTab, dashboardSlug = '', relayWheel = false }: {
   target: DashboardTarget
+  /** Report the frame's horizontal wheel runs to the host (see `relayWheel` in
+   *  lib/widgetSrcdoc). Only a host that listens may ask: the relay cancels the
+   *  browser's back swipe over the frame. The Mates side panel does. */
+  relayWheel?: boolean
   displayName: string
   /** The crew record's `avatar` field, verbatim, for the suggestions page's face. */
   avatar?: unknown
@@ -270,8 +257,8 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
 }) {
   const frameRef = useRef<HTMLIFrameElement | null>(null)
   /** A gap recovery that did not arrive. The page keeps its values; this says they
-   *  are older than the record, which nothing else on screen can say: the page's
-   *  own stale band is driven by a read that never came. */
+   *  are older than the record, which nothing else on screen can say: the read
+   *  that would have moved them never came. */
   const [refetchError, setRefetchError] = useState<string | null>(null)
   /** A whole-read request is in flight. The notice's Retry is disabled on it, which is
    *  what acknowledges the press: the notice itself stays up until the read arrives, so
@@ -279,8 +266,9 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
   const [refetchPending, setRefetchPending] = useState(false)
   const onActRef = useRef(onAct)
   onActRef.current = onAct
-  // A pull request the page links to: this frame only, GitHub PR URLs only.
-  useFrameOpenLink([frameRef])
+  // A link the page asks for: the agent-page link bridge, from this frame only. A
+  // click it cannot tie to the frame gets the host's "Open <host>" button.
+  const linkChip = useFrameLinkBridge([frameRef])
   const { theme, colorTheme, themeVersion } = useTheme()
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const themeVars = useMemo(() => readThemeVars(), [theme, colorTheme, themeVersion])
@@ -296,7 +284,7 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
   const timingRef = useRef<DashboardLoadTiming | null>(null)
   const timingLabel =
     target.kind === 'member' ? `member:${target.slug}` : `session:${target.slot}`
-  const { data, isLoading, isError, isFetching, error, refetch } = useQuery({
+  const { data, dataUpdatedAt, isLoading, isError, isFetching, error, refetch } = useQuery({
     queryKey: [...dashboardQueryKey(target), locale, staged ? 'preview' : 'live'],
     queryFn: async () => {
       // A live load only; a staged/preview read is a person action, not the
@@ -332,6 +320,10 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
     // dashboard nobody is looking at does not need to be current.
     refetchInterval: DASHBOARD_FALLBACK_REFETCH_MS,
     refetchIntervalInBackground: false,
+    // A tab coming back to the front re-reads ONLY when its read is older than one
+    // interval: the paused interval would otherwise leave it on pre-sleep values for
+    // up to a minute. A quick switch away and back costs nothing.
+    refetchOnWindowFocus: (query) => Date.now() - query.state.dataUpdatedAt > DASHBOARD_FALLBACK_REFETCH_MS ? 'always' : false,
   })
   // The crewmate behind a member target; empty for a root-session target, which has
   // neither a slug nor a package and so arms neither the refetch nor the push below.
@@ -398,8 +390,8 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
       .catch((err) => {
         // REPORTED, not swallowed. The page keeps the values it has, which is right,
         // but those values are now known to be older than the record and the reader
-        // cannot tell: the page's own stale band is driven by the host's read, and a
-        // refetch that never arrived leaves it saying nothing. The notice sits beside
+        // cannot tell: the document draws no warning of its own, and a refetch that
+        // never arrived leaves nothing on the page saying so. The notice sits beside
         // the page rather than over it, and a retry that fails again leaves it there.
         setRefetchError(apiErrorCode(err) || 'refetch_failed')
       })
@@ -458,7 +450,7 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
       // (crewmate, package) page can still be armed from before. Letting its pushes
       // through gave the template's bootstrap a generation it cannot place, so it asked
       // for a whole read with no package to name, the gateway answered 400
-      // `missing_dashboard`, and the stale band came back on every push.
+      // `missing_dashboard`, and the page refetched on every push.
       const mine = livePackageRef.current
       if (fromPackage !== mine) return
       // Same reason as the refetch answer above: an opaque origin cannot be named,
@@ -552,7 +544,7 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
     // the gateway deliberately does not compose that state -- `_render` is skipped, so
     // there is no data island, no bootstrap and no ready beacon. Promoting it would
     // draw the template's own placeholder markup as a healthy dashboard: every cell
-    // empty, nothing marked missing, no band, and no sign to a reader that what they
+    // empty, nothing marked missing, and no sign to a reader that what they
     // are looking at is not their data.
     //
     // It is not the same answer as the guard below, which is why it is asked separately.
@@ -693,8 +685,9 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
   const srcdoc = useMemo(
     () =>
       shown && !isError
-        // `rewriteBareLinks: false`: the sandbox withholds `allow-popups`, so a
-        // `target="_blank"` link here would be a blocked popup (a dead click).
+        // `linkBridge`: the sandbox withholds `allow-popups` and top navigation, so
+        // a `_blank` or `_top` link would be a dead click. The shim hands it to
+        // `useFrameLinkBridge` above, which checks the frame, URL and gesture.
         ? // offlineScripts: the CDN script origins are dropped for THIS document.
           // The page is filled with this crewmate's own task titles, summaries
           // and costs, and since the preview/apply pair it can be written by an
@@ -706,18 +699,114 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
             html: shown.html,
             themeVars,
             mode: theme,
-            rewriteBareLinks: false,
+            linkBridge: true,
             offlineScripts: true,
             // The phone side panel's closing drag starts over this frame.
             relayTouches: true,
+            // So does the desktop trackpad swipe that hides the panel, where
+            // the host asks for it.
+            relayWheel,
           })
         : null,
     // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on the page, see above
-    [shownKey, docRev, isError, themeVars, theme],
+    [shownKey, docRev, isError, themeVars, theme, relayWheel],
   )
   const mint = useSandboxDoc(srcdoc)
-  const { url, pending, retry } = mint
+  const { pending, retry } = mint
   const failed = mint.failed || mint.stalled
+  const runsScript = Boolean(mayRunScript && shown?.scripts)
+  const grantKey = crewDashboardSandbox(runsScript)
+
+  /**
+   * A NEW DOCUMENT LOADS OFF SCREEN, AND THE OPEN FRAME IS REPLACED ONLY WHEN IT IS UP.
+   *
+   * The mint hands back a new URL whenever the document is rebuilt (a page the open
+   * document cannot take as a refill, a theme change). Pointing the frame a reader is
+   * looking at at that URL navigates it, and until the new document paints the frame
+   * shows its own background: a black flash in the dark theme, on every agent field
+   * write and on every fallback read.
+   *
+   * So `held` is the URL of the document the visible frame holds, and a minted URL
+   * that differs from it is mounted in a second, invisible frame first (`stageUrl`).
+   * That same element is moved on screen once it reports it came up, so the document
+   * loads once. Nothing is held back where there is nothing to protect: the first
+   * document, and a change of grant, both go straight to the visible frame.
+   * The grant is part of the frame's identity (see its `key`), so a frame under a
+   * withdrawn grant must be replaced at once, and cannot wait on the page.
+   */
+  const [held, setHeld] = useState<{ url: string | null; grant: string }>({ url: null, grant: grantKey })
+  const stageUrl =
+    mint.url !== null && held.url !== null && held.grant === grantKey && mint.url !== held.url
+      ? mint.url
+      : null
+  const url = stageUrl !== null ? held.url : mint.url
+  const stageUrlRef = useRef(stageUrl)
+  stageUrlRef.current = stageUrl
+  const grantKeyRef = useRef(grantKey)
+  grantKeyRef.current = grantKey
+  useEffect(() => {
+    if (stageUrl !== null) return
+    setHeld(prev => (prev.url === url && prev.grant === grantKey ? prev : { url, grant: grantKey }))
+  }, [stageUrl, url, grantKey])
+  /** What the off-screen frame had already shown when it moved on screen, so the
+   *  "drawn" bookkeeping below does not wait for a `load` or a beacon that will not
+   *  come again. Recorded as observed: a frame shown because the wait ran out has
+   *  NOT reported ready, and a Keep that names a page nobody saw come up is wrong. */
+  const preloadedRef = useRef<{ url: string; loaded: boolean; ready: boolean } | null>(null)
+  const stageRef = useRef<HTMLIFrameElement | null>(null)
+  /** When the current run of off-screen documents began. A read that lands while one
+   *  is loading rebuilds it under a new url, and the wait is measured from the first,
+   *  or writes arriving more often than the wait would keep the old document up for as
+   *  long as they last. */
+  const stagingSinceRef = useRef<number | null>(null)
+  // A LAYOUT effect, so the off-screen frame's listeners are attached in the same commit
+  // that puts the frame in the DOM. A passive effect can run a task later, once React
+  // yields, and a `load` or ready beacon that arrives in that gap is lost, since neither
+  // is sent again: the frame then waits out the timeout, or comes on screen counted as
+  // never loaded.
+  useLayoutEffect(() => {
+    if (stageUrl === null) {
+      stagingSinceRef.current = null
+      return
+    }
+    if (stagingSinceRef.current === null) stagingSinceRef.current = Date.now()
+    let loaded = false
+    let ready = false
+    const promote = () => {
+      preloadedRef.current = { url: stageUrl, loaded, ready }
+      setHeld({ url: stageUrl, grant: grantKeyRef.current })
+    }
+    // Not coming up in time is not a reason to keep the old document for good: it
+    // would go on showing numbers that are behind with nothing saying so, and a page
+    // whose script threw was shown as it was before this existed.
+    const waited = Date.now() - stagingSinceRef.current
+    const timer = window.setTimeout(promote, Math.max(0, READY_TIMEOUT_MS - waited))
+    const el = stageRef.current
+    const onLoad = () => {
+      loaded = true
+      // A page without script sends no beacon, so its load is all there is to wait on.
+      if (!runsScript) {
+        ready = true
+        promote()
+      }
+    }
+    const onMessage = (event: MessageEvent) => {
+      const win = stageRef.current?.contentWindow
+      if (!win || event.source !== win) return
+      const payload = event.data as { type?: unknown } | null
+      if (payload && payload.type === READY_MESSAGE_TYPE) {
+        ready = true
+        promote()
+      }
+    }
+    el?.addEventListener('load', onLoad)
+    if (runsScript) window.addEventListener('message', onMessage)
+    return () => {
+      window.clearTimeout(timer)
+      window.removeEventListener('message', onMessage)
+      el?.removeEventListener('load', onLoad)
+    }
+  }, [stageUrl, runsScript])
 
   // The staged page the person can Keep is the one MOUNTED, never the newest read:
   // while a mint is pending, or after one failed, the frame still holds the earlier
@@ -726,8 +815,20 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
   // and nothing is offered until the url on screen was minted from `shown`'s own.
   const srcdocRef = useRef<string | null>(null)
   srcdocRef.current = srcdoc
+  // A document can reach the screen after newer ones were minted, so the srcdoc a url
+  // came from is recorded when it lands rather than read when it is shown.
+  const mintedFromRef = useRef(new Map<string, string | null>())
+  useEffect(() => {
+    if (!mint.url) return
+    const minted = mintedFromRef.current
+    minted.set(mint.url, srcdocRef.current)
+    while (minted.size > 8) minted.delete(minted.keys().next().value as string)
+  }, [mint.url])
   const [urlSource, setUrlSource] = useState<{ url: string | null; srcdoc: string | null }>({ url: null, srcdoc: null })
-  useEffect(() => { setUrlSource({ url, srcdoc: srcdocRef.current }) }, [url])
+  useEffect(() => {
+    const from = url ? mintedFromRef.current.get(url) : undefined
+    setUrlSource({ url, srcdoc: from !== undefined ? from : srcdocRef.current })
+  }, [url])
   // STEP 2 (#20952): the sandbox-doc POST resolved and a URL is in hand. Timed once
   // per URL -- the mint keeps only the latest request, so a URL landing is that POST
   // completing. The step-1 timer carries this load; a probe only.
@@ -740,7 +841,11 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
   const drawnUrlRef = useRef(url)
   drawnUrlRef.current = url
   const [drawn, setDrawn] = useState<{ url: string | null; loaded: boolean; ready: boolean }>({ url: null, loaded: false, ready: false })
-  useEffect(() => { setDrawn({ url, loaded: false, ready: false }) }, [url])
+  useEffect(() => {
+    // A document loaded off screen brings what it already reported with it.
+    const pre = url !== null && preloadedRef.current?.url === url ? preloadedRef.current : null
+    setDrawn({ url, loaded: pre?.loaded ?? false, ready: pre?.ready ?? false })
+  }, [url])
   const onFrameLoad = useCallback(() => {
     // STEP 3 (#20952): the iframe loaded the minted document -- the third and last
     // transfer. This completes the three-step load the "Drawing…" state covers.
@@ -753,7 +858,6 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
   // Listened on the element rather than through `onLoad`, which the a11y lint reads
   // as an interaction handler on a non-interactive element. Re-attached whenever the
   // frame element can be replaced: a new url, or a new grant (its key).
-  const grantKey = crewDashboardSandbox(Boolean(mayRunScript && shown?.scripts))
   useEffect(() => {
     const el = frameRef.current
     if (!el || !url) return
@@ -772,7 +876,6 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
   }, [staged])
-  const runsScript = Boolean(mayRunScript && shown?.scripts)
   const isDrawn = drawn.url === url && drawn.loaded && (drawn.ready || !runsScript)
   const mountedStagedMs = staged && shown && url && !pending && !failed && isDrawn
     && urlSource.url === url && urlSource.srcdoc === srcdoc
@@ -804,7 +907,14 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
   const refillUrlRef = useRef<string | null>(null)
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
-      const win = frameRef.current?.contentWindow
+      // The off-screen frame speaks for the document that is about to be shown, so
+      // what its beacon says is recorded against ITS url: it moves on screen without
+      // a second beacon, and a refill ability recorded nowhere would make the next
+      // read re-mint it.
+      const visibleWin = frameRef.current?.contentWindow
+      const stageWin = stageRef.current?.contentWindow
+      const fromStage = Boolean(stageWin) && event.source === stageWin
+      const win = fromStage ? stageWin : visibleWin
       if (!win || event.source !== win) return
       const payload = event.data as { type?: unknown; refill?: unknown } | null
       if (!payload || payload.type !== READY_MESSAGE_TYPE) return
@@ -812,7 +922,7 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
         refillUrlRef.current = null
         return
       }
-      refillUrlRef.current = urlRef.current
+      refillUrlRef.current = fromStage ? stageUrlRef.current : urlRef.current
       // A read that landed while this document was loading is in `shown` but may not
       // be in the document, so the newest values are posted as soon as it can take
       // them. Same values again is a redraw, not a reload.
@@ -835,7 +945,11 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
     if (!before || before.key !== key || before.html === shown.html) return
     const win = frameRef.current?.contentWindow
     const docUrl = urlRef.current
-    if (win && docUrl && refillUrlRef.current === docUrl && postRefill(win, shown.html)) return
+    const refilled = Boolean(win && docUrl && refillUrlRef.current === docUrl && postRefill(win, shown.html))
+    // A document still loading off screen was built from the values before this read,
+    // so it is rebuilt too: it can only be handed these values once it beacons, and a
+    // page that does not take refills would otherwise appear holding the old ones.
+    if (refilled && stageUrlRef.current === null) return
     // NEVER STALE: a page that has not said it takes refills gets a new document.
     setDocRev(n => n + 1)
   }, [shown])
@@ -885,13 +999,16 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
             html: candidate.html,
             themeVars,
             mode: theme,
-            rewriteBareLinks: false,
+            linkBridge: true,
             offlineScripts: true,
             // The phone side panel's closing drag starts over this frame.
             relayTouches: true,
+            // So does the desktop trackpad swipe that hides the panel, where
+            // the host asks for it.
+            relayWheel,
           })
         : null,
-    [probating, candidate, isError, themeVars, theme],
+    [probating, candidate, isError, themeVars, theme, relayWheel],
   )
   const probe = useSandboxDoc(probeSrcdoc)
 
@@ -1094,7 +1211,7 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
   }
 
   return (
-    <div className="h-full min-h-0 flex flex-col" data-testid="crew-dashboard-frame" data-preview={preview ? 'true' : undefined}>
+    <div className="relative h-full min-h-0 flex flex-col" data-testid="crew-dashboard-frame" data-preview={preview ? 'true' : undefined}>
       {lockBadge}
       {broken && (
         // The page on screen is the last one that parsed. Banded, never replaced: the
@@ -1120,9 +1237,9 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
       )}
       {reverted && (
         // THE KEPT-PAGE BAND, above the frame and never over it: the document on
-        // screen keeps every pixel it earned. It is distinct from the document's
-        // OWN stale band, which is about values that did not resolve; this one is
-        // about a newer page that did not load at all.
+        // screen keeps every pixel it earned. It is about a newer page that did not
+        // load at all; a field that did not resolve draws no band anywhere, because
+        // that is the crewmate's to fix and its turn block tells it.
         <div
           className="shrink-0 border-b border-border p-2 flex items-start gap-2"
           data-testid="crew-dashboard-kept-band"
@@ -1166,14 +1283,19 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
           </Btn>
         </div>
       )}
+      {/* THE PAGE-WIDE "may be behind" band, drawn here so no page can hide it. The
+          refetch band below says the same thing more precisely, with a Retry; when it
+          is up this one stands down rather than say it twice, but stays mounted so a
+          drop seen meanwhile is not forgotten. */}
+      <CrewDashboardBehindBand readAt={dataUpdatedAt} staleAfterMs={DASHBOARD_BEHIND_AFTER_MS} hidden={Boolean(refetchError)} />
       {refetchError && (
         <div
           className="shrink-0 border-b border-border p-2 flex items-start gap-2"
           data-testid="crew-dashboard-refetch-error-band"
         >
           {/* The page keeps its values, which is right. What a reader cannot otherwise
-              learn is that those values are older than the record: the page's own stale
-              band is raised by a read, and this is the case where the read never came.
+              learn is that those values are older than the record, because the read
+              that would have moved them never came.
               Beside the page rather than over it, like the two bands above.
 
               ITS OWN SENTENCE, not the kept-last-good one. That string says a newer
@@ -1207,7 +1329,7 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
           </Btn>
         </div>
       )}
-      {url ? (
+      {url ? [
         <iframe
           // THE GRANT IS PART OF THE FRAME'S IDENTITY, and it has to be.
           //
@@ -1222,20 +1344,49 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
           // Keyed on the GRANT alone rather than on the read: a key that moved with every
           // poll would discard the page state the push exists to keep (a scroll position,
           // an animation, a 3D camera) once a minute.
-          key={`grant-${crewDashboardSandbox(mayRunScript && shown.scripts)}`}
+          //
+          // AND THE URL: the element that loaded a document off screen is the one that
+          // is shown when it is promoted, so React has to see the same key on both
+          // sides of the swap. A key without the url would navigate this frame to the
+          // new document, which is the blank frame the swap exists to avoid.
+          key={`frame-${grantKey}-${url}`}
           ref={frameRef}
           src={url}
           // The SERVER's latest answer, not the promoted document's. A revocation that
           // arrived after this document was promoted has to reach the frame that is
           // mounted, which is what the key above makes happen.
+          // Marks the frame whose document carries the wheel relay: the host arms only these.
+          data-wheel-relay={relayWheel ? '' : undefined}
           sandbox={crewDashboardSandbox(mayRunScript && shown.scripts)}
           className="flex-1 min-h-0 w-full border-none bg-bg"
           style={{ colorScheme: theme }}
           title={i18nT('pages.membersPage.dashboard_frame_title', { crew: displayName })}
           data-testid="crew-dashboard-iframe"
           data-instance-version={shown.instanceVersion}
-        />
-      ) : failed && !pending ? null : (
+        />,
+        stageUrl !== null && (
+          // The document that replaces the one above, loading where nobody sees it.
+          // Full size and transparent rather than one pixel: a page that sizes a chart
+          // from its window on load would draw at 1x1 and keep that size once shown.
+          // It sits after the visible frame and never before, so promotion removes the
+          // old element and leaves this one in place -- moving an iframe in the DOM
+          // reloads it.
+          <iframe
+            key={`frame-${grantKey}-${stageUrl}`}
+            ref={stageRef}
+            src={stageUrl}
+            // Marks the frame whose document carries the wheel relay: the host arms only these.
+            data-wheel-relay={relayWheel ? '' : undefined}
+            sandbox={crewDashboardSandbox(mayRunScript && shown.scripts)}
+            aria-hidden
+            tabIndex={-1}
+            className="absolute inset-x-0 bottom-0 h-full w-full opacity-0 pointer-events-none border-none"
+            style={{ colorScheme: theme }}
+            title={i18nT('pages.membersPage.dashboard_rendering')}
+            data-testid="crew-dashboard-swap"
+          />
+        ),
+      ] : failed && !pending ? null : (
         <div className="p-4 text-[11px] text-muted">{i18nT('pages.membersPage.dashboard_rendering')}</div>
       )}
       {probating && probe.url && (
@@ -1254,6 +1405,8 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
           // A candidate on probation gets the SAME grants its own response
           // decided, so a page cannot earn promotion while running under looser
           // ones than it will be mounted with.
+          // Marks the frame whose document carries the wheel relay: the host arms only these.
+          data-wheel-relay={relayWheel ? '' : undefined}
           sandbox={crewDashboardSandbox(mayRunScript && (candidate ? candidate.scripts : shown.scripts))}
           aria-hidden
           tabIndex={-1}
@@ -1266,6 +1419,7 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
           data-testid="crew-dashboard-probe"
         />
       )}
+      {linkChip}
     </div>
   )
 }

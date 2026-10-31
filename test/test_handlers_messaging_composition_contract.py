@@ -131,7 +131,7 @@ _BASE_NAMES = frozenset("""
         extract_options format_overflow generate_token get_command_bus
         guard_owner_surface_routes internal_memory_scope is_direct_local_request
         is_proxied_request is_sensitive_path live logger mint_options_token
-        parent_template_allowlists parent_work_supported persisted_replay_denial_reason
+        parent_project_dirs parent_template_allowlists parent_work_supported persisted_replay_denial_reason
         persisted_snapshot_denial_reason pip_extra_install_command platform_compat
         read_bounded_json read_config_text read_panel_records read_state read_tombstone
         record_panel_dismissal_outcome redact_credentials redact_exfiltration_urls
@@ -252,7 +252,7 @@ _BASE_OWNERS: dict[str, tuple[str, ...]] = {
 #: SHA-256 of the sorted ``"<name> <kind> <signature>"`` lines of every name in
 #: ``_BASE_OWNERS``, captured from the facade before the split that moved it: each
 #: moved name keeps the kind and signature it had there.
-_BASE_SHAPE_DIGEST = "2c20b392e339e1d74c03a21bebc7aa0baa18f2f15e0d1dbe32adaa416fe46dd0"
+_BASE_SHAPE_DIGEST = "66b4494d6fbf53f0767bed2f2cc698ce1b8f79181925565702d2875021de1caf"
 
 
 #: Helpers the split of ``api_send_message`` added to the send owner: the body it
@@ -413,7 +413,7 @@ def test_the_routes_and_the_package_reach_the_facade_objects() -> None:
     assert len({id(h) for h in served}) >= 28
     assert [h.__name__ for h in served if getattr(msg, h.__name__) is not h] == []
     reexports = _package_reexports()
-    assert len(reexports) == 59
+    assert len(reexports) == 60
     assert [n for n in reexports if getattr(handlers_pkg, n) is not getattr(msg, n)] == []
     server_names = _server_handler_names()
     assert {"api_spawn", "api_send_message", "stop_browser_install"} <= server_names
@@ -463,7 +463,6 @@ def test_the_seams_other_modules_import_keep_their_identity() -> None:
 #: and must keep importing from there (not from a re-route).
 _IMPORTED_BY_NAME = {
     "_resolve_channel_target": "kiro_crew.dashboard.chat_runner",
-    "_run_chat": "kiro_crew.dashboard.chat_runner",
     "_get_config_lock": "kiro_crew.dashboard.handlers.agents",
     "is_allowed_user": "kiro_crew.slack.handler",
     "is_tracked_channel": "kiro_crew.slack.handler",
@@ -1330,18 +1329,11 @@ def test_the_whole_census_holds_the_known_rebinds_and_an_owner_s_definitions() -
 # ── the path-keyed guards keep their reach ────────────────────────────────────
 
 #: Constructs repository guards read by path, each with the owners that hold it beside
-#: ``dashboard/handlers/messaging.py``: the cron origin-session dispatch the
-#: turn-timeout scan counts, the slot task publish the slot-reader inventory keys by
-#: ``api_send_message``, and the two bounded body reads the JSON-body register keys
+#: ``dashboard/handlers/messaging.py``: the two bounded body reads the JSON-body register keys
 #: by function -- the Teams activity route's in the facade, the agent push's in
 #: ``agent_push``, a row the register names by that path. An owner that grew one would
 #: move it out of the guard's sight, so each stays in exactly these files.
-_STAYS_IN_THE_FACADE = (
-    (r"spawn_guarded_turn\(", ()),
-    (r"\b_run_chat\(", ()),
-    (r"\bslot\.task = task\b", ()),
-    (r"await read_bounded_json\(", ("agent_push",)),
-)
+_STAYS_IN_THE_FACADE = ((r"await read_bounded_json\(", ("agent_push",)),)
 
 
 @pytest.mark.parametrize(
@@ -1436,7 +1428,7 @@ def _facade_in(root: Path) -> str:
 def test_the_parked_run_ratchet_reads_the_owners(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import test_subagent_spawn_approval_parked_6484 as guard
+    import test_subagent_spawn_approval_parked as guard
 
     root = _mirror(tmp_path)
     monkeypatch.setattr(msg, "__file__", _facade_in(root))
@@ -1637,6 +1629,20 @@ def _telegram_put(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: dict) -
         ({"allow_forum": "yes"}, "allow_forum must be a boolean"),
         ({"allowed_forum_chat_ids": "x"}, "allowed_forum_chat_ids must be a list"),
         ({"allowed_forum_chat_ids": ["abc"]}, "invalid Telegram chat ID: abc (integer IDs only)"),
+        # "²".isdigit() is True while int("²") raises: a 400, never a crash.
+        ({"allowed_user_ids": ["²"]}, "invalid Telegram user ID: ² (numeric IDs only)"),
+        ({"allowed_user_ids": ["١"]}, "invalid Telegram user ID: ١ (numeric IDs only)"),
+        ({"allowed_forum_chat_ids": ["-²"]}, "invalid Telegram chat ID: -² (integer IDs only)"),
+        ({"allowed_forum_chat_ids": ["-١"]}, "invalid Telegram chat ID: -١ (integer IDs only)"),
+        # Past int()'s digit limit it raises too: a 400, never a crash.
+        (
+            {"allowed_user_ids": ["1" * 21]},
+            f"invalid Telegram user ID: {'1' * 21} (numeric IDs only)",
+        ),
+        (
+            {"allowed_forum_chat_ids": ["-" + "1" * 21]},
+            f"invalid Telegram chat ID: -{'1' * 21} (integer IDs only)",
+        ),
     ],
 )
 def test_the_telegram_saver_refuses_a_bad_field_with_its_text(

@@ -108,11 +108,13 @@ describe('ChatInput reasoning effort on the model chip', () => {
     expect(screen.getByTestId('composer-model-chip')).toHaveAccessibleName('Model: claude-opus-4.7')
   })
 
-  it('shows disabled state when running, and still names the level', () => {
+  it('stays enabled when running, still names the level, and says a pick applies next', () => {
     renderInput({ isRunning: true })
-    const btn = screen.getByTitle('Stop the current response to switch model · Reasoning effort: High')
-    expect(btn).toBeDisabled()
-    expect(btn).toHaveAccessibleName('Stop the current response to switch model · Reasoning effort: High')
+    const btn = screen.getByTestId('composer-model-chip')
+    expect(btn).toBeEnabled()
+    expect(btn).toHaveAccessibleName(
+      'Model: claude-opus-4.7 · Reasoning effort: High\nYour next message runs on the model you pick. This reply finishes on the model it started with.',
+    )
   })
 
   it('EFFORT_LABEL_KEY covers all valid values incl xhigh', () => {
@@ -147,6 +149,19 @@ describe('ChatInput reasoning effort on the model chip', () => {
     expect(modelSupportsEffort('deepseek-3.2')).toBe(false)
     expect(modelSupportsEffort('minimax-m2.5')).toBe(false)
     expect(modelSupportsEffort('glm-5')).toBe(false)
+  })
+
+  it('modelSupportsEffort offers Haiku 5.5 and later, never older Haiku (#26173)', () => {
+    // kiro-cli accepts /effort on claude-haiku-5.5 and refuses it on 4.5.
+    expect(modelSupportsEffort('claude-haiku-5.5')).toBe(true)
+    expect(modelSupportsEffort('global.anthropic.claude-haiku-5-5[1m]')).toBe(true)
+    expect(modelSupportsEffort('claude-haiku-5.6')).toBe(true)
+    expect(modelSupportsEffort('claude-haiku-6')).toBe(true)
+    expect(modelSupportsEffort('claude-haiku-4.5')).toBe(false)
+    expect(modelSupportsEffort('anthropic.claude-haiku-4-5-20251001-v1:0')).toBe(false)
+    expect(modelSupportsEffort('claude-3-5-haiku-20241022')).toBe(false)
+    expect(modelSupportsEffort('claude-haiku-5')).toBe(false)
+    expect(modelSupportsEffort('claude-haiku')).toBe(false)
   })
 })
 

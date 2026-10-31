@@ -177,7 +177,7 @@ class TestShellBeforePython:
 
     **Validates: Requirements 7.4**
 
-    This property is enforced by handle_enable_app in routes.py which:
+    This property is enforced by handle_enable_app in routes_enable.py which:
     1. Runs _run_lifecycle_script(on_enable) first (shell)
     2. Then calls on_app_enable() (Python hooks)
     """
@@ -226,7 +226,6 @@ class TestShellBeforePython:
         ):
             from kiro_crew.apps.routes import handle_enable_app
 
-            # Build a minimal fake request
             request = MagicMock()
             request.match_info = {"name": "test-app"}
             request.app = {"state": MagicMock(owner_id="")}

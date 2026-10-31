@@ -55,7 +55,7 @@ import kiro_crew.agent as _agent_module  # noqa: F401
 from kiro_crew import model_registry, resource_status  # noqa: F401
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent import _prompt_path, _shipped_prompt, is_managed_prompt  # noqa: F401
-from kiro_crew.agent_discovery import agent_skill_globs
+from kiro_crew.agent_discovery import WHOLE_CATALOG_TEMPLATES, agent_skill_globs
 from kiro_crew.agent_sdk.drivers import acp as acp_driver
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_ACP, is_claude_code
 from kiro_crew.agent_spec_format import iter_agent_spec_files, parse_agent_spec_text  # noqa: F401
@@ -75,6 +75,7 @@ from kiro_crew.context_assembly import replay as _replay
 from kiro_crew.context_assembly import sections as _sections  # noqa: F401 - loaded eagerly
 from kiro_crew.context_assembly import session_start as _session_start  # noqa: F401
 from kiro_crew.context_assembly import store_admission as _store_admission  # noqa: F401
+from kiro_crew.context_assembly import tool_names as _tool_names  # noqa: F401 - loaded eagerly
 from kiro_crew.context_assembly import turn as _turn  # noqa: F401 - loaded eagerly
 from kiro_crew.context_assembly import turn_message as _turn_message  # noqa: F401 - loaded eagerly
 from kiro_crew.context_assembly.agent_spec import (  # noqa: F401
@@ -179,7 +180,9 @@ from kiro_crew.context_assembly.output_contract import (  # noqa: F401
     _CRITICAL_RULES,
     _CRITICAL_RULES_CHANNEL,
     _CRITICAL_RULES_HEAD,
+    _CRITICAL_RULES_SUBAGENT,
     _CRITICAL_RULES_TAIL,
+    _CRITICAL_RULES_VARIANTS,
     _DIFF_RULE_CHANNEL,
     _DIFF_RULE_DASHBOARD,
     _UI_LANGUAGE_CATALOGS,
@@ -236,7 +239,10 @@ from kiro_crew.context_assembly.store_admission import (  # noqa: F401
     _TURN_LESSONS_CHARS,
     _TURN_LESSONS_MAX,
     _ShownLessons,
+    discard_memory_prefetch,
     embed_startup_query,
+    prefetch_session_memory,
+    reserve_memory_prefetch,
 )
 from kiro_crew.context_assembly.turn_message import build_message as _build_message
 from kiro_crew.context_blocks import measure_prompt  # noqa: F401
@@ -289,6 +295,10 @@ from kiro_crew.security import (  # noqa: F401
 )
 from kiro_crew.sel import sel  # noqa: F401
 from kiro_crew.session_surface import has_dashboard_surface  # noqa: F401
+from kiro_crew.skill_scope_pin import (  # noqa: F401 - read as ctx.<name>
+    pinned_session_skill_spec,
+    pinned_skill_globs,
+)
 from kiro_crew.skills import PROJECT_SKILL_BODY_CAP, SkillsLoader
 from kiro_crew.warm_task_brief_contract import is_warm_task_brief_message
 
@@ -890,7 +900,7 @@ def _board_safe_tag_name(raw: object) -> str:
 
 
 # Per-section limits are derived below; shared admission never sums them.
-def _member_backend_can_dispatch(cfg: "KiroCrewConfig | None" = None) -> bool:
+def _member_backend_can_dispatch(cfg: "KiroCrewConfig | None" = None, crew: str = "") -> bool:
     """Whether the configured member backend can mount the dispatch tools.
 
     The member operating-mode block teaches ``session_*`` tools that arrive as
@@ -903,19 +913,23 @@ def _member_backend_can_dispatch(cfg: "KiroCrewConfig | None" = None) -> bool:
 
     ``cfg`` lets a caller that already loaded the config share the handle —
     the context builder calls this once per member turn, so a second disk
-    read would be pure waste.
+    read would be pure waste. *crew* names the crewmate whose thread this is:
+    its own harness pin (``agents.<name>.acp_backend``) outranks the member
+    route, as it does in ``members.select_provider_backend``, and a pin that
+    cannot start withholds the block.
     """
     try:
         from kiro_crew.acp_backends import (
             ACP_BACKENDS_MEMBER_DISPATCH,
             resolve_selected_backend,
         )
+        from kiro_crew.crewmate_harness import pinned_backend
 
         if cfg is None:
             from kiro_crew.config import KiroCrewConfig
 
             cfg = KiroCrewConfig.load()
-        backend = resolve_selected_backend(cfg.agent.member_acp_backend)
+        backend = pinned_backend(cfg, crew, resolve_selected_backend(cfg.agent.member_acp_backend))
         return backend in ACP_BACKENDS_MEMBER_DISPATCH
     except Exception:
         logger.debug("member backend capability check failed", exc_info=True)
@@ -1134,10 +1148,13 @@ def build_cancelled_turn_preamble(
     is observed on the session.
     """
     try:
-        recent = conversation_log.recent(session_key, max_messages=20)
+        # Whole rows: ``recent()`` keeps only role and content, and the walk reads
+        # ``meta`` to step past a steer the person took back. Both callers run this
+        # in a worker thread, since it reads the whole transcript.
+        rows = _without_warm_task_brief_messages(conversation_log.read_messages(session_key))
     except Exception:
         return ""
-    return _replay.cancelled_turn_preamble(recent, user_cap=user_cap, assist_cap=assist_cap)
+    return _replay.cancelled_turn_preamble(rows[-20:], user_cap=user_cap, assist_cap=assist_cap)
 
 
 # ── Provider-Agnostic Session Replay ──
@@ -1154,6 +1171,7 @@ def _replay_rows(
     exclude_last_n: int = 0,
     pending_messages: list[dict] | None = None,
     current_message: dict | None = None,
+    exclude_messages: list[dict] | None = None,
 ) -> list[dict]:
     """Tail of the chain under per-role quotas, in chronological order.
 
@@ -1162,10 +1180,13 @@ def _replay_rows(
     """
     messages = conversation_log.read_messages_chained(session_key) if conversation_log else []
     if pending_messages is not None or current_message is not None:
-        messages = _merge_replay_rows(messages, pending_messages or [], current_message)
+        messages = _merge_replay_rows(
+            messages, pending_messages or [], current_message, exclude_messages
+        )
     elif exclude_last_n > 0:
         messages = messages[:-exclude_last_n]
     messages = _without_warm_task_brief_messages(messages)
+    messages = [row for row in messages if not _replay.is_context_cap_notice(row)]
     return _replay._quota_tail(
         messages, conv_max=_REPLAY_CONVERSATION_MAX_ROWS, inject_max=_REPLAY_INJECT_MAX_ROWS
     )
@@ -1213,12 +1234,15 @@ def build_session_replay(
     model_window: int | None = None,
     pending_messages: list[dict] | None = None,
     current_message: dict | None = None,
+    budget_chars: int = _REPLAY_BUDGET_CHARS,
+    exclude_messages: list[dict] | None = None,
 ) -> str | None:
     """Build session replay from KiroCrew's conversation_log.
 
-    Keeps as many recent messages as fit within _REPLAY_BUDGET_CHARS,
-    prioritizing the most recent exchanges (tail-heavy). Used when a
-    session is picked up by a different provider or after process death.
+    Keeps as many recent messages as fit within *budget_chars*
+    (``_REPLAY_BUDGET_CHARS`` unless the conductor context cap's trim asks for
+    its larger tail), prioritizing the most recent exchanges (tail-heavy). Used
+    when a session is picked up by a different provider or after process death.
 
     Same-provider resume uses native ACP session/load instead (full fidelity
     without needing this injection).
@@ -1226,6 +1250,8 @@ def build_session_replay(
     With *pending_messages*, merge the disk and live window by delivery identity
     and exclude *current_message* explicitly before applying quotas or budgets.
     The legacy *exclude_last_n* applies only when no live snapshot is supplied.
+    *exclude_messages* (with a live snapshot) are left out on both sides by
+    delivery identity: the previous reply a Regenerate is replacing.
 
     *model_window* scales the replay budget to the active model's context
     window (the dashboard's primary history vehicle — it must shrink on a
@@ -1239,11 +1265,12 @@ def build_session_replay(
         exclude_last_n=exclude_last_n,
         pending_messages=pending_messages,
         current_message=current_message,
+        exclude_messages=exclude_messages,
     )
     if not messages:
         return None
 
-    replay = _replay.replay_text(messages, model_window)
+    replay = _replay.replay_text(messages, model_window, budget_chars=budget_chars)
     replay, _ = redact_exfiltration_urls(replay)
     replay, _ = redact_credentials(replay)
     return replay.translate(_MULTIBYTE_TABLE)
@@ -1255,8 +1282,13 @@ def _skills_injection_plan(
     is_cc: bool,
     project_dir: str | Path | None = None,
     provider_type: str | None = None,
+    session_key: str | None = None,
 ) -> tuple[bool, list[str]]:
     """Whether to inject skills for *agent*, plus the glob restriction to apply.
+
+    A session whose skill scope is pinned to one spec file (``skill_scope_pin``: a
+    palette-opened app agent on kiro-cli) is scoped by that file, never by a name
+    lookup that could reach a checkout's same-named spec.
 
     THE single source of truth for the agent-scoping rule, shared by the
     session-start injection and the post-compaction re-injection. Mapped agents
@@ -1270,11 +1302,26 @@ def _skills_injection_plan(
     hand-copied second gate is exactly what let the re-injection path ship
     without scoping, handing a mapped agent the catalog its mapping excludes.
     """
+    from kiro_crew.agent_files import is_kirocrew_default_agent
+
     inherit = provider_type == PROVIDER_ACP
-    globs = (
-        agent_skill_globs(agent, project_dir=project_dir, inherit_defaults=inherit) if agent else []
+    pinned = pinned_skill_globs(session_key, project_dir=project_dir, inherit_defaults=inherit)
+    if pinned is not None:
+        globs = pinned
+    elif agent:
+        globs = agent_skill_globs(
+            agent,
+            project_dir=project_dir,
+            inherit_defaults=inherit,
+            session_key=session_key or "",
+        )
+    else:
+        globs = []
+    is_custom = (
+        bool(agent)
+        and not is_kirocrew_default_agent(agent)
+        and agent not in WHOLE_CATALOG_TEMPLATES
     )
-    is_custom = bool(agent) and agent != "kirocrew"
     return (bool(globs) or not is_custom), globs
 
 

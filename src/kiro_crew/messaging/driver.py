@@ -41,11 +41,13 @@ from kiro_crew.acp.types import (
     STOP_REASON_REFUSAL,
     STOP_REASON_STALE_RECOVER,
     STOP_REASON_TOOL_STALL,
+    TERMINAL_TOOL_STATUSES,
     classify_stop_reason,
 )
 from kiro_crew.constants import (
     _STEERING_TAIL_PREFIX_RE,
     DENY_CAUSE_APPROVAL_TIMEOUT,
+    DENY_CAUSE_APPROVAL_UNDELIVERABLE,
     DENY_CAUSE_POLICY,
     DENY_CAUSE_SURFACE_POLICY,
     STEER_NOTICE_BOUND_SECS,
@@ -70,6 +72,7 @@ from kiro_crew.messaging.renderer import (
     TEXT_CHUNK,
     THINKING,
     TOOL_CALL,
+    TOOL_RESULT,
     OutputEvent,
     Renderer,
 )
@@ -100,7 +103,10 @@ APPROVAL_INTERACTIVE = "interactive"
 #: human's own answer (or no answer worth explaining) and a ``DENY_CAUSE_*``
 #: name from ``kiro_crew.constants`` when the denial was the host's doing.
 #: Today that is :data:`DENY_CAUSE_APPROVAL_TIMEOUT`, recorded by every shipped
-#: decider when its prompt expires unanswered. The driver reads it after a
+#: decider when its prompt expires unanswered, or
+#: :data:`DENY_CAUSE_APPROVAL_UNDELIVERABLE`, recorded when the prompt never
+#: reached the channel (text-reply, Discord, Telegram and Teams deciders). The
+#: driver steers both, each with its own reason. The driver reads it after a
 #: denial and steers the cause into the running turn BEFORE it rejects, so the
 #: model is not left with kiro-cli's generic "User denied tool execution" for a
 #: call nobody answered. A plain callable without the attribute is a denial
@@ -497,6 +503,14 @@ class TurnDriver:
         drain, and may also reject a structured monitor whose conversation
         generation changed. It must not await: the gate, monitor acceptance, and
         the stream's synchronous turn registration are one event-loop span.
+    event_tap:
+        Optional synchronous observer handed every RAW provider event, before
+        the driver acts on it. For a second surface that shows the turn as it
+        runs (the dashboard tab of a channel conversation) and needs fields an
+        ``OutputEvent`` does not carry -- a tool call's arguments and identity,
+        a tool's result. It only observes: its return value is ignored, and an
+        exception it raises is logged and swallowed, so a broken observer can
+        never change or end the turn.
     """
 
     def __init__(
@@ -515,9 +529,17 @@ class TurnDriver:
         audit_agent: str = "kirocrew",
         closing_gate: Callable[[], None] | None = None,
         monitor_completion: MonitorCompletionHook | None = None,
+        undelivered_watch_key: str = "",
+        event_tap: Callable[[Any], None] | None = None,
     ) -> None:
         self.provider = provider
         self.renderer = renderer
+        # The session key the caller authenticated for this turn, used ONLY to say
+        # whose worker-tool call the harness failed to deliver
+        # (:class:`kiro_crew.undelivered_call_watch.UndeliveredCallWatch`), so a
+        # dispatched worker resumed on a channel is still heard when its report
+        # never arrives. Empty watches nothing.
+        self.undelivered_watch_key = undelivered_watch_key
         self.approval_mode = approval_mode
         self.decider = decider
         self.auto_approve_tool = auto_approve_tool
@@ -542,6 +564,7 @@ class TurnDriver:
         # identity was recorded at EVENT_TOOL_CALL — the forgery gate.
         self.directive_consumer = directive_consumer
         self.monitor_completion = monitor_completion
+        self.event_tap = event_tap
         # Terminal stop reason of the last run() — read by the dispatcher's
         # post-turn bookkeeping (e.g. COMPACTION_FAILED -> session reset).
         self.last_stop_reason: str = ""
@@ -622,6 +645,17 @@ class TurnDriver:
         released = ""
         tool_gap = False
         break_after: str | None = None
+        # The run the redactor held when the first tool call after some text
+        # came: the END of that text, which comes out only with the first text
+        # after the call. ``release`` splits it off so a renderer can put it
+        # back before the call (``OutputEvent.continues_segment``). ``None``
+        # when nothing is pending.
+        segment_tail: str | None = None
+        # The part of ``segment_tail`` already released while the rest is held.
+        tail_released = ""
+        # How much raw text had been fed when ``segment_tail`` was taken: a
+        # second call before any MORE text keeps the run the first one saw.
+        tail_fed_at = 0
         pending_steer_events = 0
         unmatched_marker_events = 0
         # Monotonic start of this turn, compared with the provider's stamp of
@@ -673,6 +707,12 @@ class TurnDriver:
         # anything — the grant still comes solely from directive_tool_for at
         # call time.
         seen_tool_identity: dict[str, tuple[str, str]] = {}
+        # A worker-tool call the harness never delivered, judged per turn.
+        undelivered_watch = None
+        if self.undelivered_watch_key:
+            from kiro_crew.undelivered_call_watch import UndeliveredCallWatch
+
+            undelivered_watch = UndeliveredCallWatch(self.undelivered_watch_key, self.provider)
         # Purpose text from each tool_call, keyed by its tool_call_id, so a
         # permission request can be paired with the purpose of the tool IT asks
         # about. A permission payload may carry the title but no purpose, and the
@@ -722,18 +762,52 @@ class TurnDriver:
                     break_after = fed_raw[len(released) :]
             fed_raw += text
             safe = place_tool_break(stream_redactor.feed(text))
+            await release(safe)
+
+        async def flush_redactor() -> None:
+            await release(place_tool_break(stream_redactor.flush()), final=True)
+
+        async def release(safe: str, *, final: bool = False) -> None:
+            """Hand redacted output to the renderer, ending the pre-call text first.
+
+            While ``segment_tail`` is pending, the first output opens with the
+            run the redactor held when the tool call came. That run is the end
+            of the text BEFORE the call, so it goes out on its own as a
+            ``continues_segment`` chunk and the rest follows as ordinary text.
+            Joined, the two chunks are exactly the output, so a renderer that
+            lays text end to end sees no change. When the output does not open
+            with the run verbatim (a redaction reached across the join), the
+            continuation is empty and everything goes to the text after the
+            call. A release that is only a prefix of the run is kept back until
+            the rest comes, so the run is handed over whole. ``final`` closes a
+            pending tail even when nothing is left.
+            """
+            nonlocal accumulated, segment_tail, tail_released
+            if segment_tail is not None and (safe or final):
+                if safe.startswith(segment_tail):
+                    cut = len(segment_tail)
+                elif segment_tail.startswith(safe) and not final:
+                    # Only part of the run came out: it is still the earlier
+                    # text's, and so is what stays held. Wait for the rest; the
+                    # rescue's view of the turn still includes what came out.
+                    tail_released += safe
+                    segment_tail = segment_tail[len(safe) :]
+                    self.partial_text = accumulated + tail_released
+                    return
+                else:
+                    cut = 0
+                head = tail_released + safe[:cut]
+                safe = safe[cut:]
+                segment_tail, tail_released = None, ""
+                accumulated += head
+                self.partial_text = accumulated
+                await self.renderer.dispatch(
+                    OutputEvent(kind=TEXT_CHUNK, text=head, continues_segment=True)
+                )
             if safe:
                 accumulated += safe
                 self.partial_text = accumulated
                 await self.renderer.dispatch(OutputEvent(kind=TEXT_CHUNK, text=safe))
-
-        async def flush_redactor() -> None:
-            nonlocal accumulated
-            tail = place_tool_break(stream_redactor.flush())
-            if tail:
-                accumulated += tail
-                self.partial_text = accumulated
-                await self.renderer.dispatch(OutputEvent(kind=TEXT_CHUNK, text=tail))
 
         def steer_entered_turn() -> bool:
             try:
@@ -792,6 +866,11 @@ class TurnDriver:
         if self.monitor_completion is not None:
             self.monitor_completion.mark_accepted()
         async for event in self.provider.stream(message):
+            if self.event_tap is not None:
+                try:
+                    self.event_tap(event)
+                except Exception:
+                    logger.debug("driver: event tap failed; the turn goes on", exc_info=True)
             kind = event.kind
             if kind == EVENT_TEXT_CHUNK:
                 filtered = compaction_filter.feed(event.text or "")
@@ -812,6 +891,8 @@ class TurnDriver:
                     pending_steer_events += 1
             elif kind == EVENT_TOOL_CALL:
                 productive = True
+                if undelivered_watch is not None:
+                    undelivered_watch.on_call(event)
                 # Native handle_message treats every EVENT_TOOL_CALL uniformly
                 # (complete previous task + start new), regardless of tool_final;
                 # emit a single tool_call event so the renderer matches it.
@@ -841,6 +922,16 @@ class TurnDriver:
                     mcp_server=getattr(event, "mcp_server_name", "") or "",
                 )
                 tool_gap = True
+                if segment_tail is not None and len(fed_raw) != tail_fed_at:
+                    # Text came since the pending run without ending it (it
+                    # joined the run, so nothing was released). The run cannot
+                    # be told apart from that text now, so the earlier call's
+                    # text ends as it stands and what is held now is this
+                    # call's.
+                    await release("", final=True)
+                if segment_tail is None and stream_redactor.held:
+                    segment_tail = stream_redactor.held
+                    tail_fed_at = len(fed_raw)
                 await self.renderer.dispatch(
                     OutputEvent(
                         kind=TOOL_CALL,
@@ -852,6 +943,15 @@ class TurnDriver:
                         tool_name=getattr(event, "tool_name", "") or "",
                         tool_kind=getattr(event, "tool_kind", ""),
                         tool_purpose=_purpose,
+                        text_held=segment_tail is not None,
+                        # The whole command behind a raw-fallback title, which
+                        # the title cuts to a line; a renderer that rewrites
+                        # the label for its audience starts from all of it.
+                        raw_title=(
+                            ""
+                            if _derived.derived or not _derived.title
+                            else _redact(_derived.raw_title)
+                        ),
                     )
                 )
                 # Forgery gate: record the directive-tool name ONLY from the
@@ -884,6 +984,8 @@ class TurnDriver:
                 if event.tool_call_id and getattr(event, "sub_session_id", ""):
                     native_tool_call_ids.add(event.tool_call_id)
             elif kind == EVENT_TOOL_RESULT:
+                if undelivered_watch is not None:
+                    await undelivered_watch.on_result(event)
                 # Session directive: a stateless session-bound tool returns a
                 # marker instead of resolving its own session identity; the
                 # caller-injected consumer applies it against the caller's own
@@ -898,6 +1000,23 @@ class TurnDriver:
                         native_tool_call_ids,
                         consumed_directives,
                         seen_tool_identity,
+                    )
+                # Forward a TERMINAL outcome to the renderer so a per-call card
+                # is finalized honestly ("failed" / "cancelled" / "refused"
+                # instead of the blanket "complete" the next tool_call/on_done
+                # would otherwise stamp). Non-terminal updates (a streaming
+                # rawOutput chunk, ``status="in_progress"``) are skipped: only a
+                # status in ``TERMINAL_TOOL_STATUSES`` is an outcome. A renderer
+                # that does not override ``on_tool_result`` ignores it, so this
+                # is additive to every channel.
+                _tool_status = getattr(event, "tool_status", "") or ""
+                if event.tool_call_id and _tool_status in TERMINAL_TOOL_STATUSES:
+                    await self.renderer.dispatch(
+                        OutputEvent(
+                            kind=TOOL_RESULT,
+                            tool_call_id=event.tool_call_id,
+                            tool_status=_tool_status,
+                        )
                     )
             elif kind == EVENT_PERMISSION_REQUEST:
                 # Untrusted sender: no tool runs, full stop. This precedes even
@@ -1016,12 +1135,15 @@ class TurnDriver:
                                 ),
                             )
                             continue
-                        logger.warning(
-                            "declining a hook auto-approve: %s; the request "
-                            "falls through to the channel's normal approval "
-                            "ladder",
-                            _ng_refusal.log_text,
-                        )
+                        # Once per session for a platform-scope refusal; the
+                        # audit row below is still written for every call.
+                        if name_grant.should_log_decline(self.audit_session_key, _ng_refusal):
+                            logger.warning(
+                                "declining a hook auto-approve: %s; the request "
+                                "falls through to the channel's normal approval "
+                                "ladder",
+                                _ng_refusal.log_text,
+                            )
                         # The decline row uses the shared cross-surface writer
                         # (log_tool_invocation) rather than this ladder's
                         # log_api_access rows, so every surface's decline has
@@ -1356,10 +1478,11 @@ class TurnDriver:
         """Explain a host-caused denial to the model before the reject goes out.
 
         Reads the decider's ``last_deny_cause`` (see :data:`ApprovalDecider`).
-        Only :data:`DENY_CAUSE_APPROVAL_TIMEOUT` is steered: a human's Deny is a
-        real decision the generic tool result already describes correctly, and
-        deny-by-default with no decider is a configuration the model cannot act
-        on. Best-effort and bounded through
+        Steers :data:`DENY_CAUSE_APPROVAL_TIMEOUT` (prompt expired) and
+        :data:`DENY_CAUSE_APPROVAL_UNDELIVERABLE` (prompt not delivered): a
+        human's Deny is a real decision the generic tool result already describes
+        correctly, and deny-by-default with no decider is a configuration the
+        model cannot act on. Best-effort and bounded through
         :func:`kiro_crew.deny_notice.steer_refusal_notice`; a failure there
         never blocks the reject that follows.
 
@@ -1373,11 +1496,16 @@ class TurnDriver:
         security control), and the cancellation re-raises.
         """
         cause = getattr(self.decider, "last_deny_cause", "") if self.decider is not None else ""
-        if cause != DENY_CAUSE_APPROVAL_TIMEOUT:
+        if cause not in (DENY_CAUSE_APPROVAL_TIMEOUT, DENY_CAUSE_APPROVAL_UNDELIVERABLE):
             return
+        reason = (
+            "the tool-approval prompt went unanswered until its window closed"
+            if cause == DENY_CAUSE_APPROVAL_TIMEOUT
+            else "the tool-approval prompt could not be delivered to the channel"
+        )
         await self._steer_host_deny(
             event,
-            "the tool-approval prompt went unanswered until its window closed",
+            reason,
             cause=cause,
             # The caller audits this outcome after the wire is answered; a
             # cancellation here would skip that row, so the orphan reject

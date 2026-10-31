@@ -152,7 +152,7 @@ describe('offer and consent', () => {
     renderGuide('/chat/slot-A')
     expect(await screen.findByTestId('guide-start')).toBeTruthy()
     // The gateway's internal reason token is never painted as copy.
-    expect(screen.queryByText('You asked for a crewmate.')).toBeNull()
+    expect(screen.queryByText('You asked for a mate.')).toBeNull()
     // Offered is not accepted: no claim, no navigation, no pre-fill.
     await tickTracker(1)
     expect(calls).toHaveLength(0)
@@ -174,7 +174,7 @@ describe('offer and consent', () => {
     expect(screen.queryByTestId('guide-pending-error')).toBeNull()
   })
 
-  it('Start claims first, then navigates to the Crewmates hand-off with the draft', async () => {
+  it('Start claims first, then navigates to the Mates hand-off with the draft', async () => {
     pending = [guide()]
     onWrite = (name, b) => (name === 'claim' ? claimed({ ...guide(), revision: b.revision as number }) : null)
     renderGuide('/chat/slot-A')
@@ -185,7 +185,7 @@ describe('offer and consent', () => {
     expect(claim.body).not.toHaveProperty('take_over')
   })
 
-  it('reads the Crewmates page thread, not a stale chat activeSlot', async () => {
+  it('reads the Mates page thread, not a stale chat activeSlot', async () => {
     pending = [guide({ status: 'active', owner_tab: 'other-tab' })]
     // activeSlot is still slot-A from an earlier chat visit, but on /members
     // the thread on screen is whatever the page registered.
@@ -198,7 +198,7 @@ describe('offer and consent', () => {
     expect(await screen.findByText(L('other_tab'))).toBeTruthy()
   })
 
-  it('keeps the members address when entering from the Crewmates page', () => {
+  it('keeps the members address when entering from the Mates page', () => {
     const r = resolveGuideAction({ id: 'crewmate.create', params: { goal: 'g' } })
     if (!r.ok || r.action.enter.kind !== 'navigate') throw new Error('expected navigate')
     expect(r.action.enter.to({ pathname: '/members', search: '?member=default' })).toBe('/members?member=default&create=1&goal=g')
@@ -1006,10 +1006,12 @@ describe('leaving a step and coming back', () => {
     expect(await screen.findByText(L('target_missing'))).toBeTruthy()
     expect(screen.getByTestId('guide-go-back')).toBeTruthy()
     expect(screen.queryByText(L('looking_for_control'))).toBeNull()
-    expect(screen.getByText('flaky')).toBeTruthy()
+    // Said from the catalog, never as the gateway's own error text.
+    expect(screen.getByText(L('error_generic'))).toBeTruthy()
+    expect(screen.queryByText('flaky')).toBeNull()
     // Going back restarts the attempt: the stopped reports' error goes with it.
     fireEvent.click(screen.getByTestId('guide-go-back'))
-    await waitFor(() => expect(screen.queryByText('flaky')).toBeNull())
+    await waitFor(() => expect(screen.queryByText(L('error_generic'))).toBeNull())
   }, 15_000)
 
   it('a failed target_missing report is offered again, and Go back re-arms a tracker that gave up', async () => {
@@ -1450,6 +1452,18 @@ describe('owner tab and revision', () => {
     fireEvent.click(screen.getByTestId('guide-take-over'))
     await waitFor(() => expect(writes('/api/guide/claim')).toHaveLength(1))
     expect(writes('/api/guide/claim')[0].body).toEqual({ guide_id: 'g1', tab_id: TAB_ID, revision: 5, take_over: true })
+  })
+
+  it('a refused takeover says so from the catalog, never with the gateway\'s own error text', async () => {
+    pending = [guide({ status: 'active', owner_tab: 'other-tab', revision: 5 })]
+    server.use(http.post('/api/guide/claim', () => HttpResponse.json(
+      { error: 'the guide changed; reload it', code: 'stale_revision' }, { status: 409 },
+    )))
+    renderGuide('/chat/slot-A', <Target anchor={GUIDE_ANCHORS.crewmateCreate} />)
+    fireEvent.click(await screen.findByTestId('guide-take-over'))
+    const line = await screen.findByTestId('guide-error')
+    expect(line.textContent).toContain(L('error_moved'))
+    expect(line.textContent).not.toContain('the guide changed')
   })
 
   it('the old tab stops once another tab takes the guide over', async () => {

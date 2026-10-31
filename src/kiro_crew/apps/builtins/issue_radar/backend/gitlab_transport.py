@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from collections.abc import Callable, Mapping
 from urllib.parse import quote, urlparse
 
@@ -27,8 +28,10 @@ from .errors import (
 #: bound keeps every individual segment inside a path component. Bounding a
 #: segment's SIZE and the segment COUNT below together bound the whole parsed
 #: value, keeping ``owner/repo`` well inside the one argv element it rides in.
+#: Anchored with ``\Z``, not ``$``: ``$`` also matches before a final newline, so
+#: a segment one newline past the bound would still match.
 GITLAB_MAX_SEGMENT_CHARS = 255
-SEGMENT_RE = re.compile(rf"^[A-Za-z0-9._-]{{1,{GITLAB_MAX_SEGMENT_CHARS}}}$")
+SEGMENT_RE = re.compile(rf"^[A-Za-z0-9._-]{{1,{GITLAB_MAX_SEGMENT_CHARS}}}\Z")
 _URL_PATH_SEPARATOR = "/"
 
 #: GitLab's own ceiling on how deep a group may sit. ``Namespace`` validates
@@ -272,6 +275,23 @@ def is_forbidden(tail: str) -> bool:
     return "403" in low or "forbidden" in low or "insufficient" in low
 
 
+#: Seconds to wait before each re-send of a request GitLab refused with HTTP 429.
+#: Opening one project fans out into dozens of calls (every open-issue page, the
+#: open MR list, then notes + labels + label/state events + pipelines per detail
+#: pane), and a self-managed instance's per-user throttle trips on that burst.
+#: ``glab api`` exits on the first 429 without retrying and reports no
+#: ``Retry-After``, so the transport backs off itself. Three short waits clear a
+#: burst window and cap the added latency at seven seconds per call, however
+#: many pages the call reads.
+RATE_LIMIT_BACKOFF_SEC: tuple[float, ...] = (1.0, 2.0, 4.0)
+
+
+def is_rate_limited(tail: str) -> bool:
+    """Whether stderr identifies a GitLab HTTP 429 throttle response."""
+    low = (tail or "").lower()
+    return "http 429" in low or "too many requests" in low
+
+
 def glab_api(
     path: str,
     *,
@@ -286,10 +306,20 @@ def glab_api(
     stderr_tail: Callable[[subprocess.CompletedProcess], str],
     raise_if_auth_failure: Callable[[str, str], None],
     is_forbidden: Callable[[str], bool],
+    sleep: Callable[[float], None] = time.sleep,
 ) -> object:
-    """Run ``glab api`` through an injected spawn and parse explicit pages."""
+    """Run ``glab api`` through an injected spawn and parse explicit pages.
+
+    A page GitLab throttles (HTTP 429) is re-sent after the next delay in
+    ``RATE_LIMIT_BACKOFF_SEC``. The delays are one budget for the whole call, not
+    per page, so a long list waits at most seven seconds in total; once they are
+    spent the call fails, so a short burst window costs latency instead of an
+    error pane. A 429 means the request was
+    not processed, so re-sending a write is as safe as re-sending a read.
+    """
     pages: list[object] = []
     page = 1
+    throttled = 0
     while True:
         separator = "&" if "?" in path else "?"
         target = f"{path}{separator}page={page}&per_page={page_size}" if paginate else path
@@ -310,6 +340,15 @@ def glab_api(
             if is_forbidden(tail):
                 raise ProviderPermissionError(
                     f"glab api {path} was forbidden (exit {proc.returncode}): {tail}"
+                )
+            if is_rate_limited(tail):
+                if throttled < len(RATE_LIMIT_BACKOFF_SEC):
+                    sleep(RATE_LIMIT_BACKOFF_SEC[throttled])
+                    throttled += 1
+                    continue
+                raise ProviderCliError(
+                    f"GitLab is rate-limiting requests (HTTP 429) and glab api {path} "
+                    f"still failed after {throttled} retries; try again in a minute"
                 )
             raise ProviderCliError(f"glab api {path} failed (exit {proc.returncode}): {tail}")
 

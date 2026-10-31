@@ -88,8 +88,11 @@ async def test_a_project_spec_grants_nothing(layout):
 
     entry = await _project("proj", checkout)
 
-    for key in ("mcpServers", "permissions", "includeMcpJson", "includePowers", "resources"):
+    for key in ("mcpServers", "includeMcpJson", "includePowers", "resources"):
         assert key not in entry, key
+    # The one rule this spec gets is Crew's own skill scope, and it only takes away:
+    # a ``tools: ["*"]`` agent with no mapping loads no skill on kiro-cli either.
+    assert entry["permissions"] == {"rules": [{"capability": "skill", "effect": "deny"}]}
     assert "planted" not in json.dumps(entry)
     spec, _ = resolve_projected_spec(paths_mod.kiro_agents_dir(), "proj", checkout)
     assert set(spec) == {"name", "prompt", "tools"}
@@ -186,6 +189,33 @@ async def test_a_relative_project_prompt_may_not_escape_the_checkout(layout):
         await _project("proj", checkout)
 
 
+def test_a_project_prompt_is_handed_on_as_the_checked_target(layout, tmp_path):
+    # The read must not resolve the checkout's ref a second time: a link
+    # repointed after the containment check would be followed.
+    _user, checkout, project = layout
+    (project / "real.md").write_text("inside", encoding="utf-8")
+    (project / "p.md").symlink_to(project / "real.md")
+    _write(project, "proj", {"name": "proj", "prompt": "file://./p.md"})
+
+    spec, _anchor = resolve_projected_spec(tmp_path / "home" / "agents", "proj", checkout)
+
+    assert spec["prompt"] == "file://" + (project / "real.md").resolve().as_posix()
+
+
+@pytest.mark.asyncio
+async def test_a_project_prompt_symlinked_out_of_the_checkout_is_refused(layout, tmp_path):
+    # A trusted user-level spec may climb with `..`; a checkout's may not, and a
+    # link inside the checkout is judged by where it points.
+    _user, checkout, project = layout
+    outside = tmp_path / "notes.md"
+    outside.write_text("the user's own notes", encoding="utf-8")
+    (project / "p.md").symlink_to(outside)
+    _write(project, "proj", {"name": "proj", "prompt": "file://./p.md"})
+
+    with pytest.raises(AcpRuntimeError, match="escapes the agent directory"):
+        await _project("proj", checkout)
+
+
 @pytest.mark.asyncio
 async def test_an_unreadable_project_only_spec_refuses_the_session(layout):
     _user, checkout, project = layout
@@ -218,3 +248,65 @@ def test_the_tool_search_judgement_reads_the_spec_the_projection_sends(layout):
     rt._work_dir = checkout
 
     assert rt._projected_spawn_spec() == {"name": "proj", "prompt": "p", "tools": ["tool_search"]}
+
+
+# ── a session bound to an app's own agent ───────────────────────────────────
+
+
+@pytest.fixture
+def bound(layout, monkeypatch):
+    """*layout*, with an app's ``app--deploy.json`` registered and a session bound to it."""
+    from kiro_crew.apps import agent_launch, bridges
+
+    user, checkout, project = layout
+    monkeypatch.setattr(bridges, "KIRO_AGENTS_DIR", user)
+    monkeypatch.setattr(agent_launch, "_KAS_BINDINGS", {})
+    _write(user, "app--deploy", {"name": "deploy", "prompt": "the app's prompt", "tools": []})
+    _write(project, "deploy", {"name": "deploy", "prompt": "the checkout's prompt"})
+    agent_launch.bind_session_app_agent("dashboard:app-slot", "app", "deploy")
+    return user, checkout
+
+
+@pytest.mark.asyncio
+async def test_a_bound_session_projects_the_registered_file(bound):
+    _user, checkout = bound
+    extras = await KasHarness().session_extras(
+        "deploy", work_dir=str(checkout), session_key="dashboard:app-slot"
+    )
+    [entry] = extras.custom_agents
+    assert entry["prompt"] == "the app's prompt"
+
+
+@pytest.mark.asyncio
+async def test_a_bound_session_whose_registered_file_is_gone_is_refused(bound):
+    # The app is switched off between the turn's check and the session start: its
+    # registered file is gone, and the checkout's same-named spec is not run.
+    from kiro_crew.acp.session_handle import AcpAgentUnavailable
+
+    user, checkout = bound
+    (user / "app--deploy.json").unlink()
+    with pytest.raises(AcpAgentUnavailable):
+        await KasHarness().session_extras(
+            "deploy", work_dir=str(checkout), session_key="dashboard:app-slot"
+        )
+    # A session bound to nothing still resolves the name, checkout included.
+    extras = await KasHarness().session_extras(
+        "deploy", work_dir=str(checkout), session_key="dashboard:other"
+    )
+    [entry] = extras.custom_agents
+    assert entry["prompt"] == "the checkout's prompt"
+
+
+@pytest.mark.asyncio
+async def test_a_binding_applies_only_to_the_agent_it_names(bound):
+    from kiro_crew.apps import agent_launch
+
+    user, checkout = bound
+    _write(user, "other", {"name": "other", "prompt": "another agent", "tools": []})
+    (user / "app--deploy.json").unlink()
+    extras = await KasHarness().session_extras(
+        "other", work_dir=str(checkout), session_key="dashboard:app-slot"
+    )
+    [entry] = extras.custom_agents
+    assert entry["prompt"] == "another agent"
+    assert agent_launch.read_bound_app_spec("dashboard:app-slot", "other") is None

@@ -20,7 +20,7 @@ logger = logging.getLogger("kiro_crew.config.loader")
 # ---------------------------------------------------------------------------
 # SINGLE SOURCE OF TRUTH for the upper bounds on the config knobs that govern
 # host resource consumption. These same ceilings are enforced by the dashboard
-# config API (``dashboard/handlers/core.py`` for the agent knobs,
+# config API (``dashboard/handlers/core_config_view.py`` for the agent knobs,
 # ``session.py`` for ``pool_size``); they live HERE so the API-write gate and
 # the loader's load-time clamp cannot drift apart.
 #
@@ -110,7 +110,7 @@ MAX_SUBAGENTS_FIXED_FLOOR = 3
 
 # session.autocompact_pct — context-usage percentage at which the backend
 # autocompactor fires. SINGLE SOURCE OF TRUTH for the documented 5-90 range:
-# the dashboard config API (``dashboard/handlers/core.py``) validates writes
+# the dashboard config API (``dashboard/handlers/core_config_schema.py``) validates writes
 # against these same constants, and the load read clamps a hand-edited
 # config.json value into them, so the two ranges cannot drift as separate
 # literals. The autocompactor is the backstop that keeps a session's context
@@ -121,6 +121,42 @@ MAX_SUBAGENTS_FIXED_FLOOR = 3
 # read instead.
 AUTOCOMPACT_PCT_MIN = 5.0
 AUTOCOMPACT_PCT_MAX = 90.0
+
+
+class AutocompactPctError(ValueError):
+    """A per-session threshold refused by :func:`parse_autocompact_pct`.
+
+    ``code`` is ``pct_not_finite`` or ``pct_out_of_range``, the codes both
+    routes that set a session's override answer with.
+    """
+
+    def __init__(self, message: str, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def parse_autocompact_pct(value: int | float, *, name: str = "pct") -> float:
+    """``value`` as a per-session threshold, or :class:`AutocompactPctError`.
+
+    The one finite and range check shared by the slot's "Auto-compact at" route
+    and ``session_create``. The caller has already refused a non-number (and a
+    bool) with its own code. Refused rather than clamped: a caller that asked
+    for 95 learns it instead of silently running at 90.
+    """
+    try:
+        pct = float(value)
+    except OverflowError:
+        # An int too large for a float; out of range by definition.
+        raise AutocompactPctError(f"{name} must be a finite number", "pct_not_finite") from None
+    if pct != pct:  # NaN fails every comparison below
+        raise AutocompactPctError(f"{name} must be a finite number", "pct_not_finite")
+    if not (AUTOCOMPACT_PCT_MIN <= pct <= AUTOCOMPACT_PCT_MAX):
+        raise AutocompactPctError(
+            f"{name} must be between {AUTOCOMPACT_PCT_MIN:g} and {AUTOCOMPACT_PCT_MAX:g}",
+            "pct_out_of_range",
+        )
+    return pct
+
 
 # ``session.compact_wait_secs``: 0 is the sentinel for "use the built-in
 # budget"; any positive value is lifted to at least ``COMPACT_WAIT_SECS_MIN``
@@ -191,6 +227,12 @@ SESSION_SORT_MODES: tuple[str, ...] = (
     "name-desc",
     "manual",
 )
+# The "Translucent panels" (Liquid Glass) switch as the workspace stores it: a
+# string like ``theme_mode``, with ``""`` for "never chosen here" so the browser's
+# own stored choice keeps holding on a workspace that predates the key. The
+# loader normalizes to this set, ``PUT /api/config/theme`` accepts exactly it, and
+# the frontend's ``liquidGlass.ts`` mirrors the two non-empty values.
+TRANSLUCENT_PANELS_VALUES: tuple[str, ...] = ("", "on", "off")
 SESSION_TIMEOUT_MIN = 0
 SESSION_TIMEOUT_MAX = 86400
 POOL_TTL_SECS_MIN = 0
@@ -433,10 +475,41 @@ class ResourceLimitsConfig:
         metadata=_meta(
             "Max total processes",
             "cgroup TasksMax for the whole agents SLICE, counting tasks "
-            "(threads) across every agent tree. 0 or unset uses the module "
-            "default; the aggregate ceiling is never left unset where a "
+            "(threads) across every agent tree. 0 or unset sizes it from the "
+            "host: 512 tasks for every 512 MB of the slice's memory ceiling "
+            "plus one scope ceiling, so legitimate load reaches max_total_memory_mb "
+            "first. Capped at half the tightest of kernel.pid_max, "
+            "kernel.threads-max and the user slice's TasksMax, but never below "
+            "32768 unless that tightest limit is itself lower; kirocrew doctor "
+            "shows the value and its inputs. The aggregate ceiling is never left unset where a "
             "systemd user manager is available (Linux); not enforced on "
             "Windows/macOS.",
+            nullable=True,
+        ),
+    )
+    scope_memory_high_pct: int | None = field(
+        default=None,
+        metadata=_meta(
+            "Scope memory soft ceiling (%)",
+            "cgroup MemoryHigh for EACH agent runtime scope, as a percent of "
+            "that scope's own MemoryMax. A runtime that grows past it reclaims "
+            "its own page cache and is throttled alone, before the shared "
+            "slice ceiling slows every runtime. Unset or out of range (1-100) "
+            "uses the default (90); 0 emits no MemoryHigh at all. Linux only.",
+            nullable=True,
+        ),
+    )
+    slice_reclaim_trigger_pct: int | None = field(
+        default=None,
+        metadata=_meta(
+            "Slice page-cache reclaim trigger (%)",
+            "The gateway writes the agents SLICE's memory.reclaim once "
+            "memory.current reaches this percent of the slice memory.high and "
+            "clean page cache is at least half of it, so cached files alone do "
+            "not hold the slice at its ceiling and throttle every agent. Unset "
+            "uses 95, 0 turns it off for this gateway only (the slice is shared "
+            "by every gateway of the user), 50-99 is accepted and anything else "
+            "uses 95. Never runs inside a pod. Linux with cgroup v2 only.",
             nullable=True,
         ),
     )
@@ -476,6 +549,12 @@ class ResourceLimitsConfig:
             ),
             max_total_processes=_limit_int(
                 section.get("max_total_processes"), "max_total_processes", lo=0
+            ),
+            scope_memory_high_pct=_limit_int(
+                section.get("scope_memory_high_pct"), "scope_memory_high_pct", lo=0, hi=100
+            ),
+            slice_reclaim_trigger_pct=_limit_int(
+                section.get("slice_reclaim_trigger_pct"), "slice_reclaim_trigger_pct", lo=0, hi=99
             ),
             xdist_auto_cap=_limit_int(section.get("xdist_auto_cap"), "xdist_auto_cap", lo=-1),
         )

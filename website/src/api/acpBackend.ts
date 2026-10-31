@@ -77,19 +77,29 @@ export function isKiroHarness(cfg: AcpBackendConfig | undefined): boolean {
   return KIRO_HARNESS_BACKENDS.includes(configuredAcpBackend(cfg))
 }
 
-/** Shared translated harness labels; unknown harnesses keep the server's policy name. */
+/** Shared translated harness labels, one per harness the gateway knows
+ *  (`ACP_BACKENDS_KNOWN`; `test_harness_names_cover_every_known_backend` holds
+ *  the list). A harness an edition registers later keeps the server's policy name. */
 export function acpBackendName(backend: { id: string; policy_id?: string }): string {
   switch (backend.id) {
     case ACP_BACKEND_KIRO: return i18nT('pages.developer.agentBackendTab.kiro_cli')
     case 'claude': return i18nT('pages.developer.agentBackendTab.claude_code')
     case ACP_BACKEND_KAS: return i18nT('pages.developer.agentBackendTab.kas_kiro_agent')
+    case 'codex': return i18nT('pages.developer.agentBackendTab.codex')
+    case 'copilot': return i18nT('pages.developer.agentBackendTab.copilot')
+    case 'deepseek': return i18nT('pages.developer.agentBackendTab.deepseek')
+    case 'goose': return i18nT('pages.developer.agentBackendTab.goose')
+    case 'opencode': return i18nT('pages.developer.agentBackendTab.opencode')
+    case 'pi': return i18nT('pages.developer.agentBackendTab.pi')
     default: return backend.policy_id || backend.id
   }
 }
 
-/** A harness name short enough for a row badge; the full label elsewhere. */
+/** A harness name for a row badge. Every built-in name is already short
+ *  ("Kiro Agent", "Kiro CLI", "Claude Code"), so the badge reads the same
+ *  translated label as everywhere else rather than a private abbreviation. */
 export function acpBackendShortName(id: string): string {
-  return id === ACP_BACKEND_KAS ? 'KAS' : acpBackendName({ id })
+  return acpBackendName({ id })
 }
 
 /**
@@ -102,8 +112,8 @@ export function acpBackendShortName(id: string): string {
  *
  * - `rule`: only where the server classed the reach as able to cost a whole
  *   server (`mcp.costs_whole_server === true`). The classification is the
- *   server's (`agent_sdk/backend_mcp_ability.COSTS_WHOLE_SERVER`, held to the
- *   reach vocabulary by a completeness test), never re-derived from the reach
+ *   server's (each reach declares it on
+ *   `providers/mirrors/registry.PerToolDeny.costs_whole_server`), never re-derived from the reach
  *   name here: today it is `whole-server` and `per-call`. Compared against
  *   `true`, so a missing flag (an older gateway) or a truthy string says nothing.
  * - `exception`: only on a `per-call` reach, which spares Crew's own servers.
@@ -122,6 +132,35 @@ export function mcpWholeServerDeny(
       : '',
     exception: probe.mcp?.per_tool_deny === 'per-call'
       ? i18nT('pages.developer.agentBackendTab.mcp_deny_exception', { name })
+      : '',
+  }
+}
+
+/**
+ * The same cost, worded for ONE server's open tool list.
+ *
+ * The gateway lists the servers its reach spares (`mcp.spared_servers`, read from
+ * the same `CONTROL_PLANE_SERVERS` tuple the codex and opencode mirrors use), so
+ * the list says only the fact that holds there: the rule on every other server,
+ * and "stops only that tool" on a spared one. The harness card keeps both
+ * sentences, since it describes the harness rather than one server.
+ *
+ * A gateway that predates the field sends no list, and then this is the pair
+ * `mcpWholeServerDeny` returns, as before: guessing which servers are spared
+ * from a name here would drift from the server's tuple.
+ */
+export function mcpServerDeny(
+  probe: AcpBackendProbe | undefined,
+  server: string,
+): { rule: string; exception: string } {
+  const pair = mcpWholeServerDeny(probe)
+  const spared = probe?.mcp?.spared_servers
+  if (!probe || !Array.isArray(spared)) return pair
+  if (!spared.includes(server)) return { rule: pair.rule, exception: '' }
+  return {
+    rule: '',
+    exception: pair.rule
+      ? i18nT('pages.overview.mcpTab.mcp_deny_spared', { name: acpBackendName(probe) })
       : '',
   }
 }

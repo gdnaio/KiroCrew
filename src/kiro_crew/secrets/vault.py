@@ -95,6 +95,19 @@ class SecretVault:
         plaintext = self._decrypt_entry(name, entries[name], key)
         return SecretValue(plaintext.decode("utf-8"))
 
+    def get_with_revision(self, name: str) -> Optional[tuple[SecretValue, str]]:
+        """The secret and its :func:`entry_revision`, read from one snapshot, or None.
+
+        Pairs with :meth:`delete_if_revision`: a reader that later deletes what it
+        read deletes only that entry, never one another writer stored since.
+        """
+        entries = self._load_entries()
+        if name not in entries:
+            return None
+        entry = entries[name]
+        plaintext = self._decrypt_entry(name, entry, self._get_or_create_key())
+        return SecretValue(plaintext.decode("utf-8")), entry_revision(entry)
+
     def get_many(self, names: list[str]) -> dict[str, Optional[SecretValue]]:
         """Batch-retrieve secrets, loading the store and key exactly once.
 
@@ -539,7 +552,9 @@ class SecretVault:
         """
         self._config_dir.mkdir(parents=True, exist_ok=True)
         lock_path = self._store_path.with_name(".secrets.enc.lock")
-        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_WRONLY, 0o600)
+        from kiro_crew.platform_compat import open_create_or_existing
+
+        lock_fd = open_create_or_existing(str(lock_path), os.O_WRONLY, 0o600)
         try:
             with file_lock(lock_fd, exclusive=True):
                 yield

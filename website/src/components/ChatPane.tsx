@@ -1,4 +1,8 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
+import { crewApprovalDecidableHere, crewModeRoot, crewRootOf, runsCrewMode } from '../lib/crewMode'
+import CrewApprovalCards from './crew/CrewApprovalCards'
+import { CrewSteerUnrecordedNotice, CrewWorkerComposerGate } from './crew/CrewWorkerComposerGate'
+import { useCrewRoot } from './crew/useCrewRoot'
 import { X } from 'lucide-react'
 import { SplitGlyph } from './SplitGlyph'
 import { useQuery } from '@tanstack/react-query'
@@ -8,11 +12,15 @@ import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { createTranscriptVersioner } from '../chat-core/transcript/transcriptVersion'
 import { DOCK_CLEARANCE_PX, useComposerDockMetrics } from '../pages/chat/composerDockMetrics'
 import ChatInput from './ChatInput'
+import { DeliveryWarningStrip } from './DeliveryWarningStrip'
+import { useDeliveryWarningStrip } from './useDeliveryWarningStrip'
+import { mergePaneSends, type PaneSentRestore } from './useChatPaneSend'
 import { busySteerFlag } from './chat-input/busySend'
 import { filterCrewmateChat, withQueuedAsBubbles } from './chat/crewmateBubbles'
+import { crewmateFollowUps } from './chat/crewmateChips'
 import { AWAITING_REPLY_ACTIVITY, useCrewmateAwaitingReply } from './chat/useCrewmateAwaitingReply'
 import CrewmateLiveActivity from './chat/CrewmateLiveActivity'
-import { useCrewmateGreetingShown } from './chat/useCrewmateGreetingShown'
+import { useUnreadLanding } from './chat/useUnreadLanding'
 import ErrorNotice from './ErrorNotice'
 import StatusNotice from './StatusNotice'
 import { Btn } from './ui'
@@ -22,11 +30,13 @@ import PendingQuestionCard from './PendingQuestionCard'
 import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from './QueueStack'
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
 import ChatFooter from '../pages/chat/ChatFooter'
+import { useEnvironmentStartLabel, useSlotRunsHere } from './sessionEnvironmentHooks'
 import PinnedPrompt from '../pages/chat/PinnedPrompt'
 import SessionTitleControl from '../pages/chat/SessionTitleControl'
 import { pinCandidateKey, usePinnedPrompt } from '../pages/chat/usePinnedPrompt'
 import { useJevAutoSend } from '../pages/chat/useJevAutoSend'
 import type { DisplayItem } from '../pages/chat/types'
+import { viewSubagentSlots } from '../lib/subagentReplayScope'
 import { useSlotActivity } from '../pages/members/useSlotActivity'
 import { agentOrDefaultLabel } from '../utils/agentLabel'
 import { sessionMemoryTag } from '../lib/agentMemorySource'
@@ -52,6 +62,7 @@ import { api } from '../api/client'
 import { slotMessagesQueryKey } from '../api/slotMessagesQuery'
 import { Composer, type ComposerHandle, type ComposerVoiceOptions } from '../chat-core/composer/Composer'
 import { slotApprovalMode } from '../utils/slotApprovalMode'
+import { isUntitledSession, sessionDisplayTitle } from '../utils/sessionDisplayTitle'
 import { isComposerSendHeld } from '../utils/composerSendHolds'
 import { i18nT } from '../i18n/t'
 import { answerRejectedMessage } from '../utils/questionAnswers'
@@ -65,6 +76,8 @@ import { useChatPaneSend } from './useChatPaneSend'
 import { useChatPaneStop, useChatPaneRunSync } from './useChatPaneTurnControl'
 import { useChatPaneContinue } from './useChatPaneContinue'
 import { useChatPaneRenderers, ChatPaneAboveRows } from './ChatPaneTranscript'
+import { slotRowByKey } from '../store/slotIndex'
+import { useMarkTranscriptShown } from '../hooks/useAckCronNotesInView'
 
 export type { PaneLeading } from './ChatPaneProps'
 
@@ -76,6 +89,10 @@ export type { PaneLeading } from './ChatPaneProps'
  * Messages stream live from the store; per-slot metadata comes from
  * s.dashboard.slots. Server reads/writes go through React Query + the api client.
  */
+
+/** Older pages a crewmate pane fetches on its own while looking for the
+ *  crewmate's last words (about a thousand rows at the older-page size). */
+const CREWMATE_AUTO_WALK_MAX_PAGES = 10
 
 export default function ChatPane({
   slotKey,
@@ -90,16 +107,17 @@ export default function ChatPane({
   frameless,
   topInset = 0,
   followContentWidth,
+  pushToTalk = false,
   hideEmptyHint,
   openSideChat,
   leading,
   onFileOpen,
+  onOpenCrewTab,
   onArtifactOpen,
   busyMode = 'split',
   crewmate,
-  crewmateGreeting,
+  crewmateShown = true,
   onOpenCrewWorkLog,
-  onOpenSubagents,
   threads,
   onSessionOpen,
   sessions,
@@ -144,6 +162,15 @@ export default function ChatPane({
   }, [pinItemsRef, updatePinnedPrompt])
   // A different session starts collapsed with nothing pinned.
   useEffect(() => { setPinned(null); setPinExpanded(false) }, [slotKey, setPinned, setPinExpanded])
+  // This pane draws the slot's subagent cards, so the gateway's durable replay is asked for it.
+  useEffect(() => (slotKey ? viewSubagentSlots([slotKey]) : undefined), [slotKey])
+  const getDisplayItems = useCallback(() => pinItemsRef.current, [pinItemsRef])
+  // Which slot's authoritative page has landed in the store. A live frame can
+  // put a partial transcript in `slotMessages` before this fetch resolves; the
+  // unread landing waits for this rather than reading that partial list.
+  const [hydratedSlot, setHydratedSlot] = useState<string | null>(null)
+  const mountRowIndex = useCallback((index: number) => { listRef.current?.mountIndex(index) }, [])
+  const transcriptRestoreOwned = useCallback(() => listRef.current?.restoreGate ?? false, [])
 
   const allMessages = useAppSelector((s) => selectSlotMessages(s, slotKey))
   const activeSlot = useAppSelector((s) => s.chat.activeSlot)
@@ -170,7 +197,23 @@ export default function ChatPane({
   // Prefer the warm's value: this pane's own query is staleTime:Infinity, so its
   // has_more freezes at mount while a later bounded warm can truncate the cache.
   const warmHasMore = useAppSelector((s) => s.chat.slotPaneHasMore?.[slotKey])
-  const paneSlot = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey))
+  const paneSlot = useAppSelector((s) => slotRowByKey(s.dashboard.slots, slotKey))
+  // Children accepted but still queued behind the spawn caps: delegated work the
+  // slots frame's `subagents_running` does not count. Read only as the pill
+  // seam's `delegatedOnly` input, so this caption and the header pill resolve
+  // one moment the same way. The caption itself shows only while the crewmate's
+  // own turn runs (`crewmateTyping`); delegated work after the turn, started or
+  // queued, is the header pill's and the roster's to show.
+  const paneQueued = useAppSelector((s) => (s.chat.subagentQueued?.[slotKey] ?? 0) > 0)
+  const paneRunsHere = useSlotRunsHere(paneSlot && paneSlot.executor !== 'remote' ? paneSlot.key : null)
+  // A Split View pane holding a Crew Mode worker follows the main pane's rule:
+  // its approval is decided only on the conductor's card (no band here), and a
+  // closed conductor turns its composer off. A pane holding the conductor keeps
+  // its approval cards (edge review R3 G3, Z1).
+  const paneCrewRoot = crewRootOf(paneSlot)
+  const { rootClosed: paneCrewRootClosedRaw } = useCrewRoot(paneCrewRoot)
+  const paneCrewRootClosed = !!paneCrewRoot && paneCrewRootClosedRaw
+  const noSend = useCallback(() => {}, [])
   // A stop is under way on this pane's turn: the stream state's own `stopping`
   // phase, or a Stop pressed from another tab that reaches this pane only as
   // the slots frame's `stopping` flag. This is the footer's and composer's
@@ -212,15 +255,19 @@ export default function ChatPane({
   // P3-b). Its Voice atom is what gives the pane a microphone: the pane wires no
   // voice props, only the two things the atom cannot know — the endpointer's
   // auto-submit, and (through the root) that a pane's composer IS its slot's, so
-  // the atom's default on-screen predicate is exact. No push-to-talk here: that
-  // key binding is document-wide and ChatPage owns it (follow-up: focused-pane
-  // ownership). The pane's steer-not-queue rule (#8852) stays on `canSteer`
-  // below until the Send atom exists.
+  // the atom's default on-screen predicate is exact. Push-to-talk only when the
+  // host says so (`pushToTalk`): the key binding is document-wide, so exactly
+  // one composer may hold it. In split view that is the focused pane (the
+  // grid moves it with focus, and a pane that loses it mid-hold commits what
+  // was said); the Members page's single DM pane holds it while nothing
+  // covers the chat. The pane's steer-not-queue rule
+  // (#8852) stays on `canSteer` below until the Send atom exists.
   const composerRef = useRef<ComposerHandle>(null)
   const autoSubmitRef = useRef<(() => void) | null>(null)
   const composerVoiceOptions = useMemo<ComposerVoiceOptions>(() => ({
     onAutoSubmit: () => { autoSubmitRef.current?.() },
-  }), [])
+    pushToTalk,
+  }), [pushToTalk])
   // Shared composer-busy rule (chatSlice.selectComposerBusy): main turn
   // streaming OR sub-agents running (dual signal). Drives the queue affordance
   // and skips the optimistic user bubble (the backend returns a "queued"
@@ -229,9 +276,16 @@ export default function ChatPane({
   // Parent link for the "↳ fork of <parent>" tag. forked_from is the parent's
   // history key (dashboard:<slot>); strip the prefix to match the bare slot key.
   const parentKey = paneSlot?.forked_from ? paneSlot.forked_from.replace(/^dashboard:/, '') : null
-  const parentTitle = useAppSelector((s) =>
-    parentKey ? s.dashboard.slots.find((x) => x.key === parentKey)?.title : undefined,
+  const parentSlot = useAppSelector((s) =>
+    parentKey ? slotRowByKey(s.dashboard.slots, parentKey) : undefined,
   )
+  // An untitled parent reads "Untitled session", never its slot key; the tag's
+  // hover keeps the key so two untitled parents stay tellable apart. A parent
+  // missing from the slot list (closed) has an unknown title, so it keeps its key.
+  const parentTitle = parentSlot ? sessionDisplayTitle(parentSlot) : (parentKey ?? '')
+  const parentHoverName = parentSlot && isUntitledSession(parentSlot)
+    ? `${parentTitle} · ${parentKey}`
+    : parentTitle
   const approvalMode = useAppSelector((s) => s.dashboard.approvalMode)
   const title = paneSlot?.title || slotKey
   const displayMode = slotApprovalMode(approvalMode, paneSlot)
@@ -250,6 +304,9 @@ export default function ChatPane({
     () => splitPaneMessages(allMessages),
     [allMessages],
   )
+  // Whether the person has sent this chat a message: the gateway refuses to move
+  // a Crew Mode chat off its conductor from then on.
+  const paneHasUserMessage = useMemo(() => paneMessages.some(m => m.role === 'user'), [paneMessages])
   // A crewmate's chat draws only what the crewmate says (see the `crewmate`
   // prop). Filtered HERE, above the list, so the run positions the assistant
   // rows compute from their neighbours see the drawn list, and so the pinned
@@ -262,7 +319,11 @@ export default function ChatPane({
   // The typing bubble shows from the person's Send, not only once the turn
   // that answers is live (useCrewmateAwaitingReply).
   const { awaitingReply, markSent: markCrewmateSent } = useCrewmateAwaitingReply(!!crewmate, slotKey, allMessages, crewmateLive, paneSlot)
-  const crewmateTyping = crewmateLive || awaitingReply
+  // The gateway is preparing a message for this slot outside any turn (a
+  // background reply such as the warm task brief). It shows the same working
+  // indicator a turn shows, but is not a turn: the composer stays idle.
+  const preparing = !!paneSlot?.preparing
+  const crewmateTyping = crewmateLive || awaitingReply || preparing
   // The composer agrees with the typing bubble: from the person's Send it is
   // busy (Stop while empty), not idle, though the answering turn's first frame
   // can be seconds away. `busy` alone is the store's word, and the store has
@@ -274,9 +335,36 @@ export default function ChatPane({
     () => (crewmate ? filterCrewmateChat(withQueuedAsBubbles(allMessages, queuedMessages)) : paneMessages),
     [crewmate, allMessages, paneMessages, queuedMessages],
   )
-  // The host's greeting is drawn while it is still the newest word: a reply
-  // landing after it (a patrol / wake turn keeps it up) takes it down.
-  const greetingShown = useCrewmateGreetingShown(!!crewmate && !!crewmateGreeting, messages)
+  // This pane shows the chat's transcript once it has rows; a bell note for a
+  // cron run is read against that, and a closed pane drops out (#23564).
+  // The scroller is what the on-screen backstop probes.
+  useMarkTranscriptShown(slotKey, messages.length > 0, () => scrollerRef.current)
+  // A crewmate's thread re-opens on the last message the reader saw, with the
+  // unseen run below a divider; the pill carries the count. Only the crewmate
+  // thread: a split pane keeps the transcript's default entry placement.
+  const unreadOlder = useMemo(() => ({
+    hasMore: pagesActiveSlot ? activeHasMore : warmHasMore === true,
+    loading: pagesActiveSlot ? loadingOlder : paneLoadingOlder,
+    load: pagesActiveSlot ? loadOlder : pagesPane ? loadOlderPane : null,
+  }), [pagesActiveSlot, activeHasMore, warmHasMore, loadingOlder, paneLoadingOlder, loadOlder, pagesPane, loadOlderPane])
+  const { unreadRun, unreadCount } = useUnreadLanding({
+    enabled: !!crewmate,
+    slotKey,
+    // The transcript mount's own `sessionId` below, under which the reader's
+    // saved position lives.
+    anchorSessionId: `pane:${slotKey}`,
+    hydrated: hydratedSlot === slotKey,
+    // The same older-history walk the quiet hint uses, so a marker beyond the
+    // hydrated page is paged back to rather than written off.
+    older: unreadOlder,
+    shown: crewmateShown,
+    messages,
+    isAtBottom,
+    scrollerRef,
+    getDisplayItems,
+    mountIndex: mountRowIndex,
+    restoreOwned: transcriptRestoreOwned,
+  })
   // What the crewmate is doing right now, for the status line above the
   // working indicator: read through the SAME seam the DM header's identity
   // pill reads (`useSlotActivity` over the slot's live status record), so the
@@ -287,12 +375,16 @@ export default function ChatPane({
   // keep resolving one moment from one seam.
   const liveActivity = useSlotActivity(crewmate ? slotKey : '', {
     running: crewmateLive,
-    delegatedOnly: !!paneSlot?.subagents_running && !paneSlot?.running,
+    delegatedOnly: (!!paneSlot?.subagents_running || paneQueued) && !paneSlot?.running,
     stopping: !!paneSlot?.stopping,
   })
   // The host declares the conversation surface; only the gateway decides
   // how to prioritize the human's message on the validated member DM.
   const composerBusyMode = crewmate ? 'responsive' : busyMode
+  // A reply on record means this session's environment connected before, so a
+  // later engine restart is a reconnect, not setup (see useEnvironmentStartLabel).
+  const paneHasReplied = useMemo(() => paneMessages.some(m => m.role === 'assistant'), [paneMessages])
+  const paneEnvironmentStart = useEnvironmentStartLabel(slotKey, !!paneSlot?.running, paneHasReplied)
   // The unfiltered rows, handed to the row set for the one read that must see
   // what the filter dropped (the steer-chip decision reads the policy-block
   // inject row). `undefined` for an ordinary chat, so its renderer set does not
@@ -337,10 +429,11 @@ export default function ChatPane({
   // for the same reason as ChatPage: both would offer the same choices, and
   // only the card can answer the blocked tool call.
   const pendingQuestion = useAppSelector((s) => pendingQuestionFor(s.chat.pendingQuestions, slotKey))
-  const { followUpOptions, followUpSourceKey, followUpMulti } = useMemo(
-    () => deriveFollowUpOptions(allMessages, busy, !!pendingQuestion),
-    [allMessages, busy, pendingQuestion],
-  )
+  // A crewmate chat never offers a chip that asks it for a card (crewmateChips).
+  const { followUpOptions, followUpSourceKey, followUpMulti } = useMemo(() => {
+    const derived = deriveFollowUpOptions(allMessages, busy, !!pendingQuestion)
+    return crewmate ? crewmateFollowUps(derived) : derived
+  }, [allMessages, busy, pendingQuestion, crewmate])
   // Visual-only highlight state; the composer text is the source of truth for
   // what gets sent. Cleared whenever the options list changes (new assistant
   // message) or the pane is re-bound to another slot — both signal a fresh turn.
@@ -435,27 +528,40 @@ export default function ChatPane({
   // fetch. Lifting the bound for a running slot pulled its WHOLE transcript on
   // every open: on a long, busy session that froze the renderer, and the crash
   // recovery reopened the same chat into the same freeze (#12907).
-  const limitRef = useRef<number | undefined>(PANE_HYDRATE_LIMIT)
-  const limitLatched = useRef(false)
+  const hydrateLimit = PANE_HYDRATE_LIMIT
   // A crewmate's chat that filters a BOUNDED window down to no speech has
   // proved nothing: the last thing it said may sit just behind the window,
   // under fifty newer patrol rows. The never-spoken hint is a claim about the
-  // whole history, so that read is upgraded to the whole transcript first
-  // (same latch as the streaming upgrade) and the hint waits for it. An
-  // unbounded read that is still empty is the real never-spoken case.
-  const crewmateQuietUnproven = !!crewmate && warmHasMore === true && paneMessages.length > 0 && messages.length === 0
-  if (!limitLatched.current && crewmateQuietUnproven) {
-    limitRef.current = undefined
-    limitLatched.current = true
-  }
-  const hydrateLimit = limitRef.current
+  // whole history, so the hint waits while the pane walks back one older page
+  // at a time (the same loaders the "earlier" bar uses) until a bubble shows or
+  // the history runs out. Never one unbounded read: a long patroller's whole
+  // transcript is slow to fetch and parse.
+  const olderHasMore = pagesActiveSlot ? activeHasMore : warmHasMore === true
+  const crewmateQuietUnproven = !!crewmate && olderHasMore && paneMessages.length > 0 && messages.length === 0
+  const walkFailed = pagesActiveSlot ? olderFailed : paneOlderFailed
+  const walkLoading = pagesActiveSlot ? loadingOlder : paneLoadingOlder
+  const canWalk = pagesActiveSlot || pagesPane
+  // Bounds the automatic walk for a crewmate that never spoke; past it the
+  // "earlier" bar stays for the reader to page by hand.
+  const autoPages = useRef({ slot: slotKey, n: 0 })
+  if (autoPages.current.slot !== slotKey) autoPages.current = { slot: slotKey, n: 0 }
+  useEffect(() => {
+    if (!crewmateQuietUnproven || !canWalk || walkLoading || walkFailed) return
+    if (autoPages.current.n >= CREWMATE_AUTO_WALK_MAX_PAGES) return
+    autoPages.current.n += 1
+    if (pagesActiveSlot) loadOlder()
+    else loadOlderPane()
+  }, [crewmateQuietUnproven, canWalk, walkLoading, walkFailed, pagesActiveSlot, loadOlder, loadOlderPane])
   const { data: slotDetail, isError: slotDetailFailed, refetch: refetchSlotDetail } = useQuery({
     queryKey: slotMessagesQueryKey(slotKey, hydrateLimit),
     queryFn: () => api.chatSlotDetail(slotKey, hydrateLimit),
     staleTime: Infinity,
   })
   useEffect(() => {
-    if (slotDetail?.messages) dispatch(hydrateSlotMessages({ slot: slotKey, messages: slotDetail.messages, queue: slotDetail.queue, hasMore: slotDetail.has_more, bounded: hydrateLimit !== undefined, total: slotDetail.total, running: slotDetail.running, nextBefore: slotDetail.next_before }))
+    if (slotDetail?.messages) {
+      dispatch(hydrateSlotMessages({ slot: slotKey, messages: slotDetail.messages, queue: slotDetail.queue, hasMore: slotDetail.has_more, bounded: hydrateLimit !== undefined, total: slotDetail.total, running: slotDetail.running, nextBefore: slotDetail.next_before }))
+      setHydratedSlot(slotKey)
+    }
   }, [slotDetail, slotKey, dispatch, hydrateLimit])
 
   // Scroll follow (auto-pin, release, jump pill) is owned by the virtualizer
@@ -477,11 +583,14 @@ export default function ChatPane({
   })
   const { recoverInto: recoverQuoteInto } = messageQuote
 
-  const { stopError, dismissStopError, paneStopState, onStop } = useChatPaneStop({ slotKey, busy: composerBusy, paneSlot, dispatch })
+  const { stopError, stopErrorDetail, dismissStopError, paneStopState, onStop } = useChatPaneStop({ slotKey, busy: composerBusy, paneSlot, dispatch })
   // The endpointer auto-submit (handed to the Voice atom above) is an Enter
   // press: the composer's default busy decision with this pane's own composer
   // inputs (never the flipped chord), so it steers where Send would steer.
   autoSubmitRef.current = () => {
+    // A crew member of a closed conductor sends nothing (its box is off): stop
+    // the dictation and keep its text, as an upload hold does in doSend.
+    if (paneCrewRootClosed) { composerRef.current?.voice()?.disarmForSend(); return }
     // An attachment still uploading holds the composer: doSend owns that hold
     // (it ends the dictation and sends nothing) and doSteer has no copy of it.
     if (isComposerSendHeld(slotKey)) { doSend(); return }
@@ -528,7 +637,12 @@ export default function ChatPane({
     // picker inserts it, relative to that project.
     project: () => paneSlot?.project,
   })
-  const { listMessages, renderers } = useChatPaneRenderers({ slotKey, busyMode, onFileOpen, crewmate, crewmateTranscript, onSessionOpen, onOpenSubagents, sessions, activeSession, messages, foldBefore, resume })
+  // The Crew Mode dispatch-notice reveal is the host's single `onOpenCrewTab`
+  // (one reveal path: switch to the card's slot so the panel it opens is that
+  // chat's, select Workers, open the dock, close Find). It is threaded down from
+  // ChatPage so a split pane uses the SAME reveal as the single-chat surface,
+  // with no second copy here.
+  const { listMessages, renderers } = useChatPaneRenderers({ slotKey, busyMode, onFileOpen, onOpenCrewTab, crewmate, crewmateTranscript, onSessionOpen, sessions, activeSession, messages, foldBefore, resume })
 
   // The composer dock floats over the bottom of the scroller (ChatPage's
   // layout, shared measurement): `dockH` is what the scroller pays below its
@@ -540,6 +654,14 @@ export default function ChatPane({
   // only: the SDK's assistant row draws the actions the host hands it, and no
   // host but ChatPage handed any.
   const { onQuote, onAsk, quoteFlight, endQuoteFlight } = useSelectionQuoteAsk({ slot: slotKey, setInput, revealComposer, openSideChat })
+
+  const currentPaneSlot = useCallback(() => slotKeyRef.current, [slotKeyRef])
+  const restorePaneSend = useCallback((forSlot: string, sent: PaneSentRestore) => {
+    restoreIntoComposer(recoverQuoteInto(sent.text, sent.quote, mountedRef.current && forSlot === slotKeyRef.current), sent.files, sent.pastes, forSlot)
+  }, [restoreIntoComposer, recoverQuoteInto, mountedRef, slotKeyRef])
+  const deliveryStrip = useDeliveryWarningStrip<PaneSentRestore>({
+    slot: slotKey, surface: 'pane', currentSlot: currentPaneSlot, restore: restorePaneSend, merge: mergePaneSends, disabled: !!crewmate,
+  })
 
   return (
     <SlotProvider slotId={slotKey}>
@@ -586,7 +708,7 @@ export default function ChatPane({
         } as React.CSSProperties}
       >
         {!frameless && (
-        <div data-pane-title-row className={`group/header relative z-50 flex items-center gap-2 pr-3 py-2 border-b border-border bg-card shrink-0 transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)] ${leading?.inset ? 'pl-[49px]' : 'pl-3'}`}>
+        <div data-pane-title-row className={`@container/panehead group/header relative z-50 flex items-center gap-2 pr-3 py-2 border-b border-border bg-card shrink-0 transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)] ${leading?.inset ? 'pl-[49px]' : 'pl-3'}`}>
           {/* Leading edge (#10585): in split view this pane may stand in for
               the single-chat title row at the surface's top-left. `inset`
               clears the shell's stationary sidebar toggle: the pane starts at
@@ -616,9 +738,9 @@ export default function ChatPane({
           {parentKey && (
             <span
               className="shrink-0 text-[10px] text-accent bg-accent/10 rounded-full px-1.5 py-0.5 truncate max-w-[38%]"
-              title={i18nT('components.chatPane.forked_from', { name: parentTitle || parentKey })}
+              title={i18nT('components.chatPane.forked_from', { name: parentHoverName })}
             >
-              ↳ {parentTitle || parentKey}
+              ↳ {parentTitle}
             </span>
           )}
           <span className="flex-1" />
@@ -722,6 +844,7 @@ export default function ChatPane({
           handOff={false}
           onDisplayItems={onDisplayItems}
           hiddenRow={pinHiddenRow}
+          unreadRun={unreadRun}
           onQuote={onQuote}
           onQuoteMessage={messageQuote.quoteMessage}
           onAsk={onAsk}
@@ -770,7 +893,6 @@ export default function ChatPane({
                  carousel, theme-swappable via themeBranding): a running turn
                  was otherwise invisible between tool steps. */
               <>
-              {greetingShown && crewmateGreeting}
               {crewmate
                 ? crewmateTyping && (
                   <CrewmateLiveActivity
@@ -789,7 +911,8 @@ export default function ChatPane({
                 )
                 : (
                   <ChatFooter
-                    running={running || !!paneSlot?.running}
+                    statusLabel={paneEnvironmentStart}
+                    running={running || !!paneSlot?.running || preparing}
                     stopping={stopUnderWay}
                     state={streamState}
                     lastRole={messages[messages.length - 1]?.role ?? ''}
@@ -825,7 +948,7 @@ export default function ChatPane({
             it follows it in DOM order. `right: dockGutter` keeps the
             scrollbar column clear. */}
         <div ref={dockRef} className="absolute left-0 bottom-0 pointer-events-none" style={{ right: dockGutter }} data-testid="composer-dock-root">
-        <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={scrollToBottom} />
+        <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={scrollToBottom} unreadCount={unreadCount} />
 
         <div className="dock-inert" data-testid="composer-status-stack">
         {!crewmate && <SubagentProgressBar slot={slotKey} />}
@@ -855,6 +978,8 @@ export default function ChatPane({
               agent that asked may not be the pane the user is looking at, and
               without this its card never appears anywhere, so it waits out its
               full window. */}
+          {/* `data-question-slot`: the Crew tab's "Answer in chat" scrolls here. */}
+          <div data-question-slot={slotKey}>
           <PendingQuestionCard
             slotKey={slotKey}
             onFallbackSend={(text, questions) => {
@@ -868,6 +993,7 @@ export default function ChatPane({
             }}
             onDirectSend={onDirectQuestionSend}
           />
+          </div>
         </div>
 
         <StatusNotice
@@ -926,7 +1052,9 @@ export default function ChatPane({
           variant="inline"
           className="mx-4 mt-2"
           testId="chat-pane-stop-error"
-          message={stopError}
+          title={stopErrorDetail ? stopError : undefined}
+          message={stopErrorDetail || stopError}
+          messagePlacement="below"
           onDismiss={dismissStopError}
         />
         {/* No hand-off: the composer draft is untouched by a refused Resume.
@@ -958,6 +1086,15 @@ export default function ChatPane({
             shape as ChatPage's inputAreaRef). */}
         {quoteFlight && <FlyingQuote text={quoteFlight.text} from={quoteFlight.from} targetRef={inputAreaRef} onComplete={endQuoteFlight} />}
         <div ref={inputAreaRef} className="relative z-10 dock-inert">
+        {crewModeRoot(paneSlot) && <CrewApprovalCards root={slotKey} />}
+        {paneCrewRoot ? (
+          <CrewWorkerComposerGate root={paneCrewRoot} worker={slotKey} workerTitle={title}
+            waitingForApproval={!!paneSlot?.pending_approval} />
+        ) : (
+          // Without the gate (the Crew Mode preview off) a send the server still
+          // took as a steer can come back unrecorded: say so here.
+          <CrewSteerUnrecordedNotice worker={slotKey} workerTitle={title} />
+        )}
         <Composer
           ref={composerRef}
           slotKey={slotKey}
@@ -969,8 +1106,21 @@ export default function ChatPane({
         <ComposerInput
           value={input}
           onChange={handleUserInput}
-          onSend={doSend}
-          terminalCommands={!paneSlot ? 'pending' : paneSlot.executor === 'remote' ? 'remote' : 'local'}
+          onSend={paneCrewRootClosed ? noSend : doSend}
+          aboveComposer={deliveryStrip.show ? (
+            <DeliveryWarningStrip
+              noteId={`pane-delivery-note-${slotKey}`}
+              onDismiss={deliveryStrip.onDismiss}
+            />
+          ) : undefined}
+          slotApprovalChrome={crewApprovalDecidableHere(paneSlot, 'worker_split_pane')}
+          disabled={paneCrewRootClosed}
+          lockedPlaceholder={paneCrewRootClosed ? '' : undefined}
+          // A chat bound to a Session Environment runs in its workspace, so a `!`
+          // command would land on this machine instead: refused like a remote
+          // crew's, and held while that placement is still unread.
+          terminalCommands={!paneSlot ? 'pending' : paneSlot.executor === 'remote' || paneRunsHere === false ? 'remote'
+            : paneRunsHere === undefined ? 'pending' : 'local'}
           hiddenCommands={paneHiddenCommands}
           isRunning={composerBusy}
           onStop={onStop}
@@ -997,13 +1147,14 @@ export default function ChatPane({
           jevAutoAvailable={jevAutoConsented && running}
           busyMode={composerBusyMode}
           autoFocusKey={slotKey}
+          environmentSlot={slotKey}
           agentName={paneAgentName}
           // The chip shows the inherited-default marker; `agentName` stays the
           // raw resolved alias for the skills query and switch title. Uses the
           // SLOT's stored agent (not `paneAgentName`, which has already
           // collapsed empty->default) so an agent-less slot reads
           // `<default> · default` and a pinned one reads the bare alias (#8770).
-          agentLabel={agentOrDefaultLabel(paneSlot?.agent, defaultAgent)}
+          agentLabel={agentOrDefaultLabel(paneSlot?.agent, defaultAgent, paneSlot?.agent_kind)}
           agentIsInheritedDefault={!paneSlot?.agent && !!defaultAgent}
           // Same rows the pane's picker lists, so chip and picker agree on when
           // a same-name pair needs telling apart.
@@ -1023,7 +1174,11 @@ export default function ChatPane({
           contextPct={contextPct}
           contextUsedTokens={contextTokens?.used}
           contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
-          onAgentClick={!agentLocked && provider.capabilities.agentTemplates ? (rect, trigger) => { anchorAgentBtn(rect, trigger); agentDD.setOpen(!agentDD.open) } : undefined}
+          derivePctFromUsed={contextTokens?.used != null && contextTokens.window == null}
+          // A Crew Mode root with a message offers no switch, preview on or off: the raw
+          // `crew_mode_root` stamp is the gateway's own lock (`crew_mode_locked`).
+          onAgentClick={!agentLocked && !runsCrewMode(paneSlot?.agent, paneSlot?.agent_kind, paneSlot?.crew_mode_agent)
+            && !(paneHasUserMessage && !!paneSlot?.crew_mode_root) && provider.capabilities.agentTemplates ? (rect, trigger) => { anchorAgentBtn(rect, trigger); agentDD.setOpen(!agentDD.open) } : undefined}
           onModelClick={(rect, trigger) => { anchorModelBtn(rect, trigger); modelDD.setOpen(!modelDD.open) }}
           approvalMode={displayMode}
           followUpOptions={followUpOptions}
@@ -1069,7 +1224,7 @@ export default function ChatPane({
               setFollowUpPicked(next)
             }
           }}
-          onFollowUpSend={(text?: string) => doSend(text)}
+          onFollowUpSend={(text?: string) => { if (!paneCrewRootClosed) doSend(text) }}
           project={paneSlot?.project ?? ''}
           // A crewmate's chat is a DM with one named crewmate, so the composer
           // addresses it by name rather than the product ("Message Kiro Crew…")

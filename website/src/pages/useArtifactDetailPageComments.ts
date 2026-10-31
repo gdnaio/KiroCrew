@@ -100,13 +100,13 @@ export function useArtifactDetailPageComments({
       ? (resolveSourcePos(range, root, sourceContent) ?? findCoords(sourceContent, raw) ?? findCoords(sourceContent, anchor))
       : (findCoords(sourceContent, raw) ?? findCoords(sourceContent, anchor))
     // Rendered-text offset of the selection start, in the same space the
-    // highlighter's indexTextNodes/rangeForAnchor use — pins the highlight to
+    // highlighter's indexTextNodes/rangesForAnchor use — pins the highlight to
     // THIS occurrence when the quote repeats (line/col drive the agent prompt;
     // the offset drives the visual anchor).
     // The box is about to take focus and collapse the selection: paint the
     // passage so the reader can still see what the open box is attached to.
     paintAnnotationHighlight(highlightOwner, range)
-    // prefix/suffix ride along: `rangeForAnchor` scores a repeated quote by its
+    // prefix/suffix ride along: `rangesForAnchor` scores a repeated quote by its
     // neighbours, so a comment on the second "beta" re-anchors to the second.
     return { anchor, line: coords?.line, column: coords?.column, prefix: derived.prefix, suffix: derived.suffix, startOffset: derived.startOffset, endOffset: derived.endOffset }
   }, [isMarkdown, sourceContent, previewRef])
@@ -252,10 +252,22 @@ export function useArtifactDetailPageComposer({
   // switch unmount the toolbar (and the box with it), so both run
   // `guardCommentDraft` first — in the draft's own words, since "unsaved
   // changes" would read as file edits at risk.
+  // The anchor of the last post that SUCCEEDED, bumped per post: a code block
+  // clears the line range that post was made on (see useArtifactCodeComments).
+  // Taken from the post itself, so a draft the composer kept, a refused post,
+  // or someone else's comment never counts.
+  const [lastPosted, setLastPosted] = useState<{ startOffset: number; quote: string; seq: number } | null>(null)
+  const submitAndRecord = useCallback((text: string, pending: PendingAnchor) => submitAnchored(text, pending).then(ok => {
+    if (ok && pending.startOffset != null && pending.anchor) {
+      const { startOffset, anchor: quote } = pending
+      setLastPosted(p => ({ startOffset, quote, seq: (p?.seq ?? 0) + 1 }))
+    }
+    return ok
+  }), [submitAnchored])
   const {
     selectionComposer, iframeSelection, stageIframeSelection, clearSelectionState, guardCommentDraft, hasCommentDraft,
   } = useSelectionComposerAnchor<PendingAnchor>({
-    resolveDomAnchor: resolveSelectionAnchor, quoteOf, quoteOnly, submit: submitAnchored,
+    resolveDomAnchor: resolveSelectionAnchor, quoteOf, quoteOnly, submit: submitAndRecord,
     draftKey: `mc-artifact-composer-draft:${slug}`, confirmDiscard: confirmDiscardDraft, onRefusedAfterClose,
   })
   // Navigating between artifacts drops any anchor of the departing document.
@@ -360,7 +372,7 @@ export function useArtifactDetailPageComposer({
   return {
     selectionComposer, iframeSelection, clearSelectionState, guardCommentDraft, onSidebarDraftDirtyChange,
     onThreadDraftDirtyChange, sidebarDiscardSignal, composerResetNonce, guardSendToSession, selectionActions,
-    handleIframeSelect, openThread, setOpenThread,
+    handleIframeSelect, stageIframeSelection, openThread, setOpenThread, lastPosted,
   }
 }
 

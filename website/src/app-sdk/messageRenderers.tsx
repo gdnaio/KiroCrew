@@ -32,13 +32,16 @@ import UserMessage from '../pages/chat/UserMessage'
 import { renderMcpOAuthMessage } from '../pages/chat/McpOAuthBanner'
 import SubagentCompletionCard from '../pages/chat/SubagentCompletionCard'
 import NudgeCard from '../pages/chat/NudgeCard'
+import ElicitationCard from '../pages/chat/ElicitationCard'
 import NoticeCard from '../pages/chat/NoticeCard'
 import { SystemNoticeRow, isSystemNoticeRow } from '../pages/chat/CompactionCard'
+import { replyShowsFooter } from '../pages/chat/replyFooter'
 import SkillLoadCard, { isSkillLoadRow } from '../pages/chat/SkillLoadCard'
 import { ErrorCard } from '../pages/chat/ErrorCard'
 import { decisionStripFieldOf } from '../pages/chat/decisionRecord'
-import { resolveTransientNotice } from '../pages/chat/transientNotice'
+import { resolveGatewayNotice } from '../pages/chat/gatewayNotice'
 import StopEventCard from '../pages/chat/StopEventCard'
+import { warmBriefBodyOf } from '../components/chat/WarmBriefCard'
 import { ToolDetails } from '../pages/chat/ToolDetails'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import { REASONING_ROLES, stripAppEnvelope } from '../pages/chat/groupDisplayItems'
@@ -101,6 +104,10 @@ export interface MessageRenderContext {
   handOff?: boolean
   /** tool_call_ids whose call a policy or hook blocked. */
   autoDeniedIds: Set<string>
+  /** Whether a tool row opens its input/output panel on click. Absent =
+   *  `true`; `false` draws the bare status pill (ChatEmbed's
+   *  `hide={['toolDetails']}`). A `renderTool` row is the host's own. */
+  toolDetails?: boolean
   /** Host-injected tool row, kept as a shorthand for replacing the tool entries. */
   renderTool?: (message: ChatMessage) => React.ReactNode
   /** Reply threads on this transcript's messages (a crewmate's chat). Absent
@@ -192,14 +199,19 @@ const TOOL_PANEL_COLLAPSED_CHARS = 800
  */
 const TOOL_PANEL_EXPANDED_MAX_H = 'max-h-[500px]'
 
-/** Prop-driven tool row. The store-connected variant is a host entry. */
-export const ToolCallPill = memo(function ToolCallPill({ message, running, onFileOpen, autoDenied, askAgent = true }: { message: ChatMessage; running: boolean; onFileOpen?: (path: string) => void; autoDenied?: boolean; askAgent?: boolean }) {
+/** Prop-driven tool row. The store-connected variant is a host entry.
+ *  `expandable={false}` draws the pill as a plain status label: no toggle and
+ *  no input/output panel. */
+export const ToolCallPill = memo(function ToolCallPill({ message, running, onFileOpen, autoDenied, askAgent = true, expandable = true }: { message: ChatMessage; running: boolean; onFileOpen?: (path: string) => void; autoDenied?: boolean; askAgent?: boolean; expandable?: boolean }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [expanded, setExpanded] = React.useState(false)
   // Second axis, deliberately separate from `expanded`: the pill toggles whether
   // the panel exists, this toggles how tall it is. Collapsing the pill and
   // re-opening it returns to the short form, which is the cheaper default.
   const [showAll, setShowAll] = React.useState(false)
+  // Losing the toggle closes the panel for good, so a host that hides details
+  // and then shows them again gets a collapsed pill, not the panel it hid.
+  React.useEffect(() => { if (!expandable) setExpanded(false) }, [expandable])
   type CopyOutcome = 'idle' | 'copied' | 'failed'
   const [copyOutcome, setCopyOutcome] = React.useState<CopyOutcome>('idle')
   const copyResetTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -214,7 +226,7 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
   const isRejected = isRejectedDecision(message.meta?.resolved)
   const hasPendingPerm = message.role === 'permission' && !message.meta?.resolved
   // A running or opened pill never folds into its turn's fold (rowActivity).
-  useReportRowActive(!isDone || hasPendingPerm || expanded)
+  useReportRowActive(!isDone || hasPendingPerm || (expandable && expanded))
 
   // Prefer the backend-stamped purpose ("Add teams_data dict guard…") over the
   // raw command, matching the main chat. The raw label is the fallback, and is
@@ -341,16 +353,33 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
         ? i18nT('appSdk.chatMessageList.copy_failed')
         : i18nT('appSdk.chatMessageList.copy')
 
+  const pillBody = (
+    <>
+      <Icon size={12} className={iconClass} />
+      <span className="truncate">{label}</span>
+    </>
+  )
+
+  // The two pill shapes repeat their classes inline: a class string held in a
+  // variable is read as copy by the i18n gate.
   return (
     <div className="animate-scale-in flex items-center gap-2 flex-wrap">
-      <button
-        onClick={() => setExpanded(e => !e)}
-        aria-expanded={expanded}
-        className={`inline-flex items-center gap-2 text-[13px] leading-5 font-mono px-2 py-0.5 rounded-md cursor-pointer transition-all max-w-[min(600px,90%)] hover:brightness-110 ${tone}`}
-      >
-        <Icon size={12} className={iconClass} />
-        <span className="truncate">{label}</span>
-      </button>
+      {expandable ? (
+        <button
+          onClick={() => setExpanded(e => !e)}
+          aria-expanded={expanded}
+          className={`inline-flex items-center gap-2 text-[13px] leading-5 font-mono px-2 py-0.5 rounded-md cursor-pointer transition-all max-w-[min(600px,90%)] hover:brightness-110 ${tone}`}
+        >
+          {pillBody}
+        </button>
+      ) : (
+        <span
+          className={`inline-flex items-center gap-2 text-[13px] leading-5 font-mono px-2 py-0.5 rounded-md transition-all max-w-[min(600px,90%)] ${tone}`}
+          data-testid="tool-pill-static"
+        >
+          {pillBody}
+        </span>
+      )}
       {filePath && onFileOpen && (
         <button
           onClick={() => onFileOpen(filePath)}
@@ -362,7 +391,9 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
           <PanelRight size={11} />
         </button>
       )}
-      {expanded && (hasPayload || message.content) && (
+      {/* Gated on `expandable` too, not only through the missing toggle: a
+          host that turns details off while a panel is open must close it. */}
+      {expandable && expanded && (hasPayload || message.content) && (
         <div className="w-full mt-1 ml-4" data-testid={hasPayload ? 'tool-pill-details' : undefined}>
           {/* Not `compact`: that form caps the payload at 160px, which is what
               the main transcript reserves for the composer's approval mirror.
@@ -455,7 +486,7 @@ function toolRow(m: ChatMessage, ctx: MessageRenderContext, autoDenied?: boolean
   return ctx.row(
     ctx.renderTool
       ? ctx.renderTool(m)
-      : <ToolCallPill message={m} running={ctx.running} onFileOpen={ctx.onFileOpen} autoDenied={autoDenied} askAgent={ctx.handOff !== false} />,
+      : <ToolCallPill message={m} running={ctx.running} onFileOpen={ctx.onFileOpen} autoDenied={autoDenied} askAgent={ctx.handOff !== false} expandable={ctx.toolDetails !== false} />,
     true,
   )
 }
@@ -499,11 +530,11 @@ export interface AssistantBubbleOptions {
 
 /**
  * The assistant reply as the SDK draws it, minus the row layout: the footer
- * rule (a finished reply shows its footer once the turn is over — another user
- * or assistant row follows, or nothing follows and the session is idle) and
- * every prop the bubble takes off the message. Exported so a host that places
- * the reply differently (a crewmate's chat draws it as a bordered bubble in a
- * run) renders the SAME bubble rather than a second copy of this logic.
+ * rule (`replyShowsFooter`: a finished reply shows its footer once its turn is
+ * over) and every prop the bubble takes off the message. Exported so a host
+ * that places the reply differently (a crewmate's chat draws it as a bordered
+ * bubble in a run) renders the SAME bubble rather than a second copy of this
+ * logic.
  * Returns null for a say-nothing row (bare U+200B): invisible-only content
  * would draw as an empty bubble.
  */
@@ -535,25 +566,10 @@ export function renderAssistantBubble(
   // Same skip as ChatPage's inline chain — see utils/invisibleText.
   if (isHiddenInvisibleAssistantRow(m)) return null
   const isStreaming = m.role === 'streaming'
-  // The footer belongs to a FINISHED reply. It shows once the turn is over,
-  // which is either because another user or assistant row follows, or
-  // because nothing follows and the session has gone idle.
-  let showFooter = false
-  if (!isStreaming) {
-    let nextRelevant = false
-    for (let j = ctx.index + 1; j < ctx.messages.length; j++) {
-      if (ctx.messages[j].role === 'user') { showFooter = true; nextRelevant = true; break }
-      // A hidden invisible-only row draws nothing, so it cannot host the
-      // footer; pass over it to the row that renders.
-      if (isHiddenInvisibleAssistantRow(ctx.messages[j])) continue
-      // A system-notice row (compaction / session reload) draws a system
-      // card, not a reply, so it cannot end the turn either.
-      if (isSystemNoticeRow(ctx.messages[j])) continue
-      if (ctx.messages[j].role === 'assistant' || ctx.messages[j].role === 'streaming') { nextRelevant = true; break }
-    }
-    if (!nextRelevant) showFooter = !ctx.running
-    if (opts.forceFooter) showFooter = true
-  }
+  // The footer belongs to a FINISHED reply, by the rule every surface shares
+  // (`replyShowsFooter`); a host that groups rows into runs claims it at the
+  // run's end (`forceFooter`).
+  const showFooter = !isStreaming && (opts.forceFooter === true || replyShowsFooter(m, ctx.messages, ctx.index, ctx.running))
   const bubble = (
     <AssistantMessage
       content={m.content}
@@ -584,6 +600,9 @@ export function renderAssistantBubble(
       bubbleClassName={bubbleClassName}
       onReplyInThread={isStreaming ? undefined : replyInThreadFor(m, ctx)}
       onQuoteMessage={quoteMessageFor(m, ctx, 'assistant')}
+      // A structured warm brief draws as a fixed card in place of the markdown,
+      // inside this same bubble, so it keeps the timestamp and row actions.
+      body={warmBriefBodyOf(m)}
     />
   )
   // The column's child is the bubble itself unless this message has a thread
@@ -733,10 +752,10 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     // The shared ErrorCard, deliberately without `onContinue`: omitting the
     // handler selects its settled (non-continuable) shape, and the app-sdk
     // surface has no turn to resume, so it must never grow the affordance.
-    // Same transient-notice split as transcriptRenderers: a pending gateway
+    // Same gateway-notice split as transcriptRenderers: a pending gateway
     // retry is a soft localized NoticeCard, not a red error.
     render: (m, ctx) => {
-      const transient = resolveTransientNotice(m, ctx.messages, ctx.index)
+      const transient = resolveGatewayNotice(m, ctx.messages, ctx.index)
       if (transient?.card === 'notice') {
         return ctx.row(<NoticeCard content={transient.text} tone={transient.tone} />)
       }
@@ -752,7 +771,13 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
   {
     id: 'notice',
     roles: ['notice'],
-    render: (m, ctx) => ctx.row(<NoticeCard content={m.content} />),
+    // A gateway notice row (empty response, model fallback) draws localized
+    // copy keyed on its token; any other notice keeps its own text.
+    render: (m, ctx) => {
+      const notice = resolveGatewayNotice(m, ctx.messages, ctx.index)
+      if (notice?.card === 'notice') return ctx.row(<NoticeCard content={notice.text} tone={notice.tone} />)
+      return ctx.row(<NoticeCard content={m.content} />)
+    },
   },
   {
     // Grouped and lifecycle-only roles have no row of their own: a thinking or
@@ -789,6 +814,14 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
       if (!banner) return null
       return ctx.row(banner)
     },
+  },
+  {
+    // An MCP server's own question to the person. The default has no slot to
+    // answer on, so it draws the ask read-only (buttons disabled); a host that
+    // knows its slot replaces this entry by id, as ChatPage does.
+    id: 'elicitation',
+    roles: ['elicitation'],
+    render: (m, ctx) => ctx.row(<ElicitationCard message={m} slot={null} />),
   },
   {
     // Auto-nudge cycle marker. `onOpenLoop` (jump to the loop popover) is

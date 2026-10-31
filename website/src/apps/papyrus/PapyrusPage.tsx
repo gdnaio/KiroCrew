@@ -36,7 +36,7 @@ import type { ChatSlot } from '../../types'
 import { papyrusApi, pdfUrl, type Diagnostic } from './api'
 import { companionContextLines, DEFAULT_MAIN_FILE } from './companionPrompt'
 import {
-  countDiagnostics, countWords, gitBranchLabel, loadLastProject, loadSlot,
+  countDiagnostics, countWords, forgetSlot, gitBranchLabel, loadLastProject, loadSlot,
   saveLastProject, saveSlot, texFiles,
   TREE_WIDTH_KEY, TREE_COLLAPSED_KEY, DEFAULT_TREE_WIDTH, MIN_TREE_WIDTH, MAX_TREE_WIDTH,
   COLLAPSED_TREE_WIDTH,
@@ -808,6 +808,25 @@ export default function PapyrusPage() {
     }
   }, [project, slotCreating, dispatch, injectContext])
 
+  // The remembered session no longer exists on the gateway (deleted or archived
+  // from the sessions list). Forget it so the panel offers "Start a session"
+  // instead of trying the dead key again on every open of this paper. Only the
+  // key that failed is dropped: a newer session started meanwhile is kept.
+  const forgetGoneSession = useCallback((gone: string) => {
+    if (project && loadSlot(project) === gone) forgetSlot(project)
+    setSlotKey(current => (current === gone ? null : current))
+  }, [project])
+
+  // The embedded chat replaced the paper's session with a new one (picking a
+  // memory mode does this): remember the new session for the paper, and hand it
+  // the paper's context, which the replacement does not carry over.
+  const adoptReplacedSession = useCallback((old: string, next: string) => {
+    if (project && loadSlot(project) === old) saveSlot(project, next)
+    setSlotKey(current => (current === old ? next : current))
+    contextRequestSeq.current += 1
+    injectContext({ slotKey: next, seq: contextRequestSeq.current })
+  }, [project, injectContext])
+
   const toggleChat = useCallback(() => {
     setChatOpen(open => {
       if (!open && !slotKey) void startSession()
@@ -1006,7 +1025,10 @@ export default function PapyrusPage() {
   }
 
   return (
-    <div className="flex flex-col flex-1 min-h-0" data-testid="papyrus-workspace">
+    <div
+      className={`flex flex-col flex-1 ${isMobile ? 'min-h-0' : ''}`}
+      data-testid="papyrus-workspace"
+    >
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-border bg-card shrink-0">
         <Btn onClick={closeProject}>
@@ -1054,7 +1076,7 @@ export default function PapyrusPage() {
               that somewhere was `flex: 0 0 14rem` on the trigger itself, this
               span sized to the trigger's TEXT (measured at 202px against 315px
               of content) and the 224px trigger painted 113px past the span, over
-              the "Editing …" label beside it — a percentage width is circular
+              the file status beside it — a percentage width is circular
               while the parent is being measured, so the basis never reached the
               parent's intrinsic size. A definite width on a plain wrapper is not
               circular, so the span measures the full group. */}
@@ -1069,11 +1091,13 @@ export default function PapyrusPage() {
           </span>
         </span>
 
-        <span className="text-[12px] text-muted truncate">
-          {dirty
-            ? i18nT('apps.papyrus.workspace.editing_unsaved', { file: currentFile })
-            : i18nT('apps.papyrus.workspace.editing', { file: currentFile })}
-        </span>
+        {currentFile && (dirty || currentFile !== mainFile) && (
+          <span className="text-[12px] text-muted truncate">
+            {dirty
+              ? i18nT('apps.papyrus.workspace.editing_unsaved', { file: currentFile })
+              : i18nT('apps.papyrus.workspace.editing', { file: currentFile })}
+          </span>
+        )}
 
         {hasConflict && (
           // The conflict has to be VISIBLE and have an exit. A silent read-only editor
@@ -1158,13 +1182,13 @@ export default function PapyrusPage() {
       <ErrorNotice className="mx-3 mt-2 animate-rise" message={error} onDismiss={() => setError('')} />
 
       {/* Workspace */}
-      <div className={`flex flex-1 min-h-0 ${isMobile ? 'flex-col' : ''}`}>
+      <div className={`flex flex-1 ${isMobile ? 'min-h-0 flex-col' : ''}`}>
         {/* Source column: file tree + editor + status bar (+ diagnostics).
             `flex-1` on desktop rather than a fixed share: the PDF and co-author
             columns own persisted widths, so the editor takes what is left and a
             wider window grows the text being written instead of rescaling a
             preview the user just sized. */}
-        <div className={`flex flex-col flex-1 min-h-0 min-w-0 ${narrowChat ? 'hidden' : ''}`}>
+        <div className={`flex flex-col flex-1 min-w-0 ${isMobile ? 'min-h-0' : ''} ${narrowChat ? 'hidden' : ''}`}>
           {/* Narrow: the tree is reached from the TOP, so it reserves no
               horizontal space and the editor gets the full width. */}
           {isMobile && (
@@ -1177,7 +1201,7 @@ export default function PapyrusPage() {
               {i18nT('apps.papyrus.fileTree.files')}
             </Btn>
           )}
-          <div className={`flex flex-1 min-h-0 ${isMobile ? 'flex-col' : ''}`}>
+          <div className={`flex flex-1 ${isMobile ? 'min-h-0 flex-col' : 'min-h-[180px] [contain:size]'}`}>
             {/* Height-bounded while stacked, or the tree pushes the editor off
                 the pane. `vh` rather than a percentage: no ancestor here has a
                 definite height, so a percentage max-height would not resolve. */}
@@ -1308,13 +1332,15 @@ export default function PapyrusPage() {
                 animate={{ height: 'auto', opacity: 1 }}
                 exit={{ height: 0, opacity: 0 }}
                 transition={{ duration: 0.16 }}
-                className="border-t border-border bg-card overflow-hidden shrink-0 max-h-56"
+                className="border-t border-border bg-card overflow-hidden shrink-0"
               >
-                <DiagnosticsList
-                  diagnostics={diagnostics}
-                  log={compileLog}
-                  onJumpToLine={line => editorRef.current?.jumpToLine(line)}
-                />
+                <div className="max-h-56 overflow-x-hidden overflow-y-auto">
+                  <DiagnosticsList
+                    diagnostics={diagnostics}
+                    log={compileLog}
+                    onJumpToLine={line => editorRef.current?.jumpToLine(line)}
+                  />
+                </div>
               </motion.div>
             )}
           </AnimatePresence>
@@ -1371,7 +1397,7 @@ export default function PapyrusPage() {
               // drag reads as broken. It stays animated for the open/close it was
               // written for.
               transition={{ duration: chat.dragging ? 0 : 0.18 }}
-              className={`min-h-0 overflow-hidden ${isMobile ? 'flex-1' : 'shrink-0'}`}
+              className={`min-h-0 overflow-hidden ${isMobile ? 'flex-1' : 'shrink-0 [contain:size]'}`}
             >
               {/* BOTH widths have to move together. This wrapper is animated and
                   content-sized, so a percentage on the child alone resolves
@@ -1399,6 +1425,8 @@ export default function PapyrusPage() {
                     slotKey={slotKey}
                     creating={slotCreating}
                     onStartSession={startSession}
+                    onSessionGone={forgetGoneSession}
+                    onSessionReplaced={adoptReplacedSession}
                     onOpenFull={openFullChat}
                     onClose={() => setChatOpen(false)}
                   />

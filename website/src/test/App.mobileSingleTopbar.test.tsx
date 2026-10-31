@@ -26,6 +26,7 @@ import { useLocation } from 'react-router-dom'
 import { sseConnected, sseDisconnected } from '../store/dashboardSlice'
 import { renderWithProviders } from './helpers'
 import App from '../App'
+import { api } from '../api/client'
 import { useMobileNavRail, useMobileRosterBar } from '../components/MobileNavRailContext'
 import { NavigationLeaveGuardProvider, useRegisterNavigationLeaveGuard } from '../components/NavigationLeaveGuard'
 
@@ -54,7 +55,7 @@ function MembersPageStub() {
   useLayoutEffect(() => (reportRosterBar ? () => reportRosterBar('roster') : undefined), [reportRosterBar])
   // A throw after mount, which the route's error boundary catches.
   const [crashed, setCrashed] = useState(false)
-  if (crashed) throw new Error('crewmates page crashed')
+  if (crashed) throw new Error('mates page crashed')
   // Stands in for the page's unsaved-draft guard (a Profile schedule form).
   useRegisterNavigationLeaveGuard(() => membersRailActivate.mayLeave)
   const loc = useLocation()
@@ -197,14 +198,15 @@ describe('phone chat page: one top bar', () => {
     expect(apps).not.toContainElement(customize)
   })
 
-  it('carries Library, Developer and Terminal on the rail, and leaves out Connect-your-phone', async () => {
+  it('carries Library and Terminal on the rail, and leaves out Developer and Connect-your-phone', async () => {
     localStorage.setItem('mc-onboarded', '1')
     localStorage.setItem('mc-dev-mode', '1')
     try {
       renderWithProviders(<App />, { route: '/chat' })
       const rail = await screen.findByTestId('mobile-nav-rail')
       expect(within(rail).getByRole('button', { name: 'Library' })).toBeInTheDocument()
-      expect(within(rail).getByRole('button', { name: 'Developer' })).toBeInTheDocument()
+      // Developer lives in Settings > Developer; the old dev-mode key adds nothing.
+      expect(within(rail).queryByRole('button', { name: 'Developer' })).toBeNull()
       // Terminal toggles the docked panel from the chat page itself, without a
       // detour through another page's nav drawer. Pinned below the scrolling
       // Apps frame, like Capabilities / Settings.
@@ -240,7 +242,7 @@ describe('phone chat page: one top bar', () => {
     expect(screen.queryByTestId('mobile-nav-rail')).toBeNull()
   })
 
-  it('hands the Crewmates page the same rail for its roster drawer; Home asks the page before leaving', async () => {
+  it('hands the Mates page the same rail for its roster drawer; Home asks the page before leaving', async () => {
     localStorage.setItem('mc-onboarded', '1')
     membersRailActivate.calls = 0
     membersRailActivate.mayLeave = false
@@ -268,7 +270,7 @@ describe('phone chat page: one top bar', () => {
     expect(membersRailActivate.calls).toBe(0)
   })
 
-  it('keeps the regular bar on the bare Crewmates roster, which has no drawer to reach the navigation from', async () => {
+  it('keeps the regular bar on the bare Mates roster, which has no drawer to reach the navigation from', async () => {
     localStorage.setItem('mc-onboarded', '1')
     membersRailActivate.bar = 'roster'
     try {
@@ -301,7 +303,8 @@ describe('phone chat page: one top bar', () => {
       renderWithProviders(<NavigationLeaveGuardProvider><App /></NavigationLeaveGuardProvider>, { route: '/members' })
       await screen.findByTestId('members-page-stub', undefined, LAZY_ROUTE)
       expect(header()).toHaveClass('topbar-single')
-      expect(within(header()).queryByRole('button', { name: 'Open menu' })).toBeNull()
+      // No logo row: the bar's one way to the navigation is the slot's toggle.
+      expect(within(header()).getAllByRole('button', { name: 'Open menu' })).toEqual([screen.getByTestId('mobile-topbar-nav-toggle')])
     } finally {
       membersRailActivate.bar = 'open'
     }
@@ -314,13 +317,48 @@ describe('phone chat page: one top bar', () => {
       renderWithProviders(<NavigationLeaveGuardProvider><App /></NavigationLeaveGuardProvider>, { route: '/members' })
       await screen.findByTestId('members-page-stub', undefined, LAZY_ROUTE)
       expect(header()).toHaveClass('topbar-single')
-      expect(within(header()).queryByRole('button', { name: 'Open menu' })).toBeNull()
+      // The bar is never empty while it reads: its first control is a toggle
+      // for the nav drawer, and it opens it.
+      const toggle = within(screen.getByTestId('mobile-topbar-slot')).getByTestId('mobile-topbar-nav-toggle')
+      expect(within(header()).getAllByRole('button', { name: 'Open menu' })).toEqual([toggle])
+      expect(toggle).toHaveAttribute('aria-expanded', 'false')
+      fireEvent.click(toggle)
+      await waitFor(() => expect(toggle).toHaveAttribute('aria-expanded', 'true'))
     } finally {
       membersRailActivate.bar = 'open'
     }
   })
 
-  it('gives the regular bar back when the Crewmates page is taken down by its error boundary', async () => {
+  it('drops the nav toggle once the page has a crewmate open, whose header carries its own drawer toggle', async () => {
+    localStorage.setItem('mc-onboarded', '1')
+    renderWithProviders(<NavigationLeaveGuardProvider><App /></NavigationLeaveGuardProvider>, { route: '/members?member=alpha' })
+    await screen.findByTestId('members-page-stub', undefined, LAZY_ROUTE)
+    expect(header()).toHaveClass('topbar-single')
+    expect(screen.queryByTestId('mobile-topbar-nav-toggle')).toBeNull()
+  })
+
+  it('shows the update pill, with its text, beside the bell on the Mates single bar, which has no overflow menu', async () => {
+    localStorage.setItem('mc-onboarded', '1')
+    const status = vi.mocked(api.status)
+    status.mockResolvedValue({ uptime: '1h', sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0, update_available: true } as Awaited<ReturnType<typeof api.status>>)
+    try {
+      renderWithProviders(<NavigationLeaveGuardProvider><App /></NavigationLeaveGuardProvider>, { route: '/members?member=alpha' })
+      await screen.findByTestId('members-page-stub', undefined, LAZY_ROUTE)
+      expect(header()).toHaveClass('topbar-single')
+      const pill = await within(header()).findByTestId('update-pill', undefined, LAZY_ROUTE)
+      // In the trailing cell, before the bell: two controls, not three.
+      const trail = pill.closest('.tb-trail') as HTMLElement
+      expect(trail).not.toBeNull()
+      expect(within(trail).getByRole('button', { name: 'Notifications' })).toBeInTheDocument()
+      // A bare download glyph did not say "update": the label stays visible.
+      const label = within(pill).getByText('Update available')
+      expect(label.className).not.toMatch(/(^|\s)hidden(\s|$)/)
+    } finally {
+      status.mockResolvedValue({ uptime: '1h', sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0 } as Awaited<ReturnType<typeof api.status>>)
+    }
+  })
+
+  it('gives the regular bar back when the Mates page is taken down by its error boundary', async () => {
     localStorage.setItem('mc-onboarded', '1')
     const quiet = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {
@@ -429,29 +467,24 @@ describe('phone chat page: one top bar', () => {
     }
   })
 
-  it('sizes the brand-mark glyphs on the Crewmates drawer rail like every other 20px tile', async () => {
+  it('sizes the brand-mark glyphs on the Mates drawer rail like every other 20px tile', async () => {
     localStorage.setItem('mc-onboarded', '1')
-    localStorage.setItem('mc-preview-crew', '1')
-    try {
-      renderWithProviders(<App />, { route: '/members?member=alpha' })
-      const rail = await screen.findByTestId('mobile-nav-rail', undefined, LAZY_ROUTE)
-      // The two-ghost Crewmates mark and Customize's ghost are BrandGlyph spans
-      // with an inline 16px width/height. Only an `!important` rule on the
-      // glyph slot beats that, so the tile must size every child of the slot
-      // that way -- a `>svg` rule reaches the Lucide glyphs only, which left
-      // these two at 16px beside 20px neighbours.
-      const marks = [
-        within(rail).getByTestId('crew-member-mark'),
-        within(rail).getByTestId('kiro-ghost-mark'),
-      ]
-      for (const mark of marks) {
-        expect(mark.style.width).toBe('16px')
-        expect(mark.parentElement).toHaveClass('app-icon-nav')
-        const tile = mark.closest('.nav-item') as HTMLElement
-        expect(tile).toHaveClass('[&_.app-icon-nav>*]:!w-5', '[&_.app-icon-nav>*]:!h-5')
-      }
-    } finally {
-      localStorage.removeItem('mc-preview-crew')
+    renderWithProviders(<App />, { route: '/members?member=alpha' })
+    const rail = await screen.findByTestId('mobile-nav-rail', undefined, LAZY_ROUTE)
+    // The two-ghost Crewmates mark and Customize's ghost are BrandGlyph spans
+    // with an inline 16px width/height. Only an `!important` rule on the
+    // glyph slot beats that, so the tile must size every child of the slot
+    // that way -- a `>svg` rule reaches the Lucide glyphs only, which left
+    // these two at 16px beside 20px neighbours.
+    const marks = [
+      within(rail).getByTestId('crew-member-mark'),
+      within(rail).getByTestId('kiro-ghost-mark'),
+    ]
+    for (const mark of marks) {
+      expect(mark.style.width).toBe('16px')
+      expect(mark.parentElement).toHaveClass('app-icon-nav')
+      const tile = mark.closest('.nav-item') as HTMLElement
+      expect(tile).toHaveClass('[&_.app-icon-nav>*]:!w-5', '[&_.app-icon-nav>*]:!h-5')
     }
   })
 })

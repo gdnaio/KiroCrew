@@ -148,7 +148,7 @@ async def test_the_persons_lock_outranks_the_crewmates_package(
     assert "package_served" not in served
     assert PAGE not in (
         body.get("rendered_html") or ""
-    ), "the crewmate's own page was served over the page the person locked"
+    ), "the mate's own page was served over the page the person locked"
     assert (
         body.get("structure_locked") is True
     ), "the body does not tell the tab the layout is locked"
@@ -331,6 +331,43 @@ async def test_the_refetch_route_says_so_when_nothing_is_armed(wired: Any) -> No
     )
     assert status == 409
     assert body["code"] == "no_live_page"
+
+
+@pytest.mark.asyncio
+async def test_after_a_restart_the_tabs_re_read_is_what_re_arms_the_push(wired: Any) -> None:
+    """THE RESTART GAP, and why the tab's reconnect re-read closes it.
+
+    A restart starts the gateway with no armed pages, so nothing pushes into an open
+    package page and its own refetch is refused ``no_live_page`` -- the page's gap
+    rule never fires because no patch ever arrives. The dashboard tab re-reads on
+    every socket reconnect (``refreshServerStateAfterReconnect``); this pins that the
+    re-read GET alone puts the push back."""
+    await _call(md.api_member_dashboard, _request(wired.app, "GET", PATH))
+    pages = wired.app["member_dashboard_live_pages"]
+    # The restart: every armed page gone, as a fresh process holds none.
+    for page in list(pages.values()):
+        await md._run(page.disarm)
+    pages.clear()
+    wired.frames.clear()
+    _publish("work", {"conductor": {"goal": "moved while down"}}, 1)
+    assert wired.frames == [], "nothing is armed, so nothing can push"
+    status, body = await _call(
+        md.api_member_dashboard_refetch,
+        _request(
+            wired.app,
+            "POST",
+            f"/api/members/{SLUG}/dashboard/refetch?member={CREW}&dashboard={PACKAGE_SLUG}",
+        ),
+    )
+    assert (status, body["code"]) == (409, "no_live_page")
+
+    # The reconnect re-read.
+    await _call(md.api_member_dashboard, _request(wired.app, "GET", PATH))
+    assert (SLUG, PACKAGE_SLUG) in pages
+    wired.frames.clear()
+    _publish("work", {"conductor": {"goal": "moved after the re-read"}}, 2)
+    assert wired.frames, "the re-read armed no page, so the tab is still not pushed"
+    assert wired.frames[-1][1]["read"]["fields"]["goal"] == "moved after the re-read"
 
 
 @pytest.mark.asyncio
@@ -571,7 +608,7 @@ async def test_a_tree_bound_page_does_not_fly_the_stale_band(tree_wired: Any) ->
     _status, body = await _call(md.api_member_dashboard, _request(tree_wired.app, "GET", TREE_PATH))
     island = body["rendered_html"].split('id="kirocrew-dashboard-data">')[1].split("</script>")[0]
     read = json.loads(island.replace("\\u003c", "<").replace("\\u003e", ">"))
-    assert read["stale"] is False
+    assert "stale" not in read
     assert "boards" not in read["missing"]
 
 
@@ -773,7 +810,10 @@ def test_the_tab_ignores_a_message_from_any_other_window() -> None:
     # The DECLARATION, not the file's prose. The file explains at length that it
     # withholds same-origin access, so a text search for that token matches the
     # explanation and passes whatever the sandbox actually grants.
-    assert "export const CREW_DASHBOARD_SANDBOX = 'allow-scripts'" in text, (
+    # The grant is defined once, in lib/crewDashboardSandbox.ts, and the tab imports it.
+    grant = (tab.parents[2] / "lib" / "crewDashboardSandbox.ts").read_text(encoding="utf-8")
+    assert "import { CREW_DASHBOARD_SANDBOX } from '../../lib/crewDashboardSandbox'" in text
+    assert "export const CREW_DASHBOARD_SANDBOX = 'allow-scripts'" in grant, (
         "the frame's sandbox is no longer exactly allow-scripts; same-origin access "
         "would give the page the dashboard's own storage and cookies, and a non-opaque "
         "origin would also make the wildcard postMessage target a real choice"

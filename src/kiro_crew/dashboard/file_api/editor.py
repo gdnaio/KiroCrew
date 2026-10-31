@@ -32,14 +32,17 @@ if TYPE_CHECKING:
         _PathProbeBusy,
         _probe_busy_response,
         _probe_request_path,
+        _project_relative_stall_path,
         _read_request_path,
         _resolve_project_relative,
         _run_path_probe,
         _sel,
+        git_command_env,
         is_sensitive_path,
         read_bounded_json,
         redact,
         redact_owner_view_via_context,
+        repo_exec_driver_reason,
         require_owner_dashboard_request,
         sniff_raster_mime,
     )
@@ -81,7 +84,11 @@ async def api_file_read(request: web.Request) -> web.Response:
     # the resolved string, so it cannot be folded into the probe.
     if request.query.get("resolve") == "1":
         try:
-            raw_path, _resolve_err = await _run_path_probe(_resolve_project_relative, raw_path)
+            raw_path, _resolve_err = await _run_path_probe(
+                _resolve_project_relative,
+                raw_path,
+                stall_path=_project_relative_stall_path(raw_path),
+            )
         except _PathProbeBusy:
             return _probe_busy_response(resource=raw_path, tool_name="file_read")
         if _resolve_err == "cannot_resolve":
@@ -275,6 +282,7 @@ async def api_file_raw(request: web.Request) -> web.Response:
                 max_bytes=_MAX_UPLOAD_BYTES,
             ),
             transfer=True,
+            stall_path=request.query.get("path", ""),
         )
     except _PathProbeBusy:
         return _probe_busy_response(resource=request.query.get("path", ""), tool_name="file_raw")
@@ -478,7 +486,14 @@ async def api_file_diff(request: web.Request) -> web.Response:
         "-c",
         "core.fsmonitor=",
     ]
-    _env = {**os.environ, "GIT_ATTR_NOSYSTEM": "1"}
+    # These calls run in the dashboard process, unsandboxed, in a repo an agent
+    # can write. The `-c` flags above leave hooks open: `status`/`diff` refresh
+    # the index and fire `post-index-change` from `.git/hooks` (measured on git
+    # 2.47). `git_command_env` pins hooks and every other fixed-name exec key;
+    # a repo-named filter driver is refused below, before the first diff.
+    # Filled in by `_run_redacted`, which runs in a worker thread: building the
+    # env can shell out to git (safe-directory read), so it stays off the loop.
+    _env: dict[str, str] = {}
 
     def _run() -> dict:
         try:
@@ -518,6 +533,15 @@ async def api_file_diff(request: web.Request) -> web.Response:
                 env=_env,
             ).stdout.strip()
             rel = os.path.relpath(raw_path, root)
+            # `diff HEAD` and `status` run a repo-named `filter.<name>.clean` on
+            # the file, and `diff.textconv=` does not reach `diff.<name>.command`
+            # or a config-defined hook. None has a key to pin, so such a repo
+            # gets no diff rather than a program run on the host.
+            # `dirpath`, the cwd every call below runs in, so the probe discovers
+            # the same repository they do (`root` is a stripped display value).
+            # Probed with the same bare `git` the calls below run.
+            if repo_exec_driver_reason(dirpath, git="git"):
+                return {"diff": "", "original": "", "status": "error"}
             head = subprocess.run(
                 # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args -- fixed git argv; the path is repo-relative and passed as one argument
                 [*_git, "show", "--no-textconv", f"HEAD:{rel}"],
@@ -530,7 +554,6 @@ async def api_file_diff(request: web.Request) -> web.Response:
                 env=_env,
             )
             original = head.stdout if head.returncode == 0 else ""
-            # Get diff
             r = subprocess.run(
                 [*_git, "diff", "--no-textconv", "--no-ext-diff", "HEAD", "--", raw_path],
                 cwd=dirpath,
@@ -646,6 +669,7 @@ async def api_file_diff(request: web.Request) -> web.Response:
     bypass = await _owner_view_bypasses_credential_pass(request)
 
     def _run_redacted() -> dict:
+        _env.update(git_command_env(), GIT_ATTR_NOSYSTEM="1")
         # Both text fields carry file content, so they pass through the same
         # redactor ``api_file_read`` applies to the panel's buffer. The panel's
         # diff view compares that redacted buffer against this ``original``, so

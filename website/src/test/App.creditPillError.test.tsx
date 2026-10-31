@@ -10,7 +10,7 @@
  * `data`; these tests pin both branches so they cannot collapse back together.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { fireEvent, screen, waitFor } from '@testing-library/react'
+import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import { i18nT } from '../i18n/t'
 import type { RootState } from '../store'
@@ -111,7 +111,7 @@ describe('top-bar credit segment — failed vs loading', () => {
     })
     renderWithProviders(<App />, { route: '/chat', preloadedState: connectedState })
 
-    expect(await screen.findByLabelText(i18nT('components.kiroAccountModal.kiro_credit_usage'))).toBeTruthy()
+    expect(await screen.findByLabelText(i18nT('app.kiro_account_credits'))).toBeTruthy()
     expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_unavailable'))).toBeNull()
     expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_checking_2'))).toBeNull()
   })
@@ -131,31 +131,17 @@ describe('top-bar credit segment — failed vs loading', () => {
     expect(document.querySelector('.tb-capsule')).toBeNull()
   })
 
-  it('treats an api_key_auth unavailable payload as terminal, not still loading', async () => {
-    // The backend fail-fasts API-key accounts with a reasoned marker (#5728).
-    // That payload must stop the spinner and say WHY — before the fix the
-    // panel spun forever because no terminal state ever arrived.
-    sessionsUsageMock.mockResolvedValue({ usage: { available: false, reason: 'api_key_auth' } })
-    renderWithProviders(<App />, { route: '/chat', preloadedState: connectedState })
-
-    const pill = await screen.findByLabelText(i18nT('app.kiro_credit_usage_api_key'))
-    expect(pill.textContent).toContain('—')
-    expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_checking_2'))).toBeNull()
-    expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_unavailable'))).toBeNull()
-  })
-
   it('keeps the pill as a dash on a reasonless unavailable payload, naming where to refresh', async () => {
     // The gateway holds no reading (plan-less account with the scrape parked or
     // failed). The modal this dash opens carries the Refresh that can fix that,
     // so the dash must stay on screen -- a hidden pill would make that path
-    // unreachable. Distinct from the api_key_auth dash: the label differs.
+    // unreachable.
     sessionsUsageMock.mockResolvedValue({ usage: { available: false } })
     renderWithProviders(<App />, { route: '/chat', preloadedState: connectedState })
 
     const pill = await screen.findByLabelText(i18nT('app.kiro_credit_usage_no_reading'))
     expect(pill.textContent).toContain('—')
     expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_checking_2'))).toBeNull()
-    expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_api_key'))).toBeNull()
     expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_unavailable'))).toBeNull()
   })
 
@@ -210,6 +196,40 @@ describe('top-bar credit segment — failed vs loading', () => {
 
     fireEvent.click(await screen.findByLabelText(i18nT('app.kiro_credit_usage_unavailable')))
     await screen.findByText(i18nT('components.kiroAccountModal.credit_usage_unavailable'))
+  })
+
+  it('shows the sign-in-type mark for an account whose balance cannot be tied to it', async () => {
+    // account_unproven names who is signed in and carries no balance, and holds
+    // until the sign-in changes: a terminal dash whose label says why.
+    sessionsUsageMock.mockResolvedValue({
+      usage: { available: false, reason: 'account_unproven', account_type: 'ExternalIdP' },
+    })
+    renderWithProviders(<App />, { route: '/chat', preloadedState: connectedState })
+
+    const pill = await screen.findByLabelText(i18nT('app.kiro_credit_usage_sign_in_type'))
+    // The muted dash its sibling no-value states show, plus the info mark the
+    // modal's notice uses, so the set-up state does not read as a failed read.
+    expect(pill.textContent).toContain('—')
+    expect(within(pill).getByTestId('kiro-usage-sign-in-type-mark')).toBeInTheDocument()
+    // The hover text is the same sentence as the accessible name.
+    expect(pill.getAttribute('title')).toBe(i18nT('app.kiro_credit_usage_sign_in_type'))
+    expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_checking_2'))).toBeNull()
+    expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_no_reading'))).toBeNull()
+    expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_unavailable'))).toBeNull()
+  })
+
+  it('keeps the sign-in-type mark for that account when the config read fails', async () => {
+    // The config read decides whether a `none` payload is the Kiro backend.
+    // An account_unproven payload only arises with kiro-cli, so a failed
+    // config read must not remove its dash (and the modal's notice with it).
+    sessionsUsageMock.mockResolvedValue({
+      usage: { available: false, reason: 'account_unproven', account_type: 'ExternalIdP' },
+    })
+    kirocrewConfigMock.mockRejectedValue(Object.assign(new Error('boom'), { status: 500 }))
+    renderWithProviders(<App />, { route: '/chat', preloadedState: connectedState })
+
+    const pill = await screen.findByLabelText(i18nT('app.kiro_credit_usage_sign_in_type'))
+    expect(within(pill).getByTestId('kiro-usage-sign-in-type-mark')).toBeInTheDocument()
   })
 
   it('keeps the account modal open with Refresh when usage resolves to no reading', async () => {

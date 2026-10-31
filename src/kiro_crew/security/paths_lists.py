@@ -15,7 +15,7 @@ gates read these lists, and this module imports no other part of the path floor.
 
 from __future__ import annotations
 
-from kiro_crew.agent_sdk import host_auth
+from kiro_crew.agent_sdk import host_auth, native_allow_stores
 from kiro_crew.identity_stores import AUTH_SQLITE_DB, AUTH_SQLITE_SIDECAR_SUFFIXES, fenced_home_dirs
 from kiro_crew.memory_stores import MEMORY_STORES_DIR_NAME
 
@@ -199,6 +199,9 @@ _CREW_SECRET_LEAVES: list[str] = [
     # too. The channel's own client opens it directly rather than through this
     # gate, so pairing keeps working.
     "whatsapp",
+    # Web Push: the VAPID private key and every device's push secret, enough to raise
+    # OS banners on the owner's devices. Opened directly by the notification subsystem.
+    "web-push",
     # The Notes builtin's vault registry. It is not a secret, but it stores each
     # vault's on-disk ``localPath``, which auto-sync trusts and runs ``git
     # add``/``commit``/``push`` against. A prompt-injected agent that could
@@ -405,6 +408,7 @@ _CREW_SECRET_LEAVES: list[str] = [
     # ``sandbox._CREW_READONLY_LEAVES``, which this entry does not touch: the
     # reader it fences is the AGENT'S OWN FILE TOOLS.
     "member-memory-bindings",
+    "template-mcp-additions",  # approved MCP entries' env/headers; as the bindings above
     "security_events.jsonl",
     # Rotated SEL segments. sel_rotation.py closes the live log at a size cap and renames
     # it into this directory, so a segment holds exactly the same audit records
@@ -495,6 +499,7 @@ _CREW_SECRET_LEAVES: list[str] = [
     # is ``sandbox._CREW_HIDDEN_LEAVES``. Opened only by the gateway and by the
     # operator's own ``kirocrew agent create`` / ``delete``, never by an agent tool.
     "crew-teams",
+    "member-records",  # crewmate rules/goals/DM bindings; mirror: sandbox._CREW_HIDDEN_LEAVES
     # Subagent panel dismissals (``subagent_persistence.record_panel_dismissal``):
     # one file per run whose finished card the operator dismissed, which the
     # panel's durable reader consults to keep that card hidden. It decides what
@@ -622,18 +627,6 @@ _CREW_SECRET_LEAVES: list[str] = [
     # ``/api/decisions/consent`` handler is the only writer and opens the path
     # directly, not through this gate.
     "decisions_consent.json",
-    # Recorded consent to deliver a file whose contents the credential scanner
-    # flagged. Same class of control as ``aws_service_consent.json`` above: the
-    # record is what AUTHORIZES a flagged file past four independent content
-    # gates, so an agent that could write it would consent on the owner's behalf
-    # to shipping the owner's secrets. Reading it is fenced too -- the file says
-    # which delivery destinations the owner has already blessed, which tells an
-    # agent where a flagged file would land unrefused, and that is reconnaissance
-    # it should not get for free from the shared gate. The authenticated,
-    # owner-gated dashboard ``/api/file-delivery/consent`` handler is the ONLY
-    # writer and opens the path directly, not through this gate, so it keeps
-    # working; there is deliberately no CLI verb to fence.
-    "file_delivery_consent.json",
     "ssh_auth_sock_consent.json",
     # The owner's credential-redaction switch. Same class of control as the
     # consent records above: the record is what AUTHORIZES the credential scrubber
@@ -645,20 +638,6 @@ _CREW_SECRET_LEAVES: list[str] = [
     # ``/api/security/credential-redaction`` handler is the only writer and opens
     # the path directly, not through this gate.
     "credential_redaction.json",
-    # The single-use step-up nonce that authorizes RECORDING a flagged-file
-    # delivery grant. A whole DIRECTORY, not a leaf file, because arming writes a
-    # sibling ``.tmp`` and renames it into place. It lives in its OWN top-level
-    # leaf rather than under ``trust/`` on purpose: ``trust/`` is sandbox-VISIBLE
-    # (it holds SEL append targets an in-sandbox MCP server writes), so a
-    # prompt-injected agent could FORGE a nonce there with a runtime-constructed
-    # shell path (the acknowledged evadable tier) and then drive the owner's
-    # loopback browser to POST that chosen nonce -- recording a grant with no
-    # human present. This leaf has NO in-sandbox reader (the gateway writes it on
-    # arm, the host ``kirocrew file-delivery approve`` reads it), so it is also
-    # bind-masked in ``sandbox._CREW_HIDDEN_LEAVES``; masking is what actually
-    # closes the forge path, since the text/argv file gate alone does not stop a
-    # runtime-constructed shell write.
-    "file-delivery-consent-pending",
     "token_signing.key",
     "refresh_chains.json",
     # The staging directory the two leaves above publish through. Both are masked as
@@ -682,6 +661,9 @@ _CREW_SECRET_LEAVES: list[str] = [
     # opens these paths directly rather than through this gate, so publishing keeps
     # working.
     "auth-store-staging",
+    # Mediated-secret owner-signed egress policy: writable, it would let an agent try
+    # to authorize its own origin. Only the gateway and owner CLI open it, directly.
+    "secret-request-policy",
     ".local_secret",
     # Durable channel transport state: Teams' conversation -> serviceUrl and
     # identity -> conversation maps, and Telegram's getUpdates cursor. Two shapes of
@@ -929,11 +911,15 @@ _WRITE_PROTECTED_HOME_PATHS: list[str] = [
     # NOT read that leaf, and an entry on this tier as well would make
     # ``security_posture`` publish "Reads allowed" for a path the read gate
     # refuses.
+    # app-agent-launch: the empty directory a launch copy's kiro-cli starts in
+    # (``apps.agent_launch.launch_process_cwd``); a spec written into it is the spec
+    # kiro-cli runs. Read-only in the sandbox for the same reason.
     for leaf in (
         "config.json",
         "config.local.json",
         "playwright-cli-config.json",
         "subagents",
+        "app-agent-launch",
     )
 ] + [
     # Ops Mission Control's on-call schedule. WRITE-protected, not read+write
@@ -1190,18 +1176,18 @@ _WRITE_PROTECTED_HOME_PATHS += [
     # it. So an agent that can write this file can enter ``<path>: {size, sha256}``
     # for a settings file the USER hand-wrote — the file is readable, so both values
     # are computable — and the next session adopts it: the user's project settings
-    # are overwritten with Crew's seed and unlinked on reset. As with the alias
-    # record, the damage is done by Crew's own trusted writer, and the digest check
-    # cannot defend it because the forger reads the same bytes it does.
+    # are overwritten with Crew's seed and unlinked on reset. The digest check cannot
+    # defend it, because the forger reads the same bytes Crew's own writer does.
     #
     # WRITE-protected, not read+write sensitive: the record holds no secret (it
     # names work dirs and digests), so the file-READ tools keep working and an
     # operator can still see why a seed was or was not adopted. There is no
-    # legitimate agent WRITE at all — ``seed_provenance.record`` writes
-    # the path directly through ``atomic_write``, which does not route through this
-    # gate.
-    f"{prefix}/settings_seeds.json"
+    # legitimate agent WRITE at all — ``seed_provenance.record`` writes through
+    # ``atomic_write``, outside this gate. Both the record's directory and its old
+    # top-level name (read by a process started before the upgrade) are protected.
+    f"{prefix}/{leaf}"
     for prefix in _CREW_HOME_PREFIXES
+    for leaf in ("seed-provenance", "settings_seeds.json")
 ]
 
 
@@ -1235,6 +1221,15 @@ _WRITE_PROTECTED_HOME_PATHS += [
     # builds and prunes through direct Python/subprocess calls, which are not
     # agent tool calls and never reach ``hooks.on_tool_call``.
     f"{prefix}/app-sources"
+    for prefix in _CREW_HOME_PREFIXES
+]
+_WRITE_PROTECTED_HOME_PATHS += [
+    # The Meetings app's per-meeting user notes and their pasted images: free text
+    # the user cannot regenerate, kept outside the meeting directory every meeting
+    # agent may ``fs_write``. Write-only on purpose: the dashboard serves the images
+    # through ``/api/file-raw``, which applies the READ floor. The app backend opens
+    # these files directly and never routes through this gate.
+    f"{prefix}/apps/meetings/data/notes"
     for prefix in _CREW_HOME_PREFIXES
 ]
 
@@ -1275,6 +1270,21 @@ _KIRO_AGENTS_DIR = ".kiro/agents"
 _WRITE_PROTECTED_HOME_PATHS += [_KIRO_AGENTS_DIR]
 
 
+# The crewmate folder (``config.paths.mate_agents_dir()``): crewmate and mate service
+# specs in the agents-dir format, fenced like it. Only gateway handlers write it, directly.
+_KIRO_MATE_AGENTS_DIR = ".kiro/mates/agents"
+_WRITE_PROTECTED_HOME_PATHS += [_KIRO_MATE_AGENTS_DIR]
+# Its siblings: who owns each crewmate file, revoked approvals, the tool-access
+# record and the migration ledger. Only gateway handlers write them.
+_KIRO_MATE_STATE_LEAVES: tuple[str, ...] = (
+    ".kiro/mates/owners.json",
+    ".kiro/mates/revoked-approvals.json",
+    ".kiro/mates/tool-access.json",
+    ".kiro/mates/migrated.json",
+)
+_WRITE_PROTECTED_HOME_PATHS += list(_KIRO_MATE_STATE_LEAVES)
+
+
 # ── kiro-cli global MCP registry (~/.kiro/settings/mcp.json) ──
 # The sibling of the agents dir above, and an INPUT TO A SECURITY DECISION by the
 # same route: an ``autoApprove`` on an entry here is honoured by default
@@ -1311,18 +1321,25 @@ _KIRO_SETTINGS_MCP_JSON = ".kiro/settings/mcp.json"
 _WRITE_PROTECTED_HOME_PATHS += [_KIRO_SETTINGS_MCP_JSON]
 
 
-#: The kiro-cli-owned entries on the write-only tier, as ONE list because they
-#: share an anchoring rule rather than only an owner: each is re-anchored under
-#: ``KIRO_HOME`` and each has its ``$HOME``-rooted form resolved, so a symlink
-#: anywhere below the home root cannot move the real file out from under the
-#: fence. BOTH halves are driven from this tuple -- the ``$HOME`` resolve loop and
-#: the ``KIRO_HOME`` re-anchoring -- so a third kiro-cli leaf joins both by landing
-#: here, and neither half can be the one somebody forgets.
+#: The ``KIRO_HOME``-relative entries on the write-only tier, as ONE list because
+#: they share an anchoring rule rather than an owner: each is re-anchored under
+#: ``KIRO_HOME``, and like every entry each has its ``$HOME``-rooted form
+#: resolved, so a symlink anywhere below the home root cannot move the real file
+#: out from under the fence. The ``KIRO_HOME`` re-anchoring is driven from this
+#: tuple and the ``$HOME`` half from the entries themselves, so a third kiro-cli
+#: leaf joins both by landing here and in the write tier.
 _KIRO_CLI_WRITE_TIER_LEAVES: tuple[str, ...] = (
     _KIRO_AGENTS_DIR,
     _KIRO_SETTINGS_MCP_JSON,
+    _KIRO_MATE_AGENTS_DIR,
+    *_KIRO_MATE_STATE_LEAVES,
 )
 
+
+# Other harnesses' own permission files: the same threat, anchored like the leaves above.
+_NATIVE_ALLOW_STORE_LEAVES: tuple[str, ...] = native_allow_stores.home_leaves()
+_WRITE_PROTECTED_HOME_PATHS += list(_NATIVE_ALLOW_STORE_LEAVES)
+_native_store_write = native_allow_stores.matches_store  # a project's own harness config
 
 _WRITE_PROTECTED_HOME_PATHS += [
     # Operator-authored panel templates (agent_panel.py). WRITE-protected rather

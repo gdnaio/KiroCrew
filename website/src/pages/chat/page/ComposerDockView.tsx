@@ -1,7 +1,12 @@
 import type { NavigateFunction } from 'react-router-dom'
-import type { RefObject, Dispatch, SetStateAction, MutableRefObject } from 'react'
+import { useId, useState, type RefObject, type Dispatch, type SetStateAction, type MutableRefObject } from 'react'
 import { OverlayPortal } from '../../../components/overlayRoot'
 import { Undo2 } from 'lucide-react'
+import { CrewModeComposerChip } from '../../../components/crew/CrewModeMarks'
+import { CREW_STEER_MAX_CHARS, crewApprovalDecidableHere, crewModeRoot } from '../../../lib/crewMode'
+import CrewApprovalCards from '../../../components/crew/CrewApprovalCards'
+import { CrewSteerUnrecordedNotice, CrewWorkerComposerGate } from '../../../components/crew/CrewWorkerComposerGate'
+import { useCrewRoot } from '../../../components/crew/useCrewRoot'
 import { Composer, type ComposerHandle, type ComposerVoiceOptions } from '../../../chat-core/composer/Composer'
 import type { ComposerPasteSlice } from '../../../chat-core/composer/composerPastes'
 import type { ComposerDraftStore } from '../../../chat-core/composer/draftStore'
@@ -10,6 +15,7 @@ import type { UseMessageQuote } from '../../../chat-core/composer/useMessageQuot
 import AgentDropdownList, { isCrewmateChat, DefaultAgentRow, defaultWriteKind, ManageAgentsFooter, type DefaultWriteFailure } from '../../../components/AgentDropdownList'
 import type { KiroCrewAgent } from '../../../components/AgentSelector'
 import { MemoryModeChip, type MemoryMode } from '../../../components/MemoryModeChip'
+import { CrewModeChip } from '../../../components/CrewModeChip'
 import type { PromptHistoryItem } from '../../../components/composerPromptHistory'
 import type { ResolvedSessionControl } from '../../../hooks/useSessionControls'
 import type { ProviderAdapter, ModelInfo } from '../../../providers/types'
@@ -21,6 +27,7 @@ import type { SlotApprovalMode } from '../../../utils/slotApprovalMode'
 import { SETTINGS_DEFAULT_MODEL_ID } from '../../../hooks/useSettingHighlight'
 import { settingsPath } from '../../../components/settingsPath'
 import { agentOrDefaultLabel } from '../../../utils/agentLabel'
+import { isUntitledSession, sessionDisplayTitle } from '../../../utils/sessionDisplayTitle'
 import { sessionMemoryTag } from '../../../lib/agentMemorySource'
 import { dismissFollowupItem, type FollowupItem } from '../../../store/chatSlice'
 import { Input } from '../../../components/ui'
@@ -58,7 +65,9 @@ import { JumpToBottomButton } from '../../../app-sdk/ChatScrollChrome'
 import WorkflowProgressBar from '../WorkflowProgressBar'
 import { tryQuickSend } from '../../../lib/quickSend'
 import { i18nT } from '../../../i18n/t'
-import { fmtDateFields } from '../../../i18n/format'
+import { acpBackendName } from '../../../api/acpBackend'
+import { fmtDateFields, fmtNumber } from '../../../i18n/format'
+import { useSlotRunsHere } from '../../../components/sessionEnvironmentHooks'
 
 /**
  * The main composer, with its callback props held at stable identities. This
@@ -83,7 +92,7 @@ interface ComposerDockViewProps {
   activityOpen: boolean
   composerBusy: boolean
   contextPct: number
-  contextTokens: { used?: number; window: number; }
+  contextTokens: { used?: number; window?: number; }
   knowledgeFetch: ReturnType<typeof useActiveSlotState>['knowledgeFetch']
   messages: ChatMessage[]
   pendingFollowup: { items: FollowupItem[]; ts: number; } | undefined
@@ -112,6 +121,12 @@ interface ComposerDockViewProps {
   codexPairModels: boolean
   filteredModels: ModelInfo[]
   hiddenModelsQ: ReturnType<typeof useModelPickerModels>['hiddenModelsQ']
+  /** The session's own harness list (`?backend=`) failed to load. */
+  ownModelsFailed: boolean
+  ownModelsFetching: boolean
+  retryOwnModels: () => void
+  /** The harness whose list the picker shows, when it is not the configured one. */
+  modelsBackend?: string
   jevRouteOn: boolean
   modelDropdown: boolean
   modelDropdownRef: RefObject<HTMLDivElement>
@@ -168,7 +183,7 @@ interface ComposerDockViewProps {
   composerRootChange: (v: string) => void
   composerUserEdit: (v: string) => void
   followUpMulti: boolean
-  followUpOptions: string[]
+  followUpOptions: readonly string[]
   followUpPicked: Set<string>
   followUpPickedRef: MutableRefObject<Set<string>>
   followUpSourceKey: string | null
@@ -180,7 +195,7 @@ interface ComposerDockViewProps {
   send: ReturnType<typeof useComposerSend>['send']
   pickModel: (modelName: string) => void
   setProject: (path: string) => Promise<void>
-  switchAgent: (agentName: string, kind?: 'member' | 'template') => Promise<void>
+  switchAgent: (agentName: string, kind?: 'member' | 'template') => Promise<boolean>
   currentSlot: ChatSlot | undefined
   activeFolderName: string
   anchorSessionControl: (rect: DOMRect, trigger?: HTMLElement | null) => void
@@ -200,9 +215,9 @@ interface ComposerDockViewProps {
   removeDirChip: (rel: string) => void
   removeFileChip: (p: string) => void
   selectPickedFile: ReturnType<typeof useFileMentionActions>['selectPickedFile']
-  followupAddToSession: (item: FollowupItem) => void
-  followupStartInNewChat: (item: FollowupItem) => Promise<void>
-  followupStartInWorktree: (item: FollowupItem) => Promise<void>
+  followupAddToSession: (item: FollowupItem, index: number) => void
+  followupStartInNewChat: (item: FollowupItem, index: number) => Promise<void>
+  followupStartInWorktree: (item: FollowupItem, index: number) => Promise<void>
   displayMode: SlotApprovalMode
   _modelPinActive: string
   _modelPinAgent: string
@@ -249,10 +264,37 @@ interface ComposerDockViewProps {
   switchMemoryMode: (newMode: MemoryMode) => Promise<void>
   composerAbove: JSX.Element
   composerSessionControls: ReturnType<typeof useSessionControlChips>
+  /** The Crew Mode chip (crewModeSwitch): offered on this chat, and its switch on. */
+  crewModeOffered: boolean
+  turnOnCrewMode: () => void
+  /** Set only while Crew Mode is on and no message is sent yet: the composer's
+   *  Crew Mode mark is then a toggle that turns it off. */
+  turnOffCrewMode?: () => void
+  /** The Crew Mode switch is in flight for this chat (crewModeSwitch): the
+   *  composer is held, its reason as placeholder, like a memory-mode switch. */
+  crewModeSwitching?: 'on' | 'off' | null
+  /** A conductor session (Crew Mode): the composer offers no agent picker, since
+   *  the conductor is chosen by Crew Mode itself. Workspace and model stay. */
+  agentPickerHidden?: boolean
+  /** Ultra Mode is on and no message is sent yet: the chip row stays
+   *  with the chip pressed (a toggle), the memory chip is held, and the agent
+   *  slot shows nothing. */
+  crewChipPressed?: boolean
+  /** The gateway refuses any agent switch of this chat (a Crew Mode chat with a
+   *  message, `crew_mode_locked`) while the Crew Mode preview is off on this
+   *  device: no agent picker, and no Crew Mode mark either. */
+  agentSwitchLocked?: boolean
+  /** The main pane holds a Crew Mode worker: the composer is that worker's steer
+   *  composer. It looks like the conductor's normal composer; a running turn
+   *  takes the text as a steer rather than queueing it. The worker's title. */
+  steerWorker?: string
+  /** The steered worker's Crew Mode root (its `crew_root`). Its approvals are
+   *  decided on that root's card, and with the root closed the composer is off. */
+  steerWorkerRoot?: string
 }
 
 /**
- * The floating composer dock, the next positioned sibling after the scroller (that DOM order is what paints it over the transcript), and its contents: the jump-to-bottom pill, the status stack (task, sub-agent and workflow bars, queued messages), the flying quote, and the input area (refused-press notice, history suggestions, knowledge picker, question and follow-up cards, memory-mode chip, the composer), and the composer toolbar's popovers (the agent and model dropdowns, the project picker, the open app session control).
+ * The floating composer dock, the next positioned sibling after the scroller (that DOM order is what paints it over the transcript), and its contents: the jump-to-bottom pill, the status stack (task, sub-agent and workflow bars, queued messages), the flying quote, and the input area (refused-press notice, history suggestions, knowledge picker, question and follow-up cards, memory-mode and Crew Mode chips, the composer), and the composer toolbar's popovers (the agent and model dropdowns, the project picker, the open app session control).
  *
  * Its body is not re-indented: `ChatPage.statusStackLayering.test.tsx` finds the status stack's end by its closing tag's depth (14 spaces).
  */
@@ -260,7 +302,7 @@ export default function ComposerDockView({
   embedded, mode, activeSlot, connected, dispatch, isMobile, isTouch, navigate, provider, activityOpen, composerBusy, contextPct, contextTokens, knowledgeFetch, messages, pendingFollowup,
   pendingQuestion, projectLocked, restoredQuestionNotice, sentMessages, slotRunning, slotStopping, composerDraft, historySuggestions, showHistorySuggestions, chatConfig, agentDropdown,
   agentDropdownRef, agentFilter, agentInputRef, defaultAgent, defaultAgentFailed, effectiveAgents, filteredAgents, installedAgents, setAgentDropdown, setAgentFilter, toggleDefaultAgent,
-  codexPairModels, filteredModels, hiddenModelsQ, jevRouteOn, modelDropdown, modelDropdownRef, modelFilter, modelInputRef, modelPickerConfigured, modelPickerReturnsFocusRef, setModelDropdown,
+  codexPairModels, filteredModels, hiddenModelsQ, ownModelsFailed, ownModelsFetching, retryOwnModels, modelsBackend, jevRouteOn, modelDropdown, modelDropdownRef, modelFilter, modelInputRef, modelPickerConfigured, modelPickerReturnsFocusRef, setModelDropdown,
   setModelFilter, onAgentListKeyDown, onModelListKeyDown, anchorModelBtn, modelBtnRect, messageQuote, applyAutomationChange, automation, automationCreationReady, automationOpen,
   automationSnapshotFailed, setAutomationOpen, prefillHint, setPrefillHint, pasteSlice, pendingFiles, pendingSessions, resizedInfo, unstageSessionRef, uploading, agentBtnRect, anchorAgentBtn,
   projectPickerOpen, setProjectPickerOpen, anchorProjectBtn, projectBtnRect, pendingDirs, composerRef, composerVoiceOptions, isMac, cancelUpload, composerUploadFiles, dropTargetProps, handleCapture,
@@ -272,8 +314,34 @@ export default function ComposerDockView({
   effortSupported, modelMarker, pinModelToAgentMut, projectBranch, projectGit, projectGitError, shownModel, cardOwnsRecovery, continuable, continuing, handleContinue, interrupted, dockGutter, dockRef,
   endQuoteFlight, flyingQuote, inputAreaRef, isAtBottom, answerQuestionCard, handleCancelQueued, handleEditQueued, handleInterruptQueued, handleReorderQueued, keepQuestionAnswer, queuedMessages,
   queuePendingIds, steer, stopTurn, systemDeliveryCount, handleEditLastRequest, composerOptimizing, handleOptimizingChange, memorySwitching, showComposerMemoryChip, switchMemoryMode, composerAbove,
-  composerSessionControls,
+  composerSessionControls, crewModeOffered, turnOnCrewMode, turnOffCrewMode, crewModeSwitching = null, agentPickerHidden = false, crewChipPressed = false, agentSwitchLocked = false, steerWorker, steerWorkerRoot = '',
 }: ComposerDockViewProps) {
+  // A chat on a Session Environment runs in its workspace; see ChatPane.
+  const runsHere = useSlotRunsHere(currentSlot && currentSlot.executor !== 'remote' ? currentSlot.key : null)
+  const crewModeNoteId = useId()
+  // Disabled while a reply runs (the agent switch refuses mid-turn): the
+  // composer's own turn state, which a send sets at once, as well as the listed
+  // slot's, which follows the server.
+  const crewModeBusy = slotRunning || !!currentSlot?.running
+  // A Crew Mode worker's composer (edge review R2, owner decisions): its tool
+  // approvals are decided only on the conductor's card, so it shows none of its
+  // own; with the conductor closed it does not send until the person reopens it.
+  const crewWorkerView = steerWorker !== undefined && !!steerWorkerRoot
+  const { rootClosed: steerRootClosedRaw } = useCrewRoot(crewWorkerView ? steerWorkerRoot : '')
+  const steerRootClosed = crewWorkerView && steerRootClosedRaw
+  // A worker's steer is refused past the steer route's limit BEFORE the draft is
+  // cleared, so an over-long paste stays in the box with the reason beside it.
+  const [steerTooLong, setSteerTooLong] = useState(false)
+  const steerFits = (text?: string): boolean => {
+    if (steerWorker === undefined) return true
+    const fits = (text ?? composerDraft.get()).length <= CREW_STEER_MAX_CHARS
+    setSteerTooLong(!fits)
+    return fits
+  }
+  // The chip's hint as a visible line, named by its `aria-describedby`, so a
+  // keyboard, a screen reader and a touch reader all reach it, not only a mouse
+  // hovering the title. It says, while a reply runs, when the chip works again.
+  const crewModeNote = crewModeOffered && crewModeBusy ? i18nT('components.crewMode.chip_hint_busy') : null
   return (
     <>
             {/* Composer dock. Floats over the bottom of the transcript scroller
@@ -293,7 +361,7 @@ export default function ComposerDockView({
                 width either side of the column lets wheel and touch reach the
                 transcript underneath, as the strip beside an iOS toolbar does.
                 `right: dockGutter` keeps the scrollbar column clear (above). */}
-            <div ref={dockRef} className="absolute left-0 bottom-0 pointer-events-none" style={{ right: dockGutter }} data-testid="composer-dock-root" {...{ [SELECTION_INERT_ATTR]: '' }}>
+            <div ref={dockRef} className="absolute left-0 bottom-0 pointer-events-none" style={{ right: dockGutter }} data-testid="composer-dock-root" {...{ [SELECTION_INERT_ATTR]: '' }} data-scroll-peek-stop="">
               <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={() => scrollBottom(true)} />
               {/* Status chrome never claims more than half the pane. The dock
                   is anchored to the pane's bottom edge and grows upward, so an
@@ -315,12 +383,8 @@ export default function ComposerDockView({
                   exactly on the padding box, and the equal negative margin keeps
                   the wrapper's contribution to the column unchanged, so the seam
                   still fuses. Layout-neutral when the queue is empty: the pair
-                  cancels. `scrollbar-overlay` is what every other internal
-                  scroller here uses (SkillDirectoryBrowser pairs it with the same
-                  `overflow-y-auto overscroll-contain`): it replaces the global
-                  always-visible `var(--border)` thumb with a hover-revealed
-                  overlay one, so the capped box does not carry a permanent bar. */}
-              <div ref={composerBandRef} className="max-h-[50svh] overflow-y-auto overscroll-contain scrollbar-overlay pb-[11px] mb-[-11px] dock-inert" data-testid="composer-status-stack">
+                  cancels. */}
+              <div ref={composerBandRef} className="max-h-[50svh] overflow-y-auto overscroll-contain pb-[11px] mb-[-11px] dock-inert" data-testid="composer-status-stack">
               {/* Not gated on activityOpen (unlike the two bars below): the
                   activity sidebar has no TODO view, so hiding it there would
                   lose the information rather than de-duplicate it. */}
@@ -388,8 +452,15 @@ export default function ComposerDockView({
                         onKeyDown={(e) => { if (e.key === 'Enter') handleResumeSession(s.key, s.title || s.key) }}
                       >
                         <div className="flex-1 min-w-0">
-                          <div className="font-mono text-[13px] text-text truncate">{s.title || s.key}</div>
-                          {s.created && <div className="text-[11px] text-muted font-mono mt-0.5">{fmtDateFields(s.created, { year: 'numeric', month: 'short', day: 'numeric' })}</div>}
+                          <div className="font-mono text-[13px] text-text truncate">{sessionDisplayTitle(s)}</div>
+                          {/* An untitled row's name does not say which session it is, so its
+                              key leads the second line: two untitled rows stay distinct, and a
+                              query typed as part of a key shows why the row matched. */}
+                          {(isUntitledSession(s) || s.created) && (
+                            <div className="text-[11px] text-muted font-mono mt-0.5 truncate">
+                              {[isUntitledSession(s) ? s.key : '', s.created ? fmtDateFields(s.created, { year: 'numeric', month: 'short', day: 'numeric' }) : ''].filter(Boolean).join(' · ')}
+                            </div>
+                          )}
                         </div>
                         <Undo2 size={14} className="text-accent shrink-0" />
                       </div>
@@ -414,7 +485,7 @@ export default function ComposerDockView({
                 />
               ) : null}
               {(pendingQuestion || restoredQuestionNotice) && (
-                <div className="px-4 pb-2 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+                <div className="px-4 pb-2 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }} data-testid="composer-question-card" data-question-slot={activeSlot ?? undefined}>
                   <PendingQuestionCard
                     slotKey={activeSlot}
                     onFallbackSend={keepQuestionAnswer}
@@ -436,16 +507,57 @@ export default function ComposerDockView({
                   />
                 </div>
               )}
-              {showComposerMemoryChip && (
+              {(showComposerMemoryChip || crewChipPressed) && (
                 // No backdrop: the chip is glass and whatever scrolls under it is meant to show.
                 // `w-fit`, not a full-width flex row: the box is a `dock-inert` child, so
-                // it catches input, and it should be no wider than the chip it holds.
-                <div className="relative z-10 mx-auto w-fit px-4 pt-2 pb-2" data-testid="composer-memory-chip">
+                // it catches input, and it should be no wider than the chips it holds.
+                // The Crew Mode chip sits right of the memory chip, on the welcome state
+                // only. Once Crew Mode is chosen the parent stops offering both chips,
+                // so this row leaves with them; turned off before the first message,
+                // they come back.
+                // The row wraps, so on a phone the chip's note drops under the chip
+                // instead of overlapping it.
+                <div className="relative z-10 mx-auto w-fit max-w-full px-4 pt-2 pb-2 flex flex-wrap items-center justify-center gap-x-2 gap-y-1" data-testid="composer-memory-chip">
                   <MemoryModeChip memoryMode={currentSlot?.memory_mode ?? 'persistent'} onSwitchMode={switchMemoryMode} switching={memorySwitching} disabled={composerOptimizing} />
+                  {(crewModeOffered || crewChipPressed) && (
+                    // Busy while a reply runs; disabled while a memory-mode switch is
+                    // replacing this session.
+                    // Rendered in place: no shared layout id, so it never slides in on
+                    // mount or on a session switch; pressed, it stays where it is.
+                    <CrewModeChip onTurnOn={turnOnCrewMode} pressed={crewChipPressed} onTurnOff={turnOffCrewMode} busy={crewModeBusy} disabled={memorySwitching || !!crewModeSwitching} describedBy={crewModeNote ? crewModeNoteId : undefined} />
+                  )}
+                  {crewModeNote && (
+                    <span id={crewModeNoteId} data-testid="crew-mode-note" className="text-[12px] text-muted text-center">
+                      {crewModeNote}
+                    </span>
+                  )}
                 </div>
               )}
               {/* Announces why the composer is locked; in every session, as the user may move on mid-switch. */}
               <span role="status" className="sr-only" data-testid="memory-switch-status">{memorySwitching ? i18nT('components.welcomeView.switching_memory_mode') : ''}</span>
+              {/* A Crew Mode conductor's workers' tool approvals, the one thing it
+                  cannot answer, stacked above its composer. */}
+              {/* The Crew tab's Needs your input shows the same cards, compact. */}
+              {crewModeRoot(currentSlot) && activeSlot && <CrewApprovalCards root={activeSlot} />}
+              {/* A crew member's composer is the conductor's normal composer: no
+                  frame, header or hint. What it does differs only in delivery: a
+                  send is a person steer, and a running turn takes it as a steer. */}
+              <div data-testid={steerWorker !== undefined ? 'crew-steer-composer' : undefined}>
+              {/* The gate lines sit on the composer's own column (its px-4 and
+                  content width), now that no ring frames them. */}
+              {activeSlot && (
+                <div className="px-4 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+                  {crewWorkerView ? (
+                    <CrewWorkerComposerGate root={steerWorkerRoot} worker={activeSlot} workerTitle={steerWorker ?? ''}
+                      waitingForApproval={!!currentSlot?.pending_approval} />
+                  ) : (
+                    // Without the gate (the Crew Mode preview off) a send the server
+                    // still took as a steer can come back unrecorded: say so here.
+                    <CrewSteerUnrecordedNotice worker={activeSlot}
+                      workerTitle={currentSlot ? sessionDisplayTitle(currentSlot) : ''} />
+                  )}
+                </div>
+              )}
               <Composer
                 ref={composerRef}
                 slotKey={activeSlot}
@@ -461,20 +573,37 @@ export default function ComposerDockView({
               // (typing, paste, undo, picker inserts), never for a parent-driven
               // seed -- so it is the signal that arms the prefill hint's expiry.
               onChange={composerUserEdit}
-              onSend={() => send()}
-              terminalCommands={activeSlot && !currentSlot ? 'pending' : currentSlot?.executor === 'remote' ? 'remote' : 'local'}
+              onSend={() => { if (!steerRootClosed && steerFits()) send() }}
+              terminalCommands={activeSlot && !currentSlot ? 'pending'
+                : currentSlot?.executor === 'remote' || runsHere === false ? 'remote'
+                  : currentSlot && runsHere === undefined ? 'pending' : 'local'}
               canSteer={composerBusy}
-              onSteer={steer}
+              onSteer={opts => { if (!steerRootClosed && steerFits(opts?.text)) steer(opts) }}
               // AND a turn actually running. `composerBusy` is also true when only
               // background sub-agents are working, and there is no turn to decide
               // ABOUT in that state: the send starts a fresh turn and the point
               // never runs, so offering the mode there would promise a decision
               // nothing makes.
               jevAutoAvailable={jevAutoConsented && !!slotRunning}
-              onFollowUpSend={(text?: string) => send(text)}
+              onFollowUpSend={(text?: string) => { if (!steerRootClosed) send(text) }}
               // Streaming, compaction and stopping keep the input interactive (api_chat queues on slot.running and stop preserves the
-              // queue, so Enter queues a follow-up during the stop window). Only a memory-mode switch locks it, the reason as placeholder.
-              disabled={memorySwitching} lockedPlaceholder={memorySwitching ? i18nT('components.welcomeView.switching_memory_mode') : undefined}
+              // queue, so Enter queues a follow-up during the stop window). A memory-mode switch locks it, the reason as placeholder; a
+              // worker of a closed conductor too, its reason said once by the gate's line above the composer. The Crew Mode
+              // switch locks it the same way for its one round-trip: a send that reached the server first would start the
+              // turn on the agent the chat is leaving and the switch would be refused, so the draft waits in the box.
+              disabled={memorySwitching || !!crewModeSwitching || steerRootClosed}
+              // A crew member's box names its target and what a send does, so it
+              // never reads as a plain chat with the conductor's own agent.
+              placeholder={steerWorker !== undefined ? i18nT('components.crewMode.steer_placeholder', { name: steerWorker }) : undefined}
+              lockedPlaceholder={memorySwitching ? i18nT('components.welcomeView.switching_memory_mode')
+                : crewModeSwitching ? i18nT(crewModeSwitching === 'on' ? 'components.crewMode.switching_on' : 'components.crewMode.switching_off')
+                  : steerRootClosed ? '' : undefined}
+              // A worker's approval band (Allow once / Trust / Reject) is not drawn:
+              // the conductor's approval card is the one place it is decided.
+              slotApprovalChrome={crewApprovalDecidableHere({ crew_root: crewWorkerView ? steerWorkerRoot : '' }, 'worker_main_pane')}
+              // A worker's composer: a running turn takes the text as a steer
+              // (no queue choice to make). The placeholder stays the normal one.
+              {...(steerWorker !== undefined ? { busyMode: 'steer-only' as const } : {})}
               autoFocusKey={activeSlot}
               prefillHint={prefillHint}
               onDismissHint={() => setPrefillHint(false)}
@@ -523,7 +652,7 @@ export default function ComposerDockView({
               // Uses the SLOT's stored agent (not `activeAgentName`, which has
               // already collapsed empty->default) so an agent-less slot reads
               // `<default> · default` and a pinned one reads the bare alias (#8770).
-              agentLabel={agentOrDefaultLabel(currentSlot?.agent, defaultAgent)}
+              agentLabel={agentOrDefaultLabel(currentSlot?.agent, defaultAgent, currentSlot?.agent_kind)}
               agentIsInheritedDefault={!currentSlot?.agent && !!defaultAgent}
               // Read from the same rows the picker lists, so the chip marks a
               // session exactly when the picker shows a same-name pair.
@@ -539,7 +668,10 @@ export default function ComposerDockView({
               // would hide every routed turn. Same `jevRouteOn` the picker's row is
               // drawn from, so chip, menu and gate cannot disagree.
               modelIsJevRouted={jevRouteOn && isUnpinnedModel(currentSlot?.model)}
-              onAgentClick={provider.capabilities.agentTemplates ? (rect, trigger) => { anchorAgentBtn(rect, trigger); setAgentDropdown(!agentDropdown) } : undefined}
+              // A crew member's footer is the conductor's: the Crew Mode mark (never
+              // a switch there) in place of the agent picker and its label.
+              agentBadge={crewChipPressed ? undefined : agentPickerHidden || steerWorker !== undefined ? <CrewModeComposerChip /> : undefined}
+              onAgentClick={provider.capabilities.agentTemplates && !agentPickerHidden && !agentSwitchLocked && steerWorker === undefined ? (rect, trigger) => { anchorAgentBtn(rect, trigger); setAgentDropdown(!agentDropdown) } : undefined}
               onModelClick={(rect, trigger, composerHadFocus) => {
                 modelPickerReturnsFocusRef.current = !!composerHadFocus
                 anchorModelBtn(rect, trigger); setModelDropdown(!modelDropdown)
@@ -568,8 +700,10 @@ export default function ComposerDockView({
               contextPct={contextPct}
               contextUsedTokens={contextTokens?.used}
               contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
+              derivePctFromUsed={contextTokens?.used != null && contextTokens.window == null}
               showContextPct={chatConfig.showContextPct}
               showContextTokens={chatConfig.showContextTokens}
+              environmentSlot={activeSlot}
               isRunning={composerBusy}
               projectLocked={projectLocked}
               /* Composed with `interrupted`, matching the ErrorCard gate above.
@@ -647,6 +781,8 @@ export default function ComposerDockView({
               connected={connected}
             />
               </Composer>
+              {steerWorker !== undefined && steerTooLong && <p role="alert" className="mt-1 px-4 mx-auto w-full text-[12px] text-danger-text" style={{ maxWidth: 'var(--mc-content-width, 900px)' }} data-testid="crew-steer-too-long">{i18nT('components.crewMode.steer_too_long', { name: steerWorker, max: fmtNumber(CREW_STEER_MAX_CHARS) })}</p>}
+              </div>
             </div>
             {/* Agent dropdown portal — triggered from input bar */}
             {agentDropdown && agentBtnRect && <OverlayPortal>{
@@ -680,6 +816,10 @@ export default function ComposerDockView({
                 models={filteredModels}
                 activeModel={jevRouteShownModel(shownModel, currentSlot)}
                 onSelectModel={pickModel}
+                modelsFailed={ownModelsFailed}
+                modelsFailedMessage={i18nT('components.modelEffortDropdown.harness_models_failed', { harness: acpBackendName({ id: modelsBackend ?? '' }) })}
+                retryingModels={ownModelsFetching}
+                onRetryModels={retryOwnModels}
                 filter={modelFilter}
                 setFilter={setModelFilter}
                 onClose={() => setModelDropdown(false)}

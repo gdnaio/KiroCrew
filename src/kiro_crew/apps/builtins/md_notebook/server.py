@@ -85,6 +85,7 @@ from kiro_crew.apps.builtins.md_notebook.server_store import (
     _clone_root,
     _coerce_auto_sync_mins,
     _home,
+    _is_app_clone,
     _write_pat_sync,
     _write_settings_sync,
     logger,
@@ -531,12 +532,12 @@ async def api_health(request: web.Request) -> web.Response:
 
 
 async def api_vaults(request: web.Request) -> web.Response:
-    clone_root = str(_clone_root())
     vaults = []
     for v in await read_vaults():
         # `external` = attached in place rather than cloned by this app.
         # Computed on read, never persisted.
-        vaults.append({**v, "external": not str(v["localPath"]).startswith(clone_root)})
+        cloned = await asyncio.to_thread(_is_app_clone, str(v["localPath"]))
+        vaults.append({**v, "external": not cloned})
     return web.json_response(
         {
             "vaults": vaults,
@@ -1459,8 +1460,35 @@ def create_app() -> web.Application:
     return app
 
 
+#: Canonical dotted name of this module. The backend launches it with
+#: ``runpy.run_module(run_name='__main__')``, which registers the running copy
+#: only under ``sys.modules['__main__']`` — not under this key. Any later
+#: ``from kiro_crew.apps.builtins.md_notebook import server`` (the one ``syncer``
+#: does) then misses and imports a SECOND copy with its own module-level locks
+#: and caches, so routes and the auto-sync loop guard different lock objects.
+_CANONICAL_NAME = "kiro_crew.apps.builtins.md_notebook.server"
+
+
+def _register_canonical_self() -> None:
+    """Alias the ``__main__`` launch copy under its canonical dotted name.
+
+    Run before ``create_app()`` imports ``syncer``: it makes the dotted import
+    resolve to this already-running module instead of loading a fresh copy, so
+    the whole process shares one set of module-level locks and caches.
+    """
+    running = sys.modules.get("__main__")
+    if running is None or getattr(running, "__name__", None) != "__main__":
+        return
+    existing = sys.modules.get(_CANONICAL_NAME)
+    if existing is running:
+        return
+    if existing is None:
+        sys.modules[_CANONICAL_NAME] = running
+
+
 def main() -> int:
     """Entry point when run as a module by the app backend system."""
+    _register_canonical_self()
     app = create_app()
     logger.info("Notes backend starting on 127.0.0.1:%d (home: %s)", PORT, _home())
     web.run_app(app, host="127.0.0.1", port=PORT, print=None)
@@ -1497,10 +1525,12 @@ __all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("
 
 if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
     from kiro_crew.apps.builtins.md_notebook.server_host import (  # noqa: F401
+        _F,
         PICK_FOLDER_SCRIPT,
         PICK_FOLDER_TIMEOUT_SEC,
         REVEAL_BINARIES,
         REVEAL_TIMEOUT_SEC,
+        _timeout_as_api_error,
         _windows_gh_candidates,
     )
     from kiro_crew.apps.builtins.md_notebook.server_http import (  # noqa: F401
@@ -1542,6 +1572,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
 
 if TYPE_CHECKING:  # names it serves from outside the owner family, from their homes
+    from kiro_crew import (  # noqa: F401
+        md_notebook_state,
+    )
     from kiro_crew.apps.proxy_auth import (  # noqa: F401
         raw_request_target,
         verify_proxy_request,

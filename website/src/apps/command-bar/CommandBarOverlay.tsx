@@ -3,6 +3,8 @@ import { OverlayPortal } from '../../components/overlayRoot'
 import { Command, Loader2 } from 'lucide-react'
 
 import { useAppDispatch, useAppSelector, useAppStore } from '../../store'
+import { selectSlotsWithLiveLastTs } from '../../store/slotLastTs'
+import { selectPersonSlots } from '../../store/dashboardSlice'
 import { findReport } from '../../utils/errorReport'
 import { errMessage } from '../../utils/thunkError'
 import ErrorNotice from '../../components/ErrorNotice'
@@ -26,11 +28,12 @@ import {
   type ContributedCommand,
 } from './contributedCommands'
 import { useImeGuard } from '../../hooks/useImeGuard'
-import { usePreviewFlag } from '../../hooks/usePreviewFlag'
-import { PREVIEW_CREW } from '../../utils/previewFlags'
+import { usePointerMotion } from '../../hooks/usePointerMotion'
 import { ARTIFACTS_ROW_LIMIT, COPY_KEY, DEBOUNCE_MS, ENTER_KEY, SKELETON_WIDTHS, actionLabel, headerOf, rootRowCopyable, type Scope } from './commandBarOverlayModel'
 import { useCommandBarOverlayEngines } from './useCommandBarOverlayEngines'
 import { useCommandBarOverlayRootRows } from './CommandBarOverlayRootRows'
+import { crewWaitingApprovals } from '../../pages/chat/command-center/model'
+import { useCrewMode } from '../../hooks/usePreviewFlag'
 import { useCommandBarOverlaySlots } from './useCommandBarOverlaySlots'
 import { useCommandBarOverlayActivation } from './useCommandBarOverlayActivation'
 import { commandBarOverlaySlotRenderer } from './CommandBarOverlaySlot'
@@ -56,30 +59,21 @@ import { commandBarOverlaySlotRenderer } from './CommandBarOverlaySlot'
 export default function CommandBarOverlay({
   open,
   onClose,
+  initialQuery = '',
 }: {
   open: boolean
   onClose: () => void
+  initialQuery?: string
 }) {
   const ime = useImeGuard()
-  /**
-   * Whether the Crewmates preview is on for this reader.
-   *
-   * This bar is an INGRESS to `/members`, and that page is registered with
-   * `previewFlag: PREVIEW_CREW` — so every other door to it applies this gate, and a
-   * surface that did not would advertise a page the operator has not opted into. The
-   * app ships `defaultEnabled: true`, so without this a default install shows
-   * `Search Crewmates` in the root, carries a typed query into it, and lets Enter
-   * reach `/members` while the page itself is supposed to be invisible.
-   *
-   * It gates all THREE rows this feature adds — the view row, the fallback row and the
-   * empty-state row — because each one is independently reachable.
-   */
-  const crewPreview = usePreviewFlag(PREVIEW_CREW)
   const vv = useVisualViewport()
   const inputRef = useRef<HTMLInputElement | null>(null)
   const dialogRef = useRef<HTMLDivElement | null>(null)
-  const [query, setQuery] = useState('')
-  const [debounced, setDebounced] = useState('')
+  // Seeded from what the host caught while this chunk loaded, so keys typed right
+  // after the gesture rank the first render instead of being lost. The host mounts
+  // the bar once per open, so this is also what makes each open start fresh.
+  const [query, setQuery] = useState(initialQuery)
+  const [debounced, setDebounced] = useState(initialQuery)
   const [scope, setScope] = useState<Scope>(null)
   /**
    * The contributed command whose ARGUMENT the field is currently collecting.
@@ -106,6 +100,15 @@ export default function CommandBarOverlay({
   const [previewClipped, setPreviewClipped] = useState(false)
 
   const [selected, setSelected] = useState(0)
+  /**
+   * Hover selects a row only on REAL pointer motion, so a row re-ranked under a
+   * resting pointer cannot overwrite the reset to row 0 that every keystroke makes
+   * (see `usePointerMotion`). The trail is cleared each time the bar opens.
+   */
+  const pointerMoved = usePointerMotion(open)
+  const selectOnPointerMove = (i: number, e: { clientX: number; clientY: number }) => {
+    if (pointerMoved(e)) setSelected(i)
+  }
   /**
    * Whether the reader asked to see every session waiting on them. Until then the
    * attention group keeps the root's per-group cap and ends on a row counting the
@@ -174,9 +177,20 @@ export default function CommandBarOverlay({
   // current over its socket. This is what lets the root LEAD with the sessions that
   // owe the user something without issuing a request: the facts are already here,
   // and the alternative surfaces (sidebar, recents) are reading the same three.
-  const liveSlots = useAppSelector(s => s.dashboard.slots)
+  const liveSlots = useAppSelector(selectSlotsWithLiveLastTs)
+  // The person's own sessions: a Crew Mode chat's workers are listed in its side
+  // panel, never in the Needs You or Recent sessions rows (the full set stays for
+  // the engines, which key navigation and the mates' running state on it).
+  const personSlots = useAppSelector(selectPersonSlots)
+  // What those hidden workers owe the person, carried by their root: a worker's
+  // tool approval is counted on its conductor over the FULL slot set, so Needs
+  // You still names it (the fleet page counts the same way, `crewWaitingApprovals`).
+  const crewMode = useCrewMode()
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- crewMode stands for the preview crewWaitingApprovals reads
+  const crewWaiting = useMemo(() => crewWaitingApprovals(liveSlots), [liveSlots, crewMode])
   const unreadSlots = useAppSelector(s => s.dashboard.unreadSlots)
   const slotStatusDetail = useAppSelector(s => s.chat.slotStatusDetail ?? {})
+  const subagentQueued = useAppSelector(s => s.chat.subagentQueued)
   const simplifiedToolNames = useSimplifiedToolNames()
   // `aria-modal` is a promise that Tab cannot reach the page behind the dialog, so
   // the trap has to be real. Escape is owned by the dialog panel's own keydown
@@ -185,6 +199,7 @@ export default function CommandBarOverlay({
   useDialogFocusTrap(dialogRef, onClose, { handleEscape: false })
   const {
     sessions,
+    openSessionsKey,
     recentSessions,
     apps,
     chatFoldersRef,
@@ -195,12 +210,12 @@ export default function CommandBarOverlay({
     folders,
     runningMates,
     mates,
-  } = useCommandBarOverlayEngines({ scope, liveSlots, dispatch, navigate })
+  } = useCommandBarOverlayEngines({ scope, liveSlots, subagentQueued, dispatch, navigate })
 
+  // The query is NOT reset here. It is seeded at mount, and clearing it on the open
+  // edge would drop the type-ahead along with anything typed before this effect ran.
   useEffect(() => {
     if (!open) return
-    setQuery('')
-    setDebounced('')
     setScope(null)
     setArgCommand(null)
     setSelected(0)
@@ -284,8 +299,8 @@ export default function CommandBarOverlay({
   commandByIdRef.current = commandById
 
   const ranked = useCommandBarOverlayRootRows({
-    liveSlots, unreadSlots, slotStatusDetail, simplifiedToolNames, dispatch, navigate, store, cycleTheme,
-    crewPreview, commandById, apps, settingsGovernance, resolved, scope, query, usage, attentionExpanded,
+    liveSlots: personSlots, crewWaiting, unreadSlots, slotStatusDetail, simplifiedToolNames, dispatch, navigate, store, cycleTheme,
+    commandById, apps, settingsGovernance, resolved, scope, query, usage, attentionExpanded,
     setAttentionExpanded,
   })
 
@@ -296,8 +311,9 @@ export default function CommandBarOverlay({
     mateQuery, matesError, matesSearchError, refetchMates,
     rowsAnswerTheQuery, slots, rowCount, scopeLoading, scopeFetching,
   } = useCommandBarOverlaySlots({
-    scope, debounced, query, sessions, recentSessions, artifacts, folderSortMode, folders, runningMates, mates,
-    argCommand, crewPreview, ranked, selected, setSelected,
+    scope, debounced, query, sessions, openSessionsKey, recentSessions, artifacts, folderSortMode, folders,
+    runningMates, mates,
+    argCommand, ranked, selected, setSelected,
   })
 
   const { seedNewSession, activateIndex } = useCommandBarOverlayActivation({
@@ -948,7 +964,7 @@ export default function CommandBarOverlay({
                     tabIndex={-1}
                     aria-selected={selected === i}
                     onMouseDown={() => activateIndex(i, 'pointer')}
-                    onMouseEnter={() => setSelected(i)}
+                    onMouseMove={e => selectOnPointerMove(i, e)}
                     className={`flex items-center gap-2.5 px-3 py-2 cursor-pointer text-[13px] ${
                       selected === i ? 'bg-bg-hover text-text' : 'text-text'
                     }`}

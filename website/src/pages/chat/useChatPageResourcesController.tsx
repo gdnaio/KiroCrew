@@ -21,11 +21,13 @@ import {
   captureScreen,
   currentTabCaptureDeps,
   screenSnipSupported,
+  ScreenSnipRefusedError,
 } from '../../hooks/useScreenSnip'
 import { useTheme } from '../../hooks/useTheme'
 import { i18nT } from '../../i18n/t'
 import type { AppDispatch } from '../../store'
 import { openActivityPanel } from '../../store/chatSlice'
+import { openCrewSession } from './command-center/CrewWorkerList'
 import type { ChatMessage } from '../../types'
 import { mergeIntoDraft, setDraft } from '../../utils/chatDrafts'
 import { classifyDrop } from '../../utils/dropClassify'
@@ -172,7 +174,7 @@ export function useChatPageResourcesController({
   // on each tick. Instead the WS 'slots' push carries the allowlist generation
   // (see useWebSocket), which invalidates this query only when the allowlist
   // actually changes — an edit on disk still propagates, without the churn.
-  const { data: sourceHostCfg, error: sourceHostError, errorUpdatedAt: sourceHostErrorAt } = useQuery<{ gitlab_hosts?: string[]; jira_hosts?: string[]; github_hosts?: string[]; bitbucket_server_hosts?: string[]; upload_max_mb?: number }>({
+  const { data: sourceHostCfg, error: sourceHostError, errorUpdatedAt: sourceHostErrorAt } = useQuery<{ gitlab_hosts?: string[]; jira_hosts?: string[]; github_hosts?: string[]; bitbucket_server_hosts?: string[]; gerrit_hosts?: string[]; upload_max_mb?: number }>({
     queryKey: ['dashboardConfig'],
     queryFn: fetchDashboardConfig,
     staleTime: 30_000,
@@ -188,6 +190,7 @@ export function useChatPageResourcesController({
   const jiraSourceHosts = sourceHostCfg?.jira_hosts ?? []
   const githubSourceHosts = sourceHostCfg?.github_hosts ?? []
   const bitbucketServerSourceHosts = sourceHostCfg?.bitbucket_server_hosts ?? []
+  const gerritSourceHosts = sourceHostCfg?.gerrit_hosts ?? []
   // Operator link rules (dashboard.link_patterns) are registered into the
   // autolink registry by the app shell (useConfigAutolinkRules), so every
   // surface linkifies regardless of whether a chat page has rendered. This
@@ -202,6 +205,8 @@ export function useChatPageResourcesController({
   githubSourceHostsRef.current = githubSourceHosts
   const bitbucketServerSourceHostsRef = useRef(bitbucketServerSourceHosts)
   bitbucketServerSourceHostsRef.current = bitbucketServerSourceHosts
+  const gerritSourceHostsRef = useRef(gerritSourceHosts)
+  gerritSourceHostsRef.current = gerritSourceHosts
   const indexedSourceLinks = sourceLinkIndex.current.update(
     activeSlot,
     messages,
@@ -209,6 +214,7 @@ export function useChatPageResourcesController({
     jiraSourceHosts,
     githubSourceHosts,
     bitbucketServerSourceHosts,
+    gerritSourceHosts,
   )
   // One scan, one dedup map, two panels: the extractor returns pull requests and
   // issues together (they share the per-role cap), and the two side-panel tabs
@@ -438,8 +444,11 @@ export function useChatPageResourcesController({
     const newIssues = recordNewPullRequestLinks(seenSourceUrls, activeSlot, issueLinks)
     if (!newChanges && !newIssues) return
     persistSeenPullRequestLinks(seenSourceUrls)
-    if (newChanges) tabsCtl.openView('changes')
-    if (newIssues) tabsCtl.openView('issues')
+    // Automatic: a discovery focus, not a request, so a panel opened later
+    // with Pin Summary on still lands on Summary, and a Summary the landing
+    // chose keeps the focus (see `openView`).
+    if (newChanges) tabsCtl.openView('changes', { automatic: true })
+    if (newIssues) tabsCtl.openView('issues', { automatic: true })
     // tabsCtl is intentionally not a dependency: this effect reacts only to
     // source discovery, not tab focus or panel visibility changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -567,6 +576,27 @@ export function useChatPageResourcesController({
   }, [tabsCtl, dispatch, search.close])
 
 
+  /** Reveal the Crew (Workers) tab from the Crew Mode dispatch-notice button.
+   *
+   *  Host-owned because the find pane's open state lives only here (local to
+   *  `useMessageSearch`, and `shouldMountSidePanel` leaves the dock UNMOUNTED
+   *  while it is open, so a reveal that does not close Find mounts nothing).
+   *  The slot rebind + tab select + panel open is the SHARED
+   *  `openCrewSession` reveal (switch to the card's slot so the panel it opens
+   *  is that chat's, not the active one's in split view; select Workers; open
+   *  the dock) — reused rather than re-spelled, so there is ONE reveal path.
+   *  `keepPanel` is true: the button is a deliberate "open the Crew tab", so it
+   *  always reveals, on desktop and the mobile sheet alike. The one thing
+   *  `openCrewSession` does not do — close Find — is added here. This single
+   *  callback is threaded to every notice surface (single chat and split pane),
+   *  so there is no second copy. */
+  const handleOpenCrewTab = useCallback((slot: string) => {
+    openCrewSession(dispatch, slot, true)
+    search.close()
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- same as handleFolderOpen: `search.close` is a useCallback([]) and its enclosing object is rebuilt every render, so listing it would churn the onOpenCrewTab prop on every transcript row
+  }, [dispatch, search.close])
+
+
   // Open the diff panel from a file-change chip click. Closes the
   // markdown viewer and the activity panel so panels stay mutually exclusive.
   const handleOpenDiff = useCallback((filePath: string, modified: string, original: string) => {
@@ -658,6 +688,11 @@ export function useChatPageResourcesController({
     let canvas: HTMLCanvasElement | null = null
     try {
       canvas = await capture()
+    } catch (e) {
+      // A pane refusal (the packaged app's display-capture trust gate) is not
+      // a cancel: say so, or the snip button reads as broken.
+      if (!(e instanceof ScreenSnipRefusedError)) throw e
+      showActionError(i18nT('pages.chatPage.snip_refused_in_embedded_pane'))
     } finally {
       if (!canvas) endSnipHold(token)
     }
@@ -668,7 +703,7 @@ export function useChatPageResourcesController({
     }
     activeSnipTokenRef.current = token
     setSnipFrame(canvas)
-  }, [beginSnipHold, endSnipHold, activeSlotRef, setSnipFrame])
+  }, [beginSnipHold, endSnipHold, activeSlotRef, setSnipFrame, showActionError])
 
   /** Screen capture entry: cross-platform snip+crop when supported, else native macOS screenshot. */
   const handleCapture = useCallback(async () => {
@@ -872,6 +907,7 @@ export function useChatPageResourcesController({
     jiraSourceHostsRef,
     githubSourceHostsRef,
     bitbucketServerSourceHostsRef,
+    gerritSourceHostsRef,
     panelSources,
     panelIssues,
     selectedSourceUrl,
@@ -887,6 +923,7 @@ export function useChatPageResourcesController({
     handleFileOpen,
     handleOpenWorkingTreeDiff,
     handleFolderOpen,
+    handleOpenCrewTab,
     handleArtifactOpen,
     handleOpenDiff,
     handleFileSave,

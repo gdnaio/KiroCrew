@@ -125,8 +125,10 @@ def seeded_memory_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
             store.close()
         db_file = resolve_store_path(DEFAULT_MEMORY_STORE)
     # Closing the last handle checkpointed the WAL, so the one file IS the database.
-    # A sidecar left behind would mean the copy below silently drops rows.
-    assert not Path(f"{db_file}-wal").exists()
+    # A -wal with content left behind would mean the copy below silently drops rows;
+    # the store keeps an emptied -wal on close (sqlite_wal.keep_wal_on_close).
+    wal = Path(f"{db_file}-wal")
+    assert not wal.exists() or wal.stat().st_size == 0
     assert _rows(db_file) == _SEED_ROWS
     return db_file
 
@@ -655,6 +657,25 @@ class TestAFailedCopyIsCountedAndNotMistakenForASkip:
         result = mb.back_up_all_stores(keep=7)
         assert result == {"backed_up": 0, "skipped": 2, "pruned": 0, "failed": 0}
 
+    def test_the_cli_verb_exits_one_when_a_copy_failed(
+        self, live_store: VectorMemoryStore, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A store with no fresh backup must not read as success to a script.
+
+        The clean cases above (0 failed, any skipped) run the same verb and exit 0.
+        """
+        from types import SimpleNamespace
+
+        from kiro_crew.cli_commands import _memory_backup_cmd
+
+        with mock.patch.object(mb, "backup_store", side_effect=mb.MemoryBackupFailed("disk full")):
+            with pytest.raises(SystemExit) as exc:
+                _memory_backup_cmd("backup", SimpleNamespace(keep=7))
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert out.startswith("Backed up 0 store(s); removed 0 old; ")
+        assert " 0 failed;" not in out
+
 
 class TestRetentionIsBoundedAndCannotEmptyItself:
     def test_only_the_newest_keep_survive(self, live_store: VectorMemoryStore) -> None:
@@ -1134,7 +1155,12 @@ class TestRestoreIsNonDestructive:
 
         mb.restore_from_backup(backup, DEFAULT_MEMORY_STORE)
         mb.apply_pending_member_restores()
-        aside = list(src.parent.glob("memory.db.superseded.*"))
+        # The closed store's emptied -wal and its -shm go aside with the file they belong to.
+        aside = [
+            p
+            for p in src.parent.glob("memory.db.superseded.*")
+            if not p.name.endswith(("-wal", "-shm"))
+        ]
         assert len(aside) == 1
         assert aside[0].read_bytes() == b"this is not a sqlite database"
 

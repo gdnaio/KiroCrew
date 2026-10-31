@@ -12,7 +12,7 @@ from kiro_crew.config import KiroCrewConfig, config_dir
 from kiro_crew.config.loader import workspace_dir_for
 from kiro_crew.config.paths import project_agents_dir
 from kiro_crew.frontmatter import STEERING_LOADER, split_frontmatter
-from kiro_crew.hooks import safe_read_file_bytes_nolink, validate_file_path
+from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink, validate_file_path
 from kiro_crew.platform_compat import first_linked_ancestor, is_link_or_junction
 
 logger = logging.getLogger(__name__)
@@ -35,9 +35,25 @@ ESSENTIAL_MISSING_SKIP_SOURCE = "essential-context#missing-skipped"
 #: link) and that were left out instead of refusing the whole turn; the full
 #: label appends ``:<template>``.
 ESSENTIAL_UNREADABLE_SKIP_SOURCE = "essential-context#unreadable-skipped"
+#: Source-label prefix of the in-band notice that names steering documents over
+#: the per-file read cap, left out instead of refusing the whole turn; the full
+#: label appends ``:<template>``.
+ESSENTIAL_OVERSIZED_SKIP_SOURCE = "essential-context#oversized-skipped"
 _MAX_SKIPPED_LISTED = 10
 _MAX_DIRECTORY_ENTRIES = 2048
 _MAX_DOCUMENTS = 64
+_CONDITIONAL_INCLUSIONS = frozenset({"manual", "filematch", "auto"})
+
+
+def _steering_inclusion(fields: dict[str, str], path: Path) -> str:
+    """A steering file's ``inclusion`` mode; an absent or unrecognised value reads as ``always``."""
+    inclusion = fields.get("inclusion", "always").strip().casefold()
+    if inclusion == "always" or inclusion in _CONDITIONAL_INCLUSIONS:
+        return inclusion
+    logger.warning("Steering %s: unknown inclusion %r, read as always", path, inclusion)
+    return "always"
+
+
 # kiro-cli re-reads its declared resources for every request and drops whole
 # files once they total more than three bytes per token of the model's context
 # window: about 492,000 bytes for deepseek-3.2's 164,000 tokens, the smallest
@@ -93,6 +109,21 @@ class _UnreadableEssentialSourceError(MemberEssentialContextError):
     steering document refused this way is left out unread and named; every other
     source keeps failing closed.
     """
+
+
+class _OversizedEssentialSourceError(_UnreadableEssentialSourceError):
+    """An admitted source larger than the per-file read cap, ``_MAX_SOURCE_BYTES``.
+
+    Nothing past the cap is read. A steering document refused this way is left
+    out and named with its *size*, like any other unreadable steering, because
+    it could never fit the essentials envelope whole and a truncated prefix would
+    present partial rules as complete. Every other source keeps failing closed,
+    and the message names the file, its size and the cap.
+    """
+
+    def __init__(self, message: str, *, size: int) -> None:
+        super().__init__(message)
+        self.size = size
 
 
 #: Top-level workspace names the product itself writes as managed state. An entry
@@ -153,6 +184,7 @@ def _refuse_managed_source(path: Path) -> None:
                 if top in {
                     "members",
                     "member-rules",
+                    "member-records",
                     "backups",
                     "trust",
                 } or top.startswith(("memory", "lessons")):
@@ -239,12 +271,23 @@ def _read(path: Path, root: Path) -> str:
         _refuse_managed_source(Path(admitted))
         # Pin this admitted parent, not the whole home. A racing ancestor
         # redirect cannot reach managed data allowed by the generic V1 gate.
-        data = safe_read_file_bytes_nolink(
-            str(path),
-            within_root=str(Path(admitted).parent),
-            max_bytes=_MAX_SOURCE_BYTES,
-            allow_truncate=False,
-        )
+        try:
+            data = safe_read_file_bytes_nolink(
+                str(path),
+                within_root=str(Path(admitted).parent),
+                max_bytes=_MAX_SOURCE_BYTES,
+                allow_truncate=False,
+            )
+        except FileTooLargeError as exc:
+            # Not an OSError or ValueError, so without this it escaped with no path.
+            # The size is the one the read measured on the descriptor it opened;
+            # an error without a measured size fails closed instead of skipping,
+            # and the ValueError handler below names the path.
+            if exc.size is None:
+                raise MemberEssentialContextError(str(exc)) from exc
+            raise _OversizedEssentialSourceError(
+                f"Essential source {path}: {exc}", size=exc.size
+            ) from exc
         if data is None:
             raise _UnreadableEssentialSourceError(
                 f"Essential source {path}: missing, unreadable, or outside the admitted "
@@ -273,6 +316,8 @@ def _read_implicit_guide(path: Path, root: Path) -> str | None:
     """
     try:
         return _read(path, root)
+    except _OversizedEssentialSourceError:
+        raise
     except MemberEssentialContextError as exc:
         reason = str(exc.__cause__ or exc)
         logger.warning("Project guide %s not loaded: %s", path, reason)
@@ -373,6 +418,35 @@ def _skipped_unreadable_note(unreadable: list[Path], template: str) -> tuple[str
         f"{'was' if len(unique) == 1 else 'were'} left out: {listed}. The host may "
         "still load them natively, so their text can appear elsewhere in your context; "
         "this note only says the snapshot does not carry them.",
+    )
+
+
+def _skipped_oversized_note(
+    oversized: list[tuple[Path, int]], template: str
+) -> tuple[str, str] | None:
+    """The in-band note naming steering documents over the read cap, or ``None``.
+
+    Each entry is ``(path, measured size in bytes)``. The file is not read past
+    the cap and is left out whole, so the member starts and the agent does not assume
+    its contents; the note gives the size and the cap so the user knows what to
+    trim. kiro-cli applies its own limits when it loads the file natively.
+    """
+    unique = list(dict.fromkeys(oversized))
+    if not unique:
+        return None
+    listed = ", ".join(f"{path} ({size:,} bytes)" for path, size in unique[:_MAX_SKIPPED_LISTED])
+    more = len(unique) - _MAX_SKIPPED_LISTED
+    if more > 0:
+        listed += f", and {more} more"
+    return (
+        f"{ESSENTIAL_OVERSIZED_SKIP_SOURCE}:{template}",
+        f"STEERING NOT IN THIS SNAPSHOT. {len(unique)} steering "
+        f"file{'' if len(unique) == 1 else 's'} {'is' if len(unique) == 1 else 'are'} "
+        f"over the {_MAX_SOURCE_BYTES:,}-byte per-file limit and "
+        f"{'was' if len(unique) == 1 else 'were'} left out: {listed}. The host may "
+        "still load them natively, so their text can appear elsewhere in your context; "
+        "this note only says the snapshot does not carry them. To load one here, "
+        "ask the user to shorten it or split it into smaller files.",
     )
 
 
@@ -627,6 +701,18 @@ def resolve_template_path(template: str, project: str | None = None) -> Path | N
             spec_path = agent_spec_path(template)
         except ValueError as exc:
             raise MemberEssentialContextError(f"Essential template {template!r}: {exc}") from exc
+    if spec_path is None:
+        # A crewmate's own config lives in the mate store, not the user-level
+        # agents dir the picker reads. Mirror the resolution order the KAS and
+        # loader seams use: user-level first, then the mate scope, before giving
+        # up. The mate file is a full, trusted custom-agent spec, so it is read
+        # the same way as a user-level one.
+        from kiro_crew.config.paths import mate_agents_dir
+
+        try:
+            spec_path = agent_spec_path(template, agents_dir=mate_agents_dir())
+        except ValueError as exc:
+            raise MemberEssentialContextError(f"Essential template {template!r}: {exc}") from exc
     return spec_path
 
 
@@ -702,6 +788,7 @@ def documents_for_member(
     trigger_text: str = "",
     inherits_default_resources: bool = True,
     core_sources_out: set[str] | None = None,
+    template_dir: str | None = None,
 ) -> list[tuple[str, str]]:
     """Read actual project instructions and the owner's declared template sources.
 
@@ -721,6 +808,10 @@ def documents_for_member(
     out. Every other returned document (global and project steering, the
     conditional-guide index, ``AGENTS.md`` and the declared ``file://``
     resources) is a guide the caller may drop whole.
+
+    *template_dir*, used only when *project* is ``None``, is searched for the
+    template under its ``.kiro/agents`` (and anchors that template's relative
+    prompt). No guide, steering or resource is read from it.
     """
     from kiro_crew.agent import is_managed_prompt
     from kiro_crew.agent_discovery import _read_agent_spec
@@ -731,6 +822,7 @@ def documents_for_member(
     linked: list[Path] = []
     missing: list[Path] = []
     unreadable: list[Path] = []
+    oversized: list[tuple[Path, int]] = []
     project_root = _admitted_project_root(project)
 
     def _mark_core(source: str) -> None:
@@ -746,6 +838,7 @@ def documents_for_member(
             else (
                 _skipped_linked_note(linked),
                 _skipped_unreadable_note(unreadable, template),
+                _skipped_oversized_note(oversized, template),
                 _skipped_managed_note(skipped, template),
                 _missing_declared_note(
                     [path for path in missing if path.suffix.lower() == ".md"], template
@@ -768,15 +861,20 @@ def documents_for_member(
                 if not steering:
                     raise
                 # Contained and admitted, but the descriptor read refused it (a
-                # hard link an installer placed, a non-link reparse point). Left
-                # out unread and named, as a linked steering entry is.
+                # hard link an installer placed, a non-link reparse point) or it
+                # is over the read cap. Left out unread and named, as a linked
+                # steering entry is. The read precedes the inclusion check, so
+                # this holds for every inclusion mode.
                 logger.warning("Steering %s not loaded: %s", path, exc)
-                unreadable.append(path)
+                if isinstance(exc, _OversizedEssentialSourceError):
+                    oversized.append((path, exc.size))
+                else:
+                    unreadable.append(path)
                 return
         if steering:
             fields, _ = split_frontmatter(body, STEERING_LOADER)
-            inclusion = fields.get("inclusion", "always").strip().casefold()
-            if inclusion in {"manual", "filematch", "auto"}:
+            inclusion = _steering_inclusion(fields, path)
+            if inclusion in _CONDITIONAL_INCLUSIONS:
                 if conditional_index:
                     import hashlib
                     import re
@@ -830,10 +928,6 @@ def documents_for_member(
                             f"Essential source {path}: too many documents"
                         )
                 return
-            if inclusion != "always":
-                raise MemberEssentialContextError(
-                    f"Essential source {path}: unknown steering inclusion {inclusion!r}"
-                )
         seen.add(Path(os.path.abspath(path)))
         documents.append((str(path), body))
         if len(documents) > _MAX_DOCUMENTS:
@@ -866,7 +960,8 @@ def documents_for_member(
             for path in _matches(project_root, ".kiro/steering/**/*.md", skipped, linked):
                 add(path, project_root, steering=True)
 
-    spec_path = resolve_template_path(template, project)
+    template_root = project or template_dir
+    spec_path = resolve_template_path(template, template_root)
     if spec_path is None:
         if template != "kirocrew":
             raise MemberEssentialContextError(f"Essential template {template!r}: not found")
@@ -891,10 +986,22 @@ def documents_for_member(
         if prompt.startswith("file://"):
             path = Path(prompt[7:]).expanduser()
             if path.is_absolute():
-                add(path, absolute_root)
+                # An absolute persona is also contained by the template_dir
+                # that stood in for a missing project. Declared resources keep
+                # absolute_root, so nothing else is read from that directory.
+                template_root_path = (
+                    None if project_root is not None else _admitted_project_root(template_dir)
+                )
+                persona_root = (
+                    template_root_path
+                    if template_root_path is not None
+                    and spec_path.is_relative_to(template_root_path)
+                    else absolute_root
+                )
+                add(path, persona_root)
                 _mark_core(str(path))
             else:
-                resolved = resolve_relative_prompt_path(path, spec_path, project)
+                resolved = resolve_relative_prompt_path(path, spec_path, template_root)
                 if resolved is not None:
                     add(*resolved)
                     _mark_core(str(resolved[0]))
@@ -1128,13 +1235,8 @@ def projected_resource_documents(definition: dict, cwd: str) -> dict[str, str]:
             continue
         if "steering" in path.parts:
             fields, _ = split_frontmatter(body, STEERING_LOADER)
-            inclusion = fields.get("inclusion", "always").strip().casefold()
-            if inclusion in {"manual", "auto", "filematch"}:
+            if _steering_inclusion(fields, path) in _CONDITIONAL_INCLUSIONS:
                 continue
-            if inclusion != "always":
-                raise MemberEssentialContextError(
-                    f"Essential source {path}: unknown inclusion {inclusion!r}"
-                )
         documents[str(path)] = body
     return documents
 
@@ -1166,7 +1268,7 @@ def kiro_launch_documents(template: str, project: str | None) -> list[tuple[str,
             logger.warning("Steering %s not loaded: %s", path, exc)
             continue
         fields, _ = split_frontmatter(body, STEERING_LOADER)
-        if fields.get("inclusion", "always").strip().casefold() == "always":
+        if _steering_inclusion(fields, path) == "always":
             declared[str(path)] = body
     return list(declared.items())
 

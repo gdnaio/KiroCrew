@@ -63,6 +63,7 @@ from kiro_crew.safety_override import safety_override
 from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.start_priority import person_priority
 from kiro_crew.telegram.attachments import process_telegram_attachments
+from kiro_crew.telegram.client import frame_reply_context_for_message
 from kiro_crew.telegram.renderer import TelegramApprovalDecider as _APPROVAL_REGISTRY
 from kiro_crew.telegram.transport import TELEGRAM_CAPABILITIES
 
@@ -88,7 +89,7 @@ async def _run_turn(
     reply_thread: int | None,
     interpret_commands: bool,
     drain: bool,
-) -> None:
+) -> bool:
     """Run one model turn for a message ``handle_message`` admitted, then drain.
 
     By here the message has passed governance, admission and activation, is
@@ -278,8 +279,16 @@ async def _run_turn(
             attachment_result = await process_telegram_attachments(self.client, msg.attachments)
             attachment_temp_paths = list(attachment_result.temp_paths)
             text = append_attachment_context(text, attachment_result)
+        # Fold the replied-to message's quoted content onto the agent-facing
+        # text HERE — after activation and command parsing, once per turn (an
+        # album arrives already merged, carrying only its head member's
+        # reply_context; a queue replay has already framed each entry and
+        # carries no reply_context). Screened, audited and fenced inside
+        # frame_reply_context; kept out of msg.text so a quoted @handle never
+        # reached the mention gate.
+        text = frame_reply_context_for_message(msg, text, session_key=session_key)
         if not text:
-            return
+            return False
         # Publish this turn's session identity so managed MCP tools resolve
         # X-Session-Key; one shared writer lives in messaging.identity.
         await facade.publish_turn_identity(self.sessions, session_key)
@@ -369,6 +378,7 @@ async def _run_turn(
             closing_gate=turn_ceiling.gate(
                 session_key, lambda: self.sessions.begin_turn(session_key)
             ),
+            undelivered_watch_key=session_key,
         )
         accumulated = await driver.run(full_message)
 
@@ -703,6 +713,7 @@ async def _run_turn(
     # necessarily the person who queued during it.
     if drain:
         await self._drain_queue(session_key)
+    return True
 
 
 def _persist_turn(

@@ -32,6 +32,7 @@
  * and a narrow entry must precede the broader one it refines.
  */
 import type React from 'react'
+import ElicitationCard from './ElicitationCard'
 import ThinkingBlock from './ThinkingBlock'
 import ToolCallLine from './ToolCallLine'
 import NudgeCard, { nudgeMatchesLoop } from './NudgeCard'
@@ -39,10 +40,12 @@ import ConversationCard, { CARD_ROLE } from '../../cards/ConversationCard'
 import RecoveryCard, { opensTurn, resolveInjectCard } from './RecoveryCard'
 import { SystemNoticeRow, isSystemNoticeRow } from './CompactionCard'
 import SkillLoadCard, { isSkillLoadRow } from './SkillLoadCard'
-import { ErrorCard, SESSION_START_REPEAT_REFUSAL_AT, capabilityRefusal, isAppAgentRefused, isAuthRequired, isContextOverflow, isKiroCliMissing, isModelUnentitled, isSessionStartFailed, isTurnTimeout, isUsageLimit, sessionStartFailureStreak, type CapabilityFix, type FreshSessionState } from './ErrorCard'
-import { FEATURE_REQUEST_FORM_URL, isFeatureRequestRow } from '../../prompts/featureRequest'
+import { ErrorCard, SESSION_START_REPEAT_REFUSAL_AT, capabilityRefusal, isAppAgentRefused, isAuthRequired, isContextOverflow, isImageRepair, isKiroCliMissing, isModelUnentitled, isSessionStartFailed, isTurnTimeout, isUsageLimit, sessionStartFailureStreak, type CapabilityFix, type FreshSessionState, type RepairImagesState } from './ErrorCard'
+import { isFeatureRequestRow } from '../../prompts/featureRequest'
+import { feedbackTracker } from '../../feedbackTracker'
 import NoticeCard from './NoticeCard'
-import { resolveTransientNotice } from './transientNotice'
+import { resolveGatewayNotice } from './gatewayNotice'
+import CrewDispatchNoticeCard from './CrewDispatchNoticeCard'
 import WorkflowRunCard, { extractWorkflowRunId, isWorkflowRunTool } from './WorkflowRunCard'
 import SubagentRunCard, { extractSpawnRunLaunch, isSpawnRunTool } from './SubagentRunCard'
 import WorkflowCompletionCard, { isWorkflowCompletionMessage } from './WorkflowCompletionCard'
@@ -114,12 +117,15 @@ export interface TranscriptRendererOptions {
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
   /** Open a directory in the host's side panel. Same #3300 blocker. */
   onFolderOpen?: (path: string) => void
+  /** Reveal the Crew (Workers) tab from the Crew Mode dispatch-notice button.
+   *  Host-owned because it must close the find pane (which keeps the dock
+   *  unmounted while open) and rebind a background pane's slot to the active one
+   *  before opening — neither reachable from the card. Absent (a side/embedded
+   *  chat, a crew window) leaves the card's button inert, the same opt-in shape
+   *  as the other host reveals above. */
+  onOpenCrewTab?: (slot: string) => void
   /** "Show in side panel" on a sub-agent completion card. Same #3300 blocker. */
   onOpenSubagentPanel?: (parsed: ParsedSubagentCompletion) => void
-  /** How this host opens its Subagents view, for the `spawn_run` launch card.
-   *  Unset on the chat page (the card drives the chat store itself); the
-   *  Members page passes its own panel's opener. */
-  onOpenSubagents?: () => void
   /** Expanded-state map for tool rows, held ABOVE the row: a virtualised or
    *  remounted transcript unmounts the row and would otherwise forget it. */
   toolDisclosure?: Record<string, boolean>
@@ -179,6 +185,12 @@ export interface TranscriptRendererOptions {
   onFreshSession?: () => void
   /** Where that press stands, for the card's spinner and its "done" line. */
   freshSession?: FreshSessionState
+  /** Fix for the newest `image_repair` row: downscale the oversized images in
+   *  the slot's transcript in place, then re-issue the interrupted turn. Omitted
+   *  on a surface that cannot repair a session. */
+  onRepairImages?: () => void
+  /** Where that press stands, for the card's spinner and its "done" line. */
+  repairImages?: RepairImagesState
   /** Draw the assistant rows as a CREWMATE speaking: avatar + name + time on
    *  the first message of a run, one bordered bubble per message, grouped
    *  corners (components/chat/crewmateBubbles). Set by the Members page for a
@@ -281,6 +293,25 @@ export function contextOverflowIsNewest(messages: readonly ChatMessage[]): boole
   return isContextOverflow(messages[idx])
 }
 
+/** True when the newest error row is a many-image dimension wedge
+ *  (`isImageRepair`) and nothing after it opens a new turn. The row offers
+ *  "Repair images and resume" instead of Resume, and `newestErrorOwnsRecovery`
+ *  hides the composer's Resume too. */
+export function imageRepairIsNewest(messages: readonly ChatMessage[]): boolean {
+  const idx = lastErrorIndex(messages)
+  if (idx < 0) return false
+  for (let j = idx + 1; j < messages.length; j++) {
+    const row = messages[j]
+    // The repair route itself posts a `session_reload` SYSTEM-NOTICE assistant
+    // row after the teardown; it is not real assistant output, so skip it before
+    // the role check or this would return false the moment a repair runs and the
+    // card would lose its `done`/`done_not_resumed` state.
+    if (isSystemNoticeRow(row)) continue
+    if (row.role === 'assistant' || opensTurn(row)) return false
+  }
+  return isImageRepair(messages[idx])
+}
+
 /** True when the newest error row is a refused app-owned agent turn
  *  (`isAppAgentRefused`) and nothing after it opens a new turn. The row
  *  withholds Resume (a retry re-runs the same refusal); `newestErrorOwnsRecovery`
@@ -318,7 +349,7 @@ function capabilityRefusalIsNewest(messages: readonly ChatMessage[]): boolean {
  *  composer's gate by joining it here. Typing still works. */
 export function newestErrorOwnsRecovery(messages: readonly ChatMessage[]): boolean {
   return featureRequestRefusalIsNewest(messages) || sessionStartRepeatIsNewest(messages)
-    || contextOverflowIsNewest(messages) || appAgentRefusalIsNewest(messages)
+    || contextOverflowIsNewest(messages) || imageRepairIsNewest(messages) || appAgentRefusalIsNewest(messages)
     || capabilityRefusalIsNewest(messages)
 }
 
@@ -364,6 +395,22 @@ export function createTranscriptRenderers(
       roles: ['notice'],
       match: m => m.meta?.kind === 'warm_task_brief_claim',
       render: () => null,
+    },
+    {
+      // The gateway's one-per-turn Crew Mode dispatch notice: a dispatched crew
+      // member is in the Crew (Workers) tab, not the session list, so this row
+      // names that tab and opens it. The gateway decides when it appears; the
+      // card only renders localized copy and the button.
+      id: 'crew_dispatch_notice',
+      roles: ['notice'],
+      match: m => m.meta?.kind === 'crew_dispatch_notice',
+      render: (_m, ctx) => ctx.row(
+        <CrewDispatchNoticeCard
+          key={ctx.key}
+          slot={o.slot}
+          onOpenCrewTab={o.onOpenCrewTab}
+        />,
+      ),
     },
     // ── Shape-matched rows, ahead of anything keyed only by role ──
     {
@@ -423,8 +470,17 @@ export function createTranscriptRenderers(
       render: (m, ctx) => {
         const launch = extractSpawnRunLaunch(m)
         if (!launch) return toolLine(m, ctx)
-        return ctx.row(<SubagentRunCard key={ctx.key} launch={launch} slot={o.slot ?? ''} onOpenPanel={o.onOpenSubagents} />, true)
+        return ctx.row(<SubagentRunCard key={ctx.key} launch={launch} slot={o.slot ?? ''} />, true)
       },
+    },
+    {
+      // An MCP server's own question to the person (a form or a link). The SDK
+      // default draws it read-only because it has no slot to answer on; every
+      // dashboard surface that knows its slot (the page, a pane, a crew window)
+      // takes this entry instead, so the card answers on the slot it belongs to.
+      id: 'elicitation',
+      roles: ['elicitation'],
+      render: (m, ctx) => ctx.row(<ElicitationCard message={m} slot={o.slot ?? null} />),
     },
     {
       // Replaces the default pill with the live, store-connected tool line:
@@ -635,11 +691,11 @@ export function createTranscriptRenderers(
       id: 'error',
       roles: ['error'],
       render: (m, ctx) => {
-        // A transient-5xx notice the gateway is already retrying against is
-        // routine status, not a failure: localized copy on a soft NoticeCard.
-        // Only its terminal shape ("please try again") stays a red ErrorCard,
-        // with the same localized text.
-        const transient = resolveTransientNotice(m, ctx.messages, ctx.index)
+        // A gateway status row draws localized copy keyed on its notice token.
+        // A transient-5xx retry the gateway is already running is routine
+        // status, not a failure: a soft NoticeCard. Every other family keeps the
+        // red ErrorCard, with the localized text.
+        const transient = resolveGatewayNotice(m, ctx.messages, ctx.index)
         if (transient?.card === 'notice') {
           return ctx.row(<NoticeCard content={transient.text} tone={transient.tone} />)
         }
@@ -657,10 +713,11 @@ export function createTranscriptRenderers(
         // never went out, so a retry CAN help); a usage limit under a user row
         // the pill did not stamp is some other turn's; and a limit hit after
         // the user typed on in the same slot belongs to THAT turn, so it keeps
-        // today's card, Continue included. The route is a constant of the flow,
-        // never read from the row: the stamp only selects it.
+        // today's card, Continue included. The route is the tracker's, fixed
+        // for the page load (`feedbackTracker`), never read from the row: the
+        // stamp only selects it.
         const featureRequestFormUrl =
-          offersFeatureRequestForm(m) && isFeatureRequestRefusal(ctx.messages, ctx.index) ? FEATURE_REQUEST_FORM_URL : undefined
+          offersFeatureRequestForm(m) && isFeatureRequestRefusal(ctx.messages, ctx.index) ? feedbackTracker().formUrl : undefined
         const newest = ctx.index === lastErrorIndex(ctx.messages)
         // The same session start failed twice in a row (Resume between them
         // re-issued it): a third press would fail the same way, and the server
@@ -676,9 +733,11 @@ export function createTranscriptRenderers(
         // is the transcript's newest state: an older row, or one a later turn
         // already answered past, is settled and its session may already be new.
         const overflow = isContextOverflow(m)
+        const imageRepair = isImageRepair(m)
         return ctx.row(
           <ErrorCard
             content={transient ? transient.text : m.content}
+            resumeContent={transient?.card === 'error' ? transient.resumeText : undefined}
             meta={m.meta}
             // A rejection the backend says no retry can fix never offers Continue,
             // even when this row is the newest and the turn was interrupted:
@@ -702,8 +761,15 @@ export function createTranscriptRenderers(
             onOpenCapabilities={openCapabilities}
             onOpenTurnLimit={isTurnTimeout(m) ? o.onOpenTurnLimit : undefined}
             turnLimitSlot={isTurnTimeout(m) ? o.slot : undefined}
-            onFreshSession={overflow && newest && contextOverflowIsNewest(ctx.messages) ? o.onFreshSession : undefined}
+            onFreshSession={
+              (overflow && newest && contextOverflowIsNewest(ctx.messages)) ||
+              (imageRepair && newest && imageRepairIsNewest(ctx.messages))
+                ? o.onFreshSession
+                : undefined
+            }
             freshSession={o.freshSession}
+            onRepairImages={imageRepair && newest && imageRepairIsNewest(ctx.messages) ? o.onRepairImages : undefined}
+            repairImages={o.repairImages}
           />,
         )
       },

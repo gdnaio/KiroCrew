@@ -21,6 +21,8 @@ export interface CronJob {
    * skips its memory, lessons, steering and skills injection; member V2 retains
    * its complete essential guidance and protected identity. Default false. */
   minimal_context?: boolean
+  /** Whole-run time limit in seconds (the cron service's `timeout_secs`). */
+  timeout_secs?: number
   last_run_ts?: number; next_run_ts?: number | null; has_result?: boolean; has_slot?: boolean
   /** Retry telemetry for the LAST completed run: how many transient-backend
    *  retries it took (0 = none needed) and when that run finished. Absent on
@@ -29,6 +31,13 @@ export interface CronJob {
   /** The `last_run_ts` `last_retry_count` describes; a mismatch means the count
    *  belongs to an earlier run (a cancelled run advances `last_run_ts` only). */
   last_retry_run_ts?: number
+  /** Failed runs in a row; a success resets it to 0. Absent on an older gateway. */
+  consecutive_failures?: number
+  /** Epoch seconds before which a repeatedly failing job will not fire, or null
+   *  when it is not backing off. `next_run_ts` already includes the shift; this
+   *  says why the next run moved. Compare against the clock: a past value means
+   *  the backoff has elapsed. */
+  failure_backoff_until?: number | null
   /** IANA timezone the cron expression's hour/minute fields are stored in.
    * Absent / null for legacy jobs created without an explicit TZ — treat as UTC. */
   timezone?: string | null
@@ -61,6 +70,10 @@ export interface CronJob {
   /** False for a job that runs on a fresh session every fire. The form does not
    *  edit it; it only reads it to disable the chat-folder picker. */
   persistent_session?: boolean
+  /** Consecutive failed runs that auto-pause this job (0..10000). 0 never
+   *  pauses; a job at 0 or above 5 backs off from its 5th failure instead.
+   *  Absent on an older gateway. */
+  auto_pause_after_failures?: number
   /** Chat session that owns this job — ownership decides chat-side reachability
    * (cron_list only lists a session its own jobs). Null for an ownerless job,
    * which is invisible to every chat session and manageable only from the

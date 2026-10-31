@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, type MutableRefObject, type Dispatch, t
 import { useQuery } from '@tanstack/react-query'
 import { store, type AppDispatch, type AppStore } from '../store'
 import type { ErrorReport } from '../utils/errorReport'
-import { forkSlot, switchSlot, createSlot, type FollowupItem, setPendingInput, clearFollowupCard, openActivityToTab } from '../store/chatSlice'
+import { captureForkOrigin, forkMayOpen, forkOpenSettled, forkOpenStarted, forkSlot, switchSlot, createSlot, type FollowupItem, setPendingInput, dismissFollowupItem, openActivityToTab, requestSlotFolderOpen } from '../store/chatSlice'
 import { api } from '../api/client'
 import { safeSetSessionItem } from '../utils/safeStorage'
 import { extractPromptFromToken, extractSlackContextFromToken } from '../utils/tokenPrompt'
@@ -21,7 +21,7 @@ interface ForkSessionOptions {
 
 /**
  * Fork from a transcript row: reads whether a tail fork is offered, forks the slot at that
- * row, and switches to the new session.
+ * row, and switches to the new session unless the user opened another one meanwhile.
  *
  * Called from ChatPage at the position its statements held, so React registers its effects in the same order.
  */
@@ -37,6 +37,17 @@ export function useForkSession({
     if (!activeSlot) return
     let direction: 'head' | 'tail' = 'head' // hoisted so the catch advises the same way
     let control: string | undefined
+    // Pending until the child is active or the fork failed (the `finally`), so
+    // the chat page does not open another session if this one leaves the list.
+    // Released once: `switchSlot.pending` makes the child active synchronously,
+    // so the count drops before the child's transcript fetch, not after it.
+    let released = false
+    const release = () => { if (!released) { released = true; dispatch(forkOpenSettled()) } }
+    dispatch(forkOpenStarted())
+    // Read after the start, which numbers this fork (`requestSeq`), and before
+    // the config fetch and the fork request: the user can open another
+    // session while either runs, and the fork then must not take the view.
+    const origin = captureForkOrigin(store.getState())
     try {
       // Fork WITHOUT a prompt: an unsent composer draft must never be
       // auto-submitted into the freshly forked session. The
@@ -57,13 +68,24 @@ export function useForkSession({
       }
       const result = await dispatch(forkSlot({ slot: activeSlot, atIndex: visibleIndex, messageId, direction })).unwrap()
       if (result.ok) {
-        await dispatch(switchSlot(result.key))
+        if (forkMayOpen(store.getState(), origin)) {
+          const switching = dispatch(switchSlot({ key: result.key, requestSeq: origin.seq }))
+          // The child inherits this session's folder, which can be collapsed when
+          // the session was opened from the command bar, a tab or a link: open
+          // that path so the child's row shows. switchSlot.pending has already
+          // made the child active, so the request follows the activation.
+          dispatch(requestSlotFolderOpen({ key: result.key, folder_id: result.folder_id }))
+          release()
+          await switching
+        }
       } else {
         showTranscriptForkFailure(showActionError, result.code, result.error, direction, control)
       }
     } catch (e) {
       // A refusal is a non-2xx, so the thunk REJECTS: its code rides the rejection payload.
       showTranscriptForkFailure(showActionError, (e as { code?: string } | null)?.code, errMessage(e), direction, control)
+    } finally {
+      release()
     }
   }, [activeSlot, dispatch, forkCfg, showActionError])
   return {
@@ -223,7 +245,8 @@ export function useOpenFollowupSession({
 }: OpenFollowupSessionOptions) {
   // The post-create half both spawn routes share: open a session (scoped to
   // `project` when there is one), hand it the prompt, take the user to it, and
-  // only then clear the card. Every step fails CLOSED with the caller's message
+  // only then remove THIS item from the origin card. The other suggestions stay
+  // on the card, so the user finds them again on returning to the origin session. Every step fails CLOSED with the caller's message
   // for that step, so a route can name what it already left behind (the
   // worktree route names the reusable worktree) and no failure ever prefills
   // an unrelated conversation.
@@ -234,10 +257,11 @@ export function useOpenFollowupSession({
       folderId?: string | null
       originSlot: string | null
       originTs: number | undefined
+      originIndex: number
       fail: { notCreated: string; noSession: string; notOpened: string; notFocused: string }
     },
   ) => {
-    const { project, folderId, originSlot, originTs, fail } = target
+    const { project, folderId, originSlot, originTs, originIndex, fail } = target
     let slotKey = ''
     try {
       // `activate: false` on purpose: the slot must be SCOPED to its directory
@@ -287,7 +311,10 @@ export function useOpenFollowupSession({
     }
     if (store.getState().chat.activeSlot !== slotKey) throw new Error(fail.notFocused)
     dispatch(setPendingInput(item.prompt))
-    if (originSlot) dispatch(clearFollowupCard({ slot: originSlot, ts: originTs }))
+    // `originTs` pins the card the click came from, so a newer card that landed
+    // while the create was in flight is left alone; `item` lets the reducer find
+    // this suggestion even if a Skip shifted its index meanwhile.
+    if (originSlot) dispatch(dismissFollowupItem({ slot: originSlot, index: originIndex, ts: originTs, item }))
   }, [dispatch, mode])
   return {
     openFollowupSession,

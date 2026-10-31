@@ -358,7 +358,19 @@ class WorkflowScope:
             modes[key] = stricter_memory_mode(execution.memory_mode, modes.get(key, "persistent"))
         return self.store
 
-    async def prompt(self, context, key, text, *, is_new, agent, cwd, provider, resumed=False):
+    async def prompt(
+        self,
+        context,
+        key,
+        text,
+        *,
+        is_new,
+        agent,
+        cwd,
+        provider,
+        resumed=False,
+        skill_trigger_text: str | None = None,
+    ):
         await self.prepare(context, key)
         from kiro_crew.executors import run_in_embed_pool
 
@@ -390,6 +402,7 @@ class WorkflowScope:
             blocks_reads=self.memory_mode == "temporary",
             context_provider=provider,
             resumed=resumed,
+            skill_trigger_text=skill_trigger_text,
         )
         return full
 
@@ -445,8 +458,8 @@ _GENERIC_MEMORY_REFUSAL = "Workflow memory is unavailable; no Global fallback wa
 _WORKFLOW_HEADLINE_REFUSAL = "Workflow memory is unavailable; Global was not used"
 _MEMBER_BINDING_REASONS = frozenset({MEMBER_ON_GLOBAL_REASON, MEMBER_WITHOUT_IDENTITY_REASON})
 _MEMBER_BINDING_REMEDY = (
-    "To run workflows here, start a chat with no crewmate picked, or pick a crewmate "
-    "that has its own memory (every new crewmate gets one)."
+    "To run workflows here, start a chat with no mate picked, or pick a mate "
+    "that has its own memory (every new mate gets one)."
 )
 
 

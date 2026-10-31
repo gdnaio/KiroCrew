@@ -16,8 +16,8 @@ import asyncio
 import logging
 from typing import Any
 
-from kiro_crew.constants import DENY_CAUSE_APPROVAL_TIMEOUT
-from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
+from kiro_crew.constants import DENY_CAUSE_APPROVAL_TIMEOUT, DENY_CAUSE_APPROVAL_UNDELIVERABLE
+from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S, adoptable_reservation
 from kiro_crew.messaging.renderer import new_approval_nonce, nonce_eq
 
 logger = logging.getLogger("kiro_crew.discord.renderer")
@@ -64,6 +64,11 @@ class DiscordApprovalDecider:
     #: per-turn sweep would otherwise drop a prompt the user is still looking at.
     _DETACHED: set[str] = set()
 
+    #: Keys whose recorded refusal came from :meth:`refuse_undelivered`, so the
+    #: adopting ``__call__`` can name the cause instead of reading it as a
+    #: human's Deny. Cleared on every exit that drops the key.
+    _UNDELIVERED: set[str] = set()
+
     def __init__(self, *, session_key: str) -> None:
         self._session_key = session_key
         #: Why the LAST call denied -- see ``messaging.driver.ApprovalDecider``.
@@ -99,14 +104,20 @@ class DiscordApprovalDecider:
         :meth:`discard_session` must leave it alone. Pass it whenever the prompt
         outlives its own turn -- the window then closes at the decision, at the
         wait's timeout, or at a ``retire``, and nowhere else.
+
+        A reservation another event loop left behind is no reservation at all
+        (:func:`~kiro_crew.messaging.approval.adoptable_reservation`): it is
+        replaced, so the wait blocks on a future this loop can resolve.
         """
         nonce = new_approval_nonce()
         cls._NONCES[key] = nonce
         if detached:
             cls._DETACHED.add(key)
-        reserved = cls._REGISTRY.get(key)
+        loop = asyncio.get_running_loop()
+        reserved = adoptable_reservation(cls._REGISTRY.get(key), loop)
         if reserved is None or reserved.done():
-            cls._REGISTRY[key] = asyncio.get_running_loop().create_future()
+            cls._REGISTRY[key] = loop.create_future()
+            cls._UNDELIVERED.discard(key)
         return nonce
 
     @classmethod
@@ -127,6 +138,7 @@ class DiscordApprovalDecider:
         cls._NONCES.pop(key, None)
         cls._REGISTRY.pop(key, None)
         cls._DETACHED.discard(key)
+        cls._UNDELIVERED.discard(key)
 
     @classmethod
     def refuse_undelivered(cls, key: str) -> None:
@@ -146,6 +158,7 @@ class DiscordApprovalDecider:
         reserved = cls._REGISTRY.get(key)
         if reserved is not None and not reserved.done():
             reserved.set_result(False)
+            cls._UNDELIVERED.add(key)
 
     @classmethod
     def discard_session(cls, session_key: str) -> None:
@@ -175,6 +188,7 @@ class DiscordApprovalDecider:
         ]:
             cls._REGISTRY.pop(k, None)
             cls._NONCES.pop(k, None)
+            cls._UNDELIVERED.discard(k)
 
     async def __call__(self, event: Any) -> bool:
         self.last_deny_cause = ""
@@ -184,7 +198,10 @@ class DiscordApprovalDecider:
         # and this wait starting, in which case the reservation holds the user's
         # decision and there is nothing left to await. Minting a fresh future
         # here would discard that decision and deny when the window elapsed.
-        reserved = DiscordApprovalDecider._REGISTRY.get(k)
+        # An entry from another event loop is not adopted: awaiting it raises
+        # instead of deciding, and a verdict on it belongs to an ended turn.
+        loop = asyncio.get_running_loop()
+        reserved = adoptable_reservation(DiscordApprovalDecider._REGISTRY.get(k), loop)
         if reserved is not None and reserved.done():
             if reserved.cancelled() or reserved.exception() is not None:
                 # A torn-down reservation, not a decision. Open a fresh window
@@ -192,8 +209,13 @@ class DiscordApprovalDecider:
                 reserved = None
             else:
                 try:
-                    return bool(reserved.result())
+                    answer = bool(reserved.result())
+                    if not answer and k in DiscordApprovalDecider._UNDELIVERED:
+                        # The prompt never reached the channel; nobody refused.
+                        self.last_deny_cause = DENY_CAUSE_APPROVAL_UNDELIVERABLE
+                    return answer
                 finally:
+                    DiscordApprovalDecider._UNDELIVERED.discard(k)
                     DiscordApprovalDecider._REGISTRY.pop(k, None)
                     DiscordApprovalDecider._NONCES.pop(k, None)
                     # Every exit that drops this key drops its detached mark with
@@ -201,12 +223,13 @@ class DiscordApprovalDecider:
                     # turn-end sweep for the life of the process, so the next
                     # request reusing it is swept by nothing.
                     DiscordApprovalDecider._DETACHED.discard(k)
-        fut: "asyncio.Future[bool]" = (
-            reserved if reserved is not None else asyncio.get_running_loop().create_future()
-        )
+        fut: "asyncio.Future[bool]" = reserved if reserved is not None else loop.create_future()
         DiscordApprovalDecider._REGISTRY[k] = fut
         try:
             answer = bool(await asyncio.wait_for(fut, _APPROVAL_TIMEOUT_S))
+            if not answer and k in DiscordApprovalDecider._UNDELIVERED:
+                self.last_deny_cause = DENY_CAUSE_APPROVAL_UNDELIVERABLE
+                return False
             # A button was pressed: a loop paused for approval in this session resumes.
             from kiro_crew.autonudge import release_approval_hold_for
 
@@ -233,6 +256,7 @@ class DiscordApprovalDecider:
                 logger.debug("autonudge.notify_approval_stalled failed", exc_info=True)
             return False  # deny-by-default on timeout
         finally:
+            DiscordApprovalDecider._UNDELIVERED.discard(k)
             DiscordApprovalDecider._REGISTRY.pop(k, None)
             # Retire the prompt's nonce with the decision window: a press on
             # the (now stale) buttons can never resolve a future request.

@@ -16,7 +16,7 @@ import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { createTestStore } from './helpers'
+import { createTestStore, expectWheelToScrollRow } from './helpers'
 import type { RootState } from '../store'
 
 const mockNavigate = vi.fn()
@@ -148,6 +148,30 @@ describe('EmbedTabStrip — initial tab resolution', () => {
     wrap(makeStore({ activeSlot: null }))
     expect(tabTitles()).toEqual(['Second Chat', 'Third Chat'])
     expect(mockNavigate).toHaveBeenCalledWith('/embed/chat/chat-3?sid=chat-3', { replace: true })
+  })
+
+  it('labels an untitled tab "Untitled session" and keeps its key only in the hover (#23084)', () => {
+    // The stored title of an untitled session can equal its key.
+    tabsWindow.__kirocrewTabs = ['chat-u', 'chat-2']
+    tabsWindow.__kirocrewActiveTabIndex = 0
+    wrap(makeStore({
+      activeSlot: null,
+      slots: [{ key: 'chat-u', title: 'chat-u' }, { key: 'chat-2', title: 'Second Chat' }] as unknown as Slots,
+    }))
+    expect(tabTitles()).toEqual(['Untitled session', 'Second Chat'])
+    const [untitled, titled] = screen.getAllByRole('tab')
+    expect(untitled.getAttribute('title')).toBe('Untitled session · chat-u')
+    expect(titled.getAttribute('title')).toBe('Second Chat')
+  })
+
+  it('shows the slug of a tab with no slot row, not "Untitled session" (#23084)', () => {
+    // A missing row means the title is unknown, not that the session has none.
+    // Before the slot list hydrates every restored tab is in that state.
+    tabsWindow.__kirocrewTabs = ['chat-gone']
+    tabsWindow.__kirocrewActiveTabIndex = 0
+    wrap(makeStore({ activeSlot: null, slots: [] as unknown as Slots }))
+    expect(tabTitles()).toEqual(['chat-gone'])
+    expect(screen.getByRole('tab').getAttribute('title')).toBe('chat-gone')
   })
 
   it('ignores malformed stored state and falls back to the active slot', () => {
@@ -377,9 +401,7 @@ describe('EmbedTabStrip — selection and scrolling', () => {
   it('turns vertical wheel movement into horizontal scrolling', () => {
     seed(['chat-1', 'chat-2'], 0)
     wrap(makeStore())
-    const strip = layOut(screen.getAllByRole('tab'))
-    fireEvent.wheel(strip, { deltaY: 120 })
-    expect(strip.scrollLeft).toBe(120)
+    expectWheelToScrollRow(stripOf(screen.getAllByRole('tab')))
   })
 })
 

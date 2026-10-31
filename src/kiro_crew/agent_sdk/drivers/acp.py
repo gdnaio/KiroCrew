@@ -67,6 +67,7 @@ __all__ = [
     "is_auth_failure_output",
     "kas_engine_gap",
     "kas_engine_unsupported_reason",
+    "kas_engine_verdict",
     "kiro_cli_resolves",
     "narrowed_agent_permissions",
     "provider_error_client",
@@ -273,6 +274,24 @@ def provider_label(provider: object) -> str:
     return _impl(provider)
 
 
+def _provider_backend(provider: object) -> object:
+    """The backend id *provider* talks to, or ``None`` for a shape that carries none.
+
+    Private, and kept out of ``__all__``: ``llm_helpers.provider_backend`` is the
+    public reader (``""`` on a miss); this one exists only for the ``harness``
+    metric attribute, which must tell a miss from kiro-cli's ``""``.
+
+    Thin delegation to :func:`kiro_crew.providers.acp._provider_backend`, the
+    shape check :func:`provider_label` resolves through, so the ``harness``
+    metric attribute (``metrics/harness.py``) reads the same answer the session
+    map persists without importing the providers layer. Function-local import
+    for the same reason as :func:`resolve_pin_spelling`.
+    """
+    from kiro_crew.providers.acp import _provider_backend as _impl
+
+    return _impl(provider)
+
+
 def catalog_row_would_drop(model_id: str, advertised: object) -> bool:
     """Whether the entitlement filter drops catalog row *model_id* against
     *advertised*.
@@ -285,6 +304,36 @@ def catalog_row_would_drop(model_id: str, advertised: object) -> bool:
     the same reason as :func:`resolve_pin_spelling`.
     """
     from kiro_crew.acp.client import catalog_row_would_drop as _impl
+
+    return _impl(model_id, advertised)  # type: ignore[arg-type]
+
+
+def advertised_model_ids(entries: object) -> list[str]:
+    """The model ids out of an ``availableModels``-shaped list, or ``[]``.
+
+    Thin delegation to :func:`kiro_crew.acp.client.advertised_model_ids`, the shared
+    shape parser of a live session's advertised list, so the dashboard's model-pin
+    validator (``dashboard/handlers/core_config_models.py``) reads a session's
+    evidence through the SDK surface instead of importing the ACP layer (the
+    agent-sdk-boundary gate refuses a new edge). Plain data in, a list of strings
+    out. Function-local import for the same reason as :func:`resolve_pin_spelling`,
+    which also keeps a patch of the client's name visible to the caller.
+    """
+    from kiro_crew.acp.client import advertised_model_ids as _impl
+
+    return _impl(entries)
+
+
+def model_is_unusable(model_id: str, advertised: object) -> bool:
+    """Whether *advertised* is known and excludes *model_id*.
+
+    Thin delegation to :func:`kiro_crew.acp.client.model_is_unusable`, the one
+    entitlement predicate the session-start withhold also applies, so the
+    dashboard's model-pin validator (``dashboard/handlers/core_config_models.py``)
+    and the wire cannot disagree. Plain data in, a bool out. Function-local import
+    for the same reason as :func:`resolve_pin_spelling`.
+    """
+    from kiro_crew.acp.client import model_is_unusable as _impl
 
     return _impl(model_id, advertised)  # type: ignore[arg-type]
 
@@ -421,6 +470,20 @@ def narrowed_agent_permissions(
     return {"rules": carried}
 
 
+def backend_delivers_spec_servers(backend: str) -> bool:
+    """Whether *backend* runs the servers an agent spec declares.
+
+    kiro-cli and KAS read the spec itself (``ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE``); a
+    backend with a mirror (``providers.mirrors.has_mirror``) is handed them in its
+    ``session/new`` array. A broker-only backend runs only the pooled stubs. Asked here
+    so a caller above the boundary need not import the mirror registry.
+    """
+    from kiro_crew.agent_sdk.backends import ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE
+    from kiro_crew.providers.mirrors import has_mirror
+
+    return backend in ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE or has_mirror(backend)
+
+
 def agent_spec_mcp_refs(agent: str) -> tuple[bool, list[tuple[str, list[str], bool]]]:
     """Per selectable backend: which of *agent*'s ``@server`` refs resolve to nothing.
 
@@ -523,18 +586,33 @@ def kas_engine_unsupported_reason() -> str | None:
 
     Blocking: one bounded spawn. Never raises.
     """
+    return kas_engine_verdict()[1]
+
+
+def kas_engine_verdict() -> tuple[bool | None, str | None]:
+    """``(offers_kas, reason)`` from the pinned kiro-cli's ``acp --help``.
+
+    ``offers_kas`` is ``True`` only for help text that RAN and names the engine,
+    ``False`` with the gap as *reason* for help text that ran without it, and
+    ``None`` for every unknown (no pinned binary, a failed spawn). The one probe
+    behind :func:`kas_engine_unsupported_reason`, read by the gateway's KAS floor,
+    which acts on a Kiro CLI pick only on ``True``.
+
+    Blocking: one bounded spawn. Never raises.
+    """
     from kiro_crew import kiro_cli
 
     try:
         binary, _unpinned = kiro_cli.pin_kiro_cli()
     except Exception:  # noqa: BLE001 - an unanswerable probe is unknown, not an error
-        return None
+        return None, None
     if binary is None:
-        return None
+        return None, None
     help_text = kiro_cli.kas_relay_help(binary)
     if help_text is None:
-        return None
-    return kas_engine_gap(help_text)
+        return None, None
+    gap = kas_engine_gap(help_text)
+    return gap is None, gap
 
 
 def claude_components_resolve() -> tuple[bool, bool]:
@@ -727,6 +805,29 @@ def self_served_install_command(backend: str) -> str:
     return launch_for(backend).install_command
 
 
+def self_served_wrong_version(backend: str) -> str:
+    """The release *backend*'s binary would run, when it is not the one Crew verified.
+
+    ``""`` when the binary does not resolve, when its release cannot be read, when it
+    is the verified one, and for every harness with no single verified release. Only
+    Copilot CLI has one (``COPILOT_VERIFIED_VERSION``): a session on any other release
+    is refused at the handshake, so an install row that only looked for the binary
+    would call a harness ready that refuses every chat. Read from the install's own
+    manifest, never by running it.
+    """
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_COPILOT, COPILOT_VERIFIED_VERSION
+
+    if backend == ACP_BACKEND_COPILOT:
+        from kiro_crew.acp.client import _resolve_self_served_bin
+        from kiro_crew.acp.harness.copilot import copilot_installed_version
+
+        binary, _searched_path = _resolve_self_served_bin(backend)
+        version = copilot_installed_version(binary) if binary else ""
+        if version and version != COPILOT_VERIFIED_VERSION:
+            return version
+    return ""
+
+
 def pi_components_resolve() -> tuple[bool, bool]:
     """``(adapter, pi_cli)`` -- the pi backend's two halves, separately.
 
@@ -847,6 +948,14 @@ def pi_install_command() -> str:
     return PI_INSTALL_COMMAND
 
 
+def claude_adapter_min_version() -> str:
+    """``CLAUDE_ACP_SETTING_SOURCES_MIN_VERSION`` as ``x.y.z`` -- the floor the
+    read-only Side Chat shape needs, read from the constant the check uses."""
+    from kiro_crew.acp import client as _client
+
+    return ".".join(str(part) for part in _client.CLAUDE_ACP_SETTING_SOURCES_MIN_VERSION)
+
+
 def claude_adapter_install_command() -> str:
     """``npm i -g <adapter package>`` -- the adapter's remedy, from the repo.
 
@@ -953,6 +1062,28 @@ def inherits_default_resources(work_dir: str | Path | None) -> bool:
     )
 
     return projection_inherits_default_resources(work_dir)
+
+
+def native_skill_view(
+    spec: dict[str, Any], source: Path, agent_name: str, *, crew_home_id: str
+) -> tuple[dict[str, Any] | None, bool, str | None]:
+    """*spec*'s native skill view as a Kiro spawn runs it: ``(view, search, refusal)``.
+
+    The skill projection's own transform (``project_agent_view``) for a spec read
+    by its path, judged as the shared runtime mounts it (a per-session
+    ``kirocrew-core`` element) and as if its workspace lends inherited skill trees.
+    Plain data in, plain data out.
+    """
+    from kiro_crew.acp.skill_projection import project_agent_view
+
+    return project_agent_view(
+        spec,
+        source,
+        agent_name,
+        crew_home_id=crew_home_id,
+        inherits_skills=True,
+        per_session_element=True,
+    )
 
 
 def skill_view_alias_census(agents_dir: "Path") -> dict[str, int]:

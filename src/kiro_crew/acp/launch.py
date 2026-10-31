@@ -51,7 +51,7 @@ from kiro_crew.acp.transport_framing import _STDOUT_BUFFER_LIMIT
 from kiro_crew.agent_sdk.backends import launch_for
 from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
 from kiro_crew.env import describe_search_path, mise_data_dir
-from kiro_crew.sandbox import RLIMIT_PROFILE_SESSION_HOST
+from kiro_crew.sandbox import RLIMIT_PROFILE_SESSION_HOST, ssh_auth_sock_consent_notice
 
 # The client's logger name, because the helpers below were the client's and every
 # log line they emit has always been filed there. The launch tail itself logs under
@@ -828,6 +828,24 @@ class LaunchTools:
     retrying_spawn_factory: Callable[..., Awaitable[asyncio.subprocess.Process]] | None = None
     #: ``agent.env`` (``acp.agent_env.agent_env_overlay``); blocking, run off-loop.
     agent_env_overlay: Callable[[], dict[str, str]] = field(default=dict)
+    #: ``sandbox.ssh_auth_sock_consent_notice``; blocking (tier floor + consent
+    #: leaf), run off-loop. Diagnostic only: the forward verdict is
+    #: ``forward_ssh_auth_sock``'s.
+    ssh_auth_sock_consent_notice: Callable[[str, str, tuple[str, ...]], str] = field(
+        default=ssh_auth_sock_consent_notice
+    )
+    #: ``sandbox.remember_namespace_launcher``; non-blocking ``/proc`` reads, never raises.
+    remember_namespace_launcher: Callable[[int, Sequence[str], str | None], None] = field(
+        default_factory=lambda: _remember_namespace_launcher
+    )
+
+
+def _remember_namespace_launcher(
+    pid: int, wrapped_argv: Sequence[str], launcher_script: str | None
+) -> None:
+    from kiro_crew.sandbox import remember_namespace_launcher
+
+    remember_namespace_launcher(pid, wrapped_argv, launcher_script)
 
 
 def _unscoped(argv: list[str]) -> tuple[list[str], str]:
@@ -887,6 +905,49 @@ class LaunchedProcess:
     scope_unit: str = ""
 
 
+#: Harnesses this process has already named in the ssh-agent consent notice. The
+#: notice is a remedy, not an event log: one line per harness per gateway run is
+#: enough for an operator to find it, and a respawn loop must not flood the log.
+_SSH_AUTH_SOCK_NOTICE_LOGGED: set[str] = set()
+
+
+async def _note_ssh_auth_sock_withheld(
+    host: LaunchHost, tools: LaunchTools, request: LaunchRequest
+) -> None:
+    """Log, once per harness, why this child starts without the ssh-agent socket.
+
+    Called only when the parent had a socket and the forward verdict scrubbed it.
+    The notice says something only when the verdict came from the consent route
+    with consent not granted (see ``sandbox.ssh_auth_sock_consent_notice``), and
+    then names the consent and how to grant it. It never changes the verdict, the
+    child's environment or its sandbox, and a failure to compute it is ignored:
+    the spawn proceeds exactly as it would have without it.
+    """
+    if request.backend in _SSH_AUTH_SOCK_NOTICE_LOGGED:
+        return
+    # Claimed BEFORE the hop: two spawns of one harness in flight cannot both
+    # log, and a harness whose notice cannot be computed is not re-read on every
+    # respawn. One attempt per harness per gateway process.
+    _SSH_AUTH_SOCK_NOTICE_LOGGED.add(request.backend)
+
+    def _compute() -> str:
+        # Swallowed INSIDE the thread: the guarded hop discards the sandbox
+        # launcher on any exception it sees, and this spawn still needs it.
+        try:
+            return tools.ssh_auth_sock_consent_notice(
+                request.backend, request.sandbox_mode, tuple(request.extra_hidden_dirs)
+            )
+        except Exception:
+            tools.logger.debug("ssh-agent consent notice could not be computed", exc_info=True)
+            return ""
+
+    # Guarded so a cancellation here still reclaims the launcher the wrap wrote.
+    notice = await host._to_thread_guarding_sandbox(_compute)
+    if not notice:
+        return
+    tools.logger.warning("%s", notice)
+
+
 def _well_formed_port(value: str) -> bool:
     """1-5 ASCII decimal digits naming a port in 1..65535 (the KAS projection's gate)."""
     return 1 <= len(value) <= 5 and value.isascii() and value.isdecimal() and 0 < int(value) < 65536
@@ -928,6 +989,42 @@ def drop_foreign_inherited_port(env: dict[str, str]) -> None:
     env.pop("KIROCREW_PORT", None)
 
 
+def process_directory(host: LaunchHost) -> tuple[str, int | None]:
+    """The directory the host process is created in, and the descriptor that enters it.
+
+    An app agent's launch copy on kiro-cli must START in its empty, read-only launch
+    directory (``apps.agent_launch.launch_process_cwd``): kiro-cli takes project agents
+    from its process directory, so no checkout spec is read, while its sessions still
+    name ``host._work_dir``. Crew's Linux launcher enters that directory itself, after
+    its seals (:func:`exec_cwd_options`), so it is created in the workspace like any
+    other host: a process created inside the directory would keep the writable mount
+    under the seal, and the launcher's hardlinked-credential scan walks the directory it
+    was created in. Every other launch copy spawn (no Crew launcher) is created in the
+    directory directly. Every other host starts in its workspace.
+    """
+    process_cwd = getattr(host, "_launch_process_cwd", "")
+    if process_cwd and not _launcher_enters_exec_cwd(host):
+        return process_cwd, None
+    return host._spawn_work_dir, host._bound_workspace_fd
+
+
+def exec_cwd_options(host: LaunchHost) -> dict[str, str]:
+    """The sandbox wrap's ``exec_cwd`` for a launch copy, as keyword arguments."""
+    process_cwd = getattr(host, "_launch_process_cwd", "")
+    return {"exec_cwd": process_cwd} if process_cwd else {}
+
+
+def _launcher_enters_exec_cwd(host: LaunchHost) -> bool:
+    """Whether the wrap put the spawn behind Crew's Linux launcher, which takes ``exec_cwd``.
+
+    Read off the wrap's own record (``_sandbox_wrapped_by_crew``): on Linux Crew's only
+    wrapper is that launcher. Crew's macOS Seatbelt wrap takes no working directory.
+    """
+    return bool(getattr(host, "_sandbox_wrapped_by_crew", False)) and sys.platform.startswith(
+        "linux"
+    )
+
+
 async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -> LaunchedProcess:
     """Start *request*'s host process for *host*, suspended, through the shared tail.
 
@@ -941,9 +1038,10 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
     # OS-level sandbox: wrap the command to hide sensitive paths.
     # strip_python_env keeps the host PYTHONPATH/PYTHONHOME out of kiro-cli's
     # foreign MCP subprocesses (which bundle their own interpreter + deps).
-    # is_kiro_cli is membership in ACP_BACKENDS_INTERNAL_SANDBOX
-    # (harness-parity H7), not "not claude": the flag makes wrap_argv SKIP
-    # Crew's seatbelt on macOS and grants Windows's Kiro-only delegation in
+    # is_kiro_cli is the driver's request.internal_sandbox, the positive verdict
+    # of spawn_delegates_to_internal_sandbox (harness-parity H7), not "not
+    # claude": the flag makes wrap_argv SKIP Crew's seatbelt on macOS and
+    # grants Windows's Kiro-only delegation in
     # favour of the harness's own internal sandbox, so a harness without one
     # must never be granted it by the absence of another harness.
     #
@@ -952,7 +1050,12 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
     # own sandbox, so the child runs the bundle binary and Crew's launcher
     # wraps it. Off-loop because the resolution stats the candidate path.
     argv, delegate_internal_sandbox = await asyncio.to_thread(
-        tools.apply_pod_bundle_spawn, request.argv, backend=request.backend
+        functools.partial(
+            tools.apply_pod_bundle_spawn,
+            request.argv,
+            backend=request.backend,
+            internal_sandbox=request.internal_sandbox,
+        )
     )
     spawned_binary = argv[0] if argv else None
     # Per-process scratch containment. Allocated BEFORE the sandbox is built:
@@ -1017,6 +1120,7 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
         extra_hidden_dirs=request.extra_hidden_dirs,
         extra_private_dirs=scratch_window,
         extra_expose_files=request.extra_expose_files,
+        **exec_cwd_options(host),
         is_kiro_cli=delegate_internal_sandbox,
         _prepare=tools.wrap_argv,
     )
@@ -1027,6 +1131,7 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
     # refusal has to name the layer to turn off; the cgroup scope below prepends
     # its own tokens, so the read happens before it.
     host._sandbox_wrapped_by_crew = tools.wrapped_by_crew_sandbox(argv)
+    sandbox_wrapped_argv = tuple(argv)
     host._sandbox_hidden_dirs = tuple(request.extra_hidden_dirs)
     # cgroup v2 scope (OUTERMOST): bound this agent + all its MCP-server / tool
     # descendants with pids.max (fork bomb) + memory.max (RSS balloon). No-op +
@@ -1041,6 +1146,16 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
     env = {**os.environ}
     # Before any configured layer: only the INHERITED value can be foreign.
     drop_foreign_inherited_port(env)
+    # Likewise the scratch exports of the agent shell that started this gateway:
+    # they name a tree another process owns and the sweep reclaims, and a spawn
+    # whose own allocation failed above would otherwise hand them to the child
+    # as its temp (``agent_scratch.drop_inherited_scratch_env``).
+    dropped_scratch = tools.agent_scratch.drop_inherited_scratch_env(env)
+    if dropped_scratch:
+        tools.logger.debug(
+            "agent-scratch: dropped inherited %s naming another process's scratch",
+            ",".join(dropped_scratch),
+        )
     # ``agent.env``: the operator's variables for everything the agent runs, over
     # the inherited gateway environment and under everything below -- the
     # driver's ``extra_env``, its session identity and credential repair, and the
@@ -1055,12 +1170,17 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
         env.update(request.extra_env)
     env["PATH"] = tools.augmented_path(env.get("PATH", ""))
     env = await request.env_before_scrub(env, spawned_binary)
+    # Whether the child would have had an agent socket before the scrub, read
+    # here because the driver's credential repair above may have just found one.
+    had_ssh_auth_sock = bool(env.get("SSH_AUTH_SOCK"))
     # Match the OS launchers' sensitive + Python env scrub in the parent. Windows
     # Kiro delegation has no POSIX `env -u` wrapper, so this is the enforcement
     # point there. Kept after the driver's credential repair so no resolver can
     # reintroduce a denied variable. forward_ssh_auth_sock is the opt-in resolved
     # off-loop above and reused here.
     env = tools.scrub_agent_subprocess_env(env, forward_ssh_auth_sock=forward_ssh_auth_sock)
+    if had_ssh_auth_sock and not forward_ssh_auth_sock:
+        await _note_ssh_auth_sock_withheld(host, tools, request)
     # Bundled skill scripts must not depend on a system ``python`` name. The
     # desktop bundles carry their interpreter outside the user's PATH, while this
     # path is already running under the exact environment that can import
@@ -1127,7 +1247,7 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=host._spawn_work_dir,
+        cwd=process_directory(host)[0],
         limit=_STDOUT_BUFFER_LIMIT,
         env=env,
         start_new_session=tools.platform_compat.IS_POSIX,
@@ -1140,7 +1260,7 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
         # workspace through this verified descriptor instead of resolving
         # ``cwd``'s pathname, which a same-UID symlink retarget could aim elsewhere
         # in between; ``cwd`` stays the same directory by name.
-        chdir_fd=host._bound_workspace_fd,
+        chdir_fd=process_directory(host)[1],
         profile=RLIMIT_PROFILE_SESSION_HOST,
     )
     if tools.retrying_spawn_factory is not None:
@@ -1151,4 +1271,9 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
         await host._discard_bound_workspace()
         host._discard_sandbox_cleanup()
         raise
+    # The live-agent confinement check trusts a namespace launcher only from this
+    # record: the launcher stays in the host namespaces by design, so its command
+    # line cannot be what proves Crew started it. The recorder checks the wrap's
+    # own argv against the launcher script the wrap generated.
+    tools.remember_namespace_launcher(process.pid, sandbox_wrapped_argv, host._sandbox_cleanup)
     return LaunchedProcess(process=process, scope_unit=scope_unit)

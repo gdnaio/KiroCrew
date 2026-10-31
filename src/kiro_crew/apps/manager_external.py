@@ -20,6 +20,7 @@ from kiro_crew.apps.execution import repository_bound_grant_denied
 from kiro_crew.apps.manager_builtins import _builtin_owns_install
 from kiro_crew.apps.manager_records import (
     APP_MANIFEST_FILENAME,
+    INSTALLED_META_FILENAME,
     AppResult,
     InstalledApp,
     _approved_grants_after_manifest_change,
@@ -35,6 +36,8 @@ from kiro_crew.apps.manager_records import (
     app_data_dir,
     app_dir,
     get_app_manifest,
+    hold_app_record_lock,
+    holds_app_record_locks,
 )
 from kiro_crew.apps.manager_tree import _check_path_safety
 from kiro_crew.apps.manifest import (
@@ -55,6 +58,7 @@ logger = logging.getLogger("kiro_crew.apps.manager")
 # ---------------------------------------------------------------------------
 
 
+@holds_app_record_locks
 def register_external_app(
     name: str,
     version: str,
@@ -66,8 +70,14 @@ def register_external_app(
     resources: str = "app",
     lifecycle: str = "app",
     source_repository: str = "",
+    start_disabled: bool = False,
+    version_checked: bool = False,
 ) -> AppResult:
     """Register a self-managed app with Kiro Crew's app system.
+
+    ``version_checked=True`` says the caller already asked the governance
+    ``app_versions`` list off the loop (``admission.app_version_refusal``), so
+    admission skips that blocking read here.
 
     Self-managed apps (``resources="app"``) handle their own agent/skill/MCP
     registration.  Kiro Crew only tracks metadata so the dashboard can display them.
@@ -86,6 +96,8 @@ def register_external_app(
         source_repository: Server-resolved repository coordinate for a registry
             install/update. An empty value on an existing repository-owned record
             is a metadata refresh, not permission to erase its provenance.
+        start_disabled: Create a new record disabled until an explicit enable.
+            Existing records retain their enabled state, subject to consent.
 
     Returns:
         AppResult indicating success or failure.
@@ -133,7 +145,13 @@ def register_external_app(
     admission_manifest = None
     if manifest_data:
         admission_manifest = AppManifest.from_dict(manifest_data)
-    denied = app_admission_denied(name, manifest=admission_manifest, action="register_external")
+    denied = app_admission_denied(
+        name,
+        manifest=admission_manifest,
+        action="register_external",
+        check_version=not version_checked,
+        version=version,
+    )
     if denied:
         sel().log_api_access(
             caller="app_register_external",
@@ -144,6 +162,7 @@ def register_external_app(
         )
         return AppResult(ok=False, name=name, error=f"blocked by admission policy: {denied}")
 
+    hold_app_record_lock(name)
     existing = _read_installed(name)
     requested_repository = source_repository.strip()
     preserve_server_provenance = bool(
@@ -305,6 +324,11 @@ def register_external_app(
         prior_manifest_text = (
             manifest_path.read_text(encoding="utf-8") if manifest_path.is_file() else None
         )
+        # The record as it is on disk, restored byte for byte on rollback. A
+        # rewrite of ``existing`` would add a consent key that a record from
+        # before the key existed never had, and could record no consent needed.
+        meta_path = dest / INSTALLED_META_FILENAME
+        prior_meta_text = meta_path.read_text(encoding="utf-8") if meta_path.is_file() else None
         manifest_text = json.dumps(manifest_data, indent=2) + "\n" if manifest_data else ""
         try:
             if manifest_data:
@@ -328,7 +352,10 @@ def register_external_app(
                 # while a set file is present.
                 if manifest_data:
                     _write_approved_grants(name, prior_grants if prior_grants_present else None)
-                _write_installed(name, existing)
+                if prior_meta_text is not None:
+                    atomic_write(meta_path, prior_meta_text)
+                else:
+                    _write_installed(name, existing)
             except OSError as rollback_exc:
                 rollback_errors.append(f"metadata rollback failed: {rollback_exc}")
             try:
@@ -350,10 +377,9 @@ def register_external_app(
             name=name,
             version=version,
             displayName=display_name,
-            # Self-managed apps are "enabled" by default; a manifest that asks for
-            # session control is the one exception, since that grant needs a
-            # consent moment the self-registration path cannot provide.
-            enabled=not widened_session_approval,
+            # Callers that guard activation separately need the first durable
+            # record disabled, just as a new session-control grant needs consent.
+            enabled=not (widened_session_approval or start_disabled),
             sessionApprovalConsentPending=widened_session_approval,
             installedAt=_now_iso(),
             source=source,

@@ -1,8 +1,8 @@
 """The tracked background maintenance both entrypoints start once the listener serves.
 
 The warm-mint scavenge and its cleanup, the local decision model, the session search
-indexer, the knowledge orphan reclaim, the data home's owner-only mode repair, and the
-own-address read for the ssh self-target floor.
+indexer, the knowledge orphan reclaim, the data home's owner-only mode repair, the
+pinned-session order load, and the own-address read for the ssh self-target floor.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.server import (
         _OWN_HOST_WARM_TASKS,
         DashboardState,
+        chat,
         data_home,
         logger,
         shutdown_event,
@@ -383,8 +384,115 @@ def _kick_knowledge_orphan_reclaim(state: DashboardState) -> None:
             await asyncio.to_thread(_reclaim_in_thread)
         except Exception:  # noqa: BLE001 -- hygiene must never take the gateway down
             logger.warning("Knowledge store orphan reclaim failed", exc_info=True)
+        # The memory prebuild follows the knowledge maintenance rather than racing
+        # it: both are O(data) CPU passes, and the one a session waits on should
+        # not share the cores with the other.
+        try:
+            await _prebuild_memory_after_preparation(state)
+        except Exception:  # noqa: BLE001 -- a warm-up must never take the gateway down
+            logger.warning("Memory prebuild failed", exc_info=True)
 
     task = asyncio.create_task(_knowledge_orphan_reclaim())
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
+async def _prebuild_memory_after_preparation(
+    state: DashboardState, *, wait_secs: float = 900.0, poll_secs: float = 1.0
+) -> None:
+    """Run the memory prebuild once memory preparation has finished, off the loop.
+
+    Before preparation is ready every store read raises ``MemoryStartupUnavailable``,
+    so a prebuild that ran then would warm nothing. The wait shields the shared
+    preparation task, so cancelling this one never cancels recovery, and it ends on
+    shutdown or after ``wait_secs``. A gateway with no
+    context builder has nothing to build and takes no thread hop.
+    """
+    from kiro_crew.memory_startup import memory_prepared, memory_startup_preparing
+
+    if getattr(state, "context_builder", None) is None:
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + wait_secs
+    while memory_startup_preparing() and not shutdown_event.is_set():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            logger.info("memory prebuild skipped: memory preparation is still running")
+            return
+        task = getattr(state, "memory_startup_task", None)
+        wait = min(poll_secs, remaining)
+        if task is None:
+            await asyncio.sleep(wait)
+            continue
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=wait)
+        except asyncio.TimeoutError:
+            continue
+        except Exception:  # noqa: BLE001 -- the preparation reports its own failure
+            break
+    if shutdown_event.is_set() or not memory_prepared():
+        return
+    await asyncio.to_thread(_prebuild_memory_in_thread, state)
+
+
+def _prebuild_memory_in_thread(state: DashboardState) -> None:
+    """Build the default memory store's session-start reads, so restart's first sessions are warm.
+
+    Read-only and embed-free (``memory_startup_prebuild``). Skipped when the
+    gateway has no context builder or its memory has no vector store, and when the
+    memory store cannot start: the session-start build reports that itself.
+    """
+    builder = getattr(state, "context_builder", None)
+    if builder is None or shutdown_event.is_set():
+        return
+    try:
+        store = builder.memory.vector_store
+    except Exception:  # noqa: BLE001 -- an unavailable store is reported by its readers
+        logger.debug("Memory prebuild skipped: memory store unavailable", exc_info=True)
+        return
+    if store is None:
+        return
+    from kiro_crew.memory_startup_prebuild import prebuild_startup_reads
+
+    spent = prebuild_startup_reads(store, should_stop=shutdown_event.is_set)
+    logger.info(
+        "memory prebuild: %s",
+        ", ".join(f"{name} {secs * 1000:.0f} ms" for name, secs in spent.items()) or "nothing",
+    )
+
+
+def _kick_otel_crew_log_subscriber(state: DashboardState) -> None:
+    """Install the OTel usage export's crew-log subscription post-bind, off the loop.
+
+    ``install_otel_crew_log_subscriber`` reads telemetry consent through
+    ``get_recorder()``, and on an opted-in host the first ``get_recorder()`` builds
+    the recorder synchronously: it imports the OTel SDK (about 57 ms) and writes the
+    install id. Called inline between the bind and the ``KIROCREW_READY`` publish, that
+    import and file write sit on the one ordered path the listener's readiness waits on
+    (``no-new-work-on-gateway-boot-path``). So the install runs on a worker thread,
+    the same shape as the ``_kick_*`` calls above it, and nothing is awaited in front
+    of the publish.
+
+    A no-op for an unopted host (``telemetry.enabled`` off, the default): the consent
+    read returns, the thread finds nothing to subscribe, and the task ends. The bus
+    subscription the install registers is a process-global write guarded by the bus's
+    own lock, not loop-bound, so it is safe off the loop; a fold delivered before the
+    subscription lands is simply not exported, which is the baseline the exporter
+    already treats as its floor.
+    """
+
+    def _install_in_thread() -> None:
+        from kiro_crew.metrics.crew_log_export import install_otel_crew_log_subscriber
+
+        install_otel_crew_log_subscriber()
+
+    async def _otel_crew_log_install() -> None:
+        try:
+            await asyncio.to_thread(_install_in_thread)
+        except Exception:  # noqa: BLE001 -- telemetry must never take the gateway down
+            logger.warning("OTel crew-log subscriber install failed", exc_info=True)
+
+    task = asyncio.create_task(_otel_crew_log_install())
     state._background_tasks.add(task)
     task.add_done_callback(state._background_tasks.discard)
 
@@ -418,3 +526,15 @@ def _own_host_warm_done(task: "asyncio.Future[None]") -> None:
     exc = task.exception()
     if exc is not None:
         logger.warning("own-address read failed at startup", exc_info=exc)
+
+
+def _kick_pinned_order_load(state: DashboardState) -> None:
+    """Read the pinned-session order after the bind, as a tracked background task.
+
+    Off the boot path (``no-new-work-on-gateway-boot-path``): the file is
+    read after the listener accepts requests, and every writer reads it first
+    if it has not landed (``chat_folders.ensure_pinned_order_loaded``).
+    """
+    task = asyncio.create_task(chat.load_pinned_order_after_listen(state))
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)

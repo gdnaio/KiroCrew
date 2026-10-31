@@ -26,6 +26,9 @@ While `require_memory_ready()` raises `MemoryStartupUnavailable` (Global memory 
 
 - One task per line (no multiline support)
 - Lines starting with `#`, empty lines, and HTML comments (`<!-- -->`) are ignored
+- A closed comment (ended by `-->` or `--!>`, as in HTML) hides only what is inside it, even across lines; text before `<!--` or after `-->` on the same line is still a task
+- A deliver tag inside a comment is part of that comment, so commenting out a task together with its tag keeps it hidden
+- A `<!--` that is never closed hides only the rest of its own line, and logs a warning naming that line. It never hides later lines. This is a choice of "run them and warn" over "skip them" (how HTML reads it): the rewrite keeps only parsed tasks, so skipped lines would be erased from the file for good
 - List markers (`-`, `*`, `- [ ]`, `- [x]`) are stripped
 - File is auto-created on first start with an empty template
 
@@ -53,8 +56,10 @@ Progress: 3/5 files processed. HEARTBEAT_KEEP
 
 ## Concurrency
 
-- `_processing` flag prevents overlapping ticks from double-processing tasks
-- FTS rebuild runs independently of task processing
+- Task processing runs as its own tracked task (`_process_task`), started by the tick and never awaited by it, so a turn that runs up to `HEARTBEAT_TASK_TIMEOUT_SECS` does not hold the FTS rebuild, the daily prune or idle consolidation; those keep their tick cadence
+- A tick that finds the previous pass still running (`_process_task` not done, or `_processing` set) skips the file, so passes never overlap and no task is double-processed
+- A failing pass is logged (`Heartbeat task processing failed`) by the task itself; it never reaches the tick
+- `stop()` cancels the loop, the running pass and the backup pass; `wait_closed()` awaits them (bounded by `_STOP_DRAIN_SECS`), so a cancelled turn unwinds its session release and cycle-end recycle before gateway shutdown moves on. A cancelled pass rewrites nothing: its tasks stay in `HEARTBEAT.md`
 - Uses dedicated `heartbeat:task` session key — no interference with user or cron sessions
 
 ## Per-Task Timeout (Unattended Turn Bound)
@@ -67,7 +72,7 @@ mirroring cron's `_JOB_TIMEOUT_SECS`). This is the analogue of cron's
 
 Without it, if the agent calls a non-allowlisted tool, the interactive-approval
 callback would block on the human-approval wait with no human present — wedging
-`HeartbeatService._processing=True` and freezing the whole heartbeat subsystem.
+`HeartbeatService._processing=True` so no HEARTBEAT.md task would ever run again.
 
 On `asyncio.TimeoutError`:
 1. Reset the heartbeat session (`sessions.reset(HEARTBEAT_KEY)`) BEFORE the
@@ -107,11 +112,11 @@ percentage is only logged. The next cycle's first task starts a fresh session.
 - `on_task` callback: prepends a `HEARTBEAT_KEEP` reminder to the task text, opens a session under `HEARTBEAT_KEY` with `agent="kirocrew-heartbeat"`, streams the response (gated by the heartbeat allowlist in `_heartbeat_approval`), posts the result, and releases the per-key semaphore
 - `on_cycle_end` callback: invokes `SessionManager.recycle_heartbeat` once after `asyncio.gather` completes — tears the session down unconditionally
 - Callback re-raises exceptions so heartbeat can track failures
-- Stopped during gateway shutdown
+- Stopped during gateway shutdown: `exit_path` calls `stop()` and then awaits `wait_closed()`
 
 ### Session Identity
 
-Heartbeat runs in its own session (`HEARTBEAT_KEY = "_hb"` in `session_parts/policy.py`), distinct from the shared `BACKGROUND_KEY = "_bg"` used by cron / consolidator / chat-title. The session uses the dedicated `kirocrew-heartbeat` agent (installed by `_install_heartbeat_agent` in `agent.py`) — a minimal MCP surface (`kirocrew-core`, plus the default-spec servers behind the edition's `heartbeat_safe_tools()` pins; a standalone install pins none) so cycle cold-starts stay cheap. SEL audit logging stays gateway-side in `_heartbeat_approval` regardless; the per-agent narrowing is purely a cold-start cost reduction.
+Heartbeat runs in its own session (`HEARTBEAT_KEY = "_hb"` in `session_parts/policy.py`), distinct from the shared `BACKGROUND_KEY = "_bg"` used by cron / consolidator / chat-title. The session uses the dedicated `kirocrew-heartbeat` agent (installed by `_install_heartbeat_agent` in `agent_parts/spec_rebuild.py`) — a minimal MCP surface (`kirocrew-core`, plus the default-spec servers behind the edition's `heartbeat_safe_tools()` pins; a standalone install pins none) so cycle cold-starts stay cheap. SEL audit logging stays gateway-side in `_heartbeat_approval` regardless; the per-agent narrowing is purely a cold-start cost reduction.
 
 The heartbeat spec copies the default spec's `heartbeat_mirrored_servers()` entries — `kirocrew-core` with `autoApprove` included and the main agent's tool filters stripped, then each server an edition pinned a tool on verbatim minus `autoApprove` (kiro-cli would honour that field locally, before `_heartbeat_approval` saw the call, on the one agent with no approver) — so it is a derived spec like `kirocrew-worker`. A name the default spec does not mount is skipped, so an edition contributes a heartbeat server by also returning it from `extra_mcp_servers()`. Every spawn runs `require_fresh_derived_spec`, which compares the heartbeat file's own grant surface with the one `heartbeat_mcp_servers` derives from `kirocrew.json` as it stands: its `mcpServers` (volatile per-launch env values aside), its `tools`, no key the installer does not write, and an `includeMcpJson` that is literally `false` (kiro-cli reads a missing key as true and merges the global `mcp.json`). A copy that does not match is re-derived once, and the start is refused with `DerivedSpecStale` when the re-derived file still does not match. An edit to any other part of the default spec does not touch the heartbeat copy; the fingerprint covers exactly the mirrored servers, edition ones included.
 
@@ -147,11 +152,12 @@ When a legitimate new read tool needs to run in heartbeat, operators observe SEL
 | `_MEMORY_BACKUP_TICKS` / `_MEMORY_BACKUP_OFFSET` | 1440 / 30 | `heartbeat.py` |
 | `_KEEP_SENTINEL` | `HEARTBEAT_KEEP` | `heartbeat.py` |
 | `HEARTBEAT_TASK_TIMEOUT_SECS` | 1800 | `heartbeat.py` |
+| `_STOP_DRAIN_SECS` | 10 | `heartbeat.py` |
 | `HEARTBEAT_FILE` | `HEARTBEAT.md` | `heartbeat.py` |
 | `HEARTBEAT_KEY` | `_hb` | `session_parts/policy.py` |
 | `_HEARTBEAT_SAFE_CORE_MCP_TOOLS` | frozenset of `kirocrew-core` reads | `slack/gateway_runtime/tool_policy.py` |
 | `_HEARTBEAT_KEEP_INJECTION` | reminder string | `slack/gateway_runtime/heartbeat_turns.py` |
-| `kirocrew-heartbeat` agent | minimal-MCP agent JSON | installed by `agent.py:_install_heartbeat_agent` |
+| `kirocrew-heartbeat` agent | minimal-MCP agent JSON | installed by `agent_parts/spec_rebuild.py:_install_heartbeat_agent` |
 
 ## Known Limitations
 
@@ -184,7 +190,7 @@ A `slack:` tag with an empty channel id (`<!-- deliver:slack: -->`) falls back t
 owner's DM: posting to channel `""` would raise inside the swallowed Slack error
 handler and lose the report.
 
-The deliver tag is agent-writable — `config/prompt.md` tells the agent to append
+The deliver tag is agent-writable — the `kirocrew-dev/babysit` skill tells the agent to append
 HEARTBEAT.md entries itself, and HEARTBEAT.md is not a fenced path — so the channel
 id on a `slack:<channel_id>` tag is untrusted input. Both channel forms therefore
 require the id to be a well-formed Slack channel id (`validation.CHANNEL_ID_RE`, so

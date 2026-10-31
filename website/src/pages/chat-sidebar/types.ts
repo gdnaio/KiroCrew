@@ -28,6 +28,11 @@ export interface Slot {
    *  crew log is off), so it never asks a client to come back for an answer that will
    *  not change. */
   lineage_pending?: boolean
+  /** A Crew Mode root (`crew_mode.stamp_rows`): the Crew Mode chip matches it. */
+  crew_mode_root?: boolean
+  /** On a session a Crew Mode root dispatched: the root's key. Such rows are left
+   *  out of the list before it is built (`crewModeView`). */
+  crew_root?: string
   /** Peer OWNERSHIP, present ONLY on a row sourced from a connected remote
    *  instance's live slot list (see `useInstanceSessions`). Absent on every local
    *  slot, so a consumer tests presence to decide whether the local-only
@@ -128,6 +133,8 @@ export interface Slot {
   pinned?: boolean
   /** The per-row mute (see ChatSlot.muted); drawn as a marker at rest. */
   muted?: boolean
+  /** A worker tab's process: `released` once the idle sweep stopped it. */
+  process?: 'live' | 'released'
   tags?: string[]
   forked_from?: string | null
   source_links?: Array<{
@@ -142,6 +149,9 @@ export interface Slot {
     // the gateway it talks to must keep rendering. See `chipLabel`.
     label?: string
     ci?: 'running' | 'passed' | 'failed' | null
+    // `'1'` when `ci` is `failed` but other checks are still running. See
+    // `PullRequestStatus.ciPending`.
+    ciPending?: string
     state?: 'open' | 'draft' | 'merged' | 'closed'
     // Owner-gated chips spread the whole cached chip-status entry, which also
     // carries the settled merge pair. Present only once the provider settled it.
@@ -182,9 +192,11 @@ export interface AgentInfo {
   session_color?: string
   /** The roster namespace (`/api/agents/catalog`); `member` is a crewmate. */
   selection_kind?: 'member' | 'template'
+  /** A crewmate's presentation label, shown in place of `name`. */
+  display_name?: string
 }
 
-export type SessionFilterKey = 'unread' | 'running' | 'pinned' | 'recent'
+export type SessionFilterKey = 'unread' | 'running' | 'pinned' | 'recent' | 'crew'
 
 /**
  * Which session lane the list renders. One persisted preference, three values.
@@ -225,6 +237,10 @@ export interface FilterDimension {
    *  folder filter: counting it would strand every folder as an empty
    *  "New chat in <name>" shell while one is hidden). */
   narrows: (() => boolean) | null
+  /** Does a pinned row pass this dimension whatever it says? Read by
+   *  `pinnedExemptNarrowing`, so the pinned-band caption follows the same
+   *  rule `filtersRow` applies instead of restating it. */
+  exemptsPinned: boolean
   /** Does this dimension hide THIS row from a reveal? `excluded` reports list
    *  membership, for dimensions (search, status) that rank against backend
    *  state a single row cannot answer for alone. Non-nullable on purpose,

@@ -289,7 +289,7 @@ class TestLeafOnlyPopulationIsRecorded:
     #: hold, so leaf-only is the only hold available to them:
     #:
     #: * ``credential_redaction.json`` -- the owner's credential-redaction
-    #:   switch, on the same read-only floor as ``file_delivery_consent.json``;
+    #:   switch, on the same read-only floor as ``aws_service_consent.json``;
     #: * ``auth-store-staging`` -- the masked directory the two gateway auth
     #:   stores publish through, so the temp holding a full signing key or
     #:   refresh-chain state is never listable from inside the namespace;
@@ -365,7 +365,45 @@ class TestLeafOnlyPopulationIsRecorded:
     #:   sandboxed session cannot rewrite the engine code and Node runtime its
     #:   next session runs. At the data-home root beside writable siblings, so
     #:   leaf-only is the only hold available.
-    EXPECTED: dict[str, int] = {"standard": 284, "cc": 291, "strict": 292}
+    #:
+    #: One more root-level directory, three entries per tier:
+    #:
+    #: * ``seed-provenance`` -- the settings-seed record, moved out of the root-level
+    #:   ``settings_seeds.json`` file into its own directory so the gateway's
+    #:   ``atomic_write`` of the record renames INSIDE the sealed name rather than
+    #:   over it. That is the move this module asks for: the directory's own inode
+    #:   stays the same on a republish. It sits at the data-home root beside
+    #:   writable siblings, so it is counted leaf-only like ``skill-projection``.
+    #: * ``app-agent-launch`` -- the empty directory kiro-cli runs an app agent's
+    #:   launch copy from (``apps.agent_launch.launch_process_cwd``), sealed read-only
+    #:   so no sandboxed writer can plant the spec kiro-cli reads there. At the
+    #:   data-home root beside writable siblings, so leaf-only is the only hold.
+    #:   Three more entries per tier.
+    #:
+    #: One more root-level directory, three entries per tier:
+    #:
+    #: * ``member-records`` -- each crewmate's permanent rules, goals and DM
+    #:   binding, which the gateway writes on a person's action. Masked at the
+    #:   data-home root beside ``crew-teams`` rather than under the sandbox
+    #:   read-write ``trust/``, so leaf-only for the same reason.
+    #:
+    #: One more root-level directory, three entries per tier:
+    #:
+    #: * ``web-push`` -- the Web Push VAPID key and device subscription secrets
+    #:   (``notifications/push_store.py``), masked as a whole directory so the
+    #:   ``atomic_write`` temps they publish through are hidden too. At the data-home
+    #:   root beside writable siblings, so leaf-only is the only hold.
+    #:
+    #: One more root-level directory, three entries per tier:
+    #:
+    #: * ``secret-request-policy`` -- the mediated-secret request directory: the
+    #:   owner-signed egress policy ``kirocrew secrets authorize`` writes and its
+    #:   authorize lock, masked whole so an agent can neither read the allowlist nor
+    #:   plant an entry. Every publication renames INSIDE it, so the directory's own
+    #:   inode stays the same on a republish. It sits at the data-home root beside
+    #:   writable siblings, so no enclosing directory mask can hold it and leaf-only
+    #:   is the only hold available, the same as ``member-records``.
+    EXPECTED: dict[str, int] = {"standard": 299, "cc": 306, "strict": 307}
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_leaf_only_count_has_not_grown(self, tier: str) -> None:

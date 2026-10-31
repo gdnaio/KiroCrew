@@ -59,30 +59,40 @@ _OWNER_MODULES = frozenset(
         "account_identity",
         "acp_recovery",
         "app_agent_binding",
+        "context_cap",
         "crew_log_attribution",
         "decisions_hooks",
         "deny_chokepoints",
         "directives",
         "eager_spawn",
+        "elicitation_prompt",
         "file_changes",
         "mcp_session",
         "model_fallback",
         "native_cards",
+        "permission_prompt",
         "prompt_assembly",
         "queue_cycle",
         "queue_drain",
         "recipient",
         "recovery",
+        "regenerate_swap",
         "segment_flush",
+        "session_events",
         "session_reset",
         "slash_commands",
         "steer_queue",
+        "stop_recovery",
+        "stream_chunks",
         "tool_approval",
+        "tool_results",
         "tool_rows",
         "turn_admission",
         "turn_context",
         "turn_dispatch_gates",
+        "turn_ending",
         "turn_entry",
+        "turn_failures",
         "turn_ledgers",
         "turn_locals",
         "turn_marker",
@@ -404,8 +414,9 @@ def test_the_chat_facade_reexports_the_runner_objects() -> None:
 #: file, and the stall test below proves the reach for each. ``_run_chat``'s row is the
 #: exit guard's ``guarded`` (``_hands_off_queue_on_exit``), the coroutine every turn task
 #: runs; ``_arm_pending_reset_retry`` and ``_arm_synthesis_recheck`` define the coroutines
-#: they start, ``_launch_synthesis`` starts the pending synthesis, and
-#: ``_finish_queue_cycle`` starts it and the title and summary passes.
+#: they start, ``_launch_synthesis`` starts the pending synthesis,
+#: ``_finish_queue_cycle`` starts it and the title and summary passes, and
+#: ``_prewarm_startup_query`` starts a first message's early embed and memory reads.
 _RUNNER_HOME = "dashboard/chat_runner.py"
 _TASK_ENTRY_HOMES: dict[str, str] = {
     "_run_chat": _RUNNER_HOME,
@@ -417,6 +428,8 @@ _TASK_ENTRY_HOMES: dict[str, str] = {
     "_arm_synthesis_recheck": "dashboard/chat_turn/queue_cycle.py",
     "_launch_synthesis": "dashboard/chat_turn/queue_cycle.py",
     "_finish_queue_cycle": "dashboard/chat_turn/queue_cycle.py",
+    "_embed_startup_query_off_loop": "dashboard/chat_turn/prompt_assembly.py",
+    "_prefetch_session_memory_off_loop": "dashboard/chat_turn/prompt_assembly.py",
 }
 
 
@@ -442,7 +455,9 @@ def test_a_stalled_task_entry_reads_as_a_dashboard_chat_turn(name: str) -> None:
 #: and its body still runs without a suspension point: the check-then-mutate a queue
 #: drain or a consume gate makes stays atomic on the event loop, as the inline block
 #: was. An ``await`` added to one would let another task change the slot between the
-#: check and the mutation.
+#: check and the mutation. The ``finally``'s phases before ``_turn_release_session`` are
+#: await-free too: they run before its ``try``, so an ``await`` added to one would let a
+#: cancel skip the session permit's release.
 _AWAIT_FREE_PHASES = (
     "_refresh_genuine_turn_allowances",
     "_rearm_turn_episode",
@@ -453,6 +468,22 @@ _AWAIT_FREE_PHASES = (
     "_requeue_auth_retry",
     "_requeue_after_prompt_busy",
     "_report_unclaimed_directives",
+    "_on_mcp_server_initialized",
+    "_on_mcp_server_init_failure",
+    "_on_todo_update",
+    "_on_subagent_list",
+    "_on_subagent_activity",
+    "_on_compaction_status",
+    "_on_clear_status",
+    "_on_steer_consumed",
+    "_on_thinking_chunk",
+    "_turn_context_usage",
+    "_on_app_agent_not_loaded",
+    "_on_session_closing",
+    "_turn_record_outcome",
+    "_turn_close_crew_log",
+    "_turn_release_handles",
+    "_turn_settle_debts",
 )
 _SUSPENDING_OPS = frozenset(
     {"GET_AWAITABLE", "SEND", "YIELD_VALUE", "GET_AITER", "GET_ANEXT", "BEFORE_ASYNC_WITH"}
@@ -502,12 +533,16 @@ def test_run_chat_keeps_its_entry_signature() -> None:
         "_responsive_human",
         "_responsive_protected",
         "_directive_user_origin",
+        "_message_is_typed",
         "_turn_provenance_restored",
         "_directive_self_wake",
         "_directive_loop_id",
         "_directive_loop_gen",
+        "_skill_trigger_text",
         "_directive_channel_origin",
+        "_directive_owner_origin",
         "_commands_off",
+        "_recovery_echo_owed",
         "_turn_actor",
         "regenerate_hint",
         "_on_consumed",
@@ -1216,7 +1251,7 @@ def test_no_owner_captures_a_name_tests_rebind_on_the_runner() -> None:
     assert {
         "sel",
         "save_slot_off_loop",
-        "_flush_file_changes",
+        "_flush_file_changes_off_loop",
         "_resolve_channel_target",
         "_recovery_delay",
         "_should_suppress_requeue",
@@ -1248,31 +1283,47 @@ def test_no_owner_captures_a_name_tests_rebind_on_the_runner() -> None:
 _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
     r"\b\w*redact\w*\(": (
         _RUNNER_HOME,
+        "dashboard/chat_turn/acp_recovery.py",
         "dashboard/chat_turn/deny_chokepoints.py",
         "dashboard/chat_turn/eager_spawn.py",
+        "dashboard/chat_turn/elicitation_prompt.py",
         "dashboard/chat_turn/file_changes.py",
         "dashboard/chat_turn/mcp_session.py",
         "dashboard/chat_turn/model_fallback.py",
         "dashboard/chat_turn/native_cards.py",
+        "dashboard/chat_turn/permission_prompt.py",
         "dashboard/chat_turn/prompt_assembly.py",
         "dashboard/chat_turn/queue_drain.py",
         "dashboard/chat_turn/recipient.py",
         "dashboard/chat_turn/segment_flush.py",
+        "dashboard/chat_turn/session_events.py",
+        "dashboard/chat_turn/slash_commands.py",
+        "dashboard/chat_turn/stream_chunks.py",
+        "dashboard/chat_turn/tool_approval.py",
+        "dashboard/chat_turn/tool_results.py",
         "dashboard/chat_turn/tool_rows.py",
         "dashboard/chat_turn/turn_admission.py",
+        "dashboard/chat_turn/turn_failures.py",
         "dashboard/chat_turn/turn_ledgers.py",
         "dashboard/chat_turn/turn_reply_seams.py",
         "dashboard/chat_turn/turn_spec_hooks.py",
         "dashboard/chat_turn/turn_stats.py",
     ),
     r"StreamRedactor": (
-        _RUNNER_HOME,
+        "dashboard/chat_turn/stream_chunks.py",
         "dashboard/chat_turn/turn_entry.py",
         "dashboard/chat_turn/turn_locals.py",
     ),
     r"\.reject_tool\(": ("dashboard/chat_turn/deny_chokepoints.py",),
-    r"_reject_attributed\(": (_RUNNER_HOME, "dashboard/chat_turn/deny_chokepoints.py"),
-    r"\.approve_tool\(": (_RUNNER_HOME,),
+    r"_reject_attributed\(": (
+        "dashboard/chat_turn/deny_chokepoints.py",
+        "dashboard/chat_turn/permission_prompt.py",
+        "dashboard/chat_turn/tool_approval.py",
+    ),
+    r"\.approve_tool\(": (
+        "dashboard/chat_turn/permission_prompt.py",
+        "dashboard/chat_turn/tool_approval.py",
+    ),
     r"begin_turn\(": (
         "dashboard/chat_turn/turn_dispatch_gates.py",
         "dashboard/chat_turn/turn_entry.py",
@@ -1286,11 +1337,21 @@ _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
         "dashboard/chat_turn/turn_reply_seams.py",
         "dashboard/chat_turn/turn_stats.py",
     ),
-    r"_emit_turn_metric\(": (_RUNNER_HOME, "dashboard/chat_turn/turn_stats.py"),
-    r"caused_by_this_session": (_RUNNER_HOME,),
-    r"note_shared_death": (_RUNNER_HOME,),
-    r"clear_shared_deaths": (_RUNNER_HOME,),
-    r"_acp_pipe_death_retries": (_RUNNER_HOME, "dashboard/chat_turn/recovery.py"),
+    r"_emit_turn_metric\(": ("dashboard/chat_turn/turn_stats.py",),
+    r"caused_by_this_session": (
+        "dashboard/chat_turn/acp_recovery.py",
+        "dashboard/chat_turn/stop_recovery.py",
+    ),
+    r"note_shared_death": (
+        "dashboard/chat_turn/acp_recovery.py",
+        "dashboard/chat_turn/stop_recovery.py",
+    ),
+    r"clear_shared_deaths": ("dashboard/chat_turn/stop_recovery.py",),
+    r"_acp_pipe_death_retries": (
+        "dashboard/chat_turn/acp_recovery.py",
+        "dashboard/chat_turn/recovery.py",
+        "dashboard/chat_turn/stop_recovery.py",
+    ),
     r"except AcpProcessDied": (_RUNNER_HOME,),
     # The dashboard turn is EXEMPT from the turn ceiling (test_turn_ceiling.py lists its
     # begin_turn homes): no part of the turn composes the ceiling.
@@ -1312,17 +1373,20 @@ _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
     r"\.recent\(": ("dashboard/chat_turn/decisions_hooks.py",),
     r"warm_project_agent_names\(": ("dashboard/chat_turn/turn_admission.py",),
     # The tool-gate consultation: the sync call, or the awaitable form a coroutine uses.
-    r"\.on_tool_call\(|run_in_tool_gate_pool\(\s*[\w.]+\.on_tool_call,": (_RUNNER_HOME,),
+    r"\.on_tool_call\(|run_in_tool_gate_pool\(\s*[\w.]+\.on_tool_call,": (
+        "dashboard/chat_turn/tool_approval.py",
+    ),
     r"spawn_guarded_turn\(": (
         "dashboard/chat_turn/queue_cycle.py",
         "dashboard/chat_turn/queue_drain.py",
     ),
     r"create_task\(": (
-        _RUNNER_HOME,
         "dashboard/chat_turn/eager_spawn.py",
+        "dashboard/chat_turn/prompt_assembly.py",
         "dashboard/chat_turn/queue_cycle.py",
         "dashboard/chat_turn/queue_drain.py",
         "dashboard/chat_turn/segment_flush.py",
+        "dashboard/chat_turn/session_events.py",
         "dashboard/chat_turn/session_reset.py",
     ),
     r"ensure_future\(": (
@@ -1345,27 +1409,43 @@ _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
         "dashboard/chat_turn/slash_commands.py",
     ),
     r"capabilities_of\(": (
-        _RUNNER_HOME,
         "dashboard/chat_turn/model_fallback.py",
         "dashboard/chat_turn/slash_commands.py",
+        "dashboard/chat_turn/tool_approval.py",
+        "dashboard/chat_turn/tool_rows.py",
         "dashboard/chat_turn/turn_admission.py",
         "dashboard/chat_turn/turn_spec_hooks.py",
+        "dashboard/chat_turn/turn_stats.py",
     ),
-    r"classify_stop_reason\(": (_RUNNER_HOME, "dashboard/chat_turn/turn_dispatch_gates.py"),
+    r"classify_stop_reason\(": (
+        "dashboard/chat_turn/turn_dispatch_gates.py",
+        "dashboard/chat_turn/turn_stats.py",
+    ),
     r"notify_turn_complete\(": ("dashboard/chat_turn/queue_cycle.py",),
-    r"on_tool_completed\(": (_RUNNER_HOME,),
+    r"on_tool_completed\(": ("dashboard/chat_turn/tool_results.py",),
     r"latch_crew_log_previous\(": (
         "dashboard/chat_turn/eager_spawn.py",
         "dashboard/chat_turn/turn_admission.py",
     ),
-    r"capabilities\.theme_persona": (_RUNNER_HOME,),
+    r"capabilities\.theme_persona": ("dashboard/chat_turn/prompt_assembly.py",),
     r"(?m)^_CONTEXT_FRAME_CONTRACT\b": (_RUNNER_HOME,),
-    r"slot\._infra_retries = 0": (_RUNNER_HOME,),
-    r"slot\._transient_5xx_retries = 0": (_RUNNER_HOME,),
-    r"\bmemory_store=": (_RUNNER_HOME, "dashboard/chat_turn/turn_admission.py"),
-    r"compaction_settled=_compaction_completed,": (_RUNNER_HOME,),
-    r"await _post_native_question_card\(": (_RUNNER_HOME,),
-    r"\brun_bg_oneliner\(": (_RUNNER_HOME,),
+    r"slot\._infra_retries = 0": (
+        "dashboard/chat_turn/acp_recovery.py",
+        "dashboard/chat_turn/stop_recovery.py",
+        "dashboard/chat_turn/turn_failures.py",
+    ),
+    r"slot\._transient_5xx_retries = 0": (
+        "dashboard/chat_turn/acp_recovery.py",
+        "dashboard/chat_turn/stop_recovery.py",
+        "dashboard/chat_turn/turn_failures.py",
+    ),
+    r"\bmemory_store=": (
+        "dashboard/chat_turn/prompt_assembly.py",
+        "dashboard/chat_turn/turn_admission.py",
+    ),
+    r"compaction_settled=_compaction_completed,": ("dashboard/chat_turn/segment_flush.py",),
+    r"await _post_native_question_card\(": ("dashboard/chat_turn/tool_rows.py",),
+    r"\brun_bg_oneliner\(": ("dashboard/chat_turn/turn_failures.py",),
 }
 
 

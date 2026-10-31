@@ -46,8 +46,8 @@ export interface SendTail {
    *  delivery can unstage them instead of inviting a second send. */
   restoreFiles?: string[]
   /** Set only for a send a host `onSend` carried (#21686). That send posts on
-   *  the host's own endpoint, so no `sendId` reaches the server and no row can
-   *  ever carry it: without this the notice could never retire, and a message
+   *  the host's own endpoint; unless the host forwards `meta.sendId` (#22061),
+   *  no row can ever carry the id: without this the notice could never retire, and a message
    *  that did land stayed "not confirmed" with its text back in the composer. */
   hostProof?: HostSendProof
   /** Set when a text match settled this notice ({@link sendTailProof} `'text'`):
@@ -148,7 +148,10 @@ export function sendTailProof(
     if (at < 0) return null
     from = at + 1
   }
-  return messages.slice(from).some(m => m.role === 'user' && m.content === host.text) ? 'text' : null
+  // Compared trimmed, as isPendingAcked does: a host endpoint may strip the
+  // text it stores, and an expanded paste can end in whitespace.
+  const sent = host.text.trim()
+  return messages.slice(from).some(m => m.role === 'user' && m.content.trim() === sent) ? 'text' : null
 }
 
 export interface RetireResult {

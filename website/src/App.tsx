@@ -6,16 +6,16 @@ import { setUpdateProgress } from './store/dashboardSlice'
 // module below that reads it (`shell/nav/navItems.ts` computes `NAV_ITEMS`).
 import './surfaces/builtins'
 import { surfaceLabel } from './surfaces/registry'
-import { setAgentSwitchNotice } from './store/chatSlice'
+import AgentSwitchNoticeBanner from './components/AgentSwitchNoticeBanner'
 import { GuideProvider } from './guide/GuideContext'
 import { metricColor } from './utils/metricColor'
 import { railWidthFor } from './hooks/useRailWidth'
 import { FOCUS_INSET } from './hooks/useFocusMode'
-import { OVERLAY_Z_MAX, THEME_DECOR_SLOT_ID, registerThemeDecorSlot } from './lib/themeDecorLayer'
+import { OVERLAY_Z_MAX, THEME_DECOR_BEHIND_SLOT_ID, THEME_DECOR_SLOT_ID, registerThemeDecorBehindSlot, registerThemeDecorSlot } from './lib/themeDecorLayer'
 import { ZoomProvider } from './hooks/ZoomProvider'
 import { api } from './api/client'
 import { MetricsCard } from './shell/topbar/metricsReadout'
-import { Rocket, Code, RefreshCw, Package, Download, Hammer, XCircle, Check, AlertTriangle, X, Coins, Compass, LayoutGrid, SquareTerminal, Search as SearchIcon } from 'lucide-react'
+import { Rocket, RefreshCw, Package, Download, Hammer, XCircle, Check, AlertTriangle, Coins, Compass, LayoutGrid, SquareTerminal, Search as SearchIcon } from 'lucide-react'
 import { FirstRunChapters } from './shell/boot/firstRun'
 import ErrorNotice from './components/ErrorNotice'
 import { MobileConnectDialog } from './shell/nav/mobileConnect'
@@ -51,11 +51,13 @@ import EmbedTabStrip from './components/EmbedTabStrip'
 // Dev-only layout-editor harness (RFC §7 PR 2). Lazy so it never weighs the main
 // bundle — it is a developer route, not a shipped surface.
 const LayoutEditorHarnessPage = lazy(() => import('./pages/LayoutEditorHarnessPage'))
+
 import UpdateModal from './components/UpdateModal'
 
 import ComputerUseLiveView from './components/ComputerUseLiveView'
 import BottomTerminalPanel, { TerminalDetachedBar } from './components/BottomTerminalPanel'
 import { toggleBottomTerminal } from './hooks/useBottomTerminal'
+import { RunInTerminalShellNotice, useRunInTerminalShellBridge } from './shell/runInTerminalShellBridge'
 import { TerminalHostContext } from './hooks/useTerminalCommand'
 // Side effect: closes a terminal tab when its shell exits (main window and popout).
 import './utils/terminalExitClose'
@@ -65,6 +67,7 @@ import CrashReportNotice from './components/CrashReportNotice'
 import RemoteUpdateOffer from './components/RemoteUpdateOffer'
 import KiroSignInNoticeFallback from './components/KiroSignInNoticeFallback'
 import { ImportSessionOutcomeNotice } from './components/ImportSessionItem'
+import { FileMenuResultToastFrame } from './components/notifications/FileMenuResultToast'
 import BuiltinAppRoute from './apps/BuiltinAppRoute'
 import { MobileNavRailContext, MobileRosterBarContext, type MobileNavRailOptions } from './components/MobileNavRailContext'
 import ShortcutsModal from './components/ShortcutsModal'
@@ -298,7 +301,7 @@ export { NavItem, NavBadge }
 export default function App() {
   const shell = useAppShell()
   const {
-    isEmbed, isPopout, initialPopoutPath, dispatch, updateAvailable, terminalEnabled, terminalPoppedOut,
+    isEmbed, isPopout, initialPopoutPath, updateAvailable, terminalEnabled, terminalPoppedOut,
     bottomTerminalOpen, mobileConnect, activeSlotProject, terminalPosition, navigate, mayLeaveForNavigation,
     colorTheme, onboarded, privacyAcked, markOnboarded, markImportOnboarded, markPrivacyAcked, firstRun,
     lookPreviewFrame, branding, avatar, isMobile, bottomDock, activeInstanceId, macFullscreen, macInset,
@@ -307,11 +310,13 @@ export default function App() {
     localHeaderDragGaps, shellEntered, setShellEntered, shellRef, setMembersBar, advertisedNavItems,
     sortedAppGroup, slotOwners, appBadges, discoverBadges, railAppBadges, railAppRunStates, shortcutsOpen,
     setShortcutsOpen, toggleShortcutsModal, commandPalette, agentSwitchNotice, kiroUsageOpen, setKiroUsageOpen,
-    kiroUsageState, kiroAccountEntry, metrics, devMode, subscribeLogs, subscribeSubagents, forceReconnect,
+    kiroUsageState, kiroAccountEntry, metrics, subscribeLogs, subscribeSubagents, forceReconnect,
     updateFlow, updating, setUpdating, showUpdateModal, setShowUpdateModal, showChangelog, updateError,
     setUpdateError, startupVideo, reportProblemOpen, setReportProblemOpen, effectiveCollapsed, activePath,
     libraryNavActive, discoverNavActive, isChat, needsFixedHeight, navRowActive, membersRoute, mobileSingle,
   } = shell
+  // "Run in terminal" from a code block outside every chat, on any route.
+  const runInTerminal = useRunInTerminalShellBridge(activeSlotProject, !isPopout && !isEmbed)
 
   /**
    * Phone chat page: the main navigation as a 72px icon rail.
@@ -438,19 +443,6 @@ export default function App() {
           // scroller (behind a divider) on screens where pinning them would leave
           // the app tiles less than four rows (shell/nav/adaptiveMobileRail.tsx).
           secondary={<>
-            {devMode && (
-              <NavItem
-                navId="developer"
-                path="/developer"
-                label={i18nT('app.developer')}
-                icon={<Code size={16} />}
-                active={activePath === '/developer'}
-                collapsed
-                touch
-                replace
-                onClickOverride={activePath === '/developer' ? onActivate : undefined}
-              />
-            )}
             {terminalEnabled && (
               <NavItem
                 navId="terminal"
@@ -524,6 +516,9 @@ export default function App() {
         the dashboard inside the local pane (below), where it hides with the
         local Crew. */}
     {(isPopout || isEmbed) && <ImportSessionOutcomeNotice />}
+    {/* Same rule for a file-menu action's result: the dashboard shows it in the
+        notification sheet's banner region, which these frames do not render. */}
+    {(isPopout || isEmbed) && <FileMenuResultToastFrame />}
     {isPopout ? (
       <Routes>
         <Route path="/popout/chat/:slug?" element={<ErrorBoundary><PopoutFrame /></ErrorBoundary>} />
@@ -622,6 +617,16 @@ export default function App() {
         className="fixed inset-0 pointer-events-none"
         style={{ zIndex: OVERLAY_Z_MAX }}
       />
+      {/* Behind-content slot for `layer: "behind"` overlays. z-index -1 inside
+          the shell's stacking context paints over the shell's bg-bg but under
+          the non-positioned nav and content, so bubbles and cards cover it. */}
+      <div
+        id={THEME_DECOR_BEHIND_SLOT_ID}
+        ref={registerThemeDecorBehindSlot}
+        data-testid="theme-decor-slot-behind"
+        className="fixed inset-0 pointer-events-none"
+        style={{ zIndex: -1 }}
+      />
 
       {/* Full-height activity bar slot: ChatSidePanels portals its
           Activity panel here on desktop so it spans the window top-to-bottom
@@ -687,12 +692,7 @@ export default function App() {
 
       <ShellHeader shell={shell} />
 
-      {agentSwitchNotice && (
-        <div role="status" className="fixed z-[70] top-safe-offset-14 left-safe-offset-4 right-safe-offset-4 sm:left-auto sm:w-[440px] bg-bg-elevated border rounded-lg p-3 flex items-center gap-3 shadow-xl animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, transparent)' }}>
-          <span className="text-sm text-text flex-1">{agentSwitchNotice.message}</span>
-          <button onClick={() => dispatch(setAgentSwitchNotice(null))} aria-label={i18nT('app.dismiss')} className="text-muted hover:text-text leading-none p-0.5"><X className="lucide-inline w-4 h-4" /></button>
-        </div>
-      )}
+      {agentSwitchNotice && <AgentSwitchNoticeBanner notice={agentSwitchNotice} />}
 
       {/* Report a Problem — mounted by the nav rail's "Report issue" link. */}
       <ReportProblemModal open={reportProblemOpen} onClose={() => setReportProblemOpen(false)} />
@@ -887,7 +887,8 @@ export default function App() {
       <MetricsCard metrics={metrics} />
       <KiroAccountModal open={kiroUsageOpen} onClose={() => setKiroUsageOpen(false)} usage={kiroUsageState} />
       <Lightbox />
-      <ImportSessionOutcomeNotice />
+      <ImportSessionOutcomeNotice navigateToChat />
+      <RunInTerminalShellNotice error={runInTerminal.error} onDismiss={runInTerminal.dismiss} />
       </LocalOverlayRoot>
       </div>{/* /Local pane */}
       {/* Remote instance panes — embedded dashboards kept warm (mounted, hidden)

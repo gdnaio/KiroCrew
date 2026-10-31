@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import urllib.parse
 from typing import Any
 
@@ -32,8 +31,6 @@ from kiro_crew.mcp_providers.base import (
     McpServerDetail,
     ProviderUnavailableError,
 )
-
-logger = logging.getLogger(__name__)
 
 # Official registry API base (no trailing slash).
 _API_BASE = "https://registry.modelcontextprotocol.io"
@@ -110,7 +107,13 @@ async def _fetch_json(url: str) -> Any | None:
                 return json.loads(b"".join(chunks).decode("utf-8"))
     except ProviderUnavailableError:
         raise
-    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, OSError) as exc:
+    except (
+        aiohttp.ClientError,
+        asyncio.TimeoutError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,  # a non-UTF-8 200 body (captive portal, proxy page)
+        OSError,
+    ) as exc:
         raise ProviderUnavailableError(str(exc)) from exc
 
 

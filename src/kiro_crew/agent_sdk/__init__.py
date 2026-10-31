@@ -106,6 +106,7 @@ from kiro_crew.agent_sdk.drivers.acp import (
     finish_suspended_spawn,
     kas_engine_gap,
     kas_engine_unsupported_reason,
+    kas_engine_verdict,
 )
 from kiro_crew.agent_sdk.host_auth import (
     UNKNOWN_AGENT_AUTH,
@@ -137,19 +138,6 @@ def tool_row_text(text: str) -> str:
     return _scrub(text)
 
 
-def project_claims_agent_name(agent: str, work_dir: str | Path | None) -> AgentNameClaim | None:
-    """A checkout claim or unverifiable scan, or ``None`` when no claim is found.
-
-    Scans the checkout's native agents tree the way the backend loads it (nested and
-    linked directories, stem or declared name); application code asks here rather
-    than reaching into the ACP layer.
-    """
-    # Imported lazily for the same reason as fits_tool_result.
-    from kiro_crew.acp.managed_agent_shadow import project_claims_agent_name as _claims
-
-    return _claims(agent, work_dir)
-
-
 def agents_dir_competing_claim(
     agent: str, agents_dir: Path, own_file: Path
 ) -> AgentNameClaim | None:
@@ -157,6 +145,13 @@ def agents_dir_competing_claim(
     from kiro_crew.acp.managed_agent_shadow import agents_dir_competing_claim as _claim
 
     return _claim(agent, agents_dir, own_file)
+
+
+def session_start_concurrency() -> int:
+    """The configured ``agent.session_start_concurrency`` snapshot (off-loop caller)."""
+    from kiro_crew.acp.runtime_start import _resolve_session_start_concurrency as _resolve
+
+    return _resolve()
 
 
 TURN_STOP_REASON_CANCELLED = "cancelled"
@@ -171,8 +166,8 @@ class AgentTurnUsage(Protocol):
 
 
 __all__ = [
+    "session_start_concurrency",
     "tool_row_text",
-    "project_claims_agent_name",
     "agents_dir_competing_claim",
     "ContextPromptProvider",
     "ContextStreamEvent",
@@ -212,6 +207,7 @@ __all__ = [
     "forget_for_recheck",
     "kas_engine_gap",
     "kas_engine_unsupported_reason",
+    "kas_engine_verdict",
     "probe_backend",
     "probe_backends",
     "run_kiro_native_commands",

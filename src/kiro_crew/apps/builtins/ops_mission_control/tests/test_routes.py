@@ -257,7 +257,7 @@ class TestIncidentsPayloadIsBounded(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("truncated", payload)
 
     async def test_id_filter_narrows_to_one_incident(self):
-        """``?id=`` exists for the agent surface (see dashboard/server.py).
+        """``?id=`` exists for the agent surface (see dashboard/server_internal_paths.py).
 
         The single-incident ``GET /incident`` route cannot be admitted to
         internal-secret callers without prefix-admitting the human-only
@@ -534,7 +534,7 @@ class TestLedgerHygieneWiring(unittest.IsolatedAsyncioTestCase):
 
         def _index():
             order.append("index")
-            return index_result or {"scanned": 0, "written": 0, "skipped": 0, "embedded": 0}
+            return index_result or {"scanned": 0, "written": 0, "skipped": 0}
 
         request = mock.MagicMock(spec=web.Request)
         with mock.patch.object(ledger_sync, "sync_safely", _sync):
@@ -563,9 +563,7 @@ class TestLedgerHygieneWiring(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(json.loads(getattr(response, "text", "{}") or "{}")["changed"])
 
     async def test_newly_indexed_rows_mark_the_pass_changed(self):
-        response, _ = await self._run(
-            index_result={"scanned": 5, "written": 5, "skipped": 0, "embedded": 5}
-        )
+        response, _ = await self._run(index_result={"scanned": 5, "written": 5, "skipped": 0})
         self.assertTrue(json.loads(getattr(response, "text", "{}") or "{}")["changed"])
 
     async def test_a_quiet_pass_stays_silent(self):
@@ -583,7 +581,7 @@ class TestLedgerHygieneWiring(unittest.IsolatedAsyncioTestCase):
         nothing — a single boolean cannot distinguish "no remote" from "no model"."""
         response, _ = await self._run(
             sync_result="pulled",
-            index_result={"scanned": 3, "written": 3, "skipped": 0, "embedded": 3},
+            index_result={"scanned": 3, "written": 3, "skipped": 0},
         )
         payload = json.loads(getattr(response, "text", "{}") or "{}")
         self.assertIn("sync", payload)
@@ -637,7 +635,7 @@ class TestLedgerHygieneWiring(unittest.IsolatedAsyncioTestCase):
             side_effect=RuntimeError("faiss unavailable"),
         ):
             result = routes._index_ledger_safely()
-        self.assertEqual(result, {"scanned": 0, "written": 0, "skipped": 0, "embedded": 0})
+        self.assertEqual(result, {"scanned": 0, "written": 0, "skipped": 0})
 
     async def test_persistence_switch_skips_automatic_ledger_index_write(self):
         """The nightly app sweep must obey the global automatic-write switch."""
@@ -648,7 +646,7 @@ class TestLedgerHygieneWiring(unittest.IsolatedAsyncioTestCase):
                 result = routes._index_ledger_safely()
 
         store_cls.assert_not_called()
-        self.assertEqual(result, {"scanned": 0, "written": 0, "skipped": 0, "embedded": 0})
+        self.assertEqual(result, {"scanned": 0, "written": 0, "skipped": 0})
 
     async def test_a_prune_fault_cannot_cost_the_ledger_push(self):
         """`prune_closed` sits before the push, and making the index read strict gave it a
@@ -813,7 +811,7 @@ class TestNeedsHumanNotifiesOnTheEdgeOnly(unittest.IsolatedAsyncioTestCase):
         from kiro_crew.apps.builtins.ops_mission_control.backend import models, store
 
         inc = self._claim()
-        leaked = "AKIAIOSFODNN7EXAMPLE"
+        leaked = "glpat-IOSFODNN7EXAMPLE"
         status, _payload = await self._transition(
             inc.incident_id,
             models.STATUS_NEEDS_HUMAN,
@@ -920,7 +918,7 @@ class TestLedgerWritesAreRedacted(unittest.IsolatedAsyncioTestCase):
 
         from kiro_crew.apps.builtins.ops_mission_control.backend import ledger
 
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = "glpat-IOSFODNN7EXAMPLE"
         app = web.Application()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
@@ -956,7 +954,7 @@ class TestLedgerWritesAreRedacted(unittest.IsolatedAsyncioTestCase):
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             async with TestClient(TestServer(app)) as client:
-                for secret in ("AKIAIOSFODNN7EXAMPLE", "AKIAI44QH8DHBEXAMPLE"):
+                for secret in ("glpat-IOSFODNN7EXAMPLE", "glpat-I44QH8DHBEXAMPLE"):
                     resp = await client.post(
                         "/api/apps/ops-mission-control/ledger",
                         json={"pattern": "assume-role denied", "fix": f"key {secret}"},

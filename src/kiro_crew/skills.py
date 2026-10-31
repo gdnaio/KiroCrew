@@ -665,6 +665,7 @@ class SkillsLoader:
     preview_pending_update = _review.preview_pending_update
     approve_pending_update_checked = _review.approve_pending_update_checked
     approve_pending_skill_checked = _review.approve_pending_skill_checked
+    approve_pending_as_read = _review.approve_pending_as_read
 
     def _iter_uncached(self, project_key: str | None = None) -> list[tuple[str, Path, str | None]]:
         """Walk the skills dir, extra paths, and an already-canonical project root."""
@@ -709,9 +710,9 @@ class SkillsLoader:
         """
         return _listing.list_skills(self, project_dir, _entries=_entries)
 
-    def _owning_app(self, name: str, skill_file: Path) -> str | None:
+    def _owning_app(self, name: str, skill_file: Path, within: str | None = None) -> str | None:
         """The app whose bundle this skill came from, or ``None``."""
-        return _catalog._owning_app(self, name, skill_file)
+        return _catalog._owning_app(self, name, skill_file, within)
 
     def _owned_hint(self, skill_file: Path) -> bool:
         """Whether *skill_file* sits under the directory Kiro Crew owns."""
@@ -1033,6 +1034,8 @@ class SkillsLoader:
         target: str | None = None,
         base_version: int | None = None,
         refusal: ClaimRefusal | None = None,
+        missing_scripts: list[str] | None = None,
+        rejected_scripts: dict[str, list[str]] | None = None,
     ) -> str | None:
         """Write a skill candidate to the pending queue (not live).
 
@@ -1053,6 +1056,8 @@ class SkillsLoader:
             target=target,
             base_version=base_version,
             refusal=refusal,
+            missing_scripts=missing_scripts,
+            rejected_scripts=rejected_scripts,
         )
 
     # ── Pending candidate trees: ``kiro_crew.skills_candidate_tree`` ──

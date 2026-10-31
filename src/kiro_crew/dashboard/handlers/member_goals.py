@@ -8,10 +8,13 @@ Two halves, split the way :mod:`handlers.member_self` is:
 
   - ``GET /api/members/{slug}/goals?member=`` -- the record.
   - ``PUT /api/members/{slug}/goals/long-term`` -- ``{member, long_term,
-    goal_id?, expected?}``: add a goal, or replace (an empty text: remove) the
-    goal ``goal_id``. Also the route a ``crewmate.goal`` change card applies and
-    undoes through (``change_card_catalog.HOOKED_ROUTES``); ``expected`` makes it
-    a compare-and-set so a card never overwrites a newer edit.
+    goal_id?, expected?, heartbeat_offer?}``: add a goal, or replace (an empty
+    text: remove) the goal ``goal_id``. Also the route a ``crewmate.goal`` change
+    card applies and undoes through (``change_card_catalog.HOOKED_ROUTES``);
+    ``expected`` makes it a compare-and-set so a card never overwrites a newer
+    edit, and ``heartbeat_offer`` (``accepted`` / ``declined``) stores the
+    card's Heartbeat checkbox answer with the goal. The Heartbeat itself still
+    turns on only through the schedules route below, as the card's next step.
   - ``DELETE /api/members/{slug}/goals/items/{goal_id}`` and
     ``POST .../{goal_id}/restore`` -- remove one goal, and its one Undo.
   - ``PUT /api/members/{slug}/goals/key-results`` -- ``{member, items, expected?}``:
@@ -22,9 +25,11 @@ Two halves, split the way :mod:`handlers.member_self` is:
   - ``DELETE /api/members/{slug}/goals/key-results/{kr_id}`` and
     ``POST .../{kr_id}/restore`` -- remove one key result, and its one Undo.
   - ``PUT /api/members/{slug}/goals/schedules`` -- ``{member, daily?, weekly?,
-    monthly?, time?, timezone?, weekday?, month_day?}``: the three check-in
-    switches, each keeping exactly one schedule of its own in step
-    (:mod:`kiro_crew.dashboard.goal_reminder`).
+    monthly?, heartbeat?, time?, timezone?, weekday?, month_day?, interval?}``:
+    the four check-in switches, each keeping exactly one schedule of its own in
+    step (:mod:`kiro_crew.dashboard.goal_reminder`). This route and the
+    ``crewmate.check_ins`` card it applies are the only writers of a switch, so
+    the heartbeat turns on only by the user's hand.
 
 * The **agent half** is MCP-only under the strict ``/api/member/self`` prefix,
   behind the ``kirocrew-mate`` goal tools. The crewmate acted on is the one whose
@@ -41,6 +46,7 @@ Two halves, split the way :mod:`handlers.member_self` is:
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import weakref
 from typing import Any
@@ -102,7 +108,7 @@ def _goal_refusal(exc: member_goals.GoalError) -> web.Response:
 
 
 def _unreadable() -> web.Response:
-    return _deny(500, "goals_unreadable", "this crewmate's goal record cannot be read")
+    return _deny(500, "goals_unreadable", "this mate's goal record cannot be read")
 
 
 async def _scheduled_cadences(request: web.Request, slug: str) -> set[str]:
@@ -233,9 +239,13 @@ async def api_member_goals_long_term(request: web.Request) -> web.Response:
         return _deny(400, "invalid_expected", "expected must be the goal text shown")
     goal_id = body.get("goal_id")
     if goal_id is not None and not member_goals.is_goal_id(goal_id):
-        return _deny(400, "invalid_goal_id", "goal_id must be one of the crewmate's goal ids")
+        return _deny(400, "invalid_goal_id", "goal_id must be one of the mate's goal ids")
     if goal_id is None and expected not in (None, ""):
         return _deny(400, "invalid_expected", "a new goal replaces nothing; name a goal_id")
+    # The goal card's Heartbeat checkbox, answered: stored with the goal.
+    heartbeat_offer = body.get("heartbeat_offer")
+    if heartbeat_offer is not None and heartbeat_offer not in member_goals.HEARTBEAT_OFFER_ANSWERS:
+        return _deny(400, "invalid_heartbeat_offer", "heartbeat_offer is accepted or declined")
 
     from kiro_crew.dashboard.handlers.change_cards import REQ_CARD_RAW_RESTORE
 
@@ -252,6 +262,7 @@ async def api_member_goals_long_term(request: web.Request) -> web.Response:
             goal_id=goal_id,
             expected=expected,
             restore_from=restore_from,
+            heartbeat_offer=heartbeat_offer,
         )
         saved.append({"slug": slug, "member": member, **result})
         return result["record"]
@@ -458,8 +469,8 @@ async def _sync_reminder(request: web.Request, slug: str, member: str, cfg: Kiro
 async def api_member_goals_schedules(request: web.Request) -> web.Response:
     """PUT /api/members/{slug}/goals/schedules — the check-in switches and their timing.
 
-    Body: ``{member, daily?, weekly?, monthly?, time?, timezone?, weekday?,
-    month_day?}``. Turning a switch on needs a goal (409 ``no_goal``).
+    Body: ``{member, daily?, weekly?, monthly?, heartbeat?, time?, timezone?,
+    weekday?, month_day?, interval?}``. Turning a switch on needs a goal (409 ``no_goal``).
     The record is written first, then the schedules are made to match it; when
     they cannot be written the switches turned on by this request are turned back
     off and the answer is 503, so no switch shows a check-in nothing will send.
@@ -478,10 +489,22 @@ async def api_member_goals_schedules(request: web.Request) -> web.Response:
     if isinstance(who, web.Response):
         return who
     slug, member, cfg = who
+    from kiro_crew.dashboard.handlers.change_cards import REQ_CARD_RAW_RESTORE
+
+    # Armed only on a goal card's Undo steps: its Heartbeat-off step is done when
+    # the user already turned the Heartbeat off, and the goal Undo goes on.
+    held_is_done = isinstance(request.get(REQ_CARD_RAW_RESTORE), dict)
     async with _schedule_lock(slug):
         try:
             rec = await asyncio.to_thread(
-                member_goals.set_schedules, slug, member, changes, expected=expected
+                functools.partial(
+                    member_goals.set_schedules,
+                    slug,
+                    member,
+                    changes,
+                    expected=expected,
+                    held_is_done=held_is_done,
+                )
             )
         except member_goals.GoalError as exc:
             return _goal_refusal(exc)
@@ -622,8 +645,9 @@ async def _notify_report(request: web.Request, member: str, label: str, saved: d
 
 
 async def api_member_self_goal_report(request: web.Request) -> web.Response:
-    """POST /api/member/self/goals/report — ``{kind, title, markdown}``.
+    """POST /api/member/self/goals/report — ``{kind, title, markdown | html}``.
 
+    The report is Markdown or a whole self-contained HTML page, one of the two.
     Saves a weekly report or monthly review as an artifact under
     ``Crewmates/<name>/Reports``, remembers it on the goal record, and sends one
     notification linking it. The answer carries the link for the crewmate's one
@@ -637,7 +661,8 @@ async def api_member_self_goal_report(request: web.Request) -> web.Response:
         return who
     sk, slug, member = who
     body = await _agent_body(request)
-    kind, title, markdown = str(body.get("kind") or ""), body.get("title"), body.get("markdown")
+    kind, title = str(body.get("kind") or ""), body.get("title")
+    markdown, html = body.get("markdown", ""), body.get("html", "")
     title_max = member_goals.REPORT_TITLE_MAX_CHARS
     if not isinstance(title, str) or not title.strip() or len(title) > title_max:
         return _deny(
@@ -645,6 +670,8 @@ async def api_member_self_goal_report(request: web.Request) -> web.Response:
         )
     if not isinstance(markdown, str) or len(markdown) > REPORT_MAX_CHARS:
         return _deny(400, "invalid_report", f"the report is text of up to {REPORT_MAX_CHARS} chars")
+    if not isinstance(html, str):
+        return _deny(400, "invalid_report", "the html report is one page of text")
     cfg = await asyncio.to_thread(KiroCrewConfig.load)
     label = _label(cfg, member)
     try:
@@ -656,6 +683,7 @@ async def api_member_self_goal_report(request: web.Request) -> web.Response:
             kind=kind,
             title=title.strip(),
             markdown=markdown,
+            html=html,
             session_key=sk,
         )
     except member_goals.GoalError as exc:
@@ -667,3 +695,30 @@ async def api_member_self_goal_report(request: web.Request) -> web.Response:
     await _notify_report(request, member, label, saved)
     _audit(sk, OP_GOAL_WRITE, "ok", f"report:{kind}")
     return web.json_response({"ok": True, **saved})
+
+
+async def api_member_self_notes(request: web.Request) -> web.Response:
+    """POST /api/member/self/notes — ``{text}``: replace the crewmate's own notes.
+
+    The notes are its briefing (``members/<slug>/briefing.md``), injected as its
+    ``[CURRENT ASSIGNMENT]`` section. The conductor has no file tool, so this is
+    how it keeps them; the same caller check as the goal tools applies.
+    """
+    from kiro_crew import member_notes
+    from kiro_crew.dashboard.handlers.guide import _audit
+
+    who = await _agent_member(request, OP_GOAL_WRITE)
+    if isinstance(who, web.Response):
+        return who
+    sk, slug, _member = who
+    body = await _agent_body(request)
+    try:
+        written = await asyncio.to_thread(
+            member_notes.write_member_notes, slug, body.get("text", "")
+        )
+    except member_notes.NotesError as exc:
+        _audit(sk, OP_GOAL_WRITE, "denied", exc.code)
+        status = 400 if exc.code in ("invalid_notes", "notes_too_long") else 500
+        return _deny(status, exc.code, str(exc))
+    _audit(sk, OP_GOAL_WRITE, "ok", "notes")
+    return web.json_response({"ok": True, "chars": written})

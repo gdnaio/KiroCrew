@@ -23,6 +23,7 @@ shows a reviewer which harness moved. The capture both share is
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import logging
 import os
@@ -609,6 +610,7 @@ class _Scratch:
         self._fail = fail
         self.allocated_labels: list[str] = []
         self.validated: list[Path] = []
+        self.dropped_from: dict[str, str] = {}
 
     def allocate_scratch(self, label: str) -> Path | None:
         self.allocated_labels.append(label)
@@ -623,6 +625,10 @@ class _Scratch:
     def scratch_env(self, path: Path, shared: Path | None = None) -> dict[str, str]:
         return {"KIROCREW_SCRATCH": str(path), "TMPDIR": str(path)}
 
+    def drop_inherited_scratch_env(self, env: dict[str, str]) -> tuple[str, ...]:
+        self.dropped_from = dict(env)
+        return ()
+
 
 class _Recording:
     """Every collaborator call the tail makes, in the order it made them."""
@@ -634,6 +640,7 @@ class _Recording:
         self.factory_kwargs: dict = {}
         self.socket_env_arg: dict | None = None
         self.forward_args: tuple | None = None
+        self.pod_internal_sandbox: bool | None = None
 
 
 def _launch_tools(
@@ -660,8 +667,9 @@ def _launch_tools(
 
     platform.create_windows_cleanup_owned_process = _owned_process
 
-    def _pod_bundle(argv, *, backend):
+    def _pod_bundle(argv, *, backend, internal_sandbox=None):
         rec.calls.append("apply_pod_bundle_spawn")
+        rec.pod_internal_sandbox = internal_sandbox
         return list(argv), delegate
 
     def _forward(mode, hidden_dirs):
@@ -904,6 +912,23 @@ def test_a_failed_spawn_releases_the_workspace_and_the_sandbox_launcher(
         assert host.cleanup_discards == 1
 
 
+def test_the_spawn_hands_the_recorder_the_wraps_own_argv_and_script(monkeypatch, tmp_path) -> None:
+    """The confinement check trusts a launcher only from this record.
+
+    The recorder gets the argv the wrap returned (before the cgroup scope) and the
+    launcher script the wrap generated, so it can tell a real launcher spawn from a
+    command that only looks like one.
+    """
+    _launch_env(monkeypatch)
+    recorded: list[tuple] = []
+    tools = dataclasses.replace(
+        _launch_tools(_Recording(), scratch=_Scratch(None)),
+        remember_namespace_launcher=lambda *args: recorded.append(args),
+    )
+    _run_launch(_FakeHost(tmp_path), _request(), tools)
+    assert recorded == [(99_999_999_999, ("sandbox", "/opt/bin/host", "acp"), "/run/launcher.sh")]
+
+
 def test_a_respawn_joins_the_tree_its_previous_process_staged(monkeypatch, tmp_path) -> None:
     """A respawn exposes the previous process's directory instead of hiding its work."""
     _launch_env(monkeypatch)
@@ -931,6 +956,20 @@ def test_a_scratch_that_cannot_be_allocated_spawns_with_the_inherited_temp(
     assert rec.wrap_kwargs["extra_private_dirs"] == ()
     assert "KIROCREW_SCRATCH" not in rec.factory_kwargs["env"]
     assert any("could not allocate" in r.getMessage() for r in caplog.records)
+
+
+def test_the_inherited_scratch_exports_are_judged_before_any_configured_layer(
+    monkeypatch, tmp_path
+) -> None:
+    """The drop sees the gateway's own environment, not ``agent.env`` or ``extra_env``."""
+    _launch_env(monkeypatch, TMPDIR="/gateway/inherited")
+    scratch = _Scratch(None, fail=True)
+    tools = dataclasses.replace(
+        _launch_tools(_Recording(), scratch=scratch),
+        agent_env_overlay=lambda: {"TMPDIR": "/operator/agent-env"},
+    )
+    _run_launch(_FakeHost(tmp_path), _request(extra_env={"TMPDIR": "/driver/extra"}), tools)
+    assert scratch.dropped_from["TMPDIR"] == "/gateway/inherited"
 
 
 def test_only_the_guarding_driver_allocates_scratch_through_its_guarded_hop(
@@ -961,6 +1000,9 @@ def test_a_host_with_its_own_sandbox_enters_a_verified_workspace(monkeypatch, tm
         )
         assert ("bind_voice_safe_agent_workspace_async" in rec.calls) is internal
         assert rec.factory_kwargs["chdir_fd"] == (7 if internal else None)
+        # The pod step receives the driver's verdict instead of re-deriving it
+        # from the backend, so a per-route answer reaches the sandbox wrap.
+        assert rec.pod_internal_sandbox is internal
 
 
 def test_the_driver_names_the_scope_and_the_launch_reports_it(monkeypatch, tmp_path) -> None:

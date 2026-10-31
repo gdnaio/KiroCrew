@@ -247,6 +247,9 @@ class TestAMaskedCredentialLeafRefusesASecondHardLink:
         with caplog.at_level("WARNING"):
             sandbox._refuse_aliased_masked_leaves()  # does not raise
 
+        assert target.read_text(encoding="utf-8") == "{}\n"
+        assert target.stat().st_nlink == 2
+
     def test_a_symlinked_legacy_home_does_not_refuse_the_spawn(self, crew_home, tmp_path):
         """The layout a part-migrated host actually has must keep starting agents.
 
@@ -284,7 +287,8 @@ class TestAMaskedCredentialLeafRefusesASecondHardLink:
             "token_signing.key",
             # refresh-token chain state; a read continues a session
             "refresh_chains.json",
-            # live GitHub PAT
+            # live GitHub PAT, inside the masked state directory, and its old bare name
+            "md-notebook-staging/pat",
             "workspace/md-notebook/pat",
             # named secrets store
             "ops_mission_control_secrets.json",
@@ -309,7 +313,14 @@ class TestAMaskedCredentialLeafRefusesASecondHardLink:
         A test rather than a module-level ``assert``, for the reason the tolerated set's own
         invariant gives: ``python -O`` strips an assert.
         """
-        stray = sorted(sandbox._CREW_HARDLINK_REFUSED_LEAVES - set(sandbox._CREW_HIDDEN_LEAVES))
+        hidden = set(sandbox._CREW_HIDDEN_LEAVES)
+
+        def masked(leaf: str) -> bool:
+            # A leaf or any directory above it: a mask on a directory hides every name in it.
+            parts = leaf.split("/")
+            return any("/".join(parts[:n]) in hidden for n in range(1, len(parts) + 1))
+
+        stray = sorted(leaf for leaf in sandbox._CREW_HARDLINK_REFUSED_LEAVES if not masked(leaf))
         assert not stray, f"refused on a hard link but not masked: {stray}"
 
     def test_the_sqlite_sidecars_come_from_the_shared_suffix_constant(self):
@@ -818,12 +829,12 @@ class TestACredentialLeafBehindALinkedComponentIsNotRefused:
 
     def _plant(self, crew_home, tmp_path, leaf):
         """Put an aliased leaf behind a symlinked FIRST component, outside the data home."""
-        victim = tmp_path / "agent-owned"
         parts = leaf.replace(os.sep, "/").split("/")
+        victim = tmp_path / f"agent-owned-{parts[0]}"
         (victim / "/".join(parts[1:-1])).mkdir(parents=True, exist_ok=True)
         target = victim / "/".join(parts[1:])
         target.write_bytes(b"secret")
-        os.link(target, victim / "second-name")
+        os.link(target, tmp_path / f"second-name-{parts[0]}")
         assert target.stat().st_nlink == 2
         planted = crew_home / parts[0]
         if planted.is_symlink():
@@ -834,10 +845,15 @@ class TestACredentialLeafBehindALinkedComponentIsNotRefused:
         return target
 
     def test_the_refusal_skips_it(self, crew_home, tmp_path):
-        for leaf in self._multi_component_leaves():
-            self._plant(crew_home, tmp_path, leaf)
+        targets = [
+            self._plant(crew_home, tmp_path, leaf) for leaf in self._multi_component_leaves()
+        ]
 
         sandbox._refuse_multilinked_credential_leaves()  # does not raise
+
+        for target in targets:
+            assert target.read_bytes() == b"secret"
+            assert target.stat().st_nlink == 2
 
     def test_the_doctor_read_skips_it_too(self, crew_home, tmp_path):
         """A probe wider than the refusal fails doctor's exit code over a foreign path."""

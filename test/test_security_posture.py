@@ -265,11 +265,16 @@ _BASELINE_LOG_SITE_CENSUS: dict[str, int] = {
     "acp/transport_errors.py": 1,
     "apps/builtins/pptx_maker/backend/routes.py": 1,
     "dashboard/chat_nav.py": 1,
-    "dashboard/chat_runner.py": 8,
     "dashboard/chat_title.py": 1,
     # The native sub-agent card sync's gate-side log, moved out of chat_runner.py with
     # its helper; the same gateway process as the runner's sites.
     "dashboard/chat_turn/native_cards.py": 1,
+    # The permission, tool and session-event arms' gate-side logs, moved out of
+    # chat_runner.py with their phases; the same gateway process as the runner's sites.
+    "dashboard/chat_turn/permission_prompt.py": 1,
+    "dashboard/chat_turn/session_events.py": 2,
+    "dashboard/chat_turn/tool_approval.py": 4,
+    "dashboard/chat_turn/tool_rows.py": 1,
     # The outbox owner composed into dashboard/handlers/files.py: api_outbox_notify's
     # refusal audit, in the same gateway process as the facade.
     "dashboard/file_api/outbox.py": 1,
@@ -282,7 +287,6 @@ _BASELINE_LOG_SITE_CENSUS: dict[str, int] = {
     "dashboard/session_control_parts/target_authorization.py": 1,
     "dashboard/session_transfer_install.py": 1,
     "dashboard/state_parts/slot_turns.py": 1,
-    "knowledge/agent_fetch.py": 1,
     "mcp_cron_vet.py": 1,
     # The pooled-backend daemon never composes a companion context. Its
     # declared-temp warnings therefore use the baseline pass deliberately.
@@ -292,7 +296,10 @@ _BASELINE_LOG_SITE_CENSUS: dict[str, int] = {
     "mcp_tools/messaging.py": 1,
     "mcp_tools/skills.py": 2,
     "messaging/sessions_view.py": 1,
-    "slack/events.py": 2,
+    # The sessions slash command and the Home tab, moved out of slack/events.py to the
+    # owners behind that facade: the same gateway process.
+    "slack/events_home_tab.py": 1,
+    "slack/events_slash.py": 1,
     # Owners composed into slack/gateway.py (the cron script arm, boot-time install
     # repair, the unattended result delivery, a sub-agent completion's injection
     # into its parent, the tool-approval callbacks): the gateway process.
@@ -408,6 +415,25 @@ class TestSnapshotShape:
             # The UI turns `source` into a GitHub deep link; a typo would render a
             # 404 for every reader of that row.
             assert (repo_root / control["source"]).is_file(), control["source"]
+
+    def test_every_label_and_unit_has_matching_dashboard_wording(self, snapshot):
+        import json
+        from pathlib import Path
+
+        # The dashboard words each control's name and "<count> <unit>" from its
+        # catalog by `key`, so it can translate and pluralize them; the server's
+        # English `label` and `unit` are only the fallback for a key the dashboard
+        # does not know. A rename here without the catalog would leave every
+        # language showing the old words.
+        locales = Path(__file__).resolve().parent.parent / "website/src/i18n/locales"
+        catalog: dict[str, str] = {}
+        for name in ("en.json", "en.manual.json"):
+            settings = json.loads((locales / name).read_text(encoding="utf-8"))["pages"]["settings"]
+            catalog.update(settings.get("postureDisclosure", {}))
+        for control in snapshot["controls"]:
+            key = control["key"]
+            assert catalog.get(f"label_{key}") == control["label"], key
+            assert catalog.get(f"count_{key}_other") == f"{{{{count}}}} {control['unit']}", key
 
     @pytest.mark.asyncio
     async def test_async_builder_matches_the_sync_one(self, snapshot):
@@ -546,9 +572,12 @@ class TestDisclosureContract:
         # Pinning the module as governance-free is the property that actually
         # holds the boundary: if this module cannot reach the governance
         # machinery, it cannot republish its rules under any key name.
+        import importlib
         import inspect
 
-        src = inspect.getsource(security_posture)
+        src = inspect.getsource(security_posture) + "".join(
+            inspect.getsource(importlib.import_module(owner)) for owner in security_posture._OWNERS
+        )
         for forbidden in (
             "platform.governance",
             "platform import governance",
@@ -753,7 +782,12 @@ class TestOmissionDetection:
         # The ``security`` package DEFINES the redactors; security_posture.py only
         # names them. The whole package is skipped, not one file, because the
         # definitions are spread across its submodules.
-        self_referential = {"security_posture.py"}
+        self_referential = {
+            "security_posture.py",
+            "security_posture_controls.py",
+            "security_posture_sinks_delivery.py",
+            "security_posture_sinks_gateway.py",
+        }
 
         unclassified: list[str] = []
         for path in sorted(pkg.rglob("*.py")):
@@ -922,7 +956,13 @@ class TestOmissionDetection:
         pkg = Path(security_posture.__file__).resolve().parent
         explicit: set[str] = set()
         for path in pkg.rglob("*.py"):
-            if path.name in {"sel.py", "security_posture.py"}:
+            if path.name in {
+                "sel.py",
+                "security_posture.py",
+                "security_posture_controls.py",
+                "security_posture_sinks_delivery.py",
+                "security_posture_sinks_gateway.py",
+            }:
                 continue
             explicit |= set(
                 re.findall(
@@ -1076,7 +1116,13 @@ class TestRedactionSinkRegistry:
         assert _sink_module_calls_a_redactor(tmp_path, "calls.py")
 
     def test_a_facade_counts_only_through_the_owners_it_declares(self, tmp_path):
-        """A split module's facade keeps its sink row; its declared owners must call."""
+        """A facade's sink row counts only through the owners it declares.
+
+        An owner listed in ``_OWNERS`` or imported as ``_owner_<name>`` that calls a
+        redactor makes the row pass; a plain import does not. This covers rows
+        already keyed to a facade. A new split re-keys its ``_REDACTION_SINKS`` row
+        to the owner module that makes the call, instead of leaving it on the facade.
+        """
         pkg = tmp_path / "kiro_crew"
         (pkg / "fam").mkdir(parents=True)
         (pkg / "fam" / "owner.py").write_text(

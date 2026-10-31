@@ -34,6 +34,7 @@ import { i18nT } from '../../i18n/t'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '../../api/client'
 import { providerLabel } from '../../lib/sttProviders'
+import { parseSpeechProviders, speechProviderNotice } from '../../lib/speechProviders'
 import { dictationSeparator, spliceDictationText } from '../../lib/dictationText'
 import { useVoiceInput, voiceInputSupported, type TranscriptOrigin } from '../../hooks/useVoiceInput'
 import { usePushToTalk } from '../../hooks/usePushToTalk'
@@ -52,17 +53,19 @@ let micOwner: string | null = null
  *  holds the mic (a lone DM thread shows nothing else that is capturing). */
 let micOwnerSession: string | null = null
 const micSubs = new Set<() => void>()
-function setMicOwner(next: string | null, session: string | null = null): void {
+/** Exported so a non-composer mic (the comment boxes' dictation button) takes
+ *  the same one-at-a-time lock instead of capturing beside a composer. */
+export function setMicOwner(next: string | null, session: string | null = null): void {
   if (micOwner === next && micOwnerSession === session) return
   micOwner = next
   micOwnerSession = next === null ? null : session
   for (const fn of micSubs) fn()
 }
-function subscribeMic(fn: () => void): () => void {
+export function subscribeMic(fn: () => void): () => void {
   micSubs.add(fn)
   return () => { micSubs.delete(fn) }
 }
-const readMicOwner = () => micOwner
+export const readMicOwner = () => micOwner
 const readMicOwnerSession = () => micOwnerSession
 /** Test seam. */
 export function _resetMicOwner(): void { setMicOwner(null) }
@@ -94,7 +97,20 @@ export interface ComposerVoiceHost {
   pendingCaretRef?: React.MutableRefObject<number | null>
 }
 
-export type SttConfig = { streaming?: boolean; enabled?: boolean; dictation_panel?: boolean; available?: boolean; provider?: string; polish?: boolean; submit_on_release?: boolean; code?: string; prereqs?: string[] }
+export type SttConfig = { streaming?: boolean; streaming_providers?: string[]; enabled?: boolean; dictation_panel?: boolean; available?: boolean; provider?: string; polish?: boolean; submit_on_release?: boolean; code?: string; prereqs?: string[]; providers?: unknown[] }
+
+/**
+ * Whether dictation streams. The saved preference alone is not enough: a
+ * provider that cannot stream (an edition's batch-only provider) would be sent
+ * to /api/ws/stt and refused. Stream only when the served capability list names
+ * the selected provider; a gateway that serves no list keeps the preference.
+ */
+export function sttCanStream(cfg: SttConfig | undefined): boolean {
+  return !!cfg?.streaming && (
+    !Array.isArray(cfg?.streaming_providers)
+    || (typeof cfg?.provider === 'string' && cfg.streaming_providers.includes(cfg.provider))
+  )
+}
 
 /**
  * A deliberate finish (`StopIntent` 'finish') waiting for its transcript to
@@ -192,7 +208,7 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     queryKey: ['sttConfig'],
     queryFn: () => api.sttConfig() as Promise<SttConfig>,
   })
-  const sttStreaming = !!sttCfg?.streaming
+  const sttStreaming = sttCanStream(sttCfg)
   const sttEnabled = !!sttCfg?.enabled
   // Whether a finished transcript is handed to a fast model for punctuation and
   // spacing. Read here rather than inside the replacement so the request is never
@@ -1039,7 +1055,7 @@ export function useComposerVoice(host: ComposerVoiceHost) {
   // opens capture on the keydown itself, so there is no warm-up step to
   // schedule. Only the host that owns the binding (`pushToTalk`) is armed: N
   // composers each listening would open N captures on one keystroke.
-  usePushToTalk(
+  const { config: pttConfig } = usePushToTalk(
     {
       recording: voice.recording,
       // silent: a bare modifier is also an ordinary typing modifier, so a
@@ -1050,6 +1066,16 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     },
     { disabled: !voiceInputSupported || !host.pushToTalk, shiftDraftStop: submitOnRelease },
   )
+  // The key the mic may name: only on the composer the key is armed for, only
+  // while the key trigger is on, and only when a press would record. A keyboard
+  // start is silent, so with STT not ready the key does nothing and names
+  // nothing; a live recording keeps the name, since the key still stops it.
+  const pttBinding =
+    voiceInputSupported && host.pushToTalk && pttConfig.enabled
+      && ((sttConfigLoaded && sttEnabled && sttAvailable)
+        || (voice.sessionOwner === sessionId && voice.recording))
+      ? pttConfig.binding
+      : null
   // Stop any in-flight recording and clear the streaming prefix when the host's
   // session changes. The mic is a single shared device, so a recording can't
   // follow the user to another session; a BATCH transcript is still delivered
@@ -1168,11 +1194,15 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     }
   }, [])
 
-  /** Clears both halves, so one dismissal means what the user thinks it means. */
+  /** Clears both halves, so one dismissal means what the user thinks it means.
+   *  Depends on the stable `voice.clearError`, not on `voice`: useVoiceInput
+   *  returns a fresh object every render, and this callback is the composer's
+   *  only inputProps key that would otherwise change on every stream tick. */
+  const voiceClearError = voice.clearError
   const clearVoiceError = useCallback(() => {
     setPolishError(null)
-    voice.clearError()
-  }, [voice])
+    voiceClearError()
+  }, [voiceClearError])
 
   return {
     voice,
@@ -1193,6 +1223,8 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     micBusyElsewhereSession,
     /** True for a moment after a HELD transcript landed in this composer. */
     heldLanded,
+    /** The push-to-talk key the mic may name, or null (see `pttBinding`). */
+    pttBinding,
     /** `VoiceDisabledModal` state; the host renders the modal and routes its settings link. */
     setup: {
       open: voiceSetupOpen,
@@ -1202,6 +1234,10 @@ export function useComposerVoice(host: ComposerVoiceHost) {
       /** Backend availability code, so the modal shows the same per-code reason
        *  Settings → Voice does instead of the generic provider-named sentence. */
       code: sttCfg?.code || '',
+      /** The selected edition provider's own row when it cannot run, picked the
+       *  way Settings → Voice picks it, so the modal shows that provider's reason
+       *  instead of calling an installed provider "not installed". */
+      providerNotice: speechProviderNotice(parseSpeechProviders(sttCfg?.providers), sttCfg?.provider || ''),
       /** The pip command the backend computed for a missing voice extra, shown
        *  verbatim so the user can self-serve the fix. ONLY the actionable pip
        *  entry qualifies: `prereqs` can also carry an ffmpeg install command,
@@ -1246,6 +1282,9 @@ export function composerVoiceInputProps(cv: ComposerVoice) {
     voiceBusyElsewhereSession: cv.micBusyElsewhereSession,
     /* A held dictation just landed here: the composer shows a brief cue. */
     voiceHeldLanded: cv.heldLanded,
+    /* The push-to-talk key the mic may name; null where pressing it would not
+       record here. */
+    voicePttBinding: cv.pttBinding,
     // The capture's own error wins: a microphone that never recorded outranks a
     // cleanup pass that did not run.
     voiceError: voice.error ?? polishError,

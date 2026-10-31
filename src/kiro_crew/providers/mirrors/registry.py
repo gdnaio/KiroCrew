@@ -32,6 +32,7 @@ from enum import Enum
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_COPILOT,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
@@ -42,6 +43,7 @@ from kiro_crew.acp_backends import (
 from kiro_crew.providers.mirrors.base import AgentConfigMirror
 from kiro_crew.providers.mirrors.claude_code import ClaudeCodeMirror
 from kiro_crew.providers.mirrors.codex import CodexMirror
+from kiro_crew.providers.mirrors.copilot import CopilotMirror
 from kiro_crew.providers.mirrors.deepseek import DeepSeekMirror
 from kiro_crew.providers.mirrors.goose import GooseMirror
 from kiro_crew.providers.mirrors.opencode import OpenCodeMirror
@@ -108,21 +110,39 @@ class PerToolDeny(str, Enum):
     false while the behaviour changed underneath. A reader that renders all three
     (the per-provider ability card) is a consumer this serves, not the reason it has
     three members.
+
+    Each member also declares its COST: whether switching ONE tool off there can
+    withhold a whole server (:attr:`costs_whole_server`). The cost is the second
+    item of the member's definition, so a reach cannot be declared without one --
+    the class refuses to build -- and a reach added here carries its own ruling
+    rather than waiting on a table in ``agent_sdk`` to learn it.
     """
+
+    #: Whether a tool-off under this reach can cost a whole server rather than the
+    #: one tool it names. Set by ``__new__`` from the member's own definition.
+    costs_whole_server: bool
+
+    def __new__(cls, value: str, costs_whole_server: bool) -> "PerToolDeny":
+        member = str.__new__(cls, value)
+        member._value_ = value
+        member.costs_whole_server = costs_whole_server
+        return member
 
     #: The restriction reaches the harness as a per-tool rule in config Crew writes --
     #: a settings file for claude, the inline OPENCODE_CONFIG_CONTENT block for
     #: opencode -- so the narrowed server stays MOUNTED and the harness itself
-    #: refuses the tool.
-    SETTINGS_FILE = "settings-file"
+    #: refuses the tool. The one reach that costs exactly the tool it names.
+    SETTINGS_FILE = ("settings-file", False)
     #: No per-tool slot on the wire, but the backend asks permission per MCP call
     #: with an identity Crew can match, so Crew refuses the call itself. The narrowed
-    #: server may stay mounted where that channel is complete.
-    PER_CALL = "per-call"
+    #: server may stay mounted where that channel is complete. Costly all the same:
+    #: it stays per tool on Crew's OWN servers and withholds any other server whole,
+    #: so a reader with a third-party server meets the whole-server accident.
+    PER_CALL = ("per-call", True)
     #: No channel at all -- neither a rule the harness reads nor a per-call identity
     #: Crew can match. The only faithful action is WITHHOLDING the whole server, so
     #: the restriction costs availability rather than being silently dropped.
-    WHOLE_SERVER = "whole-server"
+    WHOLE_SERVER = ("whole-server", True)
 
 
 @dataclass(frozen=True)
@@ -204,6 +224,7 @@ MIRRORS: dict[str, type[AgentConfigMirror]] = {
     ACP_BACKEND_OPENCODE: OpenCodeMirror,
     ACP_BACKEND_GOOSE: GooseMirror,
     ACP_BACKEND_DEEPSEEK: DeepSeekMirror,
+    ACP_BACKEND_COPILOT: CopilotMirror,
 }
 
 #: Every backend this build can spell, and how its MCP surface is reached.
@@ -355,6 +376,19 @@ PROJECTIONS: dict[str, McpProjection] = {
         "commonest cause, a command that does not exist, before the request: "
         "acp.mcp_startable leaves the element out and the session's MCP report names it "
         "as failed (ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP)",
+        # No per-call deny path is verified for this harness, so a narrowed server is
+        # withheld whole, the direction that cannot leave a switched-off tool reachable.
+        per_tool_deny=PerToolDeny.WHOLE_SERVER,
+    ),
+    ACP_BACKEND_COPILOT: McpProjection(
+        kind=ProjectionKind.MIRROR,
+        reason="copilot.py -- the session/new mcpServers array, whose stdio half is "
+        "mounted from the launch instead: Copilot CLI 1.0.100 drops a stdio element sent "
+        "on session/new and serves one named in --additional-mcp-config, so the spawn "
+        "writes that half to an owner-only launch file (acp/harness/copilot.py). Measured "
+        "end to end in test/fixtures/acp_frames/copilot/mcp-stdio-mount-live.jsonl "
+        "(initialize, tools/list and tools/call asked by the harness itself, the call "
+        "gated by session/request_permission first)",
         # No per-call deny path is verified for this harness, so a narrowed server is
         # withheld whole, the direction that cannot leave a switched-off tool reachable.
         per_tool_deny=PerToolDeny.WHOLE_SERVER,

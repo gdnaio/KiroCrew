@@ -65,7 +65,7 @@ try {
   })
 
   await page.goto('/capabilities?tab=crews', { waitUntil: 'domcontentloaded' })
-  await page.locator('#main-content').getByText('Your AI teammates', { exact: false })
+  await page.locator('#main-content').getByText('Always-on AI agents', { exact: false })
     .waitFor({ state: 'visible', timeout: 15000 })
 
   /* ── 1. Create — note present ──────────────────────────────────────────── */
@@ -83,10 +83,10 @@ try {
   await page.keyboard.press('Escape')
 
   /* ── 2. Edit → template pane — note absent ─────────────────────────────── */
-  const card = page.getByRole('button', { name: /Edit (crew|agent|crewmate) default/i })
+  const card = page.getByRole('button', { name: /Edit (crew|agent|mate) default/i })
   await card.waitFor({ state: 'visible', timeout: 15000 })
   await card.click()
-  const edit = page.getByRole('dialog', { name: /edit (crew|agent|crewmate)/i })
+  const edit = page.getByRole('dialog', { name: /edit (crew|agent|mate)/i })
   await edit.waitFor({ state: 'visible', timeout: 10000 })
   await edit.getByRole('button', { name: /^built from/i }).first().click()
 

@@ -29,6 +29,7 @@ _OWNERS = tuple(
         "session",
         "limits",
         "tailnet",
+        "shared_crew",
         "dashboard",
         "dashboard_hosts",
         "slack",
@@ -48,8 +49,8 @@ _BASE_IMPORTS = frozenset("""
     DEGRADED_TAILSCALE EFFORT_LEVELS ExternalRegistryConfig FORWARD_DECLARED_ENV_DEFAULT
     HeartbeatConfig InstancesConfig Iterable KnowledgeConfig MANAGED_STUB_FOLLOWERS
     MAX_RUNTIME_CEILING_SECS Mapping McpConfig McpGatewayConfig MemoryConfig MemoryStoreConfig
-    MessagingConfig MonitoringConfig Path PublishConfig SECRET_URI_PREFIX SessionSummaryConfig
-    SkillsConfig TaskRunnerConfig TunnelConfig TypeVar WatchdogConfig _COLOR_HEX_RE
+    MessagingConfig MonitoringConfig Path PowerConfig PublishConfig SECRET_URI_PREFIX SessionSummaryConfig
+    SkillsConfig TaskRunnerConfig TunnelConfig TypeVar WatchdogConfig WorkLedgerConfig _COLOR_HEX_RE
     _CONNECT_TIMEOUT_CEILING _CU_DEFAULT_ATTACH_SCREENSHOT _CU_DEFAULT_MAX_TREE_DEPTH
     _CU_DEFAULT_MAX_TREE_NODES _CU_DEFAULT_SCREENSHOT_JPEG_QUALITY _CU_DEFAULT_SCREENSHOT_MAX_PX
     _CU_DEFAULT_TEXT_LIMIT _DEFAULT_BACKOFF_MAX _DEFAULT_MAX_RECOVERY _DEFAULT_PROBE_FAILS
@@ -58,9 +59,9 @@ _BASE_IMPORTS = frozenset("""
     _DEFAULT_WARM_SET_CAP _MAX_RECOVERY_CEILING _MINT_TIMEOUT_CEILING _MINT_TIMEOUT_FLOOR
     _OBSERVED_DEGRADED_SECTIONS _RECOVER_BACKOFF_CEILING _STT_CATALOG _STT_CUSTOM_MODEL
     _STT_DEFAULT_IDLE_EVICT_SECS _STT_DEFAULT_MODEL _STT_DEFAULT_PARTIAL_INTERVAL_MS
-    _STT_DEFAULT_SILENCE_MS _SUBAGENT_TIMEOUT_MAX _SUBAGENT_TIMEOUT_MIN _SUBAGENT_TIMEOUT_SECS
+    _STT_DEFAULT_SILENCE_MS _STT_MAX_THREADS _STT_THREADS_AUTO _SUBAGENT_TIMEOUT_MAX _SUBAGENT_TIMEOUT_MIN _SUBAGENT_TIMEOUT_SECS
     _WARM_SET_CAP_AUTO _coerce_embedding_provider _coerce_int _declared_fields _is_invisible
-    _meta _os _port_or_unset _re _read_auto_add_documents _resolve_stt_model _resolve_stub_base
+    _meta _os _parse_stt_threads _port_or_unset _re _read_auto_add_documents _resolve_stt_model _resolve_stub_base
     _resolve_stub_overrides _resolve_stub_roster _resolve_stub_servers _safe_bool _safe_color
     _safe_dict _safe_float _safe_int _safe_list _safe_nonnegative_int _safe_pack_id
     _unicodedata _urlsplit _valid_stt_custom_path _valid_stt_custom_sha256 dataclass field

@@ -90,11 +90,13 @@ logger = logging.getLogger("kiro_crew.security.paths")
 _PATH_RESOLVE_TIMEOUT_SECS = 2.0
 
 
-# The ANCHOR REBUILD's own budget. One pool job there performs ~130 `realpath`
-# calls to build ~200 targets, where a candidate resolution performs one or two,
-# so a single budget sized for the candidate leaves the rebuild running ~130x
-# closer to its ceiling -- measured: a cold rebuild is 130 `_realpath_or_none`
-# calls, a warm one 4. Sizing this to the work actually done is what stops an
+# The ANCHOR REBUILD's own budget. One pool job there performs a few hundred
+# `realpath` calls -- one per declared entry under `$HOME`, plus the override
+# re-anchors -- where a candidate resolution performs one or two, so a single
+# budget sized for the candidate leaves the rebuild running far closer to its
+# ceiling -- measured with every override set: a cold rebuild resolves about 350
+# paths in one request, ~21 ms median on an idle Linux host. Sizing this to the
+# work actually done is what stops an
 # ordinarily-slow rebuild from being mistaken for a wedged mount on a loaded host
 # (4 xdist workers plus real-time antivirus on a 4-vCPU Windows runner is where it
 # was first observed); raising `_PATH_RESOLVE_TIMEOUT_SECS` globally instead would
@@ -209,7 +211,7 @@ _path_resolve_clock: Callable[[], float] = time.monotonic  # tests advance this
 # have, never in the pool.  The pool is sized and queued for the event loop's bounded
 # calls; a caller with no deadline would hold a child up to the pool's ceiling and
 # queue ahead of the loop, which is the starvation the inline entry point exists to
-# prevent (found in review).
+# prevent.
 _child_budget = threading.local()
 
 
@@ -758,7 +760,7 @@ def _run_resolution_bounded(
     governance file (found in review); the bound makes that probe safe.
 
     *budget* sizes the wait to the work the caller submits: the anchor REBUILD is
-    one request carrying ~130 paths and passes
+    one request carrying a few hundred paths and passes
     ``_PATH_RESOLVE_REBUILD_TIMEOUT_SECS``, while a candidate resolution keeps the
     default.
     """
@@ -775,7 +777,7 @@ def _run_resolution_bounded(
         # the probe is expected to wedge, and a wedged child is killed and replaced
         # only while the pool's list of killed-but-unexited children has room, so
         # spending the last child here would leave every OTHER prefix refused
-        # uncharged for as long as that mount stays wedged (found in review).  Extend
+        # uncharged for as long as that mount stays wedged.  Extend
         # the prefix's own cooldown instead and refuse; the mount is probed again when
         # a second child is back.  Nothing was observed, so no stall is recorded.
         logger.debug(

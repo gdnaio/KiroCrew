@@ -103,30 +103,40 @@ _LIVE_TARGET_STAGING_LEAF: str = "live-target-staging"
 #: needs no backend carve-out to hand the directory back to a sandboxed app.
 _AUTH_STORE_STAGING_LEAF: str = "auth-store-staging"
 
+#: The mediated-secret request directory (``secrets_mediation.provenance.
+#: REQUEST_POLICY_DIRNAME``): the owner-signed authorization policy and its
+#: authorize lock. Hidden as a WHOLE directory and
+#: precreated before every spawn, so every name inside it -- present, future, and the
+#: temps a publication renames over them -- is covered, and a rename inside it never
+#: touches the mount point the mask sits on.
+_SECRET_REQUEST_POLICY_LEAF: str = "secret-request-policy"
+
 #: The md-notebook builtin's name, and its own state files under the crew data home.
 #: Named so the mask, the backend carve-out that lifts it, and the materialiser that
 #: gives it a mount target cannot drift apart on a literal.
 MD_NOTEBOOK_APP_NAME: str = "md-notebook"
-_MD_NOTEBOOK_STATE_LEAVES: tuple[str, ...] = (
-    f"workspace/{MD_NOTEBOOK_APP_NAME}/pat",
-    f"workspace/{MD_NOTEBOOK_APP_NAME}/vaults.json",
-    f"workspace/{MD_NOTEBOOK_APP_NAME}/settings.json",
-)
-#: The backend's write-staging directory, masked as a WHOLE DIRECTORY like ``whatsapp``.
-#: Every md-notebook state writer stages its temp file HERE and renames onto its target,
-#: because a temp staged BESIDE the target carries the real PAT bytes under a name the
-#: three leaf masks do not cover — and a SIGKILL between write and rename leaves that
-#: unmasked sibling readable by a same-uid sandboxed agent forever. A directory mask
-#: covers every name inside it, present and future, so the staging window and any crash
-#: orphan both stay masked.
+#: The backend's state DIRECTORY, masked as a WHOLE DIRECTORY like ``whatsapp``. The three
+#: state files live inside it, and every writer stages its temp inside it and renames onto
+#: a name inside it. The mount point is the directory, so a rename of a name inside it
+#: never crosses a mount (the cause of the ``EXDEV`` the old file-per-mount layout hit) and
+#: never detaches the mask in a live agent's namespace. A directory mask covers every name
+#: inside it, present and future, so the staging window and any crash orphan stay masked.
 #:
 #: A TOP-LEVEL leaf, for the same reason ``aws-control-staging`` is one: a mask covers the
-#: leaf, not its ancestors, so a staging dir under the agent-writable
-#: ``workspace/md-notebook`` could be renamed out from under its own mask and a later PAT
-#: write would publish through the replacement, unmasked, into a live agent's view. It
-#: stays on the same filesystem as the state files (both under the crew data home), so the
-#: publish rename is still atomic.
+#: leaf, not its ancestors, so a directory under the agent-writable
+#: ``workspace/md-notebook`` could be renamed out from under its own mask.
 _MD_NOTEBOOK_STAGING_LEAF: str = f"{MD_NOTEBOOK_APP_NAME}-staging"
+_MD_NOTEBOOK_STATE_FILES: tuple[str, ...] = ("pat", "vaults.json", "settings.json")
+#: The live state files, inside the state directory.
+_MD_NOTEBOOK_STATE_LEAVES: tuple[str, ...] = tuple(
+    f"{_MD_NOTEBOOK_STAGING_LEAF}/{name}" for name in _MD_NOTEBOOK_STATE_FILES
+)
+#: Where an older build kept the same files. Nothing writes them now, but a copy the
+#: gateway's one-time move (``md_notebook_state``) has not moved yet can hold the PAT, so
+#: they stay masked in every mode and are NOT carved back to the backend.
+_MD_NOTEBOOK_RETIRED_STATE_LEAVES: tuple[str, ...] = tuple(
+    f"workspace/{MD_NOTEBOOK_APP_NAME}/{name}" for name in _MD_NOTEBOOK_STATE_FILES
+)
 
 #: Crew-home leaves with no legitimate in-sandbox reader — bind-masked in every mode.
 _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
@@ -226,16 +236,13 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # ``security.paths`` so the file tools refuse it too. All three, because each
     # one alone leaves a different path open.
     "work",
-    # The Notes state files below are OWNED by the md-notebook backend, which is itself
-    # a sandboxed spawn (`apps/backend.py`), so the mask alone would break the app: the
-    # registry write's final rename gets EPERM and attach/clone always fails.
-    # The backend spawn therefore passes them back as ``extra_visible_dirs`` via
-    # :func:`app_backend_visible_targets` — the mask still applies to every OTHER
-    # sandboxed process, which is the population it exists to fence.
-    *_MD_NOTEBOOK_STATE_LEAVES,
-    # The staging directory those three writers publish through. Masked as a whole
-    # DIRECTORY so the in-flight temp — which holds the same bytes as the leaves above,
-    # PAT included — and any crash orphan are covered at every name, present and future.
+    # The Notes state files' old bare spellings: kept masked for a copy not yet moved,
+    # and never carved back (the backend reads only the state directory).
+    *_MD_NOTEBOOK_RETIRED_STATE_LEAVES,
+    # The Notes state DIRECTORY, masked whole. It is OWNED by the md-notebook backend,
+    # itself a sandboxed spawn (`apps/backend.py`), which gets it back through
+    # :func:`app_backend_visible_targets`; the mask still applies to every OTHER
+    # sandboxed process.
     _MD_NOTEBOOK_STAGING_LEAF,
     # Browser session material. The extension token reaches the CLI through the
     # environment, never by ``open()``, so masking the file costs nothing; the other
@@ -273,17 +280,6 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # race. Precreating it would re-materialise the retired name on every machine.
     "ledgers",
     "cron-history",
-    # The single-use step-up nonce that authorizes recording a flagged-file
-    # delivery grant. Whole DIRECTORY (arm renames a sibling ``.tmp`` into place),
-    # with NO in-sandbox reader: the gateway writes it on arm and the host
-    # ``kirocrew file-delivery approve`` reads it. Masked because a same-UID agent
-    # could otherwise FORGE a nonce here with a runtime-constructed shell path
-    # (the file gate's text/argv matcher does not see such a path) and then drive
-    # the owner's loopback browser to POST that chosen nonce, recording a grant
-    # with no human present -- the exact self-approval hole the step-up exists to
-    # close. Deliberately NOT under ``trust/``, which is sandbox-visible for SEL
-    # appends.
-    "file-delivery-consent-pending",
     # The cron in-flight markers, masked rather than sealed read-only because
     # nothing in the sandbox reads one: they are written and cleared by the run
     # task in the GATEWAY process, and the boot-time loop-stall breaker that acts
@@ -365,6 +361,16 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # hooks) and ``kirocrew agent create`` / ``delete`` from the operator's shell. Whole
     # directory: ``atomic_write`` publishes through a sibling temp.
     "crew-teams",
+    # Each crewmate's governing records (``member_records.py``): its permanent
+    # rules, its goals and its DM thread binding, one ``<slug>.json`` per kind.
+    # The person writes them through the dashboard and the gateway injects them
+    # into that crewmate's prompt or routes its thread by them, so no sandboxed
+    # process may read or write any of them. Deliberately NOT under ``trust/``,
+    # which stays sandbox read-write for SEL; an older build kept them there and
+    # the gateway moves them once (``member_records.migrate_from_trust``). Only
+    # the gateway and the operator's own CLI open it. Whole directory: every
+    # writer publishes through a sibling temp.
+    "member-records",
     # Auth stores and signing keys owned by the gateway web server alone.
     "token_signing.key",
     "refresh_chains.json",
@@ -375,6 +381,22 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     "kas",
     "ops_mission_control_secrets.json",
     "ops_mission_control_policy.json",
+    # Web Push credential stores (``notifications/push_store.py``, ``vapid_keys.py``), owned by the
+    # gateway alone: ``vapid_keys.json`` holds the VAPID EC private key and
+    # ``subscriptions.json`` each device's ``p256dh``/``auth`` secret. Masked as a whole
+    # DIRECTORY so the ``atomic_write`` temp they publish through, which holds the same
+    # bytes, is covered at every name. No in-sandbox reader exists: the fan-out runs in
+    # the gateway loop. In ``_CREW_PRECREATE_HIDDEN_DIR_LEAVES`` too, because the stores
+    # are written lazily (first subscribe, first key fetch), so on a fresh install the
+    # ``isdir`` guard would otherwise skip the mask and let an agent read the key or
+    # plant an endpoint.
+    "web-push",
+    # The mediated-secret request directory: per Custom secret, the exact https origin
+    # the agent may reach with it, owner-signed. Read ONLY by the host gateway and the
+    # owner CLI; the sandboxed tool forwards over loopback and never touches it.
+    # Masked, not read-only, like ``.vault``: an agent that could read the policy
+    # learns the allowlist, and one that could write it could plant entries.
+    _SECRET_REQUEST_POLICY_LEAF,
     # No producer and no consumer left in the tree; masked so a backup restore that
     # resurrects a stale file cannot make it readable either.
     ".kiro_cli_binary_trust.json",
@@ -418,6 +440,12 @@ _RELOCATED_CREW_HIDDEN_LEAVES: tuple[str, ...] = (".vault",)
 #: never writable by it. See the READONLY note above for why hiding a ceiling
 #: inverts its effect; named memory stores need write integrity, not secrecy.
 _CREW_READONLY_LEAVES: tuple[str, ...] = (
+    # The empty directory kiro-cli starts in when it runs an app agent's launch copy
+    # (``apps.agent_launch.launch_process_cwd``). kiro-cli reads project agents from
+    # its process directory, so a sandboxed writer that could create
+    # ``.kiro/agents/<launch name>.json`` here would choose the spec kiro-cli runs.
+    # Read-only rather than hidden: kiro-cli itself must enter and list it.
+    "app-agent-launch",
     # Gateway-owned run records restore app authorization on cold continuation.
     # Keep results readable, but agent code must not rewrite its app owner.
     # The second root holds the same authority for retained V1 runs only.
@@ -515,14 +543,6 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # writer, an empty directory reads as "no host allowed", and a directory bind
     # shows the gateway's later writes live.
     "redaction-allow",
-    # Recorded consent to deliver a scanner-flagged file. Same class as
-    # ``aws_service_consent.json``: a writable grant lets an auto-approved agent
-    # consent, on the owner's behalf, to shipping the owner's secrets. This seal is
-    # the load-bearing half of that design -- ``is_sensitive_path`` covers the leaf
-    # on the file-tool path, but the shell gate matches no paths at all, and as the
-    # READONLY note above says a kernel write denial is what holds regardless of
-    # how a command spells the way there.
-    "file_delivery_consent.json",
     # Recorded consent to forward SSH_AUTH_SOCK into the sandbox. Same class as
     # ``aws_service_consent.json``: keeping the socket grants USE of the operator's
     # ssh-agent keys for the session, so a writable enable lets a prompt-injected
@@ -630,6 +650,16 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # Paired with the same leaf on ``security``'s write floors -- the deny rules
     # fence how a command SPELLS this path, and the kernel denial is what still
     # holds when a spelling is built at runtime (``$(printf ...)``).
+    #
+    # The record lives INSIDE the ``seed-provenance`` directory, and the directory is
+    # what is sealed, because the writer publishes every save through ``atomic_write``
+    # (a new inode) and does so on every claude-agent-acp seed and release. A sealed
+    # FILE whose inode changes after the pre-spawn pass recorded it is refused by the
+    # launcher's pin, so sealing the file made an unrelated spawn fail whenever a seed
+    # write landed in that window. The rename leaves the directory's inode alone.
+    # The old top-level name stays sealed too: a Crew process started before the
+    # upgrade still reads and writes it, so it must stay unforgeable for that process.
+    "seed-provenance",
     "settings_seeds.json",
     # The crew webview template directory. A ceiling in exactly the sense above:
     # the whole value of splitting a panel into human-authored TEMPLATE and
@@ -681,6 +711,13 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # Gateway resolve-once artifacts choose the entry point substituted for an
     # approved npm launcher. The installer runs in the unsandboxed gateway.
     "mcp/resolved",
+    # The per-template MCP additions record (``template_mcp_additions``): the servers
+    # the user approved for a template on a change card, merged into that template's
+    # spec on the next rebuild. A sandboxed writer could add a server it chose and
+    # have it launched. Read-only, not hidden: no sandboxed reader needs it, but it
+    # holds only launch entries the agent specs carry too. Every writer runs in the
+    # gateway or the CLI, outside the sandbox.
+    "template-mcp-additions",
     # This gateway's stable random identity (``gateway_identity.GATEWAY_ID_FILE``). The
     # Remote Crew cycle guard compares it to refuse a chain that loops back on itself,
     # so a sandboxed writer would choose whether a loop is detected. The read path
@@ -788,6 +825,9 @@ _CREW_READONLY_TARGETS: list[str] = _crew_home_entries(_CREW_READONLY_LEAVES)
 _CREW_CHILD_WITHHELD_LEAVES: tuple[str, ...] = (
     # The per-listener gateway credential (``run/gateway-<port>.secret``).
     "run",
+    # Approved per-template MCP server entries: an entry's ``env`` or ``headers`` can
+    # carry a credential, and no foreign child reads the record.
+    "template-mcp-additions",
     # The SEL trust root and the audit key inside it.
     "trust",
     "sel_hmac.key",
@@ -856,15 +896,14 @@ _CREW_CHILD_WITHHELD_LEAVES: tuple[str, ...] = (
     "computer_use.json",
     "oauth_endpoints.json",
     "decisions_consent.json",
-    "file_delivery_consent.json",
     "ssh_auth_sock_consent.json",
     "credential_redaction.json",
     # The paid-AWS consent grant. Unlike its sibling consent records this one stores
     # IDENTIFIERS as well as a decision -- ``Grant.to_dict`` writes ``account`` and
     # ``arn`` -- so a read tells a foreign child which AWS account and caller identity
     # the owner works as. It sits on the read+write keystone floor, so no in-sandbox
-    # reader had it before this change either: the app backend that consults it is not
-    # an enforced-harness child. Withholding it costs nothing that worked.
+    # reader has it anyway: the app backend that consults it is not an
+    # enforced-harness child. Withholding it costs nothing that works.
     "aws_service_consent.json",
     # The ONE entry here that holds no secret. It carries the launcher and sealed
     # extension of a single harness's tool gate, and only that harness's child has to
@@ -902,6 +941,9 @@ _CREW_CHILD_WITHHELD_LEAVES: tuple[str, ...] = (
 #: stayed masked and broke a boot, which someone notices. Under a complement it would
 #: be exposed, which nobody notices.
 _CREW_CHILD_READABLE_LEAVES: tuple[str, ...] = (
+    # The empty directory a launch copy's kiro-cli starts in. It holds nothing, so a
+    # foreign child that reads it learns nothing.
+    "app-agent-launch",
     # The browser launcher an agent browser command must read and execute. The only
     # entry here the read gate also fences, so the only one whose exclusion changes
     # what an enforced child can open; the rest are already outside the mask.
@@ -912,6 +954,7 @@ _CREW_CHILD_READABLE_LEAVES: tuple[str, ...] = (
     # Authorization and lineage records an in-sandbox reader resolves. Read-only
     # sealed for the same reason: a forged entry decides a later grant.
     "apps/.dev-grants.json",
+    "seed-provenance",
     "settings_seeds.json",
     "agent_model_state.json",
     "agent_model_state.json.lock",

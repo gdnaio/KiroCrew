@@ -89,7 +89,9 @@ from kiro_crew.messaging.dispatch_tools import (
     TOOLLESS_TURN_AGENT,
     TOOLLESS_TURN_REFUSAL_NOTE,
     ToollessTurnUnavailable,
+    _refuse_before_spawn_unless_toolless,
     _refuse_unless_toolless,
+    _toolless_spec_before_spawn,
     _toolless_turn_work_dir,
     _without_deny_reason,
     build_auto_approve,
@@ -461,6 +463,7 @@ class ChannelTurns:
         decider: Any = None,
         prepare: Callable[[Any, str], Awaitable[str]] | None = None,
         monitor: MonitorWake | None = None,
+        skill_trigger_text: str | None = None,
     ) -> TurnOutcome:
         """Answer *text* from *asker*, rendering into *renderer*.
 
@@ -470,6 +473,8 @@ class ChannelTurns:
         when ``asker.can_prompt``. *prepare(provider, text)* runs once per attempt,
         after the session exists, and returns the prompt to build from; it must be
         idempotent, and an empty answer ends the turn EMPTY with nothing recorded.
+        *skill_trigger_text*, when given, is what skill triggers match instead of
+        *text*: a turn Kiro Crew generated names the words its sender wrote.
 
         Every classified ending returns a :class:`TurnOutcome`. Once the turn body
         is entered only ``CancelledError`` propagates, after the turn is finalized --
@@ -488,7 +493,7 @@ class ChannelTurns:
         grant = None if guest else self._approvals.grant
         effective_decider = decider if asker.can_prompt else None
         session_key = asker.session_key
-        return await self._run(
+        return await self._run_admitted(
             asker,
             text,
             renderer,
@@ -508,6 +513,7 @@ class ChannelTurns:
             ),
             prepare=prepare,
             monitor=monitor,
+            skill_trigger_text=skill_trigger_text,
         )
 
     def _opens_crew_log(self, asker: Asker) -> bool:
@@ -601,6 +607,14 @@ class ChannelTurns:
         except Exception:
             logger.debug("%s: success audit failed", channel, exc_info=True)
 
+    async def _run_admitted(
+        self, asker: Asker, text: str, source: RendererSource, **kwargs: Any
+    ) -> TurnOutcome:
+        """Run one turn through Shared Crew fair admission; :meth:`_run` while it is off."""
+        from kiro_crew.messaging.channel_fair_admission import run_admitted
+
+        return await run_admitted(self, asker, text, source, **kwargs)
+
     async def _run(
         self,
         asker: Asker,
@@ -618,6 +632,7 @@ class ChannelTurns:
         is_muted: Callable[[], bool] | None = None,
         quiet: bool = False,
         monitor: MonitorWake | None = None,
+        skill_trigger_text: str | None = None,
     ) -> TurnOutcome:
         """Run one turn from fully resolved inputs; :meth:`answer` resolves them.
 
@@ -625,7 +640,8 @@ class ChannelTurns:
         that pipeline always ran it; it never ends the turn. *is_muted* replaces
         the mute read with :func:`drive_turn`'s :func:`conversation_is_muted`.
         *quiet* silences the tool-less refusal without touching the record, which
-        is all ``ChannelTurn.unprompted`` ever meant.
+        is all ``ChannelTurn.unprompted`` ever meant. *skill_trigger_text* is
+        handed to ``build_message`` unchanged.
         """
         channel = self.channel
         sessions = self._sessions
@@ -658,6 +674,22 @@ class ChannelTurns:
         # operator's. Decided here, on the shared seam, so no adopter can set the
         # flag and forget the agent that gives it teeth.
         session_agent = TOOLLESS_TURN_AGENT if deny_all_tools else agent
+        # The tool-less spec's pre-spawn read, before any ``get_or_create`` below can
+        # cold-start the harness on it; ``_refuse_unless_toolless`` reads it again
+        # after the start, and both must find it mounts nothing.
+        toolless_before_spawn = (
+            await asyncio.to_thread(_toolless_spec_before_spawn, session_key)
+            if deny_all_tools
+            else False
+        )
+        if deny_all_tools and monitor is not None and not toolless_before_spawn:
+            # A wake claims its session below, outside the refusal handler, so a
+            # spec the read refused ends the wake here, before anything starts.
+            try:
+                _refuse_before_spawn_unless_toolless(session_key, toolless_before_spawn)
+            except ToollessTurnUnavailable as exc:
+                logger.warning("%s: %s", channel, exc)
+                return self._outcome(Verdict.TOOLLESS_REFUSED, monitor)
         _acquired = False
         # The provider THIS attempt acquired, for the failure handler's attribution
         # question. Bound before the try so every handler can read it -- an
@@ -823,6 +855,10 @@ class ChannelTurns:
             replaying = False
             while True:
                 if not claimed:
+                    if deny_all_tools:
+                        # Before ``get_or_create``: starting the session runs what
+                        # the spec names, and a later reset cannot undo that.
+                        _refuse_before_spawn_unless_toolless(session_key, toolless_before_spawn)
                     # A linked member session must validate its own memory before a
                     # cold provider start. The same identity is then used for this
                     # turn's prompt.
@@ -853,7 +889,12 @@ class ChannelTurns:
                 # The wake's claim serves its first attempt only; a replay reacquires.
                 claimed = False
                 if deny_all_tools:
-                    _refuse_unless_toolless(sessions, session_key, provider)
+                    await _refuse_unless_toolless(
+                        sessions,
+                        session_key,
+                        provider,
+                        authored_before_spawn=toolless_before_spawn,
+                    )
                 if recovery:
                     if stop_gen_at_entry is None:
                         stop_gen_at_entry = session_stop_generation(sessions, session_key)
@@ -968,6 +1009,7 @@ class ChannelTurns:
                     runtime_source=channel,
                     context_provider=provider,
                     user_display_name=asker.display_name,
+                    skill_trigger_text=skill_trigger_text,
                 )
                 tool_gate = build_tool_gate(ctx_builder, session_key=session_key, agent=agent)
                 if Drift.GENERIC_DENY_REASON in drift:
@@ -1003,6 +1045,7 @@ class ChannelTurns:
                     audit_session_key=session_key,
                     audit_agent=agent or "kirocrew",
                     closing_gate=closing_gate,
+                    undelivered_watch_key=session_key,
                     **driver_extra,
                 )
                 if replaying and retry_guard is not None:
@@ -1369,14 +1412,19 @@ class ChannelTurns:
                     session_key,
                     exc_info=True,
                 )
-            if _acquired:
-                sessions.release(session_key)
-            if recovery:
-                # Closed LAST, after the permit is back: a message that waited behind
-                # the gap then finds an idle successor instead of a semaphore a later
-                # reset could pop from under it. Idempotent, so a turn that never
-                # opened one (or whose reset raised) costs a dictionary lookup.
-                _set_replay_gap(sessions, session_key, opened=False)
+            finally:
+                # A cancellation landing inside the close is not an ``Exception``
+                # (a channel whose turns run on its poll task cancels that task when
+                # it closes), so the release cannot wait on the guard above.
+                if _acquired:
+                    sessions.release(session_key)
+                if recovery:
+                    # Closed LAST, after the permit is back: a message that waited
+                    # behind the gap then finds an idle successor instead of a
+                    # semaphore a later reset could pop from under it. Idempotent, so
+                    # a turn that never opened one (or whose reset raised) costs a
+                    # dictionary lookup.
+                    _set_replay_gap(sessions, session_key, opened=False)
         return self._outcome(verdict, monitor, acquired=_acquired)
 
 
@@ -1410,7 +1458,7 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
         surface=turn.after_persist,
         restricted=_restricted,
     )
-    await turns._run(
+    await turns._run_admitted(
         Asker(
             turn.session_key,
             turn.conversation_id,
@@ -1432,6 +1480,7 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
         bind=turn.bind_provider,
         is_muted=lambda: conversation_is_muted(sessions, turn),
         quiet=turn.unprompted,
+        skill_trigger_text=turn.skill_trigger_text,
     )
 
 

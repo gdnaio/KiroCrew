@@ -746,7 +746,7 @@ def harvest(rows_path: Path, corpus_path: Path, surface: str) -> int:
 #: (exit 1 / ``failure``) and to a leak-safe "could not settle" notice rather than
 #: a "confirmed regression" badge. To make EVERY unsettled run resolve neutral
 #: instead -- the other candidate answer -- change this single value to
-#: ``"concerns"``; both lanes already map ``concerns`` to a non-blocking neutral.
+#: ``"nothing-new"``; both lanes already map it to a non-blocking neutral.
 #: Nothing else moves. Note the breadth: this governs every could-not-settle
 #: outcome below, marker-absent included, not only a Bedrock/matrix crash.
 _UNSETTLED_CONCLUSION: str = "error"
@@ -758,19 +758,17 @@ _UNSETTLED_CONCLUSION: str = "error"
 _CONCLUSION_SEVERITY: "dict[str, int]" = {
     "pass": 0,
     "nothing-new": 1,
-    "concerns": 2,
     "error": 3,
     "block": 3,
 }
 
 #: A published check-run conclusion, named as the lane token whose blocking
-#: severity it carries. ``neutral`` is a ``concerns`` -- the stricter of the two
-#: tokens that surface as neutral -- so the monotonic guard reads a neutral as no
-#: softer than it stands. A conclusion absent here (``cancelled``, ``timed_out``,
+#: severity it carries. ``neutral`` is a ``nothing-new``, the only token that
+#: surfaces as neutral. A conclusion absent here (``cancelled``, ``timed_out``,
 #: ``skipped``) is not a lane verdict and sets no floor.
 _CHECKRUN_CONCLUSION_TOKEN: "dict[str, str]" = {
     "success": "pass",
-    "neutral": "concerns",
+    "neutral": "nothing-new",
     "failure": "block",
 }
 
@@ -803,7 +801,6 @@ _SCOPE_FLOOR_UNSETTLED_MARKER = "[scope-floor:unsettled]"
 _TOKEN_CHECKRUN_CONCLUSION: "dict[str, str]" = {
     "pass": "success",
     "nothing-new": "neutral",
-    "concerns": "neutral",
     "block": "failure",
     "error": "failure",
 }
@@ -850,6 +847,19 @@ _VALIDATE_REFUSALS: "dict[str, tuple[str, str]]" = {
 }
 
 
+#: The ``why`` for a run whose ``generate`` job never resolved the review scope --
+#: it timed out, failed or was cancelled before ``Resolve review scope`` wrote
+#: ``in_scope``. Nothing measured whether the change touches the security surface,
+#: so this is an UNMEASURED run and stays unsettled: it is never the "nothing to
+#: scope" success, which only a resolved ``in_scope=false`` earns. The generic
+#: "no leg reported" sentence is true of such a run too, but it points at the
+#: author's diff instead of at a lane that did not finish.
+_SCOPE_UNRESOLVED_WHY = (
+    "the review scope was never resolved: the generate job did not finish (it timed "
+    "out, failed or was cancelled), so no leg ran; its log names the step that stopped"
+)
+
+
 def validate_refusal_remedy(refusal: "str | None") -> str:
     """The full author-facing remedy for a named ``validate`` refusal, or ``""``.
 
@@ -871,7 +881,7 @@ def _truthy(value: "str | None") -> bool:
 
 
 def _normalize_model(value: "str | None") -> str:
-    """Fold the raw ``Scope-Verdict`` header to one of PASS/CONCERNS/BLOCK/UNKNOWN.
+    """Fold the raw ``Scope-Verdict`` header to one of PASS/BLOCK/UNKNOWN.
 
     Anything the contract does not define -- an empty header, a typo, a value the
     lane could not parse -- is UNKNOWN, which the table treats as unsettled. This
@@ -880,7 +890,7 @@ def _normalize_model(value: "str | None") -> str:
     honoured.
     """
     header = str(value or "").strip().upper()
-    return header if header in {"PASS", "CONCERNS", "BLOCK"} else "UNKNOWN"
+    return header if header in {"PASS", "BLOCK"} else "UNKNOWN"
 
 
 def conclude_lane(
@@ -892,6 +902,7 @@ def conclude_lane(
     gap_script: bool,
     gap_model: bool,
     refusal: "str | None" = None,
+    scope_unresolved: bool = False,
 ) -> "tuple[str, str]":
     """Fold the lane signals into one ``(conclusion, why)`` -- the shared table.
 
@@ -905,10 +916,15 @@ def conclude_lane(
     conclusion: an unmeasured run fails closed either way, and a lane that
     published a softer verdict because it could explain itself would be a hole.
     It is keyed by exact match, so an unrecognized code reads as no refusal.
+
+    ``scope_unresolved`` says the review scope was never resolved (``generate``
+    died before writing ``in_scope``). Like ``refusal`` it only names the cause of
+    an unmeasured ``no-report`` run, and it outranks every other ``no-report`` row,
+    the green ``nothing-new`` one included.
     """
     # gap_model is MODEL-AUTHORED input to a merge-blocking gate, so it is
     # UNTRUSTED. It is OR-ed in here and read ONLY inside the BLOCK branch below,
-    # where a gap can do exactly one thing: upgrade concerns -> block. It can make
+    # where a gap can do exactly one thing: upgrade a pass -> block. It can make
     # the verdict STRICTER, never clear it -- so honouring it costs no safety while
     # closing the asymmetry (same-repo already honoured it; the fork did not, and a
     # fork is the more hostile source). Both sources feed both lanes now.
@@ -926,7 +942,10 @@ def conclude_lane(
     if fold == "redacted":
         return _UNSETTLED_CONCLUSION, "a confirmed row was redacted, so it names no operation"
     if fold == "unscrubbable":
-        return _UNSETTLED_CONCLUSION, "the folded verdict could not be scrubbed, so it was not published"
+        return (
+            _UNSETTLED_CONCLUSION,
+            "the folded verdict could not be scrubbed, so it was not published",
+        )
     if fold == "error":
         return _UNSETTLED_CONCLUSION, "the per-platform reports could not be folded"
 
@@ -943,7 +962,12 @@ def conclude_lane(
     #    same-repo already held and the fork did not. Every other no-report is an
     #    unmeasured run.
     if fold == "no-report":
-        # FIRST, ahead of the two `nothing_new` rows below. A refusal and the exit-3
+        # An unresolved scope is the first answer: no scope means nothing upstream
+        # of the legs ran, so no other no-report reading -- least of all the green
+        # `nothing-new` one -- describes this run.
+        if scope_unresolved:
+            return _UNSETTLED_CONCLUSION, _SCOPE_UNRESOLVED_WHY
+        # Next, ahead of the two `nothing_new` rows below. A refusal and the exit-3
         # short circuit cannot both happen -- `validate` refuses only on the rc=0
         # path -- so this reorders nothing that the lane can reach. Were they ever
         # to arrive together, the refusal is the half that must win: the green
@@ -967,13 +991,20 @@ def conclude_lane(
         return _UNSETTLED_CONCLUSION, "no [SCOPE-REVIEWED] marker for this head"
     if model == "PASS":
         return "pass", "adjudicated, zero confirmed regressions"
-    if model == "CONCERNS":
-        return "concerns", "the reviewer's own judgement; no confirmed regression"
     if model == "BLOCK":
         if gap:
-            return "block", f"the reviewer's BLOCK stands on a demonstrated platform gap ({gap_src})"
-        return "concerns", "the reviewer wrote BLOCK with no confirmed regression and no demonstrated gap"
-    return _UNSETTLED_CONCLUSION, "no parseable Scope-Verdict header carrying a marker for this head"
+            return (
+                "block",
+                f"the reviewer's BLOCK stands on a demonstrated platform gap ({gap_src})",
+            )
+        return (
+            "pass",
+            "the reviewer wrote BLOCK with no confirmed regression and no demonstrated gap, which is read as PASS",
+        )
+    return (
+        _UNSETTLED_CONCLUSION,
+        "no parseable Scope-Verdict header carrying a marker for this head",
+    )
 
 
 def _checkrun_severity(conclusion: "str | None") -> "int | None":
@@ -1033,7 +1064,9 @@ def _row_belongs_to(row: "dict[str, Any]", *, lane: str, pr: str) -> bool:
             "a completed check-run for this head names no pull request, so whether "
             "it is this pull request's prior verdict cannot be decided"
         )
-    return any(str((entry or {}).get("number")) == str(pr) for entry in numbers if isinstance(entry, dict))
+    return any(
+        str((entry or {}).get("number")) == str(pr) for entry in numbers if isinstance(entry, dict)
+    )
 
 
 def _fork_row_is_unsettled(row: "dict[str, Any]") -> bool:
@@ -1080,18 +1113,28 @@ def select_prior_conclusions(payload_text: str, *, lane: str, pr: str) -> "list[
     if lane not in ("fork", "same-repo"):
         raise CandidateError(f"unknown lane {lane!r} -- expected 'fork' or 'same-repo'")
     if not payload_text.strip():
-        raise PriorReadError("the prior check-run response is empty, so it names no check-runs either way")
+        raise PriorReadError(
+            "the prior check-run response is empty, so it names no check-runs either way"
+        )
     try:
         payload = json.loads(payload_text)
     except (ValueError, TypeError) as exc:
         raise PriorReadError(f"the prior check-run response is not readable JSON ({exc})") from exc
     if not isinstance(payload, dict):
-        raise PriorReadError("the prior check-run response is not an object, so its envelope cannot be read")
-    if not isinstance(payload.get("total_count"), int) or isinstance(payload.get("total_count"), bool):
-        raise PriorReadError("the prior check-run response carries no numeric total_count, so it is not a check-run listing")
+        raise PriorReadError(
+            "the prior check-run response is not an object, so its envelope cannot be read"
+        )
+    if not isinstance(payload.get("total_count"), int) or isinstance(
+        payload.get("total_count"), bool
+    ):
+        raise PriorReadError(
+            "the prior check-run response carries no numeric total_count, so it is not a check-run listing"
+        )
     rows = payload.get("check_runs")
     if not isinstance(rows, list):
-        raise PriorReadError("the prior check-run response carries no check_runs list, so it is not a check-run listing")
+        raise PriorReadError(
+            "the prior check-run response carries no check_runs list, so it is not a check-run listing"
+        )
     total = payload["total_count"]
     if total != len(rows):
         raise PriorReadError(
@@ -1135,10 +1178,16 @@ def monotonic_conclusion(
     cur = str(current or "").strip().lower()
     cur_sev = _checkrun_severity(cur)
     if cur_sev is None:
-        return unsettled, f"this run computed no ranked conclusion ({current!r}), so it fails closed"
+        return (
+            unsettled,
+            f"this run computed no ranked conclusion ({current!r}), so it fails closed",
+        )
     if not prior_readable:
         harder = unsettled if (_checkrun_severity(unsettled) or 0) > cur_sev else cur
-        return harder, "the prior conclusion for this head could not be read, so the lane fails closed"
+        return (
+            harder,
+            "the prior conclusion for this head could not be read, so the lane fails closed",
+        )
     hardest = ""
     hardest_sev = -1
     for candidate in priors:
@@ -1147,7 +1196,10 @@ def monotonic_conclusion(
             hardest = str(candidate).strip().lower()
             hardest_sev = sev
     if hardest_sev > cur_sev:
-        return hardest, f"a prior run of this head stands at {hardest!r}, harder than this run's {cur!r}"
+        return (
+            hardest,
+            f"a prior run of this head stands at {hardest!r}, harder than this run's {cur!r}",
+        )
     return cur, f"this run's {cur!r} is at least as hard as any prior conclusion for this head"
 
 
@@ -1160,6 +1212,7 @@ def _cmd_conclude(args: argparse.Namespace) -> int:
         gap_script=_truthy(args.gap_script),
         gap_model=_truthy(args.gap_model),
         refusal=args.refusal,
+        scope_unresolved=_truthy(args.scope_unresolved),
     )
     # Printed as GitHub ``key=value`` lines so the caller can redirect stdout
     # straight into ``$GITHUB_OUTPUT``. Both the vocabulary and the why are
@@ -1171,8 +1224,8 @@ def _cmd_conclude(args: argparse.Namespace) -> int:
     # a caller from the token. The fork lane needs the answer to decide whether to
     # stamp `_SCOPE_FLOOR_UNSETTLED_MARKER` on its check-run, and it read the token
     # to get it -- which silently breaks the "flip one constant" contract on
-    # `_UNSETTLED_CONCLUSION`: set that to `"concerns"` and an unsettled run starts
-    # arriving as a token the caller's `concerns` arm treats as settled, so flakes
+    # `_UNSETTLED_CONCLUSION`: set that to `"nothing-new"` and an unsettled run starts
+    # arriving as a token the caller's `nothing-new` arm treats as settled, so flakes
     # would floor the head again with no other edit in sight. The comparison lives
     # next to the constant instead.
     print(f"settled={'no' if conclusion == _UNSETTLED_CONCLUSION else 'yes'}")
@@ -1259,7 +1312,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     h = sub.add_parser("harvest", help="append confirmed rows to a golden-paths corpus file")
-    h.add_argument("--rows", required=True, type=Path, help="the rows file verdict --out-rows wrote")
+    h.add_argument(
+        "--rows", required=True, type=Path, help="the rows file verdict --out-rows wrote"
+    )
     h.add_argument(
         "--corpus", required=True, type=Path, help="the golden-paths corpus to extend, in place"
     )
@@ -1275,7 +1330,7 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument(
         "--model",
         default="",
-        help="the parsed Scope-Verdict header (PASS/CONCERNS/BLOCK); anything else reads as UNKNOWN",
+        help="the parsed Scope-Verdict header (PASS/BLOCK); anything else reads as UNKNOWN",
     )
     c.add_argument(
         "--marker",
@@ -1294,6 +1349,15 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "the validate return code; the codes that name their own cause select that "
             "cause as the why and print a remedy= line, and any other value is ignored"
+        ),
+    )
+    c.add_argument(
+        "--scope-unresolved",
+        dest="scope_unresolved",
+        default="false",
+        help=(
+            "true when the generate job never wrote in_scope (it timed out, failed or "
+            "was cancelled); names that cause on an unsettled no-report run"
         ),
     )
     c.add_argument(

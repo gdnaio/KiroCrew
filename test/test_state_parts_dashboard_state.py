@@ -74,6 +74,12 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "bool]]', *, reason: 'str | None' = None) -> 'None'",
     ),
     "_channel_link_is_live": ("function", False, False, "(self, link: 'ChannelLink') -> 'bool'"),
+    "_complete_slot_list_rebuild_if_ready": (
+        "function",
+        False,
+        False,
+        "(self, *, deadline_reached: 'bool' = False) -> 'bool'",
+    ),
     "_count_lessons": ("function", False, False, "(self) -> 'int | None'"),
     "_deferred_slots_flush": (
         "function",
@@ -91,6 +97,8 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "(self, slot: \"'_ChatSlot'\") -> 'None'",
     ),
     "_emit_member_slot_transitions": ("function", False, False, "(self) -> 'None'"),
+    "_expire_slot_list_rebuild": ("function", False, False, "(self) -> 'None'"),
+    "_fan_out_web_push": ("function", False, False, "(self, note: 'dict[str, Any]') -> 'None'"),
     "_flush_dirty_slots": ("function", False, False, "(self) -> 'None'"),
     "_flush_loop": ("function", True, False, "(self) -> 'None'"),
     "_has_legacy_slots_audience": ("function", False, False, "(self) -> 'bool'"),
@@ -137,6 +145,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "(self, folders: 'list[dict[str, Any]]') -> 'None'",
     ),
     "_persist_open_slots": ("function", False, False, "(self) -> 'None'"),
+    "_persistent_slot_list_hold": ("function", False, False, "(self) -> 'str | None'"),
     "_prune_source_activity": (
         "function",
         False,
@@ -168,6 +177,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
     "_running_loop": ("staticmethod", False, False, "() -> 'asyncio.AbstractEventLoop | None'"),
     "_schedule_trailing_flush": ("function", False, False, "(self, delay: 'float') -> 'None'"),
     "_send_slot_patch": ("function", False, False, "(self, data: 'dict[str, Any]') -> 'None'"),
+    "_send_web_push_all": ("function", True, False, "(self, note: 'dict[str, Any]') -> 'None'"),
     "_send_ws_all": (
         "function",
         False,
@@ -230,6 +240,12 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
     ),
     "_yolo": ("property", False, False, "(self) -> 'bool'"),
     "ack_notification": ("function", True, False, "(self, ts: 'str') -> 'bool'"),
+    "add_fold_watch_listener": (
+        "function",
+        False,
+        False,
+        "(self, listener: 'Callable[[], None]') -> 'Callable[[], None]'",
+    ),
     "adopt_pinned_session_order": (
         "function",
         False,
@@ -237,8 +253,10 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "(self, read: 'tuple[list[str], bool] | None') -> 'bool'",
     ),
     "approval_timeout_for": ("function", False, False, "(self, slot: \"'_ChatSlot'\") -> 'float'"),
+    "arm_slot_list_rebuild_deadline": ("function", False, False, "(self) -> 'None'"),
     "background_turn_stats": ("function", False, False, "(self) -> 'dict[str, int]'"),
     "begin_slot_construction": ("function", False, False, "(self, key: 'str') -> 'None'"),
+    "begin_slot_list_rebuild": ("function", False, False, "(self) -> 'None'"),
     "bind_serving_loop": (
         "function",
         False,
@@ -256,6 +274,12 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         False,
         "(self, slot_key: 'str', payload: 'dict') -> 'None'",
+    ),
+    "broadcast_slot_fold": (
+        "function",
+        False,
+        False,
+        "(self, slot: 'str', legacy: 'WsPayload', delta: 'WsPayload | None') -> 'None'",
     ),
     "broadcast_ws": (
         "function",
@@ -276,6 +300,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "(self, msg_type: 'str', data: 'WsPayload') -> 'None'",
     ),
     "bump_pinned_order_rev": ("function", False, False, "(self) -> 'None'"),
+    "bump_tags_generation": ("function", False, False, "(self) -> 'None'"),
     "cancel_questions_for_slot": ("function", False, False, "(self, slot_key: 'str') -> 'int'"),
     "channel_status": ("function", False, False, "(self) -> 'dict[str, dict[str, Any]]'"),
     "clear_notifications": ("function", True, False, "(self) -> 'None'"),
@@ -312,7 +337,15 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
     "end_slot_construction": ("function", False, False, "(self, key: 'str') -> 'None'"),
     "ensure_context_snapshots_loaded": ("function", False, False, "(self) -> 'bool'"),
     "ensure_dynamic_card_store": ("function", False, False, "(self) -> 'Any'"),
+    "finish_slot_list_rebuild": ("function", False, False, "(self) -> 'None'"),
     "flush_slot_now": ("function", False, False, "(self, slot: '_ChatSlot') -> 'None'"),
+    "fold_apply_watch": ("function", False, False, "(self) -> 'frozenset[str]'"),
+    "fold_watch_routing": (
+        "function",
+        False,
+        False,
+        "(self) -> 'tuple[bool, bool, frozenset[str]]'",
+    ),
     "folder_breadcrumb": (
         "function",
         False,
@@ -360,6 +393,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         "(self, slot_name: 'str', thread_ts: 'str', channel_id: 'str') -> 'None'",
     ),
+    "linked_session_busy": ("function", False, False, "(self, session_key: 'str') -> 'bool'"),
     "live_slot_count": ("function", False, False, "(self) -> 'int'"),
     "load_chat_pins": ("function", False, False, "(self) -> 'None'"),
     "load_cron_folders": ("function", False, False, "(self) -> 'None'"),
@@ -461,6 +495,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "(self, *, legacy_only: 'bool' = False) -> 'None'",
     ),
     "push_source_status": ("function", False, False, "(self, delta: 'dict') -> 'None'"),
+    "push_subagent_patch": ("function", False, False, "(self) -> 'None'"),
     "push_update_progress": (
         "function",
         False,
@@ -500,6 +535,12 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         "(self, ws: 'web.WebSocketResponse', *, owner: 'bool' = False) -> 'None'",
     ),
+    "release_deleted_slot_keys": (
+        "function",
+        False,
+        False,
+        "(self, keys: 'Iterable[str]') -> 'None'",
+    ),
     "remove_chat_pins_for_slots": (
         "function",
         True,
@@ -511,6 +552,12 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         False,
         "(self, folder_id: 'str', name: 'str') -> 'dict | None'",
+    ),
+    "replace_channel_slot_holds": (
+        "function",
+        False,
+        False,
+        "(self, keys: 'Iterable[str]', *, hold_channels: 'bool') -> 'bool'",
     ),
     "request_approval": (
         "function",
@@ -540,7 +587,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         False,
         "(self, ask_id: 'str', answers: 'dict[str, str] | None', *, reason: 'str "
-        "| None' = None) -> 'bool'",
+        "| None' = None, responder: 'Any' = None, response_id: 'str' = '') -> 'bool'",
     ),
     "resolve_skill_review_notifications": (
         "function",
@@ -612,7 +659,27 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
     "served_bundle_id": ("staticmethod", False, False, "(index: 'Path | None' = None) -> 'str'"),
     "serving_loop": ("property", False, False, "(self) -> \"'asyncio.AbstractEventLoop | None'\""),
     "set_dynamic_cards_enabled": ("function", False, False, "(self, enabled: 'bool') -> 'None'"),
+    "set_fold_apply_capable": (
+        "function",
+        False,
+        False,
+        "(self, ws: 'web.WebSocketResponse', capable: 'bool') -> 'bool'",
+    ),
+    "set_fold_delta_capable": (
+        "function",
+        False,
+        False,
+        "(self, ws: 'web.WebSocketResponse', capable: 'bool') -> 'bool'",
+    ),
+    "set_fold_watch": (
+        "function",
+        False,
+        False,
+        "(self, ws: 'web.WebSocketResponse', slots: 'object') -> 'frozenset[str]'",
+    ),
     "slot_exists": ("function", False, False, "(self, name: 'str') -> 'bool'"),
+    "slot_list_held_keys": ("function", False, False, "(self) -> 'list[str]'"),
+    "slot_list_hold_channels": ("function", False, False, "(self) -> 'bool'"),
     "source_link_urls": ("function", False, False, "(self) -> 'list[str]'"),
     "source_link_urls_for_slot": ("function", False, False, "(self, key: 'str') -> 'list[str]'"),
     "spend_slot_by_session": ("function", False, False, "(self) -> 'dict[str, str]'"),
@@ -647,6 +714,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         "(self) -> \"'Iterator[Callable[[str], None]]'\"",
     ),
+    "tags_generation": ("function", False, False, "(self) -> 'int'"),
     "unack_notification": ("function", True, False, "(self, ts: 'str') -> 'bool'"),
     "unregister_sse": (
         "function",
@@ -671,6 +739,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
     "wire_session_bind_listener": ("function", False, False, "(self) -> 'None'"),
     "wire_session_compact_callback": ("function", False, False, "(self) -> 'None'"),
     "wire_session_recycle_callback": ("function", False, False, "(self) -> 'None'"),
+    "wire_session_release_listener": ("function", False, False, "(self) -> 'None'"),
     "wire_session_unbind_listener": ("function", False, False, "(self) -> 'None'"),
     "withdraw_agent_ask": (
         "function",

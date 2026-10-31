@@ -18,7 +18,7 @@
 vi.mock('@radix-ui/react-select', async () => await import('./__mocks__/@radix-ui/react-select'))
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import React from 'react'
 import { SETTINGS_CARD_STAGGER_MS } from '../components/settings'
@@ -106,6 +106,7 @@ import { ApiError } from '../api/apiError'
 import { markModelsAuthRequired, markModelsDegraded } from '../providers/modelListHealth'
 import { resolveDefaultMemoryMode } from '../api/queryClient'
 import { MAX_MESSAGE_FONT_SIZE } from '../pages/chat/ChatSettings'
+import { DURABLE_PREF_KEYS } from '../lib/uiPrefs'
 
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -117,17 +118,22 @@ import { createTestStore } from './helpers'
 
 const LS_KEY = 'mc-chat-config'
 
-function wrap(sub = 'transcript') {
+function wrap(sub = 'transcript', opts: { onCommit?: () => void } = {}) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(
+  const view = render(
     <MemoryRouter initialEntries={[`/settings?tab=chat&sub=${sub}`]}>
     <Provider store={createTestStore()}>
     <QueryClientProvider client={qc}>
-      <ChatPanel />
+      {/* `onRender` runs in the commit phase, after the DOM is written and before
+          passive effects, so a probe there sees exactly what one commit shows. */}
+      <React.Profiler id="chat" onRender={() => opts.onCommit?.()}>
+        <ChatPanel />
+      </React.Profiler>
     </QueryClientProvider>
     </Provider>
     </MemoryRouter>
   )
+  return Object.assign(view, { qc })
 }
 
 /** The localStorage-backed chat config as the panel last wrote it. */
@@ -343,6 +349,22 @@ describe('ChatPanel — Composer', () => {
     )
   })
 
+  it('shows the stored soft-stop budget in the first commit that enables the input', async () => {
+    // The row is seeded from the served config in the render that first has it,
+    // not latched by a later effect: a commit with the input enabled and empty
+    // is a frame a user can see and a test can land on.
+    const commits: { enabled: boolean; value: string }[] = []
+    wrap('composer', {
+      onCommit: () => {
+        const input = screen.queryByLabelText('Soft-stop budget (seconds)') as HTMLInputElement | null
+        if (input) commits.push({ enabled: !input.disabled, value: input.value })
+      },
+    })
+    await settledInput('Soft-stop budget (seconds)')
+    const first = commits.find(c => c.enabled)
+    expect(first).toEqual({ enabled: true, value: '10' })
+  })
+
   it('PATCHes the soft-stop budget on blur with an in-range value', async () => {
     wrap('composer')
     const input = await settledInput('Soft-stop budget (seconds)')
@@ -425,6 +447,21 @@ describe('ChatPanel — Messages', () => {
     await waitFor(() => expect(storedChat()[key]).toBe(expected))
   })
 
+  it('stores Copy on select under its own device-only key, not the synced chat config', async () => {
+    wrap()
+    const sw = await screen.findByRole('switch', { name: 'Copy on select' })
+    expect(sw).toHaveAttribute('aria-checked', 'false')
+    fireEvent.click(sw)
+    await waitFor(() => expect(localStorage.getItem('mc-chat-copy-on-select')).toBe('1'))
+    expect(sw).toHaveAttribute('aria-checked', 'true')
+    expect(JSON.parse(localStorage.getItem('mc-chat-config') || '{}')).not.toHaveProperty('copyOnSelect')
+    // Not backed up to the host, so another browser of the same owner never
+    // inherits a clipboard-overwriting setting.
+    expect(DURABLE_PREF_KEYS).not.toContain('mc-chat-copy-on-select')
+    fireEvent.click(sw)
+    await waitFor(() => expect(localStorage.getItem('mc-chat-copy-on-select')).toBe('0'))
+  })
+
   it('inverts the stored collapse flag behind Show Thinking Inline', async () => {
     wrap()
     // The row shows the INVERSE of collapseAllSteps, so turning it on must
@@ -462,6 +499,48 @@ describe('ChatPanel — Messages', () => {
     fireEvent.click(await settledSwitch('MCP Apps in Side Panel'))
     await waitFor(() =>
       expect(updateDashboardConfigMock).toHaveBeenCalledWith({ mcp_app_panel: true })
+    )
+  })
+
+  it.each([
+    ['Keep Side Panel Open', 'side_panel_always_open'],
+    ['Pin Summary in Side Panel', 'side_panel_pin_summary'],
+  ])('shows %s off by default and persists turning it on', async (label, key) => {
+    wrap('sidepanel')
+    const sw = await settledSwitch(label)
+    expect(sw).toHaveAttribute('aria-checked', 'false')
+    fireEvent.click(sw)
+    await waitFor(() =>
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ [key]: true })
+    )
+  })
+
+  it('names Session summaries on the Pin Summary row while they are off, and drops it once they are on', async () => {
+    const { qc } = wrap('sidepanel')
+    const row = () => document.querySelector('[data-setting-key="dashboard.side_panel_pin_summary"]') as HTMLElement
+    const needs = 'Session summaries are off. Turn them on in Settings → Chat → Sessions to pin Summary.'
+    // BASE_MC carries no session_summary section: summaries are off.
+    await waitFor(() => expect(within(row()).getByText(needs)).toBeInTheDocument())
+    // The toggle stays usable while they are off.
+    fireEvent.click(await settledSwitch('Pin Summary in Side Panel'))
+    await waitFor(() =>
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ side_panel_pin_summary: true })
+    )
+    act(() => { qc.setQueryData(['kirocrewConfig'], { ...BASE_MC, session_summary: { enabled: true } }) })
+    await waitFor(() => expect(within(row()).queryByText(needs)).toBeNull())
+  })
+
+  it('refreshes every chat\'s cached summary state when Session summaries saves', async () => {
+    const { qc } = wrap('sessions')
+    // The side panel's + menu row and Pin Summary read this per-chat query,
+    // which never goes stale on its own.
+    qc.setQueryData(['session-summary', 'chat-1'], { enabled: false })
+    fireEvent.click(await settledSwitch('Session summaries'))
+    await waitFor(() =>
+      expect(patchConfigMock).toHaveBeenCalledWith('session_summary.enabled', true)
+    )
+    await waitFor(() =>
+      expect(qc.getQueryState(['session-summary', 'chat-1'])?.isInvalidated).toBe(true)
     )
   })
 
@@ -594,6 +673,7 @@ describe('ChatPanel — Sessions', () => {
   it.each([
     ['History Expanded', 'historyExpanded', false],
     ['Confirm Before Closing Session', 'confirmCloseSession', true],
+    ['Open Sidebar Sessions in a Session Tab', 'sidebarClickOpensTab', true],
   ])('stores %s locally when flipped', async (label, key, expected) => {
     wrap('sessions')
     fireEvent.click(await screen.findByRole('switch', { name: label }))
@@ -796,6 +876,21 @@ describe('ChatPanel — Subagents', () => {
     wrap('advanced')
     await pickOption('Completion Event Truncation', 2)
     expect(await screen.findByText(/Failed to save completion-keep mode/)).toBeInTheDocument()
+  })
+
+  it('shows the stored completion-keep characters in the first commit that enables the input', async () => {
+    // Same render-phase seed as the soft-stop budget: the first enabled commit
+    // already carries the served number, never an empty frame.
+    const commits: { enabled: boolean; value: string }[] = []
+    wrap('advanced', {
+      onCommit: () => {
+        const input = screen.queryByLabelText('Completion event characters') as HTMLInputElement | null
+        if (input) commits.push({ enabled: !input.disabled, value: input.value })
+      },
+    })
+    await settledInput('Completion event characters')
+    const first = commits.find(c => c.enabled)
+    expect(first).toEqual({ enabled: true, value: '3000' })
   })
 
   it('reverts the completion-keep characters when the write fails', async () => {

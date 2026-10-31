@@ -10,9 +10,11 @@ commits, a branch that does not track the remote).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import threading
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -58,8 +60,16 @@ class TestAutoApplyUpdateResetPath:
         Windows install) made every test here pass or fail on the refusal branch
         instead of the sequence it covers. A test about the resolver itself
         patches it again explicitly, and that inner patch wins.
+
+        The network fetch now goes through the shared isolated helper
+        ``fetch_and_pin_upstream`` (its isolation is covered against real git in
+        ``test_update_check_git_exec_neutralized``). Here it is stubbed to a
+        fixed fetched OID so these tests keep their subject -- the reset flow
+        after the fetch. ``self._fetch_and_pin`` exposes the stub.
         """
+        self._fetch_and_pin = AsyncMock(return_value="0" * 40)
         with (
+            patch("kiro_crew.slack.gateway.fetch_and_pin_upstream", self._fetch_and_pin),
             patch("kiro_crew.slack.gateway.hidden_worktree_edits", return_value=[]),
             patch(
                 "kiro_crew.slack.gateway.repo_exec_config_reason",
@@ -209,6 +219,49 @@ class TestAutoApplyUpdateResetPath:
         ds.push_update_progress.assert_any_call("building", "Building frontend…")
         ds.push_update_progress.assert_any_call("building", "Rebuilding package…")
 
+    @pytest.mark.asyncio
+    async def test_the_kas_bundle_route_skips_the_kiro_cli_update_and_says_why(self, caplog):
+        """KAS selected and ``agent.kas_bundle`` on: kiro-cli is not part of what
+        runs, so ``kiro-cli update`` is neither pinned nor spawned, and the log
+        -- the only place an unattended apply reports -- names the reason and
+        ``kirocrew kas install``, since this apply does not install the engine.
+        The rest of the flow (reset, frontend, pip) is unchanged.
+        """
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        orch.sessions = _mock_sessions()
+        _fake_exec = _git_exec_fake(status_out=b"")
+        # A real config with only the route set, so every other read this apply
+        # makes (the memory snapshot's backup_keep among them) answers as before.
+        base = KiroCrewConfig()
+        cfg = replace(base, agent=replace(base.agent, acp_backend="kas", kas_bundle=True))
+
+        with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}):
+            with patch("asyncio.create_subprocess_exec", side_effect=_fake_exec) as spawn:
+                with patch("kiro_crew.dep_sync.sync_or_reinstall", return_value=0):
+                    with patch(
+                        "kiro_crew.slack.gateway.build_frontend_async", new_callable=AsyncMock
+                    ) as mock_build:
+                        with patch("os.execv"):
+                            with patch.object(KiroCrewConfig, "load", classmethod(lambda cls: cfg)):
+                                with patch(
+                                    "kiro_crew.slack.gateway._pinned_kiro_cli", AsyncMock()
+                                ) as pinned:
+                                    with caplog.at_level(logging.INFO, logger="kiro_crew"):
+                                        await orch._auto_apply_update()
+
+        pinned.assert_not_awaited()
+        assert not any("update" in call.args for call in spawn.call_args_list)
+        mock_build.assert_awaited()
+        skipped = [
+            r.getMessage() for r in caplog.records if "kiro-cli update skipped" in r.getMessage()
+        ]
+        assert len(skipped) == 1
+        assert "kirocrew kas install" in skipped[0]
+
     @staticmethod
     async def _run_git_apply(orch, *, sync=None, build=None, reset_rc=0, reset_spawn_error=None):
         _git_fake = _git_exec_fake(status_out=b"", reset_rc=reset_rc)
@@ -228,6 +281,172 @@ class TestAutoApplyUpdateResetPath:
                         with patch("os.execv"):
                             with patch("shutil.which", return_value=None):
                                 await orch._auto_apply_update()
+
+    @staticmethod
+    async def _run_with_copy(
+        orch,
+        copy_result,
+        *,
+        status_out=b"",
+        added_out=b"",
+        project_dir="/tmp/proj",
+        status_after_copy=None,
+    ):
+        """Run the git apply with the shared memory copy stubbed; return spawns and copies.
+
+        The copy is recorded into the same list as every git spawn, so the order
+        between it and the reset is read off one sequence. ``status_after_copy``
+        is what `git status` reports once the copy has run, standing in for an
+        edit made while it ran.
+        """
+        events: list = []
+        copied = threading.Event()
+        before = _git_exec_fake(status_out=status_out, added_out=added_out, record=events)
+        after = _git_exec_fake(
+            status_out=status_out if status_after_copy is None else status_after_copy,
+            added_out=added_out,
+            record=events,
+        )
+
+        def _copy():
+            events.append(("memory-copy",))
+            copied.set()
+            return copy_result
+
+        async def _exec(*args, **kwargs):
+            return await (after if copied.is_set() else before)(*args, **kwargs)
+
+        with (
+            patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": str(project_dir)}),
+            patch("asyncio.create_subprocess_exec", side_effect=_exec),
+            patch(
+                "kiro_crew.platform.wheel_apply.snapshot_memory_before_update", side_effect=_copy
+            ),
+            patch("kiro_crew.dep_sync.sync_or_reinstall", return_value=0),
+            patch("kiro_crew.slack.gateway.build_frontend_async", AsyncMock()),
+            patch("os.execv"),
+            patch("shutil.which", return_value=None),
+        ):
+            await orch._auto_apply_update()
+        return [tuple(str(a) for a in e) for e in events]
+
+    @pytest.mark.asyncio
+    async def test_memory_is_copied_before_the_reset(self):
+        """The same copy `kirocrew update` takes lands before the tree is rewritten."""
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        orch.sessions = _mock_sessions()
+        orch._restart_after_update = AsyncMock()
+
+        events = await self._run_with_copy(orch, (1, ""))
+
+        resets = [i for i, e in enumerate(events) if e[1:3] == ("reset", "--hard")]
+        assert events.count(("memory-copy",)) == 1 and len(resets) == 1
+        assert events.index(("memory-copy",)) < resets[0]
+
+    @pytest.mark.asyncio
+    async def test_memory_copy_runs_before_the_last_moment_checks(self):
+        """A slow copy must not sit between the revalidation and the reset it guards."""
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        orch.sessions = _mock_sessions()
+        orch._restart_after_update = AsyncMock()
+
+        events = await self._run_with_copy(orch, (1, ""))
+
+        reset = next(i for i, e in enumerate(events) if e[1:3] == ("reset", "--hard"))
+        statuses = [i for i, e in enumerate(events[:reset]) if e[1:3] == ("status", "--porcelain")]
+        added = [
+            i
+            for i, e in enumerate(events[:reset])
+            if e[1:2] == ("diff",) and "--diff-filter=A" in e
+        ]
+        assert statuses and added
+        copy_at = events.index(("memory-copy",))
+        assert copy_at < statuses[-1]
+        assert copy_at < added[-1]
+
+    # Each refusal, driven with the fakes this class already uses. ``patches``
+    # are (target, return_value); ``run`` goes to `_run_with_copy`.
+    _REFUSALS = {
+        "ahead": ([("kiro_crew.slack.gateway.commits_ahead", 2)], {}),
+        "exec-config": (
+            [("kiro_crew.slack.gateway.repo_exec_config_reason", "core.fsmonitor is set")],
+            {},
+        ),
+        "dirty-status": ([], {"status_out": b" M file.py"}),
+        "hidden-edit": ([("kiro_crew.slack.gateway.hidden_worktree_edits", ["file.py"])], {}),
+        "untracked-collision": ([], {"added_out": b"newfile.txt\0"}),
+        "interpreter-floor": (
+            [
+                (
+                    "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
+                    "the incoming revision requires Python >=9.0",
+                )
+            ],
+            {},
+        ),
+    }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("refusal", sorted(_REFUSALS))
+    async def test_every_refusal_runs_before_any_memory_copy(self, refusal, tmp_path):
+        """A checkout any check keeps refusing must not rotate backups every check."""
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        orch.sessions = _mock_sessions()
+        orch._restart_after_update = AsyncMock()
+        (tmp_path / "newfile.txt").write_text("untracked\n")
+        patches, run = self._REFUSALS[refusal]
+
+        with contextlib.ExitStack() as stack:
+            for target, value in patches:
+                stack.enter_context(patch(target, return_value=value))
+            events = await self._run_with_copy(orch, (1, ""), project_dir=tmp_path, **run)
+
+        assert ("memory-copy",) not in events
+        assert not any(e[1:3] == ("reset", "--hard") for e in events)
+        orch._restart_after_update.assert_not_awaited()
+        ds.push_refresh.assert_called_with("update_available")
+
+    @pytest.mark.asyncio
+    async def test_an_edit_made_during_the_copy_refuses_the_reset(self):
+        """The checks re-run after the copy, so a tree dirtied while it ran is kept."""
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        orch.sessions = _mock_sessions()
+        orch._restart_after_update = AsyncMock()
+
+        events = await self._run_with_copy(orch, (1, ""), status_after_copy=b" M file.py")
+
+        assert events.count(("memory-copy",)) == 1
+        assert not any(e[1:3] == ("reset", "--hard") for e in events)
+        orch._restart_after_update.assert_not_awaited()
+        ds.push_refresh.assert_called_with("update_available")
+
+    @pytest.mark.asyncio
+    async def test_a_failed_memory_copy_skips_the_update_and_says_so(self):
+        """Nobody is watching: no reset, no exit, a notice and a failed progress line."""
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        orch.sessions = _mock_sessions()
+        orch._restart_after_update = AsyncMock()
+
+        events = await self._run_with_copy(orch, (0, "1 store(s) not copied"))
+
+        assert ("memory-copy",) in events
+        assert not any(e[1:3] == ("reset", "--hard") for e in events)
+        orch._restart_after_update.assert_not_awaited()
+        failed = [
+            c.args[1] for c in ds.push_update_progress.call_args_list if c.args[0] == "failed"
+        ]
+        assert len(failed) == 1 and "memory snapshot failed: 1 store(s) not copied" in failed[0]
+        assert "kirocrew memory backups" in failed[0]
+        ds.notify.assert_called_once()
+        assert ds.notify.call_args.args[:2] == ("update", "Kiro Crew update skipped")
 
     @pytest.mark.asyncio
     async def test_the_rewrite_owns_the_bundle_gap(self):
@@ -1045,17 +1264,17 @@ class TestAutoApplyUpdateResetPath:
         assert "restarting" not in steps
 
     @pytest.mark.asyncio
-    async def test_reset_target_is_resolved_through_the_full_remote_ref(self):
-        """The target capture must spell `refs/remotes/origin/<branch>`.
+    async def test_reset_target_is_the_isolated_fetch_oid_not_a_resolved_ref(self):
+        """The reset target is the OID the isolated fetch returned, resolved from
+        no ref name at all.
 
-        The short `origin/<branch>` is ambiguous in the attacker's favour:
-        rev-parse's disambiguation order checks `refs/tags/<name>` BEFORE
-        `refs/remotes/<name>`, so a tag literally named `origin/main` resolves
-        instead of the remote-tracking branch. The update's own fetch auto-follows
-        tags, so publishing that tag upstream creates it locally. git writes
-        "refname is ambiguous" to stderr and still prints the TAG's OID on stdout,
-        which is the stream this capture reads -- so the short form does not fail
-        loudly, it resets to attacker code.
+        The old flow resolved ``refs/remotes/origin/<branch>`` with ``rev-parse
+        --verify`` after an inline fetch, which carried a tag-ambiguity hazard (a
+        tag literally named ``origin/main`` could win). The shared isolated
+        helper (``fetch_and_pin_upstream``, stubbed by the autouse fixture)
+        returns the fetched commit id directly, so the reset targets that OID and
+        no ``origin/<branch>`` ref is resolved to get it -- the ambiguity cannot
+        arise. The helper is asked for ``origin`` and the current branch.
         """
         orch = _make_orchestrator()
         ds = _mock_dashboard_state()
@@ -1072,16 +1291,22 @@ class TestAutoApplyUpdateResetPath:
                         with patch("shutil.which", return_value=None):
                             await orch._auto_apply_update()
 
+        # The helper was asked for origin + the current branch.
+        _, args, kwargs = self._fetch_and_pin.mock_calls[0]
+        assert args[1:3] == ("origin", "main"), args
+
+        # The reset targets exactly the helper's returned OID.
+        resets = [[str(a) for a in args] for args in spawned if "reset" in [str(a) for a in args]]
+        assert resets, spawned
+        assert self._fetch_and_pin.return_value in resets[0], resets
+        # No ref name is resolved to get the target: the ambiguity is gone.
         revparses = [
             [str(a) for a in args]
             for args in spawned
             if "rev-parse" in [str(a) for a in args]
             and "--abbrev-ref" not in [str(a) for a in args]
         ]
-        assert revparses, spawned
-        assert any("refs/remotes/origin/main^{commit}" in argv for argv in revparses), revparses
-        # The bare form must not be what git is asked to resolve.
-        assert not any("origin/main^{commit}" in argv for argv in revparses), revparses
+        assert not any("refs/remotes/origin" in " ".join(argv) for argv in revparses), revparses
 
     @pytest.mark.asyncio
     async def test_no_restart_after_any_unclean_sync_even_when_the_repair_works(self):

@@ -39,7 +39,8 @@ this spec states the target and that one states the present.
 The dashboard's `autonudge_state` lifecycle frame carries the loop's public
 `created_ts` runtime-budget clock alongside cadence, counters, deadline and stop
 state. The dashboard caches that frame over its REST seed, so omitting this clock
-would erase a known Runtime started/Runtime value after any update. Structured
+would erase a known runtime-budget reading after any update (the composer
+popover's; the crewmate card shows no budget fields). Structured
 subject fields remain withheld from the broad frame and come only from the
 owner-gated monitor read.
 
@@ -149,7 +150,8 @@ budget or cap ran out, the `_stopped_row_is_replaceable` allowlist -- counts as
 no loop, whoever armed it, and is replaced by a fresh default: a new bind is new
 work. An inactive record a PERSON stopped is kept and the arm is refused with
 reason `user-stopped`. A refusal is logged at WARNING and the bind still
-succeeds; the bind reply carries `patrol: armed | existing | refused |
+succeeds; the shutdown refusal a dispatch racing the gateway's teardown meets is
+logged at DEBUG instead. the bind reply carries `patrol: armed | existing | refused |
 unsupported` and `patrol_reason` (`no-loop`, `replaced-system-stopped`,
 `active-work-ledger`, `active-other-watch`, `user-stopped`,
 `outside-arm-refused`, `session-cannot-host-loop`, `arm-failed`,
@@ -237,6 +239,32 @@ item ids and statuses, the same text `irq` may already persist outside the store
 gated read path. `AutoNudgeService.notify_turn_complete` brings the busy-retry
 forward to `delay=0` on turn end instead of waiting for the loop deadline, and the
 per-loop wake text is held in `_pending_monitor_wake`, a `dict` keyed by loop id.
+
+The steered wake keeps the ROW the fire writes. `steer_into_running_turn` takes the
+loop's `nudge_meta` (`{"cycle", "loop_id"}`) and persists the steer as a `nudge` row
+with `meta.steer`, so it draws as the nudge chip and never as a bubble the person
+typed; the sender names the origin, the role follows from it. A steer the turn ends
+before taking is requeued with `AUTOMATION_STEER_META` on its entry: the drain
+writes it as a `nudge` row too, and the entry drains alone, never merged into the
+person's own queued text (#22747).
+
+The wake reaches the steer through `session_deliver.deliver`, the session-side entry
+point a non-human sender calls with its origin (`automation`, `cron`, `app`). The
+sender never picks idle vs running or a row role: `origin_row` maps the origin to
+its row, an idle slot queues a cron notification or app message as a card that the
+queue drain starts at once (the drain writes the row), and a running slot gets the
+steer (an automation wake) or the same queued card. A
+script cron's result (`_deliver_script_result`) and a cron's `send_message` to its
+origin session (`api_send_message`), both with `evict_oldest` so a full live queue
+drops its oldest cron notification (never another kind of entry), and an MCP App's
+`ui/message`
+(`api_mcp_apps_message`) call it too, and so does a peer `session_send`
+(`send_to_target`) with a `peer` origin: a `user` row on both paths, a steer only
+when it asked for one and the slot is running. `send_to_target` keeps its audience
+fence, cancellation shield and post-RPC re-gate around those calls. The idle
+autonudge fire writes its nudge row through `session_deliver.write_origin_row` (the
+`automation` origin, plus its `monitor` record), the same mapping a steered wake
+uses, but still chooses idle vs running itself (#23064).
 
 The `monitoring/` package now has a different extension point:
 `models.MonitorProbe`, a structural Protocol with no behaviour inheritance, plus
@@ -373,7 +401,18 @@ release it. `monitor_inspect` reports the hold as
 `paused_for_approval` on the loop reading.
 
 A tool's “requested” response proves receipt only. The gateway's applied notice
-and a subsequent `monitor_inspect` prove activation. Unmatched directive delivery
+and a subsequent `monitor_inspect` prove activation. For crew/member sessions,
+self-arm provenance is positive: the directive consumer vouches for a
+`monitor_start`, `monitor_watch` or `monitor_update` only when the turn carries a
+mark its dispatcher set, either the authenticated-human origin
+(`_directive_user_origin`) or the delivered wake of a loop bound to this slot
+(`_directive_self_wake`). A turn's `user` actor is a fallback for attribution and
+never authority, so a dispatcher that names no producer grants nothing: cron, app,
+native sub-agent, peer-session, restored and untagged dispatcher turns keep the
+outside-arm 409. The human-origin mark rides a steer until it is consumed or
+requeued, so a person's steer that the turn ends before consuming drains with it.
+Successful arms use the existing self-arm trust record and SEL events; no
+gateway-patrol trust kind exists. Unmatched directive delivery
 produces an application-failure notice appended to the tool's own result text; its
 agent instruction names `monitor_inspect` only for the monitor tools and stays
 tool-neutral for every other directive tool, as does the turn-end notice for a parked
@@ -1172,7 +1211,7 @@ lifecycle stages, in different shapes:
 
 | Site | Lifecycle stage | Shape | Reachable from code |
 |---|---|---|---|
-| `mcp_shared._resolve_tool_policy` | per call, cached per session | `ToolPolicy(excluded, unresolved, detail, included)` from `managedToolPolicy.exclude` and the gateway's `include` (per-server tool sets, present only for a spec that opts in with `managedToolPolicy.honourToolRefs`) | yes |
+| `mcp_shared._resolve_tool_policy` | per call, cached per session | `ToolPolicy(excluded, unresolved, detail, included)` from `managedToolPolicy.exclude` and the gateway's `include` (per-server tool sets, present only for a spec that opts in with `managedToolPolicy.honourToolRefs`, or empty for a server the spec names in `managedToolPolicy.excludeServers`) | yes |
 | the same function's unresolved returns | before the exclude list is parsed | empty set plus the reason it could not be read; `tools/call` refuses, `tools/list` still lists | nothing to migrate; the refusal is audited per call |
 | `acp/kas_agents.to_client_custom_agent` | startup projection, before the session exists | `excludedTools` list relayed to the agent host | yes |
 | `acp/session_mcp.session_mcp_disabled_tools` | session projection: Claude `permissions.deny`, codex `rawInput.server`/`tool` | `(server, tool)` pairs, unioned from the agent spec AND the dashboard-written global `mcp.json` | yes |
@@ -1243,11 +1282,12 @@ their primary use, which a prose-matching refusal would break. A preference that
 cannot misfire is worth more here than an enforcement that can.
 
 The descriptor is not the only prose that states the choice, and the key moves
-only the descriptor. `config/prompt.md` carries the same rule in its own words
-("Prefer bounded `monitor_watch` when typed provider facts decide the whole
-objective"), and that sentence is true in both positions, so it is left alone
-rather than made flag-aware. The reason is reach, not effort: a prompt file is one
-of many agent prompts, while the descriptor is assembled for every session
+only the descriptor. The `kirocrew-dev/babysit` skill, which `config/prompt.md`
+points every monitoring request at, carries the same rule in its own words ("Use a
+structured monitor only when its typed provider observes every fact needed to
+decide the objective"), and that sentence is true in both positions, so it is left
+alone rather than made flag-aware. The reason is reach, not effort: a skill is read
+only by the agents that load it, while the descriptor is assembled for every session
 whatever prompt it runs, so the descriptor is the only copy a single read can
 move for all of them. An installation that turns the key on therefore gets the
 default restated on the tool list, not rewritten in every prompt.
@@ -1267,8 +1307,11 @@ corner case: a pull request reaches `readiness: passed` only once every non-PASS
 whole-design verdict carries a disposition, and those verdicts live in comment
 bodies. The digest wakes the owner when such a body changes, but a green typed
 board with an unanswered advisory finding whose text never changed is still
-indistinguishable to a probe, which is why the prompt loop keeps `gate=false` for
-that evidence in both positions of this key.
+indistinguishable to a probe, which is why that evidence stays on the prompt loop,
+whose agent turn reads the bodies, in both positions of this key. The comment-aware
+recipes arm that loop gated with `judge: false`: a finding's arrival changes its
+reading (a body digest, or the lane's check run finishing) and wakes it, and the
+quiet floor re-delivers a turn for one the woken turn left unanswered.
 
 The PR-level comment-body digest is carried as one condition,
 `review_comment_bodies:<digest>`, with severity `WAKE` and `resets_on` `NEVER`:

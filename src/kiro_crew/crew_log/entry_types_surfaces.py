@@ -1,9 +1,10 @@
 """Crew log declarations for a crewmate's panel and dashboard, and a conversation's cards.
 
-The ``panel/``, ``dashboard/``, ``card/`` and ``guide/`` types: a crew's published
-webview, an accepted change to a crewmate's dynamic dashboard, an agentic value it wrote
-and a refused write its mistake book reads back, and the change cards and guides the
-agent offers in a conversation, with how each one ended. The entry types, read ceilings
+The ``panel/``, ``dashboard/``, ``card/`` and ``guide/`` types: a crew's
+published webview, an accepted change to a crewmate's dynamic dashboard, an agentic value
+it wrote and a refused write its mistake book reads back, the change cards and guides the
+agent offers in a conversation, with how each one ended, and the crewmate's own goal
+record and "waiting on you" list as the gateway records them for its Dashboard page. The entry types, read ceilings
 and fold names the panel and dashboard folds share sit beside them, as do the statuses
 a card or a guide can finish with.
 
@@ -146,14 +147,64 @@ MISTAKE_CORRECTION_LIMIT = 3
 
 MISTAKES_FOLD_NAME = "mistakes"
 
+# -- a crewmate's own record, as folds its Dashboard page reads ---------- #
+
+#: The entry a crewmate's goal record lands as each time it changes: the goals, and
+#: each milestone with its target, its latest reading and whether that reading meets
+#: the target. A SNAPSHOT, so the fold keeps the newest whole and a page bound to it
+#: moves the moment the record does, with no value typed by the crewmate.
+GOAL_ENTRY_TYPE = "dashboard/goal_recorded"
+GOAL_FOLD_NAME = "goal"
+#: The entry a crewmate's "waiting on you" list lands as each time it changes: its
+#: open ``[OPTIONS]`` questions, ``ask_question`` cards and pending change cards.
+#: A snapshot too, so a reply or a card press empties the fold by the next entry.
+WAITING_ENTRY_TYPE = "dashboard/waiting_changed"
+WAITING_FOLD_NAME = "waiting"
+#: Milestones or goals the goal fold keeps, items the waiting fold keeps, choices one
+#: waiting item keeps, and characters per text cell: re-applied on read, and sized so a
+#: snapshot at every clamp still fits one entry.
+CREWMATE_ROW_LIMIT = 12
+CREWMATE_WAITING_LIMIT = 6
+CREWMATE_OPTION_LIMIT = 6
+CREWMATE_TEXT_LIMIT = 240
+
+# -- custom records a script writes for a crewmate's Dashboard page ---------- #
+
+#: The entry one custom record lands as: a value no host Python computes and no model
+#: turn writes, appended on a script's behalf by the gateway into the crewmate the
+#: script is bound to. ONE registered type for every record kind -- the record's own
+#: name travels in ``type`` inside the data, the way an agentic value's field name does
+#: -- so the registry stays closed while the vocabulary of records stays open.
+CUSTOM_ENTRY_TYPE = "dashboard/custom_value"
+CUSTOM_FOLD_NAME = "custom"
+#: Characters a record type name may run to. One dashboard PATH SEGMENT -- letters,
+#: digits and underscores, the characters a Model's fold path allows between its dots
+#: -- so the name is a key a page can bind as ``custom.latest.<type>`` and can never
+#: spell a dot, a slash, a colon or a path; and short enough for a page author to type.
+CUSTOM_TYPE_NAME_LIMIT = 64
+#: Bytes one record's ``data`` may occupy once serialized -- the agentic value's own
+#: ceiling, for the same reason: a record is a cell or a short series, and without a
+#: cap one record could fill the log line and take every other type's row down with it.
+CUSTOM_RECORD_BYTES = DASHBOARD_VALUE_BYTES
+#: How deep a record's ``data`` may nest. A page binds a dotted path into it, so depth
+#: past this serves no page and only costs the reader.
+CUSTOM_RECORD_DEPTH = 8
+#: Distinct record types one slot's custom fold retains. Least recently WRITTEN goes,
+#: so the types kept are the ones a script is still feeding.
+CUSTOM_TYPE_LIMIT = 64
+#: Characters the stamped ``writer`` and ``member`` cells keep on read. The gateway
+#: writes both, so these clamp a planted line, never a real one.
+CUSTOM_WRITER_LIMIT = 128
+
+
 #: The ``code`` a CORRECTION entry carries.
 #:
 #: A correction is the other shape on ``dashboard/agentic_refused``: it says an
 #: accepted write used a field an earlier refusal had reached wrongly. It needs a
 #: code of its own because ``code`` is REQUIRED on the type -- a line that cannot
-#: say what it is gets refused at the append, which is the guard working, and was
-#: how an earlier draft of this entry (a correction with no code) was caught by
-#: the validator rather than by a test. Branching on this value also beats
+#: say what it is gets refused at the append, which is the guard working: a
+#: correction with no code is caught by the validator, not left for a test.
+#: Branching on this value also beats
 #: branching on the presence of ``corrects``: the one key that is always there is
 #: the one worth deciding on.
 MISTAKE_CORRECTED_CODE = "corrected"
@@ -577,6 +628,166 @@ TYPES: tuple[EntryType, ...] = (
                 enum_closed=True,
                 note="Why, when the status alone misleads: a cancelled guide whose save went through.",
             ),
+        ),
+    ),
+    # -- a crewmate's own record ------------------------------------------- #
+    EntryType(
+        GOAL_ENTRY_TYPE,
+        "A crewmate's goal record after a change: its goals and its milestones.",
+        (
+            Field(
+                "goals",
+                JSON_ARRAY,
+                required=True,
+                item_type=JSON_OBJECT,
+                fields=(Field("text", JSON_STRING, note="The goal's text."),),
+                note="Each goal as {text}, in the record's order.",
+            ),
+            Field(
+                "milestones",
+                JSON_ARRAY,
+                required=True,
+                item_type=JSON_OBJECT,
+                fields=(
+                    Field("text", JSON_STRING, note="What the milestone measures."),
+                    Field("target", JSON_STRING, note="The target, as the crewmate set it."),
+                    Field(
+                        "current",
+                        JSON_STRING,
+                        note="The reading the crewmate last recorded, its own status for it.",
+                    ),
+                    Field("at", JSON_STRING, note="When the latest reading was taken, ISO 8601."),
+                ),
+                note=(
+                    "Each milestone as {text, target, current, at}: current is the "
+                    "reading the crewmate last recorded with key_result_progress and at "
+                    "its time; whether the target is reached is the crewmate's own word "
+                    "in that reading, not judged by the gateway. At most "
+                    "CREWMATE_ROW_LIMIT rows; the totals count the rest."
+                ),
+            ),
+            Field("goals_total", JSON_INT, note="How many goals the record holds in all."),
+            Field(
+                "milestones_total", JSON_INT, note="How many milestones the record holds in all."
+            ),
+        ),
+        note=(
+            "Appended by the gateway to the crewmate's own DM session log whenever the "
+            "goal record changes (a goal set, milestones applied, a reading recorded), "
+            "and folded under its slot as the goal fold."
+        ),
+    ),
+    EntryType(
+        WAITING_ENTRY_TYPE,
+        "What a crewmate waits on the person for, after that list changed.",
+        (
+            Field(
+                "items",
+                JSON_ARRAY,
+                required=True,
+                item_type=JSON_OBJECT,
+                fields=(
+                    Field("kind", JSON_STRING, note="options, question or card."),
+                    Field("text", JSON_STRING, note="The question or the card's title, redacted."),
+                    Field(
+                        "options",
+                        JSON_ARRAY,
+                        item_type=JSON_STRING,
+                        note=(
+                            "The choices the person can answer with, when it names any; "
+                            "at most CREWMATE_OPTION_LIMIT."
+                        ),
+                    ),
+                    Field(
+                        "options_total",
+                        JSON_INT,
+                        note="How many choices it offers in all, including any cut.",
+                    ),
+                    Field("asked_at", JSON_STRING, note="When it was asked, ISO 8601."),
+                ),
+                note=(
+                    "Each item as {kind, text, options, asked_at}, newest first: kind is "
+                    "options, question or card (dashboard.member_waiting.waiting_items). "
+                    "At most CREWMATE_WAITING_LIMIT; total counts the rest."
+                ),
+            ),
+            Field(
+                "total",
+                JSON_INT,
+                note="How many items wait in all, including any past the items list.",
+            ),
+        ),
+        note=(
+            "Appended by the gateway to the crewmate's own DM session log when the "
+            "list it reads off the thread changes: a question asked, answered by a "
+            "reply or an [OPTIONS] chip, or a card raised or pressed. Folded under its "
+            "slot as the waiting fold."
+        ),
+    ),
+    # -- custom records a script writes for a crewmate's page ---------------- #
+    EntryType(
+        CUSTOM_ENTRY_TYPE,
+        "One custom record a script cron wrote for its crewmate, stamped with who wrote it.",
+        (
+            Field(
+                "type",
+                JSON_STRING,
+                required=True,
+                note=(
+                    "The record type the script named: letters, digits and underscores "
+                    "only, at most CUSTOM_TYPE_NAME_LIMIT characters, so it is one segment "
+                    "of a page's fold path. The custom fold keys its latest value on it, so "
+                    "a page binds custom.latest.<type>.data."
+                ),
+            ),
+            Field(
+                "data",
+                JSON_OBJECT,
+                required=True,
+                note=(
+                    "The record itself, an object of at most CUSTOM_RECORD_BYTES serialized "
+                    "and CUSTOM_RECORD_DEPTH deep. Its members are the script's own and are "
+                    "deliberately undeclared, the posture panel/published's data takes."
+                ),
+            ),
+            Field(
+                "writer",
+                JSON_STRING,
+                required=True,
+                note=(
+                    "Who wrote it, stamped by the GATEWAY from the caller's attested "
+                    "identity and never taken from the request: cron:<job id> for a script "
+                    "cron. A reader attributes the record to this, and a script cannot "
+                    "choose it."
+                ),
+            ),
+            Field(
+                "member",
+                JSON_STRING,
+                note=(
+                    "The slug of the crewmate the writer is bound to, stamped by the gateway "
+                    "from the same identity. Carried so a reader of one entry can say whose "
+                    "record it is without resolving the slot."
+                ),
+            ),
+            Field(
+                "crew_key",
+                JSON_STRING,
+                note=(
+                    "Digest of that crewmate's EXACT name, for the reason the agentic value "
+                    "carries one: a slot can hold two crews, and one crew's records must "
+                    "not fill the other's page."
+                ),
+            ),
+        ),
+        note=(
+            "Appended by the gateway to the crewmate's own DM session log when a script "
+            "cron bound to that crewmate calls ctx.crew_log_append, and folded under its "
+            "slot as the custom fold, which keeps the latest record per type. The entry's "
+            "src is gateway like every gateway write; the provenance is the writer and "
+            "member cells, which the route stamps and the body cannot set. The data is a "
+            "script's own words: a page draws it as text, and nothing frames it as an "
+            "instruction to an agent."
         ),
     ),
 )

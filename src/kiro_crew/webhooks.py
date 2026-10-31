@@ -49,6 +49,7 @@ from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write, read_bytes_with_retry
 from kiro_crew.config.loader import config_dir
 from kiro_crew.validation import sanitize_string
+from kiro_crew.webhook_sources import SOURCE_AGENT, source_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -134,10 +135,14 @@ OUTCOME_ERROR = "error"
 OUTCOME_REJECTED_CAPACITY = "rejected_capacity"
 OUTCOME_UNAUTHORIZED = "unauthorized"
 OUTCOME_DISABLED = "disabled"
+#: The turn finished, but without an MCP server the agent spec declares (it
+#: failed, waits for authorization, or never reported). The detail names it.
+OUTCOME_DEGRADED = "degraded"
 
 VALID_OUTCOMES = frozenset(
     {
         OUTCOME_COMPLETED,
+        OUTCOME_DEGRADED,
         OUTCOME_TIMEOUT,
         OUTCOME_ERROR,
         OUTCOME_REJECTED_CAPACITY,
@@ -273,12 +278,17 @@ def registered_context_count(path: Path | None = None) -> tuple[int, bool]:
     count is unknown -- and a reader that reported 0 for both would publish a
     number that is a lie on exactly the install worth looking at.
 
-    Never raises: an unreadable file is ``(0, False)``.
+    Never raises: an unreadable file is ``(0, False)``, and says nothing. The
+    metrics probe calls this once per export interval and reports a fault once
+    itself; :func:`_read_json` warns on every failed read, which would log the
+    same corrupt file every interval.
     """
     target = path if path is not None else context_registrations_path()
     try:
-        raw = _read_json(target, {})
-    except WebhookStoreUnreadable:
+        raw = json.loads(read_bytes_with_retry(target).decode("utf-8"))
+    except FileNotFoundError:
+        return 0, True
+    except (ValueError, OSError):
         return 0, False
     if not isinstance(raw, dict):
         # A top-level non-object is not a registration map. It parses, so it is
@@ -463,13 +473,22 @@ class WebhookTokenStore:
     # exists, so default-on does not widen the surface on a fresh install.
 
     def is_switch_on(self) -> bool:
+        # The ``webhooks`` governance scope outranks the stored switch: a source the
+        # policy refuses reads as off (in an enterprise build, every source until a
+        # policy names it -- RFC enterprise edition, Red "Webhooks by source").
+        if source_refusal(SOURCE_AGENT):
+            return False
         raw = _read_json(self.path, {})
         if not isinstance(raw, dict):
             return True
         return raw.get("enabled", True) is not False
 
     def set_switch(self, enabled: bool) -> bool:
-        """Persist the kill switch. Returns the stored value."""
+        """Persist the kill switch. Returns the switch as it now reads.
+
+        That is the stored value, except it reads as off while the ``webhooks``
+        governance scope refuses :data:`SOURCE_AGENT`.
+        """
         with locked(self.path):
             raw = _read_json(self.path, {})
             if isinstance(raw, dict):
@@ -486,7 +505,7 @@ class WebhookTokenStore:
             data["enabled"] = bool(enabled)
             data.setdefault("tokens", [])
             write_json_atomic(self.path, data)
-        return bool(enabled)
+        return bool(enabled) and not source_refusal(SOURCE_AGENT)
 
     @staticmethod
     def _public_entry(entry: dict[str, Any], *, legacy: bool = False) -> dict[str, Any]:

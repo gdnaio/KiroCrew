@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from kiro_crew.agent_discovery import warm_agent_specs
 from kiro_crew.agent_scratch import SharedScratchJoinError
+from kiro_crew.agent_sdk.kas_floor_wait import await_kas_floor_verdict
 from kiro_crew.agent_sdk.tool_search import ToolSearchSettings
 from kiro_crew.kiro_prerequisite import (
     identity_park_grace_remaining,
@@ -116,6 +117,8 @@ class _BackgroundOwner(Protocol):
     ) -> None: ...
 
     def _advance_session_generation(self, key: str) -> int: ...
+
+    def absorb_orphaned_release(self, key: str) -> bool: ...
 
     def _dispatch_hard_kill(self, provider: LLMProvider) -> None: ...
 
@@ -241,6 +244,16 @@ class _ProviderBgSession:
         self._sem_held = False
 
     @property
+    def provider(self) -> LLMProvider:
+        """The provider serving this handle, for attribution reads.
+
+        A turn's usage row passes this handle as ``model_source``; the
+        ``harness`` metric attribute unwraps it here to name the backend that
+        ran the turn. Read-only: turns still go through :meth:`prompt`.
+        """
+        return self._sess.provider
+
+    @property
     def session_id(self) -> str:
         try:
             return self._sess.provider.session_id
@@ -359,6 +372,9 @@ class BackgroundSessionRuntime:
         # Create outside lock
         if not self._owner._provider_factory:
             return
+        # Before the permit: a defaulted KAS waits (bounded) for the kiro-cli
+        # floor, so this session starts on the backend the verdict chose.
+        await await_kas_floor_verdict()
         # The factory resolves the background agent's model pin SYNCHRONOUSLY
         # on the loop from the agent-spec snapshot, which at gateway start has
         # not been published yet (the first ``mc-discovery`` refresh is still
@@ -393,8 +409,15 @@ class BackgroundSessionRuntime:
                     getattr(self._owner, "spawn_identity_reader", None)
                 )
                 await provider.start()
-            except Exception:
-                logger.warning("Failed to create background session", exc_info=True)
+            except Exception as exc:
+                # No kiro-cli is the expected state right after a fresh install,
+                # and the dashboard answers it with its Set up Kiro page; the
+                # message already names the directories searched and the fix,
+                # so a traceback would only bury it.
+                if getattr(exc, "kiro_cli_missing", False) is True:
+                    logger.warning("Background session not started: %s", exc)
+                else:
+                    logger.warning("Failed to create background session", exc_info=True)
                 return
             # Best-effort spawn-account record; see flag_identity_stamp_mismatches.
             # A cancellation landing in this read would leak the started
@@ -428,7 +451,7 @@ class BackgroundSessionRuntime:
                         self._owner._sessions[background_key] = sess
                         self._owner._advance_session_generation(background_key)
                         try:
-                            await record_session_started(background_key)
+                            await record_session_started(background_key, provider)
                         except BaseException:
                             # Cancelled between registering and recording: roll the entry
                             # back so no claimant sees a session the caller is tearing
@@ -739,6 +762,7 @@ class BackgroundSessionRuntime:
                 "session manager is closing; no background session"
             )
 
+        await await_kas_floor_verdict()
         if not self._owner._bg_backend_supports_runtime():
             # A cached runtime spawned under a previous runtime-capable backend
             # is unreachable from the branch below, so finish any deferred
@@ -976,10 +1000,11 @@ class BackgroundSessionRuntime:
     async def _rss_recycle_reason(self, background_key: str) -> str | None:
         """The recycle reason when the background tree is at or over its ceiling.
 
-        The ceiling is ``session.watchdog_rss_max_mb`` when it is positive, else
-        ``BACKGROUND_RSS_FALLBACK_MB``: the per-session knob is off by default,
-        and this internal runtime is the one tree a transcript of oversized
-        records grows without bound, so it keeps a ceiling either way.
+        The ceiling is ``session.watchdog_rss_max_mb`` when it is positive and
+        below ``BACKGROUND_RSS_FALLBACK_MB``, else that fallback: the per-session
+        knob is sized for chat sessions with many MCP servers, while this
+        internal runtime is the one tree a transcript of oversized records grows
+        without bound, so it keeps its own lower ceiling either way.
         The RSS sweep in ``session_cleanup`` skips persistent keys and the
         background key is one, so this is the only path that compares this
         runtime's tree against that number. It belongs here rather than there
@@ -990,7 +1015,7 @@ class BackgroundSessionRuntime:
         context and prompt criteria decide the turn on their own.
         """
         ceiling = self._deps.rss_max_mb()
-        if ceiling <= 0:
+        if ceiling <= 0 or ceiling > BACKGROUND_RSS_FALLBACK_MB:
             ceiling = BACKGROUND_RSS_FALLBACK_MB
         # This module owns the background runtime: it spawns the provider, is the
         # one place that retires it, and the background key is a pool of one, so
@@ -1147,7 +1172,12 @@ class BackgroundSessionRuntime:
                     exc_info=True,
                 )
         finally:
-            session.semaphore.release()
+            # Release ONLY a permit this task still owns: a teardown that popped
+            # the session during the recycle recorded this task as the holder and
+            # handed the permit to a woken claimant, so a second release here
+            # would over-release it (``retire_turn_permit``).
+            if not self._owner.absorb_orphaned_release(background_key):
+                session.semaphore.release()
             # ``_reacquire_and_validate`` named this task the holder; the
             # holding ends with this release.
             session.turn_owner = None

@@ -13,7 +13,7 @@ Instance fields written: ``_active_run_id``, ``_cancel_grace_secs``, ``_cancel_t
 ``_permission_options``, ``_steer_answers``, ``_steer_turn``, ``_steering_waiter_map``,
 ``_steers_awaiting_echo``, ``_turn_permission_denied``.
 
-Instance fields read: ``_agent``, ``_agent_version``, ``_background_launches``,
+Instance fields read: ``_active_tool_calls``, ``_agent``, ``_agent_version``, ``_background_launches``,
 ``_last_stop_reason``, ``_permission_gate_events``, ``_process``, ``_session_id``,
 ``_session_key``, ``_stdin_stalled``, ``_turn_done``, ``_turn_lock``.
 """
@@ -28,8 +28,9 @@ from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Collection
 
+from kiro_crew import mediated_request_capability
 from kiro_crew import sel as sel_module
-from kiro_crew.acp import transport_framing
+from kiro_crew.acp import pi_steer_turn, transport_framing
 from kiro_crew.acp.client_claude_session import (
     CLAUDE_ACP_STEERING_MIN_VERSION,
     _adapter_version_at_least,
@@ -49,6 +50,7 @@ from kiro_crew.acp.transport_errors import AcpError, AcpProcessDied, AcpTimeoutE
 from kiro_crew.acp.transport_framing import write_notification_best_effort
 from kiro_crew.acp.types import (
     ACP_BACKEND_GOOSE,
+    ACP_BACKEND_PI,
     ACP_BACKENDS_STEER_CONCURRENT_PROMPT,
     ACP_BACKENDS_STEERING_REQUEST,
     EVENT_COMPLETE,
@@ -71,6 +73,13 @@ from kiro_crew.acp.types import (
     AcpEvent,
     JsonRpcMessage,
     steering_outcome,
+    wrap_user_message,
+)
+from kiro_crew.agent_sdk.backend_cards import LINE_MID_TURN_STEER, card_for
+from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_LAUNCH,
+    ACP_BACKEND_NODE_ADAPTER_PACKAGES,
 )
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -102,16 +111,69 @@ class _ConcurrentSteerTurn:
 _ConcurrentSteerTurn.__module__ = "kiro_crew.acp.client"
 
 
-def steering_advertised(init_resp: object) -> bool:
-    """Whether an ``initialize`` result advertises the ``_session/steering`` request.
+#: The oldest goose that serves ``_goose/unstable/session/steer`` as Crew sends it:
+#: 1.38.0 ("Steering messages with ACP", block/goose#9560) added the request with
+#: ``expectedRunId``, the ``{runId, messageId}`` answer, ``activeRunId`` on
+#: ``session_info_update`` and the ``_meta.goose.steer`` echo. 1.37.0 has none of
+#: them, so its answer is ``-32601`` and every steer queues.
+GOOSE_STEER_MIN_VERSION = (1, 38, 0)
 
-    The extension is advertised at the TOP level of the result, as
-    ``_meta.steering.supported``, a sibling of ``agentCapabilities``. Only a
-    literal ``true`` counts.
+#: The release each adapter needs before the card's ``mid_turn_steer`` line is true,
+#: with the command that updates it. Below it the session still runs and a steer
+#: queues, so a new chat gets one notice naming the upgrade instead of a refusal.
+_STEER_MIN_VERSIONS: dict[str, tuple[tuple[int, int, int], str]] = {
+    ACP_BACKEND_CLAUDE: (
+        CLAUDE_ACP_STEERING_MIN_VERSION,
+        f"npm i -g {ACP_BACKEND_NODE_ADAPTER_PACKAGES[ACP_BACKEND_CLAUDE]}",
+    ),
+    ACP_BACKEND_GOOSE: (
+        GOOSE_STEER_MIN_VERSION,
+        ACP_BACKEND_LAUNCH[ACP_BACKEND_GOOSE].install_command,
+    ),
+}
+
+
+def steer_version_issue(backend: str, agent_version: str) -> str:
+    """The upgrade notice for *agent_version* of *backend*, or ``""`` when it is not
+    known to be too old to steer. An absent or unreadable version gets none, as for
+    pi. Compared by :func:`_adapter_version_at_least`, the parser the steer gate
+    itself reads, so the notice cannot disagree with whether the session steers."""
+    floor_and_fix = _STEER_MIN_VERSIONS.get(backend)
+    # Readable means it parses at all: every readable version is at least 0.0.0.
+    if floor_and_fix is None or not _adapter_version_at_least(agent_version, (0, 0, 0)):
+        return ""
+    floor, fix = floor_and_fix
+    if _adapter_version_at_least(agent_version, floor):
+        return ""
+    minimum = ".".join(str(part) for part in floor)
+    return (
+        f"{backend} {agent_version} is older than {minimum}, so a message you send "
+        f"while it works waits until it finishes. "
+        f"Update it: run '{fix}', then start a new chat."
+    )
+
+
+def steer_unadvertised_issue(backend: str, init: object) -> str:
+    """The notice for a session whose handshake withdrew the card's steer line, else ``""``.
+
+    The membership card (:func:`~kiro_crew.agent_sdk.backend_cards.card_for` with no
+    handshake) says *backend* steers; the same card given this session's ``initialize``
+    result *init* says it does not, because the adapter left out the field its steer
+    is gated on. The runtime then queues every mid-turn message, so the chat says so
+    once. No notice before the handshake (*init* empty or not an object).
     """
-    meta = init_resp.get("_meta") if isinstance(init_resp, dict) else None
-    steering = meta.get("steering") if isinstance(meta, dict) else None
-    return isinstance(steering, dict) and steering.get("supported") is True
+    if not isinstance(init, dict) or not init:
+        return ""
+
+    def _steers(card) -> bool:
+        return any(line.available for line in card.capabilities if line.id == LINE_MID_TURN_STEER)
+
+    if not _steers(card_for(backend)) or _steers(card_for(backend, init=init)):
+        return ""
+    return (
+        f"This {backend} build does not offer mid-turn steering, so a message you "
+        f"send while it works waits until it finishes."
+    )
 
 
 def format_command_result(result: dict) -> str:
@@ -272,6 +334,9 @@ async def cancel_session(self: AcpClient, grace_secs: float = 0.0) -> None:
     above the 10s floor genuinely extends the window instead of the loop
     bailing early and forcing a session-losing hard kill.
     """
+    # A cancelled turn's approved mediated-secret calls must not run later on
+    # their delivered grants: revoke them first, whatever happens to the cancel.
+    mediated_request_capability.invalidate_session(getattr(self, "_session_key", "") or "")
     if not self._session_id:
         logger.debug("cancel_session: no session_id, skip")
         return
@@ -321,6 +386,9 @@ async def cancel_session(self: AcpClient, grace_secs: float = 0.0) -> None:
     # their entry, and a new turn clears the map. An ``approve_tool`` call with
     # an explicit ``option_id`` leaves its entry behind; no caller passes one to
     # this client.
+    # The same holds for an MCP elicitation still waiting on a person: the
+    # engine keeps its tool call open until the ask is answered.
+    await self.cancel_pending_elicitations()
     open_requests = list(self._permission_options)
     self._permission_options.clear()
     if not open_requests:
@@ -392,6 +460,8 @@ async def steer(self: AcpClient, message: str) -> bool:
     A backend in ``ACP_BACKENDS_STEERING_REQUEST`` is delivered by a request
     whose answer the read loop hands over instead: goose by
     :meth:`_steer_via_request`, claude by :meth:`_steer_via_steering_request`.
+    pi takes no request at all: the steer is written for Crew's gate extension
+    inside pi (:mod:`kiro_crew.acp.pi_steer_turn`).
 
     A backend in ``ACP_BACKENDS_STEER_CONCURRENT_PROMPT`` takes the steer as
     a second ``session/prompt`` instead (:meth:`_steer_via_concurrent_prompt`),
@@ -400,13 +470,15 @@ async def steer(self: AcpClient, message: str) -> bool:
     text = (message or "").strip()
     if not text or not self._session_id:
         return False
+    if self.backend == ACP_BACKEND_PI:
+        return await pi_steer_turn.steer(self, text)
     if self._speaks_steering_request:
         return await self._steer_via_request(_CLIENT_STEERING_REQUEST_METHODS[self.backend], text)
     if self.backend in ACP_BACKENDS_STEERING_REQUEST:
         return await self._steer_via_steering_request(text)
     if self.backend in ACP_BACKENDS_STEER_CONCURRENT_PROMPT:
         return await self._steer_via_concurrent_prompt(text)
-    wrapped = f"<user_message>\n{text}\n</user_message>"
+    wrapped = wrap_user_message(text)
     await self._send_request("_session/steer", {"sessionId": self._session_id, "message": wrapped})
     # See AcpSessionHandle.steer for why the stamp is taken at the write.
     self._last_steer_monotonic = time.monotonic()
@@ -418,7 +490,11 @@ def _steering_request_ready(self: AcpClient) -> bool:
     sends it: advertised at the handshake, and claude-agent-acp at or above
     :data:`CLAUDE_ACP_STEERING_MIN_VERSION`. The floor is that adapter's own
     release history, and claude is the only member this client sends
-    ``_session/steering`` to, so any other member fails closed here."""
+    ``_session/steering`` to, so any other member fails closed here -- except pi,
+    which is sent no request: it is ready once its launch minted the steer channel
+    to Crew's gate extension (:mod:`kiro_crew.acp.pi_steer_turn`)."""
+    if self.backend == ACP_BACKEND_PI:
+        return pi_steer_turn.ready(self)
     if self._is_claude and getattr(self, "_steering_advertised", False) is True:
         return _adapter_version_at_least(
             getattr(self, "_agent_version", ""), CLAUDE_ACP_STEERING_MIN_VERSION
@@ -434,6 +510,16 @@ def _steering_waiters(self: AcpClient) -> dict[int, "asyncio.Future[Any]"]:
         waiters = {}
         self._steering_waiter_map = waiters
     return waiters
+
+
+def _unanswered_steering_ids(self: AcpClient) -> set[int]:
+    """Ids of steering requests whose answer has not been read yet. Created on
+    first use so a client built without ``__init__`` (test doubles) has one."""
+    ids = getattr(self, "_unanswered_steering_id_set", None)
+    if ids is None:
+        ids = set()
+        self._unanswered_steering_id_set = ids
+    return ids
 
 
 def _settle_steering_answer(self: AcpClient, msg: JsonRpcMessage) -> bool:
@@ -475,6 +561,11 @@ async def _steer_via_steering_request(self: AcpClient, text: str) -> bool:
 
     At-least-once: a steer the adapter injected just as the turn ended is
     queued as well and runs a second time, visibly, as its own turn.
+
+    Nothing is sent while a tool call of the turn is open: claude moves a
+    running tool to the background on a steer and ends the turn early, and the
+    tool's output then lands in the next, unrelated turn. Returning False holds
+    the text for the caller to run as the next turn instead.
     """
     aimed_at = self._steering_turn_req
     if (
@@ -482,6 +573,7 @@ async def _steer_via_steering_request(self: AcpClient, text: str) -> bool:
         or self._turn_done.is_set()
         or self._cancelled
         or self._parked_on_permission
+        or self._active_tool_calls.possibly_open
         or not self._steering_request_ready()
     ):
         return False
@@ -496,10 +588,12 @@ async def _steer_via_steering_request(self: AcpClient, text: str) -> bool:
         return False
     answer: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
     sent: list[int] = []
+    unanswered = self._unanswered_steering_ids()
 
     def _register(request_id: int) -> None:
         sent.append(request_id)
         waiters[request_id] = answer
+        unanswered.add(request_id)
 
     turn_done = self._turn_done
     try:
@@ -525,6 +619,8 @@ async def _steer_via_steering_request(self: AcpClient, text: str) -> bool:
         # Every exit stops waiting, so a late answer is skipped as stray.
         if sent:
             waiters.pop(sent[0], None)
+            if answer.done():
+                unanswered.discard(sent[0])
     if not answer.done() or answer.cancelled() or answer.exception() is not None:
         return False
     outcome = steering_outcome(answer.result())
@@ -535,7 +631,7 @@ async def _steer_via_steering_request(self: AcpClient, text: str) -> bool:
         # Injected, but its turn is already over: nothing will report it
         # consumed, so the caller queues the text.
         return False
-    self._steers_accepted.append((aimed_at, f"<user_message>\n{text}\n</user_message>"))
+    self._steers_accepted.append((aimed_at, wrap_user_message(text)))
     self._last_steer_monotonic = time.monotonic()
     return True
 
@@ -627,7 +723,7 @@ async def _steer_via_request(self: AcpClient, method: str, text: str) -> bool:
     if len(held) + len(answers) >= MAX_STEERING_ANSWERS:
         return False
     answer: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-    wrapped = f"<user_message>\n{text}\n</user_message>"
+    wrapped = wrap_user_message(text)
     req_ids: list[int] = []
 
     def _register(req_id: int) -> None:
@@ -703,7 +799,7 @@ async def _steer_via_concurrent_prompt(self: AcpClient, text: str) -> bool:
         return False
     if len(text) > _MAX_CONCURRENT_STEER_CHARS or len(turn.steers) >= _MAX_CONCURRENT_STEERS:
         return False
-    wrapped = f"<user_message>\n{text}\n</user_message>"
+    wrapped = wrap_user_message(text)
     sent: list[int] = []
     steers = turn.steers
 
@@ -821,6 +917,7 @@ async def _dispatch_prompt_events(
     self._turn_permission_denied = False
     turn = _ConcurrentSteerTurn()
     self._steer_turn = turn
+    pi_steer_turn.open_turn(self, req_id)
     try:
         async with aclosing(self._dispatch_events(req_id, timeout)) as events:
             async for event in events:
@@ -832,6 +929,11 @@ async def _dispatch_prompt_events(
                 ):
                     for consumed in await self._settle_concurrent_steers(turn, event):
                         yield AcpEvent(kind=EVENT_STEER_CONSUMED, text=consumed)
+                if event.kind == EVENT_COMPLETE:
+                    # pi's steer files go with their turn, at its terminal: a
+                    # consumer that stops reading here never resumes this
+                    # generator, so the finally below may run much later.
+                    await pi_steer_turn.close_turn(self, req_id)
                 yield event
     finally:
         # Idempotent beside the settle's own close: whichever runs first records
@@ -839,6 +941,9 @@ async def _dispatch_prompt_events(
         self._close_steer_turn(turn)
         if self._steer_turn is turn:
             self._steer_turn = None
+        # pi's steer files go with their turn, so none is read into a later one;
+        # already done at a terminal, and here for every other exit.
+        await pi_steer_turn.close_turn(self, req_id)
 
 
 def _close_steer_turn(self: AcpClient, turn: "_ConcurrentSteerTurn") -> None:

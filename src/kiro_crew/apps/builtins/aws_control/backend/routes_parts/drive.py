@@ -41,7 +41,10 @@ from kiro_crew.apps.builtins.aws_control.backend.routes_parts.common import (
 )
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.deploy.engine import AWSError
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (  # noqa: F401 - pinned by test_routes_parts_facade.py
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 
 # --------------------------------------------------------------------------
 # Drive
@@ -61,7 +64,9 @@ async def _handle_drive_status(request: web.Request) -> web.Response:
     except AWSError as exc:
         return _aws_failed(exc)
     if not bucket:
-        return web.json_response({"exists": False})
+        return web.json_response(
+            {"exists": False, "searched_region": storage_mod.searched_region(region)}
+        )
     refresh = request.rel_url.query.get("refresh") == "1"
     cached = _usage_cache.get(account)
     if cached and not refresh and (time.monotonic() - cached[0]) < _USAGE_TTL_SECS:
@@ -190,7 +195,7 @@ async def _require_drive(request: web.Request) -> tuple[str, str, str, str] | we
     except AWSError as exc:
         return _aws_failed(exc)
     if not bucket:
-        return _conflict("this account has no drive yet", "drive_missing")
+        return _conflict(storage_mod.no_drive_message(region), "drive_missing")
     return account, profile, region, bucket
 
 
@@ -390,8 +395,9 @@ def _redact_preview(data: bytes, size: int) -> tuple[str, bool, bool]:
     still have seen only partially, and a split run is never shown.
     """
     text = data.decode("utf-8", errors="replace")
-    text, credential_hits = redact_credentials(text)
-    text, url_hits = redact_exfiltration_urls(text)
+    from kiro_crew.security import redact_with_findings
+
+    text, credential_hits, url_hits = redact_with_findings(text)
     truncated = size > _PREVIEW_MAX_BYTES
     if truncated:
         text = _trim_preview(text, _PREVIEW_MAX_BYTES)

@@ -216,6 +216,12 @@ EMPTY_TURN_NOTICE_KIND = "empty_turn"
 #: notice of any kind (the "crewmate chat draws messages only" decision record).
 SPEC_HOOKS_NOTICE_KIND = "spec_hooks"
 
+#: ``meta.kind`` of the session-start notice that says Crew's tools are off in
+#: this session because a settings file Crew does not govern holds its path.
+#: Sessions draws it; crewmate chat drops it (``crewmateBubbles.isCrewmateChatRow``)
+#: for the same reason as :data:`SPEC_HOOKS_NOTICE_KIND`.
+SEED_DECLINED_NOTICE_KIND = "seed_declined"
+
 
 #: Row-level kind for the terminal `error` row a prompt-time MODEL ENTITLEMENT
 #: rejection produces ("Your account does not have access to model 'X'"), so
@@ -273,9 +279,21 @@ SESSION_START_FAILED_KIND = "session_start_failed"
 #: window are not carried over.
 CONTEXT_OVERFLOW_KIND = "context_overflow"
 
+#: Row-level kind for the terminal `error` row the provider's MANY-IMAGE PIXEL
+#: cap produces: an image already in the native history is larger than 2000px on
+#: its longest edge, and once a conversation holds many images one oversized
+#: image rejects the whole turn (the ``image_dimension_wedge`` tag
+#: ``_raise_acp_error`` sets). A retry, a Resume or another model re-sends the
+#: same history and fails the same way -- but UNLIKE a context overflow this is
+#: recoverable WITHOUT losing turns: the card swaps Resume for "Repair images and
+#: resume", which stops the slot's kiro-cli (releasing the transcript lock),
+#: downscales the oversized images in place (``session_image_repair``), and
+#: re-issues the interrupted turn against the repaired conversation.
+IMAGE_REPAIR_KIND = "image_repair"
+
 #: Row-level kind for the terminal `error` row a refused app-owned agent turn
 #: produces (``apps.manager.app_command_agent_refusal``: the app's agent is
-#: shadowed, ambiguous or not installed), and for a session start whose agent has
+#: reserved, ambiguous or not installed), and for a session start whose agent has
 #: no definition at all (``AcpAgentUnavailable``, typically a disabled app's
 #: Crew Member). A retry re-runs the same check against the same files, so the
 #: frontend withholds Resume on this row and the composer does not urge it; the
@@ -455,6 +473,13 @@ STEER_POSSIBLY_DELIVERED_NOTE = (
 #: behind the children would turn that choice into a Queue they never picked.
 STEER_INTENT_META = "steer_intent"
 
+#: Queue-entry meta key: this entry is an AUTOMATION steer (a work-ledger wake)
+#: that the running turn ended before taking. Its value is the row's
+#: ``meta.nudge`` (``{"cycle", "loop_id"}``). The drain writes the entry as a
+#: ``nudge`` row instead of a ``user`` row, and the entry drains alone: merged,
+#: its text would be glued onto the human's own queued words in one row.
+AUTOMATION_STEER_META = "automation_steer"
+
 
 def releases_past_subagent_hold(item: dict) -> bool:
     """Whether the sub-agent hold lets *item* drain while children still run.
@@ -505,7 +530,9 @@ def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
 
     A merge run stops at a system injection, at an attachment-bearing entry
     (see :func:`carries_attachments`), at a possibly-delivered steer
-    (``STEER_POSSIBLY_DELIVERED_META``) and where the stamped turn actor
+    (``STEER_POSSIBLY_DELIVERED_META``), at a requeued automation steer
+    (:data:`AUTOMATION_STEER_META`), at an entry a decision steered
+    (``meta.decisions_strip``) and where the stamped turn actor
     changes, so an app's queued send never folds into the user's own words; an
     entry that starts no run pops alone.
     """
@@ -518,6 +545,10 @@ def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
                 # Its note speaks for one message; merged, it would vouch that
                 # messages never written to any pipe may already have run.
                 or (item.get("meta") or {}).get(STEER_POSSIBLY_DELIVERED_META)
+                # Automation text, never folded into a person's row.
+                or (item.get("meta") or {}).get(AUTOMATION_STEER_META)
+                # A decision's receipt names one message; a merged row has one meta.
+                or (item.get("meta") or {}).get("decisions_strip")
             ):
                 break
             if to_merge and _stamped_turn_actor(item) != _stamped_turn_actor(to_merge[0]):

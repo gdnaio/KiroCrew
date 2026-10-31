@@ -79,6 +79,7 @@ export type {
   SessionLaneKey,
   TagColumn,
   ChatMessage,
+  SideSnapshot,
   ChatSlotDetailResponse,
   SubagentActivity,
   ToolPayloadCut,
@@ -90,6 +91,12 @@ export type {
   PendingApproval,
   SubagentInfo,
   SessionInfo,
+  CrewWorker,
+  CrewTimeline,
+  CrewTimelineHandoff,
+  CrewTimelineLane,
+  CrewTimelineMark,
+  CrewTimelineSegment,
 } from './index.chat'
 export type {
   PullRequestCommit,

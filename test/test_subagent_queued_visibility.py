@@ -82,12 +82,17 @@ async def test_a_deferred_spawn_is_readable_until_it_starts(monkeypatch) -> None
         free["gb"] = 32.0
         mgr._taskq_admit_wait_secs = 0.05
         await mgr._taskq.run(mgr._taskq.defer, info.id, wait=-1.0, reason="test: eligible now")
-        for _ in range(250):
-            if started.is_set():
-                break
-            mgr._drain_queue()
-            await asyncio.sleep(0.02)
-        assert started.is_set(), "the deferred row never started"
+
+        def _drained_and_started() -> bool:
+            if not started.is_set():
+                mgr._drain_queue()
+            return started.is_set()
+
+        await async_wait_until(
+            _drained_and_started,
+            interval=0.02,
+            describe=lambda: "the deferred row never started",
+        )
         assert mgr.get(info.id) is not None
         assert await mgr.queued_run_async(info.id) is None
         assert (await mgr.queued_runs_async("dash:vis")).runs == ()
@@ -96,7 +101,11 @@ async def test_a_deferred_spawn_is_readable_until_it_starts(monkeypatch) -> None
         tasks = [task for task in mgr._tasks.values() if not task.done()]
         for task in tasks:
             task.cancel()
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 5)
+        await await_until(
+            asyncio.gather(*tasks, return_exceptions=True),
+            what="the cancelled runs settling in teardown",
+            timeout=5,
+        )
         mgr._taskq.close()
 
 
@@ -723,6 +732,36 @@ async def test_collecting_a_member_whose_announce_already_queued_settles_it(tmp_
     assert not [q for q in slot._queue if q.get("kind") == SUBAGENT_COMPLETION_KIND]
     assert slot._subagents_inline_collected == {"b1"}
     state.subagents.settle_queued_delivery.assert_awaited_once_with(owed)
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_mark_leaves_an_already_reported_member_out_of_the_set(
+    tmp_path,
+) -> None:
+    """The tool re-sends a mark whose first attempt timed out. If that first
+    attempt already settled a queued announce, the member has reached the parent
+    and no later check discards its id, so the repeat must not add it to the
+    inline-collected set. A member still running is added as before."""
+    from chat_test_helpers import _make_state
+
+    from kiro_crew.dashboard.handlers.messaging import api_spawn_mark_collected
+
+    state = _make_state(tmp_path)
+    slot = state.get_or_create_slot("chat-1")
+    infos = {
+        "a1": MagicMock(_reported_to_parent=True),
+        "b1": MagicMock(_reported_to_parent=False),
+    }
+    state.subagents = MagicMock(
+        get=MagicMock(side_effect=infos.get), settle_queued_delivery=AsyncMock()
+    )
+
+    await api_spawn_mark_collected(
+        _Req(state, body={"ids": ["a1", "b1"], "parent_session": "dashboard:chat-1"})
+    )
+
+    assert slot._subagents_inline_collected == {"b1"}
+    state.subagents.settle_queued_delivery.assert_not_awaited()
 
 
 def test_spawn_list_never_says_none_running_over_a_partial_queue() -> None:

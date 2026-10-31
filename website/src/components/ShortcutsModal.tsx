@@ -149,12 +149,17 @@ export function ShortcutGroupRows({ entries, hintClass }: { entries: readonly Sh
  * browser-reserved chord demoted in a browser host carries an inline tag naming
  * where it works, because muted alone would read as "also works" there.
  */
-export function ShortcutRow({ label, keys, secondary }: { label: string; keys: string[]; secondary?: readonly SecondaryChord[] }) {
+export function ShortcutRow({ label, keys, secondary, status }: { label: string; keys: string[]; secondary?: readonly SecondaryChord[]; status?: string }) {
   return (
     <div className="flex items-center justify-between py-1.5 px-2 rounded-md hover:bg-bg-hover transition-colors">
       <span className="text-[13px] text-text">{label}</span>
       <span className="flex items-center gap-1 flex-wrap justify-end">
-        {keys.map((p, i) => <span key={i} className="flex items-center gap-1">{i > 0 && <span className="text-muted text-[11px]">+</span>}<Kbd>{p}</Kbd></span>)}
+        {/* `status` renders muted text (e.g. "Off") in the value slot instead of
+            a Kbd cap, so a disabled shortcut does not read as a key literally
+            named "Off". It is mutually exclusive with `keys`. */}
+        {status
+          ? <span className="text-[12px] text-muted">{status}</span>
+          : keys.map((p, i) => <span key={i} className="flex items-center gap-1">{i > 0 && <span className="text-muted text-[11px]">+</span>}<Kbd>{p}</Kbd></span>)}
         {secondary?.map((sc, j) => (
           <span key={j} className="flex items-center gap-1 opacity-60">
             <span className="text-muted text-[11px] mx-1">{i18nT('components.shortcutsModal.or')}</span>
@@ -201,16 +206,19 @@ export function KeyCapSequence({ caps, plus }: { caps: string[]; plus?: boolean 
  * useKeyboardShortcuts handler), so it is documented with this dedicated row.
  *
  * The caps reflect the user's configured preset live (edited in
- * Settings → Shortcuts): the primary gesture, plus the ⌘K / Ctrl+K alias in
- * `double-shift` mode where that alias stays active. A `custom` mode awaiting a
- * recorded chord shows the record prompt.
+ * Settings → Shortcuts). ⌘K / Ctrl+K is the primary gesture in `mod-k` mode and
+ * is no longer a cross-mode alias, so no extra "or ⌘K" is advertised in
+ * `double-shift` or `custom`. A `custom` mode awaiting a recorded chord shows
+ * the record prompt.
  */
 export function SearchEverywhereRow() {
   const { config } = useQuickSearchShortcut()
+  // Keycaps for the configured gesture (⌘K / Ctrl+K, double-Shift as ⇧⇧). This
+  // is a key legend, so it shows physical keys; the top-bar trigger separately
+  // spells double-Shift as the word "Double Shift" because that chip is prose,
+  // not a legend. The only change here vs. before the PR is that the ⌘K alias
+  // is no longer advertised in double-Shift mode (it no longer fires there).
   const caps = formatQuickSearchKeys(config)
-  // ⌘K / Ctrl+K stays live as an alias in double-shift mode (see
-  // useCommandPalette), so advertise it alongside the primary gesture.
-  const showAlias = config.mode === 'double-shift'
 
   return (
     <div className="flex items-center justify-between py-1.5 px-2 rounded-md hover:bg-bg-hover transition-colors">
@@ -220,14 +228,6 @@ export function SearchEverywhereRow() {
           <KeyCapSequence caps={caps} plus={config.mode !== 'double-shift'} />
         ) : (
           <span className="text-muted text-[11px]">{i18nT('pages.settings.shortcutsPanel.record_prompt')}</span>
-        )}
-        {showAlias && (
-          <>
-            <span className="text-muted text-[11px] mx-1">{i18nT('components.shortcutsModal.or')}</span>
-            <Kbd>{IS_MAC ? '⌘' : 'Ctrl'}</Kbd>
-            <span className="text-muted text-[11px]">+</span>
-            <Kbd>{i18nT('components.shortcutsModal.k')}</Kbd>
-          </>
         )}
       </span>
     </div>
@@ -313,6 +313,18 @@ export function PanelToggleRows({ ids }: { ids: PanelToggleId[] }) {
 export function GlobalHotkeyRow() {
   const hotkey = useGlobalHotkey()
   if (!hotkey) return null
+  // Unbound on a desktop build (e.g. the opt-out default on a fresh install):
+  // show the row as "Off" with how-to-enable guidance below, rather than
+  // hiding it — a hidden switch cannot be turned back on.
+  if (!hotkey.accelerator) {
+    return (
+      <ShortcutRow
+        label={i18nT('components.shortcutsModal.show_or_focus_the_kiro_crew_window')}
+        keys={[]}
+        status={i18nT('components.shortcutsModal.global_hotkey_off')}
+      />
+    )
+  }
   return (
     <ShortcutRow
       label={i18nT('components.shortcutsModal.show_or_focus_the_kiro_crew_window')}
@@ -376,14 +388,10 @@ export default function ShortcutsModal({ onClose }: { onClose: () => void }) {
     const label = i18nT('components.shortcutsModal.search_everywhere').toLowerCase()
     const sectionName = i18nT('components.shortcutsModal.search').toLowerCase()
     const capsStr = formatQuickSearchKeys(quickSearchConfig).join(' ').toLowerCase()
-    const showAlias = quickSearchConfig.mode === 'double-shift'
-    const kKey = i18nT('components.shortcutsModal.k').toLowerCase()
-    const aliasCaps = showAlias ? [IS_MAC ? '⌘' : 'ctrl', kKey].join(' ').toLowerCase() : ''
     return (
       matchesQuery(label, normalizedQuery, queryWithoutPlus) ||
       matchesQuery(sectionName, normalizedQuery, queryWithoutPlus) ||
-      matchesQuery(capsStr, normalizedQuery, queryWithoutPlus) ||
-      (showAlias && Boolean(aliasCaps) && matchesQuery(aliasCaps, normalizedQuery, queryWithoutPlus))
+      matchesQuery(capsStr, normalizedQuery, queryWithoutPlus)
     )
   }, [normalizedQuery, queryWithoutPlus, quickSearchConfig])
 
@@ -408,7 +416,11 @@ export default function ShortcutsModal({ onClose }: { onClose: () => void }) {
     if (!normalizedQuery) return true
     const label = i18nT('components.shortcutsModal.show_or_focus_the_kiro_crew_window').toLowerCase()
     const sectionName = i18nT('components.shortcutsModal.desktop_app').toLowerCase()
-    const keys = formatAcceleratorKeys(globalHotkey.accelerator, IS_MAC).join(' ').toLowerCase()
+    // When unbound, the row shows an "Off" cap instead of key caps — match that
+    // word so searching still surfaces the section a user came to turn on.
+    const keys = globalHotkey.accelerator
+      ? formatAcceleratorKeys(globalHotkey.accelerator, IS_MAC).join(' ').toLowerCase()
+      : i18nT('components.shortcutsModal.global_hotkey_off').toLowerCase()
     return (
       matchesQuery(label, normalizedQuery, queryWithoutPlus) ||
       matchesQuery(sectionName, normalizedQuery, queryWithoutPlus) ||
@@ -493,7 +505,7 @@ export default function ShortcutsModal({ onClose }: { onClose: () => void }) {
                 <div className="grid gap-1">
                   <GlobalHotkeyRow />
                 </div>
-                <div className="text-[11px] text-muted mt-1 px-2">{i18nT('components.shortcutsModal.global_hotkey_hint')}</div>
+                <div className="text-[11px] text-muted mt-1 px-2">{i18nT(globalHotkey?.accelerator ? 'components.shortcutsModal.global_hotkey_hint' : 'components.shortcutsModal.global_hotkey_hint_off')}</div>
               </div>
             )}
           </>

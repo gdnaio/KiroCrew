@@ -2,8 +2,9 @@ import { useEffect, useState, useRef, useMemo, useCallback, type Dispatch, type 
 import type { HoverIntent } from '../../../hooks/useHoverIntent'
 import type { AppDispatch } from '../../../store'
 import type { ChatSlot, ChatFolder } from '../../../types'
-import { openActivityPanel, createSlot, deleteSlot } from '../../../store/chatSlice'
+import { openActivityPanel, createSlot, deleteSlot, requestSlotFolderOpen, setSidePanelAlwaysOpen } from '../../../store/chatSlice'
 import { safeSetItem } from '../../../utils/safeStorage'
+import { notePanelShown } from '../../../hooks/usePanelTabs'
 import type { useChatPageResourcesController } from '../useChatPageResourcesController'
 import type { useComposerChips } from './composerChips'
 import type { MemoryMode } from '../../../components/MemoryModeChip'
@@ -17,6 +18,7 @@ import { PanelLeftLight, PanelLeftSolid } from '../../../components/icons/panels
 import { sidePanelDockMotion } from '../sidePanelMount'
 import { errMessage } from '../../../utils/thunkError'
 import { memorySwitchTimeoutMs } from '../../../utils/memorySwitchTimeout'
+import { forgetSlotSuccession } from '../../../utils/slotSuccession'
 import type { MemorySwitchContext } from '../memoryModeSwitch'
 import { crewWindowShown } from '../crew-window/crewWindowStore'
 import { i18nT } from '../../../i18n/t'
@@ -37,6 +39,13 @@ interface PaneLayoutStateOptions {
   _slotProject: string
   projectGit: ReturnType<typeof useComposerChips>['projectGit']
   projectGitError: boolean
+  embedded?: boolean
+  /** A popped-out chat window: rendered `embedded`, but a full chat page in its own window. */
+  popout?: boolean
+  isMobile: boolean
+  sidePanelAlwaysOpen: boolean
+  sidePanelAlwaysOpenKnown: boolean
+  activityOpen: boolean
 }
 
 /**
@@ -48,8 +57,43 @@ interface PaneLayoutStateOptions {
  * Called from ChatPage at the position its statements held, so React registers its effects in the same order.
  */
 export function usePaneLayoutState({
-  embedMode, dispatch, slots, activeSlot, autoOpenGitPanel, autoOpenGitPanelKnown, setSplitMode, splitMode, setSplitAnchor, tabsCtl, splitFeatureEnabled, _slotProject, projectGit, projectGitError,
+  embedMode, dispatch, slots, activeSlot, autoOpenGitPanel, autoOpenGitPanelKnown, setSplitMode, splitMode, setSplitAnchor, tabsCtl, splitFeatureEnabled, _slotProject, projectGit, projectGitError, embedded, popout, isMobile, sidePanelAlwaysOpen, sidePanelAlwaysOpenKnown, activityOpen,
 }: PaneLayoutStateOptions) {
+  // Keep side panel open (dashboard.side_panel_always_open). The full chat page
+  // and a popped-out chat window turn it on. An embedded companion chat (an
+  // artifact's or an app's companion column) turns it off, so the chats it
+  // enters keep their own saved panel choice in a column too narrow for the
+  // panel. A popout renders `embedded` too, but it is a whole chat page in its
+  // own window. Off on a phone as well, where the panel covers the chat.
+  // The store opens the current chat's panel when the setting itself turns on,
+  // and reopens a panel a phone or embed flip closed when that flip turns back
+  // on. It does not reopen a panel the user closed. The store keeps its
+  // own copy of `setting`, because the setting turns on in Settings, a route
+  // that unmounts this page, and the page mounts again with the new value
+  // already in its config cache. A companion chat sends no `setting`: a
+  // companion column opened on the way back from Settings must not use up a
+  // turn-on the full chat page has not seen yet.
+  const companionEmbed = !!embedded && !popout
+  useEffect(() => {
+    // Nothing to report until the dashboard config read has returned data. A
+    // pending or failed read reads the setting as off, and the store would keep
+    // that off as the user's setting: the read's later answer would then look
+    // like a turn-on and open a panel the user closed meanwhile. With no report,
+    // a toggle made first still keeps that answer from opening the panel (see
+    // `sidePanelAlwaysOpenSetting`).
+    if (!sidePanelAlwaysOpenKnown) return
+    dispatch(setSidePanelAlwaysOpen({ on: !companionEmbed && sidePanelAlwaysOpen && !isMobile, setting: companionEmbed ? undefined : sidePanelAlwaysOpen }))
+  }, [dispatch, companionEmbed, sidePanelAlwaysOpen, isMobile, sidePanelAlwaysOpenKnown])
+  // Report the chat whose strip the side panel shows (null: none), so a show
+  // ends when the panel closes or its chat changes. The report comes from this
+  // page, not from the panel's own mount, so a panel remount (the find pane
+  // closing, a resize across the phone breakpoint) is not a new show and does
+  // not move Pin Summary's tab. usePanelTabs keeps the last report (see
+  // notePanelShown), so this page mounting again on the same chat ends nothing,
+  // and a chat change made while it was unmounted ends the old chat's show.
+  useEffect(() => {
+    notePanelShown(activityOpen && activeSlot ? activeSlot : null)
+  }, [activityOpen, activeSlot])
   // Auto-open the Git panel when the slot has a project dir that is a git repo.
   // OPT-IN (dashboard.auto_open_git_panel, default off) because the marker below
   // cannot make this the once-per-project nudge it reads like: a new slot inherits
@@ -70,7 +114,10 @@ export function usePaneLayoutState({
     // (after reclaiming a disposable tier if the quota was full), so the guard
     // is the return value rather than a caught throw.
     if (!safeSetItem(key, '1')) return
-    tabsCtl.openView('git')
+    // Without the Auto-Open Git setting the tab is only created for discovery,
+    // so it is automatic: it neither stops Pin Summary's landing nor takes the
+    // focus from a Summary the landing chose.
+    tabsCtl.openView('git', { automatic: !autoOpenGitPanel })
     if (autoOpenGitPanel) dispatch(openActivityPanel())
   }, [activeSlot, _slotProject, projectGit?.repo, projectGitError, tabsCtl, dispatch, autoOpenGitPanel, autoOpenGitPanelKnown])
 
@@ -157,6 +204,8 @@ interface PanelLayoutOptions {
   dispatch: AppDispatch
   isMobile: boolean
   filteredSlots: ChatSlot[]
+  /** True once a slot list has landed, so an empty `filteredSlots` means no sessions rather than not loaded yet. */
+  slotsLoaded: boolean
   activeSlot: string | null
   isWelcomeState: boolean
   showActionError: (message: string, title?: string) => void
@@ -193,7 +242,7 @@ interface PanelLayoutOptions {
  * Called from ChatPage at the position its statements held, so React registers its effects in the same order.
  */
 export function usePanelLayout({
-  mode, dispatch, isMobile, filteredSlots, activeSlot, isWelcomeState, showActionError, currentSlot, chatFolders, chatFoldersError, chatFoldersLoaded, mobileNewSessionBusy,
+  mode, dispatch, isMobile, filteredSlots, slotsLoaded, activeSlot, isWelcomeState, showActionError, currentSlot, chatFolders, chatFoldersError, chatFoldersLoaded, mobileNewSessionBusy,
   mobileNewSessionInFlightRef, setMobileNewSessionBusy, setSidebarPinned, sidebarPinned, railWidth, winW, effectiveSidebarWidth, mobileSessions, openSidebar, closeSidebar, previewExpanded,
   sidebarOpen, flyout, memorySwitch,
 }: PanelLayoutOptions) {
@@ -203,7 +252,7 @@ export function usePanelLayout({
     // it is bound to the ACTIVE slot, so focusing before creation fulfils puts
     // the caret on the old session and loses whatever is typed. See the module.
     // Agent-less: the server stamps the default custom agent (a template).
-    const created = dispatch(createSlot({ mode: mode || '' })).unwrap()
+    const created = dispatch(createSlot({ mode: mode || '', defaultFolder: true })).unwrap()
     focusComposerAfter(created)
     // A failed create must not be a silent no-op: `createSlot.rejected` only
     // clears the pending flag and `focusComposerAfter` swallows the rejection
@@ -231,16 +280,17 @@ export function usePanelLayout({
   }, [dispatch, mode, flyout, showActionError])
 
   // Force the list open when there is nothing in it, so a user with no sessions
-  // still has the surface that creates one. Skipped while expand mode owns the
-  // hidden state: re-pinning there would fight the auto-hide and, worse, persist
-  // 'true' over the user's stored preference, which the restore on exit then
-  // contradicts in the live state.
+  // still has the surface that creates one. Waits for the first slot list to
+  // land: on a page load the list is empty until then, and that is not "no
+  // sessions". The forced open is live only and never persisted, so a stored
+  // 'false' survives it and only a user toggle writes `mc-sidebar-pinned`.
+  // Skipped while expand mode owns the hidden state: re-pinning there would
+  // fight the auto-hide.
   useEffect(() => {
-    if (filteredSlots.length === 0 && !sidebarPinned && !previewExpanded) {
+    if (slotsLoaded && filteredSlots.length === 0 && !sidebarPinned && !previewExpanded) {
       setSidebarPinned(true)
-      safeSetItem('mc-sidebar-pinned', 'true')
     }
-  }, [filteredSlots.length, sidebarPinned, previewExpanded, setSidebarPinned])
+  }, [slotsLoaded, filteredSlots.length, sidebarPinned, previewExpanded, setSidebarPinned])
 
   // Horizontal space (px) the detail panel must keep clear so it never grows
   // past its flex row and collapses the chat pane: the open sidebar's width
@@ -330,12 +380,18 @@ export function usePanelLayout({
     mobileNewSessionInFlightRef.current = true
     setMobileNewSessionBusy(true)
     try {
-      await dispatch(createSlot({
+      const slot = await dispatch(createSlot({
         agent,
         mode: mode || '',
         ...(folderId ? { folder_id: folderId } : {}),
         ...(project ? { project } : {}),
       })).unwrap()
+      // The current session can sit in a collapsed folder when it was opened
+      // from search or a link, and createSlot opens the folder path only for a
+      // default-folder create. Open it here, or the drawer shows no row for the
+      // new chat. Only while it is active: a user who moved away keeps the
+      // sidebar they had.
+      dispatch(requestSlotFolderOpen({ key: slot.key, folder_id: slot.folder_id, onlyIfActive: true }))
     } catch (error) {
       // Same stale-project-dir sentence as the drawer's folder `+`, as the
       // notice title: it is the one create failure the user can fix, so name
@@ -421,6 +477,8 @@ export function usePanelLayout({
       try { await dispatch(deleteSlot(activeSlot)).unwrap() } catch (error) {
         // A rejected delete leaves the moved uploads with the replacement,
         // where the user is, and the old slot keeps its own later work.
+        // The old slot is still alive, so it is no longer replaced.
+        forgetSlotSuccession(activeSlot)
         showActionError(errMessage(error) || i18nT('pages.chatPage.unknown_error'))
       }
     }
