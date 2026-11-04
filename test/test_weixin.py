@@ -12,6 +12,7 @@ import asyncio
 import pytest
 
 from kiro_crew.messaging.transport import InboundMessage
+from kiro_crew.testing.wait import await_until
 from kiro_crew.weixin.client import (
     ILINK_APP_ID,
     ITEM_TEXT,
@@ -114,6 +115,34 @@ def test_context_store_is_scoped_per_account(tmp_path):
     assert store.get("acct2", "sameuser") == "two"
 
 
+@pytest.mark.parametrize("payload", ["[]", '["userA", "ctx-A"]', '"ctx-A"', "7", "null"])
+def test_context_store_ignores_a_reply_context_file_that_is_not_an_object(
+    tmp_path, caplog, payload
+):
+    # restore() runs in connect(); a well-formed but non-object file must take
+    # the same "warn and continue" path as an undecodable one, not raise out
+    # of connect and keep the channel from starting.
+    store = ContextTokenStore(str(tmp_path))
+    store.set("acct1", "userA", "ctx-A")
+    (path,) = tmp_path.rglob("acct1.context-tokens.json")
+    path.write_text(payload, encoding="utf-8")
+
+    revived = ContextTokenStore(str(tmp_path))
+    with caplog.at_level("WARNING", logger="kiro_crew.weixin.client"):
+        try:
+            revived.restore("acct1")
+        except Exception as exc:  # noqa: BLE001 - any escape stops the channel
+            pytest.fail(f"restore() raised out of connect on a {payload} file: {exc!r}")
+
+    assert revived.get("acct1", "userA") is None
+    assert "failed to restore reply context" in caplog.text
+    # The next inbound message still persists a fresh, restorable object.
+    revived.set("acct1", "userB", "ctx-B")
+    again = ContextTokenStore(str(tmp_path))
+    again.restore("acct1")
+    assert again.get("acct1", "userB") == "ctx-B"
+
+
 def test_typing_ticket_cache_expires_entries():
     cache = TypingTicketCache(ttl_seconds=0.0)
     cache.set("u1", "ticket")
@@ -161,6 +190,41 @@ def test_render_chunks_splits_oversized_content_within_the_limit():
     out = render_chunks(body)
     assert len(out) > 1
     assert all(len(c) <= WEIXIN_CHUNK_LIMIT for c in out)
+
+
+def _fence_lines(chunk: str) -> int:
+    return sum(line.startswith("```") for line in chunk.split("\n"))
+
+
+def test_render_chunks_reopens_a_code_block_cut_across_chunks():
+    # Each chunk is its own bubble: one that opens a fence must close it, and the
+    # next must reopen it with the same info string, or its code renders as prose.
+    code = "\n".join(f"value_{i} = compute({i})  # step {i}" for i in range(300))
+    text = f"intro\n\n```python\n{code}\n```\n\nouttro"
+    out = render_chunks(text)
+    assert len(out) > 1
+    assert all(_fence_lines(c) % 2 == 0 for c in out)
+    assert all(len(c) <= WEIXIN_CHUNK_LIMIT for c in out)
+    assert out[1].startswith("```python\n")
+
+
+def test_render_chunks_never_cuts_a_line_mid_way():
+    code = "\n".join(f"value_{i} = compute({i})  # step {i}" for i in range(300))
+    text = f"```python\n{code}\n```"
+    source_lines = set(text.split("\n"))
+    for chunk in render_chunks(text):
+        assert all(line in source_lines for line in chunk.split("\n"))
+
+
+def test_render_chunks_holds_the_limit_when_a_fence_line_admits_no_clean_cut():
+    # A line no cut can split cleanly is placed whole with its fence scaffolding
+    # on top; iLink's limit is the channel's own, so it still binds every chunk.
+    limit = 200
+    text = "```" + "a" * 40 + "\n" + "\n".join(["`" * (limit - 5)] * 3) + "\n```"
+    out = render_chunks(text, limit)
+    assert all(len(c) <= limit for c in out)
+    # Nothing is dropped to meet the limit: every source backtick still arrives.
+    assert "".join(out).count("`") >= text.count("`")
 
 
 def test_render_chunks_hard_splits_a_single_oversized_block():
@@ -568,6 +632,98 @@ def test_poll_loop_backs_off_on_an_unknown_error_code(tmp_path, monkeypatch):
     t._running = True
     asyncio.run(t._poll_loop())
     assert sleeps and sleeps[0] > 0
+
+
+def test_closing_the_client_handle_stops_the_transport_poll_loop(tmp_path):
+    """The gateway's channel handle is the ``WeixinClient``, and a channel restart
+    or shutdown closes only that. The long-poll belongs to the transport, so a
+    close that shut just the HTTP session left the loop re-polling a closed
+    session forever beside the replacement channel."""
+
+    async def scenario() -> None:
+        client = WeixinClient(token="t", base_url="https://example.invalid")
+        polling = asyncio.Event()
+
+        async def hold_the_poll(_buf):
+            polling.set()
+            await asyncio.Event().wait()
+
+        client.get_updates = hold_the_poll  # type: ignore[method-assign]
+        t = WeixinTransport(
+            client,
+            account_id="acct1",
+            ctx_store=ContextTokenStore(str(tmp_path)),
+            dm_policy="open",
+        )
+        await t.connect()
+        poll_task = t._poll_task
+        assert poll_task is not None
+        try:
+            await await_until(polling, what="the poll to start")
+            await await_until(asyncio.ensure_future(client.close()), what="client.close()")
+            assert poll_task.done()
+            assert client._session.closed
+            await await_until(asyncio.ensure_future(client.close()), what="a second close")
+        finally:
+            poll_task.cancel()
+            await asyncio.gather(poll_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_a_bounded_close_does_not_cut_the_poll_cleanup_short(tmp_path):
+    """A channel restart bounds ``close()`` and cancels it at the bound. The poll
+    may still be finishing an inline turn by then, and that turn's cleanup is what
+    hands the session permit back: a second cancellation reaching it skips the
+    release and leaves the conversation busy until the gateway restarts."""
+
+    async def scenario() -> None:
+        client = WeixinClient(token="t", base_url="https://example.invalid")
+        polling = asyncio.Event()
+        cleaning = asyncio.Event()
+        may_finish = asyncio.Event()
+        released = asyncio.Event()
+
+        async def poll_then_clean_up(_buf):
+            polling.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleaning.set()
+                await may_finish.wait()
+                released.set()
+                raise
+
+        client.get_updates = poll_then_clean_up  # type: ignore[method-assign]
+        t = WeixinTransport(
+            client,
+            account_id="acct1",
+            ctx_store=ContextTokenStore(str(tmp_path)),
+            dm_policy="open",
+        )
+        await t.connect()
+        poll_task = t._poll_task
+        assert poll_task is not None
+        try:
+            await await_until(polling, what="the poll to start")
+            closing = asyncio.ensure_future(client.close())
+            await await_until(cleaning, what="the poll cleanup to start")
+            closing.cancel()  # the restart's bound on close() expires
+            await await_until(
+                asyncio.ensure_future(asyncio.gather(closing, return_exceptions=True)),
+                what="the cancelled close() to return",
+            )
+            may_finish.set()
+            await await_until(released, what="the poll cleanup to finish")
+        finally:
+            may_finish.set()
+            poll_task.cancel()
+            await await_until(
+                asyncio.ensure_future(asyncio.gather(poll_task, return_exceptions=True)),
+                what="the poll to stop",
+            )
+
+    asyncio.run(scenario())
 
 
 def test_outbound_message_shape_marks_bot_and_finished():

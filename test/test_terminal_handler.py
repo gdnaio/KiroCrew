@@ -463,6 +463,51 @@ class TestResolveCwd:
         terminal._pty.openpty.assert_not_called()
         terminal._pty_child_env.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_a_cwd_under_two_stuck_probes_is_refused_by_its_key(
+        self, invalid_workspace, monkeypatch, tmp_path,
+    ):
+        """The cwd is the probe's SECOND argument, so it is keyed by ``stall_path``:
+        with two probes stuck under it the open is refused before ``_resolve_cwd``
+        runs, while a third worker is still free."""
+        from kiro_crew import executors
+        from kiro_crew.dashboard.handlers import files
+
+        request, registry, ws = invalid_workspace
+        request.query = {"cwd": str(tmp_path)}
+        resolve = MagicMock(side_effect=AssertionError("_resolve_cwd ran on a stuck mount"))
+        monkeypatch.setattr(terminal, "_resolve_cwd", resolve)
+        monkeypatch.setattr(files, "_PATH_PROBE_ADMIT_TIMEOUT_SECS", 0.2)
+        monkeypatch.setattr(files, "_PATH_PROBE_STALL_SECS", 0.0)
+        release = threading.Event()
+
+        def park(_path: str, entered: threading.Event) -> None:
+            entered.set()
+            release.wait()
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            monkeypatch.setattr(executors, "path_probe_executor", lambda: pool)
+            entered_a, entered_b = threading.Event(), threading.Event()
+            wedged = [
+                asyncio.ensure_future(files._run_path_probe(park, str(tmp_path / n), e))
+                for e, n in ((entered_a, "a"), (entered_b, "b"))
+            ]
+            try:
+                await async_wait_until(
+                    lambda: entered_a.is_set() and entered_b.is_set(),
+                    describe=lambda: "the two stuck probes starting",
+                )
+                assert await terminal.api_terminal_ws(request) is ws
+                assert registry == {}
+                assert json.loads(ws.send_str.call_args.args[0])["code"] == (
+                    "terminal_invalid_cwd"
+                )
+                resolve.assert_not_called()
+                assert await files._run_path_probe(lambda: "free") == "free"
+            finally:
+                release.set()
+                await await_until(asyncio.gather(*wedged), what="the parked probes settling")
+
     @pytest.mark.parametrize("stage", ["send_str", "close"])
     @pytest.mark.asyncio
     async def test_invalid_workspace_response_is_bounded(
@@ -598,13 +643,14 @@ class TestResolveCwd:
 class TestKillSession:
     @pytest.mark.asyncio
     async def test_cancels_reader_task(self):
-        task = AsyncMock()
-        task.cancel = MagicMock()
+        # flake-ok: a never-set Event parks the stand-in reader until teardown cancels it
+        task = asyncio.ensure_future(asyncio.Event().wait())
         sess = _make_session()
         sess.reader_task = task
         with patch("os.close"), patch("kiro_crew.dashboard.handlers.terminal.platform_compat.kill_process_tree"):
             await terminal._kill_session(sess)
-        task.cancel.assert_called_once()
+        assert task.cancelled()
+        assert sess.master_fd == -1  # wokeignore:rule=master
 
     @pytest.mark.asyncio
     async def test_closes_master_fd(self):
@@ -633,6 +679,7 @@ class TestKillSession:
                 patch("kiro_crew.dashboard.handlers.terminal.platform_compat.kill_process_tree") as mock_kill:
             await terminal._kill_session(sess)
         mock_kill.assert_any_call(UNALLOCATABLE_PID, platform_compat.SIGTERM)
+        assert sess.master_fd == -1  # wokeignore:rule=master
 
     @pytest.mark.asyncio
     async def test_the_process_tree_is_hung_up_and_ended_before_the_pty_is_closed(self):
@@ -671,6 +718,8 @@ class TestKillSession:
                 patch("kiro_crew.dashboard.handlers.terminal.platform_compat.kill_process_tree") as mock_kill:
             await terminal._kill_session(sess)
         mock_kill.assert_not_called()
+        # An exited child still leaves a PTY descriptor to close.
+        assert sess.master_fd == -1  # wokeignore:rule=master
 
     @pytest.mark.asyncio
     async def test_handles_process_lookup_error_on_sigterm(self):
@@ -679,7 +728,9 @@ class TestKillSession:
                 patch("kiro_crew.dashboard.handlers.terminal.platform_compat.kill_process_tree",
                       side_effect=ProcessLookupError):
             await terminal._kill_session(sess)
-        # Should not raise
+        # A child that vanished between the liveness check and the signal must not
+        # stop the rest of teardown.
+        assert sess.master_fd == -1  # wokeignore:rule=master
 
     @pytest.mark.asyncio
     async def test_sigkill_on_timeout(self):

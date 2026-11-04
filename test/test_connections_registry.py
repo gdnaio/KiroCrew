@@ -60,6 +60,15 @@ EXPECTED_LAUNCH_REGISTRY = {
     # Listed by both connector directories (ChatGPT's app directory and Claude's
     # connector directory); launch-gated until the manual gate, like batch 2.
     "todoist",
+    # Google Workspace: pre-registered (Google refuses DCR), so visible as
+    # "needs configuration" while launch-gated; one user-owned Google client
+    # can serve all six cards.
+    "gmail",
+    "google-calendar",
+    "google-docs",
+    "google-drive",
+    "google-sheets",
+    "google-slides",
 }
 # Tier 3: the vendor admits OAuth clients from an allowlist or waitlist, so no
 # amount of local verification can pass the gate until Kiro is admitted. They
@@ -89,6 +98,12 @@ LAUNCH_GATED = {
     "webflow",
     "zapier",
     "todoist",
+    "gmail",
+    "google-calendar",
+    "google-docs",
+    "google-drive",
+    "google-sheets",
+    "google-slides",
 } | VENDOR_APPROVAL_PENDING
 
 
@@ -111,7 +126,16 @@ def test_probe_accessor_includes_every_entry_even_when_launch_gated():
 # launch gate: their card renders an operator instruction until a client is
 # configured, and hiding an instruction is how the step never gets done. The gate
 # still governs the entry's own quality claims, so they stay in LAUNCH_GATED.
-PREREGISTERED = {"github", "asana"}
+PREREGISTERED = {
+    "github",
+    "asana",
+    "gmail",
+    "google-drive",
+    "google-calendar",
+    "google-sheets",
+    "google-docs",
+    "google-slides",
+}
 
 
 def test_only_gated_launch_services_are_visible():
@@ -159,6 +183,43 @@ def test_gitlab_installs_the_official_remote_endpoint():
     (gitlab,) = [p for p in get_all_providers() if p["slug"] == "gitlab"]
     assert gitlab["mcp_url"] == "https://gitlab.com/api/v4/mcp"
     assert gitlab["l0_expectations"]["authorization_server"] == "https://gitlab.com"
+
+
+def test_atlassian_installs_the_ga_v2_endpoint():
+    """Atlassian's card must install the GA endpoint its tools are served from.
+
+    The auth server's ``authv2`` path segment names the AUTH SERVER's version,
+    not MCP v2, and the endpoint behind it serves the v1 tools. Those check
+    classic OAuth scopes, so the ``*:agent-interface`` grant the flow obtains is
+    rejected by every Jira and Confluence tool with ``401 scope does not match``
+    while the identity tools still succeed -- a card that signs in cleanly and
+    then fails on first use. The GA endpoint at ``/v2/mcp`` advertises the
+    agent-interface scopes the grant actually carries.
+
+    Both URLs pass the static L0 checks (same authorization server, DCR and
+    PKCE all unchanged), so this is pinned here rather than left to a live call.
+    """
+    (atlassian,) = [p for p in get_all_providers() if p["slug"] == "atlassian"]
+    assert atlassian["mcp_url"] == "https://mcp.atlassian.com/v2/mcp"
+    # The auth server is shared by both endpoint versions, which is why the
+    # static checks cannot tell them apart; pinning it keeps that assumption
+    # explicit if Atlassian ever splits them.
+    assert atlassian["l0_expectations"]["authorization_server"].startswith(
+        "https://auth.atlassian.com/"
+    )
+
+
+def test_atlassian_requests_no_classic_oauth_scopes():
+    """Atlassian's endpoint is scope-gated by its own metadata, not by a grant.
+
+    ``recommended_scopes`` is empty, so ``_registry_server_entry`` puts no
+    ``scopes`` on the entry and the flow takes the endpoint's advertised
+    defaults. Naming a classic scope here is what produced the mismatch, so an
+    empty list is the load-bearing value and is pinned against a future edit
+    that helpfully adds one.
+    """
+    (atlassian,) = [p for p in get_all_providers() if p["slug"] == "atlassian"]
+    assert atlassian["recommended_scopes"] == []
 
 
 def test_gitlab_card_copy_admits_its_only_scope_can_write():

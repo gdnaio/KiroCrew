@@ -27,6 +27,7 @@ share the harness in ``acp_runtime_helpers.py``.
 """
 
 import asyncio
+import dataclasses
 import json
 import time
 from unittest.mock import AsyncMock, patch
@@ -190,7 +191,7 @@ def kas_readiness_wire(monkeypatch, tmp_path):
         assert request["method"] == (METHOD_SESSION_LOAD if resume else METHOD_SESSION_NEW)
         # The projection reaches the wire with the ACTIVE agent's hoistable
         # managed declarations carried in the session-level array instead of the
-        # block (``hoist_managed_servers``); everything else is byte-identical.
+        # block (``hoist_servers_for_session``); everything else is byte-identical.
         projection = rt._kas_custom_agents.return_value.custom_agents
         sent_agents = request["params"]["_meta"]["kiro"]["customAgents"]
         assert len(sent_agents) == len(projection)
@@ -278,6 +279,48 @@ def kas_readiness_wire(monkeypatch, tmp_path):
         tags=tags,
         handshake=handshake,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
+async def test_a_withdrawn_worker_stub_never_reaches_the_wire(
+    kas_readiness_wire, monkeypatch, tmp_path, resume
+):
+    """A stub the payload withdrew (its server muted between the two reads of the
+    worker spec) is not in the ``session/new`` or ``session/load`` array."""
+    import kiro_crew.acp.runtime as runtime_mod
+
+    wire = kas_readiness_wire
+    rt = wire.runtime
+    monkeypatch.setattr(
+        rt,
+        "_kas_custom_agents",
+        AsyncMock(
+            return_value=SessionExtras(
+                custom_agents=[{"id": "worker", "tools": []}],
+                withdrawn_stub_names=frozenset({"jira"}),
+            )
+        ),
+    )
+    servers = [{"name": "kirocrew-dashboard"}, {"name": "jira"}]
+    kwargs = {"cwd": tmp_path, "agent": "worker", "session_key": ""}
+    if resume:
+        monkeypatch.setattr(runtime_mod, "pooled_session_servers", lambda *_, **_kw: servers)
+        start = rt.load_session("", "ready-session", **kwargs)
+    else:
+        start = rt.create_session(mcp_servers=servers, **kwargs)
+    reader_task = await _start_reader(rt)
+    task = asyncio.create_task(start)
+    try:
+        request = await wire.take(wire.sent)
+        assert request["method"] == (METHOD_SESSION_LOAD if resume else METHOD_SESSION_NEW)
+        names = {entry["name"] for entry in request["params"]["mcpServers"]}
+        assert "jira" not in names
+        assert "kirocrew-dashboard" in names
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await _stop_reader(reader_task)
 
 
 @pytest.mark.asyncio
@@ -488,6 +531,45 @@ async def test_session_cwd_is_bound_through_real_create_and_load(
 
 
 @pytest.mark.asyncio
+async def test_create_session_records_the_withheld_credentials_notice(
+    kas_readiness_wire, monkeypatch
+):
+    """The real ``create_session`` copies the payload's withheld-credentials notice
+    onto the handle the provider reads for the new chat's notice row."""
+    wire = kas_readiness_wire
+    extras = wire.runtime._kas_custom_agents.return_value
+    notice = "notice naming gitlab-mcp"
+    wire.runtime._kas_custom_agents.return_value = dataclasses.replace(
+        extras, withheld_credentials_notice=notice
+    )
+    captured: list[AcpSessionHandle] = []
+    constructed = AcpSessionHandle.__init__
+
+    def capture_init(self, *args, **kwargs):
+        constructed(self, *args, **kwargs)
+        captured.append(self)
+
+    monkeypatch.setattr(AcpSessionHandle, "__init__", capture_init)
+    reader_task = await _start_reader(wire.runtime)
+    start = None
+    try:
+        start = await wire.handshake(False, pre_ready=True)
+        for _ in range(200):
+            if captured and captured[-1].kas_withheld_credentials_notice:
+                break
+            await asyncio.sleep(0)
+        assert captured, "the real create path never constructed a handle"
+        assert captured[-1].kas_withheld_credentials_notice == notice
+    finally:
+        if start is not None:
+            if not start.done():
+                start.cancel()
+            await asyncio.gather(start, return_exceptions=True)
+        reader_task.cancel()
+        await asyncio.gather(reader_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
 @pytest.mark.parametrize("pre_ready", [False, True], ids=["cold", "stale-mode"])
 async def test_kas_readiness_delays_prompt_until_active_managed_tools(
@@ -569,13 +651,18 @@ async def test_kas_readiness_delays_prompt_until_active_managed_tools(
         "authorization",
         "timeout",
         "unreported",
+        "foreign-only",
         "missing-catalog",
         "legacy-provenance",
     ],
 )
-async def test_kas_readiness_refuses_failure_or_missing_report(kas_readiness_wire, resume, state):
+async def test_kas_readiness_refuses_failure_or_missing_report(
+    kas_readiness_wire, monkeypatch, resume, state
+):
+    import kiro_crew.acp.runtime_session_load as load_mod
     from kiro_crew.acp.session_handle import AcpRequestTimeout
 
+    monkeypatch.setattr(load_mod, "_declared_governed", lambda: False)
     wire = kas_readiness_wire
     reader_task = await _start_reader(wire.runtime)
     start = None
@@ -586,10 +673,17 @@ async def test_kas_readiness_refuses_failure_or_missing_report(kas_readiness_wir
             wire.clock[0] = 31.0
             wire.status("connected" if state == "missing-catalog" else "connecting")
         elif state == "unreported":
+            # No report at all and registry mode off: silence is not proof of a
+            # governed drop, so the start still fails.
             wire.clock[0] = 31.0
             _feed(
                 wire.reader, {"method": "session/update", "params": {"sessionId": "ready-session"}}
             )
+        elif state == "foreign-only":
+            # Only a same-named server that is not this session's own: it stays
+            # pending and must never pass for a server the host did not start.
+            wire.clock[0] = 31.0
+            wire.status("connected", origin="global")
         elif state == "authorization":
             wire.status(
                 "connecting", failedAuthorization=True, errorMessage="authorization required"
@@ -605,7 +699,7 @@ async def test_kas_readiness_refuses_failure_or_missing_report(kas_readiness_wir
             wire.status(state, errorMessage="managed test failure")
         expected = (
             AcpRequestTimeout
-            if state in ("timeout", "unreported", "missing-catalog")
+            if state in ("timeout", "unreported", "foreign-only", "missing-catalog")
             else AcpRuntimeError
         )
         if not resume:
@@ -620,6 +714,44 @@ async def test_kas_readiness_refuses_failure_or_missing_report(kas_readiness_wir
             assert "reports no MCP server origin" in str(raised.value)
         assert wire.sent.empty(), "A failed startup must not prompt or delete a retained session"
         assert "ready-session" not in wire.runtime._session_queues
+    finally:
+        if start is not None and not start.done():
+            start.cancel()
+        if start is not None:
+            await asyncio.gather(start, return_exceptions=True)
+        await _stop_reader(reader_task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
+async def test_kas_readiness_under_registry_mode_starts_without_waiting(
+    kas_readiness_wire, monkeypatch, resume
+):
+    """Under registry mode a governed MCP profile drops Crew's servers unreported.
+
+    Waiting for them spends the whole budget and then fails, and the retry meets
+    the same filter, so the chat never starts. The session starts after a short
+    settle instead (7s on the fake clock, under the 30s budget), each managed
+    server named as not started, and nothing is torn down.
+    """
+    import kiro_crew.acp.runtime_session_load as load_mod
+
+    monkeypatch.setattr(load_mod, "_declared_governed", lambda: True)
+    wire = kas_readiness_wire
+    reader_task = await _start_reader(wire.runtime)
+    start = None
+    try:
+        start = await wire.handshake(resume)
+        await wire.take(wire.reads)
+        wire.clock[0] = 7.0
+        _feed(wire.reader, {"method": "session/update", "params": {"sessionId": "ready-session"}})
+        handle = await await_until(start, what="the session start")
+        assert wire.sent.empty(), "Starting degraded must not delete the session"
+        assert "ready-session" in wire.runtime._session_queues
+        report = handle.mcp_session_report()
+        for name in ("kirocrew-core", "kirocrew-dashboard"):
+            assert name in report._failed
+            assert "not started by the host" in report._failures[name]
     finally:
         if start is not None and not start.done():
             start.cancel()

@@ -491,16 +491,16 @@ def _blocks(payload: str) -> dict[str, str]:
 #: Byte extent of every block in the normalized default session context, and the
 #: total. Regenerate ONLY as part of a reviewed change to what a block contains.
 EXPECTED_EXTENTS = {
-    "[CRITICAL RULES": 3192,
+    "[CRITICAL RULES": 3289,
     "[CURRENT DATE]": 48,
     "[CURRENT AGENT]": 196,
     "[WORKSPACE IDENTITY]": 376,
     "[DOCUMENTATION]": 235,
-    "[Memory —": 2008,
+    "[Memory —": 2077,
     "[Skills:]": 413,
     "[Learned corrections": 320,
 }
-EXPECTED_TOTAL = 6788
+EXPECTED_TOTAL = 6954
 
 
 def test_session_context_char_extents(seeded: Seeded) -> None:
@@ -745,9 +745,15 @@ def test_seeded_home_file_set_is_pinned(seeded: Seeded) -> None:
     ``connections_ui_migrated.json`` is the loader's one-time migration marker.
     It records that legacy connection visibility has already been translated;
     it is config state, not a memory-store artifact.
+
+    ``config-provenance/published`` is the config writer's record of the
+    ``config.json`` inode it is about to publish, which the Linux sandbox's pin reads
+    (``config.write_provenance``). Config state again, written by the same save, and
+    only on POSIX: the Windows writer has no sandbox pin to answer.
     """
     history = seeded.history_file.relative_to(seeded.home).as_posix()
-    assert _home_files(seeded.home) == {
+    provenance = set() if sys.platform == "win32" else {"config-provenance/published"}
+    assert _home_files(seeded.home) == provenance | {
         "agent-prompt.md",
         "config.json",
         "config.json.bak",

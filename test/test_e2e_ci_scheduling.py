@@ -13,9 +13,10 @@ import signal
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
+
+from kiro_crew.testing.wait import wait_until
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "scripts" / "ci_e2e_parallel.py"
@@ -62,11 +63,11 @@ class TestE2eScheduling(unittest.TestCase):
         self.root = Path(self.temp.name)
 
     def wait_file(self, name):
-        deadline = time.monotonic() + 10
         path = self.root / name
-        while not path.exists() or path.stat().st_size == 0:
-            self.assertLess(time.monotonic(), deadline, f"missing {name}")
-            time.sleep(0.01)
+        wait_until(
+            lambda: path.exists() and path.stat().st_size > 0,
+            describe=lambda: f"missing {name}",
+        )
         return path
 
     def command(self, name, rc=0, gated=False, descendant=False):
@@ -181,10 +182,13 @@ class TestE2eScheduling(unittest.TestCase):
         child = int(self.wait_file("a.child").read_text())
         self.wait_file("b.started")
         # Release the healthy sibling only after the timed-out tree is reaped.
-        deadline = time.monotonic() + 10
-        while Path(f"/proc/{child}").exists():
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.01)
+        # Bounded well under the child's own 60 s sleep, so its natural exit can
+        # never stand in for the reap.
+        wait_until(
+            lambda: not Path(f"/proc/{child}").exists(),
+            timeout=10,
+            describe=lambda: f"pid {child} of the timed-out tree is still present",
+        )
         self.assertIsNone(proc.poll())
         (self.root / "release").touch()
         output, _ = proc.communicate(timeout=10)
@@ -402,7 +406,14 @@ raise SystemExit(m['main']())
 
         jobs = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]
         job = jobs["e2e"]
-        self.assertEqual(job["timeout-minutes"], 25)
+        # 25 on CodeBuild; 40 on a non-fleet runner, where the slowest observed
+        # fork run took 23.9 of the 25 and a green run was one slow dependency
+        # install from a cancellation with no failing test.
+        self.assertEqual(
+            job["timeout-minutes"],
+            "${{ startsWith(needs.changes.outputs.linux_runner_large, "
+            "'codebuild-') && 25 || 40 }}",
+        )
         steps = job["steps"]
         parallel = next(
             s for s in steps if s.get("run") == "exec python scripts/ci_e2e_parallel.py"
@@ -456,8 +467,12 @@ raise SystemExit(m['main']())
         job = jobs["i18n-render"]
         # A fork PR cannot be routed to the fleet, so this job must fit a hosted
         # runner on its own: default size, its own timeout, no gateway boundary.
-        self.assertEqual(job["needs"], ["changes", "await-fast-gate"])
-        self.assertEqual(job["if"], "needs.changes.outputs.only_backend != 'true'")
+        self.assertEqual(job["needs"], ["changes", "await-fast-gate", "lint-gate"])
+        self.assertEqual(
+            job["if"],
+            "${{ !cancelled() && needs.lint-gate.result == 'success'"
+            " && needs.changes.outputs.only_backend != 'true' }}",
+        )
         self.assertNotIn("defaults", job)
         self.assertLessEqual(job["timeout-minutes"], 20)
         steps = job["steps"]
@@ -474,14 +489,10 @@ raise SystemExit(m['main']())
         self.assertIn("I18N_BASE_REF", base["env"])
         self.assertNotIn("continue-on-error", base)
         self.assertNotIn("--no-vs-base", render["run"])
-        # The render needs the browser the E2E job provisions the same way: an
-        # exact version key, so a restore-key prefix cannot hand it a different
-        # Chromium revision than @playwright/test expects.
+        # The render needs the browser the E2E job provisions the same way: the
+        # exact revision @playwright/test pins, downloaded before the render.
         install = next(s for s in steps if s.get("run") == "npx playwright install chromium")
-        cache = next(s for s in steps if str(s.get("uses", "")).startswith("actions/cache@"))
-        self.assertLess(steps.index(cache), steps.index(install))
         self.assertLess(steps.index(install), steps.index(render))
-        self.assertNotIn("restore-keys", cache["with"])
         self.assertEqual(install["timeout-minutes"], 6)
         # The gate runs nowhere else in the workflow: one job owns it.
         owners = [

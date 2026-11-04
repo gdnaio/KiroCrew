@@ -167,23 +167,23 @@ def test_the_record_is_name_scoped_and_never_written_over_for_another_name() -> 
     assert _goal(member_goals.read_goals(slug, ORDINARY)) == "Keep the release notes current"
 
 
-def test_the_goal_lives_under_trust_and_never_in_the_rules_file() -> None:
+def test_the_goal_lives_in_the_member_records_and_never_in_the_rules_file() -> None:
     _seed()
     slug = _slug(ORDINARY)
     member_goals.set_goal(slug, ORDINARY, "Ship it", by="user")
     path = member_goals.member_goals_path(slug)
-    assert path.parent == (data_home() / "trust" / member_goals.GOALS_DIR_NAME).resolve()
+    assert path.parent == (data_home() / "member-records" / member_goals.GOALS_DIR_NAME).resolve()
     assert path.is_file()
     assert not _rules_dir().exists() or not any(_rules_dir().iterdir())
     assert members_mod.member_dir(slug) not in path.parents
 
 
-@pytest.mark.parametrize("linked", ["member-goals", "trust"])
+@pytest.mark.parametrize("linked", ["member-goals", "member-records"])
 @pytest.mark.parametrize("pinned", [True, False], ids=["openat", "lstat-fallback"])
 def test_a_symlinked_goal_directory_never_redirects_the_gateways_write(
     linked: str, pinned: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A sandboxed shell can plant a link in ``trust/``; the gateway must not follow it."""
+    """A link at the records leaf or the goals directory is never followed by the gateway."""
     if pinned and not member_goals._PINNED:
         pytest.skip("no openat/O_NOFOLLOW on this platform")
     monkeypatch.setattr(member_goals, "_PINNED", pinned)
@@ -192,16 +192,16 @@ def test_a_symlinked_goal_directory_never_redirects_the_gateways_write(
     home = data_home()
     sealed = home / "profiles"
     sealed.mkdir(parents=True, exist_ok=True)
-    (home / "trust").mkdir(parents=True, exist_ok=True)
-    if linked == "trust":
-        real_trust = home / "trust"
-        for child in list(real_trust.iterdir()):
+    records = home / "member-records"
+    records.mkdir(parents=True, exist_ok=True)
+    if linked == "member-records":
+        for child in list(records.iterdir()):
             child.rename(home / f"moved-{child.name}")
-        real_trust.rmdir()
+        records.rmdir()
         (sealed / member_goals.GOALS_DIR_NAME).mkdir()
-        (home / "trust").symlink_to(sealed, target_is_directory=True)
+        records.symlink_to(sealed, target_is_directory=True)
     else:
-        (home / "trust" / member_goals.GOALS_DIR_NAME).symlink_to(sealed, target_is_directory=True)
+        (records / member_goals.GOALS_DIR_NAME).symlink_to(sealed, target_is_directory=True)
     with pytest.raises(member_goals.GoalsUnreadable):
         member_goals.set_goal(slug, ORDINARY, "Ship it", by="user")
     with pytest.raises(member_goals.GoalsUnreadable):
@@ -220,7 +220,7 @@ def test_the_fallback_treats_a_junction_as_a_link(monkeypatch: pytest.MonkeyPatc
     home = data_home()
     sealed = home / "profiles"
     sealed.mkdir(parents=True, exist_ok=True)
-    junction = home / "trust" / member_goals.GOALS_DIR_NAME
+    junction = home / "member-records" / member_goals.GOALS_DIR_NAME
     junction.mkdir(parents=True, exist_ok=True)
     real = platform_compat.is_link_or_junction
     monkeypatch.setattr(
@@ -656,12 +656,57 @@ def test_each_check_in_is_dispatched_as_a_plain_hidden_turn(
     assert kwargs == {"human_seen": False}
 
 
+@pytest.mark.parametrize("cadence", ["daily", "weekly", "monthly", "heartbeat"])
+@pytest.mark.parametrize("language", ["zh-CN", ""])
+def test_a_check_in_carries_the_users_language(
+    _floor_monkeypatch, cadence: str, language: str
+) -> None:
+    """A check-in has no tab behind it: the configured language rides in its prompt."""
+    _seed()
+    slug = _slug(ORDINARY)
+    state = FakeState()
+    slot = _thread(state, ORDINARY, user_sent=False)
+    slot.task = None
+    member_goals.set_goal(slug, ORDINARY, "Keep docs current", by="user")
+    member_goals.set_schedules(slug, ORDINARY, {cadence: True})
+    sent: list[tuple] = []
+    _floor_monkeypatch.setattr(
+        mate_welcome, "dispatch_hidden_turn", lambda *a, **k: sent.append((a, k))
+    )
+    _floor_monkeypatch.setattr(mate_welcome, "hidden_turn_language", lambda *a: language)
+
+    class Job:
+        managed_by = goal_reminder.managed_key(slug, cadence)
+
+    assert asyncio.run(goal_reminder.fire(state, Job())) == "started"
+    ((args, _kwargs),) = sent
+    # One language sentence: the configured tag replaces the preamble's own.
+    if language:
+        assert mate_welcome.LANGUAGE_DEFAULT not in args[2]
+        assert args[2].count("BCP-47 tag zh-CN") == 1
+        assert "in this thread" in args[2]
+    else:
+        assert args[2].count(mate_welcome.LANGUAGE_DEFAULT) == 1
+
+
+def test_hidden_turn_language_reads_the_configured_dashboard_language(
+    _floor_monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    cfg = SimpleNamespace(dashboard=SimpleNamespace(language="zh-CN"))
+    _floor_monkeypatch.setattr(KiroCrewConfig, "load", classmethod(lambda cls: cfg))
+    assert mate_welcome.hidden_turn_language() == "zh-CN"
+
+
 @pytest.mark.parametrize(
     ("change", "outcome"),
     [
-        ("turn", "skipped: the crewmate is busy"),
-        ("queue", "skipped: the crewmate is busy"),
-        ("reopen", "skipped: the crewmate's thread is not open"),
+        ("turn", "skipped: the mate is busy"),
+        ("queue", "skipped: the mate is busy"),
+        ("reopen", "skipped: the mate's thread is not open"),
     ],
     ids=["a-turn-started", "a-message-queued", "the-thread-was-reopened"],
 )
@@ -960,6 +1005,8 @@ def test_each_switch_creates_and_removes_exactly_its_own_schedule(
         "daily": "15 7 * * *",
         "weekly": "15 7 * * 3",
         "monthly": "15 7 12 * *",
+        # The heartbeat ignores the time of day and runs on its interval.
+        "heartbeat": "0 * * * *",
     }[cadence]
     assert job.schedule.cron_expr == expected
     status, body = _owner(state, "PUT", path, {"member": ORDINARY, cadence: False})
@@ -980,7 +1027,8 @@ def test_turning_one_switch_off_leaves_the_others(tmp_path: Path) -> None:
         {"member": ORDINARY, "daily": True, "weekly": True, "monthly": True},
     )
     first = {c: [j.id for j in v] for c, v in _jobs_by_cadence(state, slug).items()}
-    assert all(len(v) == 1 for v in first.values())
+    assert all(len(first[c]) == 1 for c in ("daily", "weekly", "monthly"))
+    assert first["heartbeat"] == []
     _owner(state, "PUT", base + "/schedules", {"member": ORDINARY, "weekly": False})
     after = _jobs_by_cadence(state, slug)
     assert after["weekly"] == []
@@ -1291,6 +1339,120 @@ def test_the_reminder_fires_one_hidden_turn_in_the_crewmates_own_thread(_floor_m
     assert "short_goal" not in prompt and "next task" in prompt
 
 
+def test_the_daily_reminder_sends_progress_to_the_page_and_batches_chat() -> None:
+    """Where things stand goes on the Dashboard page; the thread gets one message, and
+    only when something changed the user should know."""
+    _seed()
+    slug = _slug(ORDINARY)
+    member_goals.set_goal(slug, ORDINARY, "Ship", by="user")
+    member_goals.set_key_results(slug, ORDINARY, [{"text": "PRs merged", "target": "8"}])
+    rec = member_goals.read_goals(slug, ORDINARY)
+    low = " ".join(goal_reminder.reminder_prompt(rec, "daily").split())
+    assert "belongs on your Dashboard page, not in a chat message" in low
+    assert "only when something changed that the user should know, and then once" in low
+    assert "Lead your message with those readings" not in low
+
+
+def test_the_daily_wake_reads_the_page_tools_from_the_crew_panel_switch(
+    _floor_monkeypatch,
+) -> None:
+    """The daily wake sends status to the page only while ``agent.crew_panel`` mounts
+    the page tools; an unreadable switch counts as off."""
+    from kiro_crew import members
+
+    _floor_monkeypatch.setattr(members, "crew_panel_enabled", lambda: True)
+    assert goal_reminder._page_tools_on() is True
+    _floor_monkeypatch.setattr(members, "crew_panel_enabled", lambda: False)
+    assert goal_reminder._page_tools_on() is False
+
+    def unreadable() -> bool:
+        raise OSError("config")
+
+    _floor_monkeypatch.setattr(members, "crew_panel_enabled", unreadable)
+    assert goal_reminder._page_tools_on() is False
+
+
+def test_the_daily_reminder_reviews_the_page_against_the_folds() -> None:
+    """Read the page against the latest data, check it still makes sense as a whole,
+    update what is stale -- three steps, in that order, so a look at a screenshot can
+    slot in before the check."""
+    _seed()
+    slug = _slug(ORDINARY)
+    member_goals.set_goal(slug, ORDINARY, "Ship", by="user")
+    rec = member_goals.read_goals(slug, ORDINARY)
+    prompt = " ".join(goal_reminder.reminder_prompt(rec, "daily").split())
+    review = " ".join(goal_reminder.DAILY_PAGE_REVIEW.split())
+    assert review in prompt
+    read = review.index("Read it:")
+    check = review.index("Check that the page as a whole still makes sense")
+    update = review.index("Update what is stale")
+    improve = review.index("Then look for one way to make the page better")
+    assert read < check < update < improve
+    assert "the dashboard skill's design guidance" in review
+    assert "not a redesign" in review and "every number still read from a fold" in review
+    assert "dashboard_fields" in review and "dashboard_types" in review
+    assert "dashboard_write" in review and "leave a page that is current as it is" in review
+    # Without the page tools (``agent.crew_panel`` off) there is no page: the readings
+    # lead the chat message, as before.
+    bare = " ".join(goal_reminder.reminder_prompt(rec, "daily", page_tools=False).split())
+    assert review not in bare and "Dashboard page" not in bare
+    assert "Lead your message with those readings" in bare
+    # Weekly and monthly reports do not carry the daily review.
+    assert review not in " ".join(goal_reminder.reminder_prompt(rec, "weekly").split())
+
+
+@pytest.mark.parametrize("has_page", [False, True], ids=["no-page", "own-page"])
+def test_the_daily_reminder_asks_for_a_page_only_while_there_is_none(
+    _floor_monkeypatch, has_page: bool
+) -> None:
+    """A crewmate whose tab shows nothing of its own, with a goal and milestones, is told
+    to write a page; once it has one, not."""
+    from kiro_crew import dashboard_agentic
+
+    _seed()
+    slug = _slug(ORDINARY)
+    state = FakeState()
+    slot = _thread(state, ORDINARY)
+    slot.task = None
+    slot._turn_user_sent = False
+    sent: list[tuple] = []
+    _floor_monkeypatch.setattr(
+        mate_welcome, "dispatch_hidden_turn", lambda *a, **k: sent.append((a, k))
+    )
+    seen: list[str] = []
+
+    def _bound(s: str) -> str:
+        seen.append(s)
+        return "own-page" if has_page else ""
+
+    _floor_monkeypatch.setattr(dashboard_agentic, "bound_package", _bound)
+    _floor_monkeypatch.setattr(dashboard_agentic, "tab_shows_suggestions", lambda _s: True)
+
+    class Job:
+        managed_by = goal_reminder.managed_key(slug)
+
+    member_goals.set_goal(slug, ORDINARY, "Keep docs current", by="user")
+    member_goals.set_key_results(slug, ORDINARY, [{"text": "pages reviewed", "target": "40"}])
+    member_goals.set_schedules(slug, ORDINARY, {"daily": True})
+    assert asyncio.run(goal_reminder.fire(state, Job())) == "started"
+    ((args, _kwargs),) = sent
+    assert seen == [slug]
+    assert (goal_reminder.DASHBOARD_BUILD_LINE in args[2]) is not has_page
+    # The weekly report never carries it: the line rides the daily wake only.
+    assert goal_reminder.DASHBOARD_BUILD_LINE not in goal_reminder.reminder_prompt(
+        member_goals.read_goals(slug, ORDINARY), "weekly", dashboard="x"
+    )
+
+
+def test_the_build_line_is_an_html_page_saved_and_applied() -> None:
+    line = goal_reminder.DASHBOARD_BUILD_LINE
+    assert "view.html" in line and "dashboard_save" in line and "dashboard_apply" in line
+    # Crewmate wording: "your work items", never "your worker". The fold that lists
+    # the sessions it created is named `workers`, and the line names it.
+    assert "your worker" not in line and "conductor" not in line
+    assert goal_reminder.dashboard_line("", {"goals": [{"text": "x"}], "key_results": [{}]}) == ""
+
+
 def _ledger_item(title: str, state: str, closed_at: str | None, summary: str = ""):
     from kiro_crew import work_ledger
 
@@ -1411,3 +1573,40 @@ def test_the_goal_section_carries_no_reading_so_progress_does_not_resend_it() ->
     assert "17 pages" not in after and "pages reviewed" in after and "40" in after
     prompt = goal_reminder.reminder_prompt(member_goals.read_goals(slug, ORDINARY), "daily")
     assert "17 pages" in prompt
+
+
+def test_a_hidden_turn_may_raise_a_card_only_for_servers_the_gateway_runs(
+    _floor_monkeypatch,
+) -> None:
+    """A worker report naming a missing capability arrives on a turn the user did not
+    send; the card for a server this gateway already runs is the next step in that
+    chain, and still changes nothing until the user presses it. Outside code
+    (a registry install), a skill, or a raw draft stays user-turn only."""
+    _capture_proposals(_floor_monkeypatch)
+    _seed()
+    state = FakeState()
+    slot = _thread(state, ORDINARY, user_sent=False)
+
+    def ask(draft):
+        return {"request": "capabilities", "params": {"draft": draft}}
+
+    gateway = {"additions": [{"server": "teamchat", "source": "gateway"}]}
+    status, body = _call(state, PROPOSE, ask(gateway), slot.key)
+    assert body.get("code") != "not_user_turn", (status, body)
+    # An auto-approval is admitted too: the card then carries its own
+    # "runs without asking" acknowledgement for the user to tick.
+    approving = {
+        "additions": [{"server": "teamchat", "source": "gateway", "auto_approve": ["post"]}]
+    }
+    status, body = _call(state, PROPOSE, ask(approving), slot.key)
+    assert body.get("code") != "not_user_turn", (status, body)
+    for draft in (
+        {"additions": [{"server": "x", "source": "registry", "registry_id": "io.x/x"}]},
+        {"additions": [{"server": "x", "source": "registry"}]},
+        {"additions": [{"skill": "pdf"}]},
+        {"additions": [{"server": "teamchat", "source": "gateway"}, {"skill": "pdf"}]},
+        {"mcpServers": {"x": {"command": "x"}}},
+        {"additions": []},
+    ):
+        status, body = _call(state, PROPOSE, ask(draft), slot.key)
+        assert (status, body["code"]) == (403, "not_user_turn"), draft

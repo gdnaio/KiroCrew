@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import ast
 import functools
-import importlib
 import os
 import subprocess
 import sys
@@ -34,6 +33,10 @@ from kiro_crew.dashboard.handlers import memory
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 pytestmark = pytest.mark.xdist_group(name="tree_scan_memory_handlers_facade")
+
+#: Checks ``test_facade_shared_checks.py`` runs against this module's helpers; each is
+#: the same for every facade, so it is written once there and parametrized per module.
+SHARED_FACADE_CHECKS = ("known_seams", "corpus_gate")
 
 FACADE = "kiro_crew.dashboard.handlers.memory"
 HANDLERS_DIR = Path(memory.__file__).resolve().parent
@@ -101,11 +104,6 @@ def _corpus_patched_names() -> frozenset[str]:
         names = facade_mirror_scan.patched_names(text, {FACADE: FACADE})
         found |= names.get(FACADE, set())
     return frozenset(found)
-
-
-def test_the_patch_scan_finds_every_known_seam() -> None:
-    """Non-vacuity: a scan that finds nothing would pass the reach test over nothing."""
-    assert sorted(_KNOWN_SEAMS - _corpus_patched_names()) == []
 
 
 def test_a_facade_patch_of_every_scanned_name_reaches_every_module_holding_it() -> None:
@@ -217,8 +215,8 @@ def test_the_embedding_setup_status_lives_in_one_owner() -> None:
 
 
 def test_the_vector_store_constructor_lives_where_its_plumbing_inventory_names_it() -> None:
-    """``test_vector_memory``'s plumbed-site table keys the dashboard's standalone store
-    construction by ``dashboard/handlers/memory_services.py``."""
+    """``test_vector_memory_config_plumbing``'s plumbed-site table keys the dashboard's
+    standalone store construction by ``dashboard/handlers/memory_services.py``."""
     services = sys.modules[OWNERS[0]]
     assert memory._get_vector_store is vars(services)["_get_vector_store"]
     assert "VectorMemoryStore(" in _owner_path(OWNERS[0]).read_text(encoding="utf-8")
@@ -297,13 +295,3 @@ def test_the_test_tree_walk_reaches_this_file() -> None:
     walked = {path.resolve() for path in _test_tree_files()}
     assert _THIS_FILE in walked
     assert source_corpus.repo_root() / "test" / "test_handlers_memory_coverage.py" in walked
-
-
-def test_leaf_test_scope_derives_this_file_as_a_corpus_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """It reads the whole test tree, so a leaf-only diff must still run it."""
-    root = source_corpus.repo_root()
-    monkeypatch.syspath_prepend(str(root / "scripts"))
-    leaf_test_scope = importlib.import_module("leaf_test_scope")
-    assert _THIS_FILE.relative_to(root).as_posix() in leaf_test_scope.corpus_gates(root)

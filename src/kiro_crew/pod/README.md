@@ -262,7 +262,14 @@ drop-in that replaces the template's `ExecStart` with the resolved checkout's
 own `.venv/bin/kirocrew`; it refuses to fall back to a global install that may
 not understand the requested seed. `pod down` removes that drop-in and reloads
 systemd as part of its zero-residue guarantee. `MemoryMax`/`CPUQuota` cap a
-runaway pod; `Restart=on-failure` self-heals.
+runaway pod at 4G and 200% by default; `pod up <wt> --memory 16G --cpu 800%`
+records `MEMORY=` / `CPU=` in the pod's env file and the drop-in carries them for
+that pod alone. Memory is capped at 80% of host RAM (the agents slice ceiling) and
+CPU at the host CPU count. `pod restart <wt>` stops the unit, keeps the HOME, and
+starts it again with the current drop-in, so a new ceiling applies without
+reclaiming anything. On Windows `pod restart` refuses before stopping anything,
+because the Windows start will not boot over the home and run record its stop keeps.
+`Restart=on-failure` self-heals.
 
 The unit has **no `ExecStopPost` teardown hook**, on purpose. systemd runs
 `ExecStopPost` *before* the final kill of the unit's cgroup, so a hook that
@@ -356,10 +363,10 @@ worktree build, and pinning a colliding pod's own `PORT=` remains the manual way
 | `KIROCREW_POD_ROOT` | `~/.kirocrew-pods` | isolated pod HOMEs (reclaimed by `pod down`) |
 | `KIROCREW_POD_ENV_DIR` | `~/.kiro/crew/pods` | per-pod `CHECKOUT=`/`PORT=`/`SEED=` files |
 | `KIROCREW_POD_ARTIFACTS_DIR` | `<pod root>/.e2e-artifacts` | pod run logs and screenshots |
-| `KIROCREW_POD_BASE_PORT` | `7810` | port derivation base |
-| `KIROCREW_POD_LIVE_PORT` | `5476` | the port a pod must never bind |
+| `KIROCREW_POD_BASE_PORT` | `7810` | port derivation base; a value outside 1–65336 (so the band BASE+1..BASE+199 stays bindable) logs a warning and uses the default |
+| `KIROCREW_POD_LIVE_PORT` | `5476` | the port a pod must never bind; a value that is not a port in 1–65535 logs a warning and uses the default |
 | `KIROCREW_POD_UNIT_PREFIX` | `kirocrew-pod` | service-manager unit/task prefix |
-| `KIROCREW_POD_PATH` | generated standard executable path | `PATH` handed to the booted gateway |
+| `KIROCREW_POD_PATH` | `~/.local/bin`, the user tool-manager bins the host gateway also searches (`env._EXTRA_PATH_DIRS`: mise shims, `~/.volta/bin`, `/opt/homebrew/bin`, ...), then `/usr/local/bin:/usr/bin:/bin` | `PATH` handed to the booted gateway; pinned into the template at `pod install`, so re-run it after an upgrade to pick up a new default |
 | `KIROCREW_POD_HEALTH_SECS` | `90` | `pod up` readiness budget: the pod must be serving AND have published a fresh internal-API credential within it. A pod still serving with no credential when it runs out fails with the same advice to raise the budget as a slow boot. `--wait-secs` wins and the result is clamped to 5–3600 seconds |
 | `KIROCREW_POD_BIN` | (auto) | binary baked into the Linux template unit; `pod up` replaces it with the worktree binary through a per-instance drop-in |
 | `KIROCREW_POD_KIRO_BIN` | (unset) | agent backend pinned into the service definition as `KIROCREW_KIRO_BIN` |
@@ -403,7 +410,7 @@ service-manager mechanics differ.
 | Elevation | none | none | none |
 | Logs | `journalctl --user` | files | files |
 | Restart on crash | `Restart=on-failure` | `KeepAlive` | **none** |
-| Memory / CPU ceiling | `MemoryMax` + `CPUQuota` (cgroup) | **not enforced** | memory + process cap (Job object); **no CPU cap** |
+| Memory / CPU ceiling | `MemoryMax` + `CPUQuota` (cgroup), per pod via `--memory` / `--cpu` | **not enforced** (recorded) | memory + process cap (Job object, from `resource_limits`; `--memory` recorded, not enforced); **no CPU cap** |
 | `pod api` / `pod token` | yes | yes | `token` yes, `api` **no** (needs an AF_UNIX dashboard socket) |
 
 Every backend keeps earlier starts' output: launchd and the Windows wrapper
@@ -565,7 +572,8 @@ pod, mints `pod token` against it, and asserts `pod down` leaves no task, home
 or env file behind. The module is opt-in: it skips unless
 `KIROCREW_E2E_POD_WINDOWS=1` is set, because a bare `pytest` on a developer's
 Windows box must not register scheduled tasks. It is also one of the two entries
-on the root `conftest.py` host-service allowlist, whose guard otherwise refuses
+on the root `conftest.py` host-service allowlist (defined in
+`test/conftest_floor_services.py`), whose guard otherwise refuses
 any test that spawns `kirocrew pod up`, `down`, `install`, `prune` or `restart`
 as a child process, or `schtasks` with a `/Create`, `/Delete`, `/Run`, `/End` or
 `/Change` switch.
@@ -588,11 +596,28 @@ has already published its `finished` receipt is given the stop budget to exit
 on its own, because the receipt is its last write to the record but the boot's
 failure audit is logged after it, and it is ended only if it outlives that
 budget. The task wrapper writes no sidecar, so no write can land after the
-producer is proven gone. Two shapes still need the
+producer is proven gone. Within one boot session, three shapes still need the
 manual procedure: a `reserved` record nobody claimed (the task never launched
-Python, or was killed during interpreter start-up), and a `preparing` record
+Python, or was killed during interpreter start-up), a `preparing` record
 whose producer died after creating the HOME without its receipt, because the
-boot did not reach the point where it could say what it left running there. A
+boot did not reach the point where it could say what it left running there,
+and a `ready` record whose supervisor died: the Job's name died with its
+handle, so `pod down` cannot drain the gateway, and `pod up` refuses to adopt
+that gateway or mint a token for it.
+
+After a full Windows restart, `pod down` recovers all three. Each record
+stores the kernel uptime (`GetTickCount64`) when it is reserved and again when
+it is claimed. That counter keeps counting through sleep and hibernation and
+starts again from zero only at a full boot, so a current uptime lower than the
+stored one proves a restart, and a restart ended every process the record names.
+A Fast Startup shutdown resumes the hibernated kernel and keeps the count, so
+it proves nothing; use **Restart**.
+`pod down` then writes a terminal receipt marked `rebooted` without opening any
+recorded pid, which may now belong to an unrelated process, and cleans up. A
+record from an older build has no uptime, and a reading that is higher, equal
+or unreadable proves nothing, so those keep the refusals above. The check can
+miss a restart: when the new session has already run longer than the old
+session had at the claim, the uptime is higher, and `pod down` still refuses. A
 `finished` receipt is that statement: the boot spawned no gateway and ended on
 its orderly refusal path, so its HOME is reclaimed. It does not cover a
 descendant of a process the boot started before any lifetime Job existed (the
@@ -647,7 +672,9 @@ Dev Fleet action, `pod up`, or manually launched wrapper.
    After the machine has restarted, before running any pod action, re-establish
    the same overrides and repeat step 1. Verify the task remains disabled (or
    absent) and no launcher has restarted the pod. If any of this is uncertain,
-   stop here and preserve its files.
+   stop here and preserve its files. If the pod has a `.winrun` record, run
+   `kirocrew pod down <name>` now: when it proves the restart it deletes the task,
+   HOME and sidecars itself and nothing below is needed. If it refuses, continue.
 
 4. Only after that verified retirement, delete the exact disabled task, if
    present, and verify its absence in Task Scheduler:

@@ -30,7 +30,6 @@ vi.mock('../../api/client', () => ({
     // The warm greeting's read of the crewmate's work ledger. No ledger is the
     // state every case not about the greeting wants: the chat opens bare.
     crewBoard: vi.fn(() => Promise.reject(Object.assign(new Error('no_ledger'), { status: 404 }))),
-    memberRecap: vi.fn(() => Promise.reject(new Error('no recap in this test'))),
     memberThread: vi.fn(),
     // Mate's first greeting: the server decides, so the page only asks.
     memberGreet: vi.fn(() => Promise.resolve({ outcome: 'started' })),
@@ -217,7 +216,6 @@ vi.mock('../../utils/terminalRegistry', () => ({
   useTerminalEnabled: () => true,
   useTerminalTitle: () => 'Terminal',
 }))
-vi.mock('../../hooks/useDevMode', () => ({ useDevMode: () => false }))
 
 // The profile settings write the live slot; the stub shows which slot the page
 // handed it, so a refused thread is proven to get none.
@@ -234,13 +232,12 @@ const CrewComposerRef = vi.hoisted(() => ({ current: null as unknown }))
 const chatPaneMounts = vi.hoisted(() => ({ count: 0 }))
 vi.mock('../../components/ChatPane', async () => {
   const { useEffect } = await import('react')
-  function ChatPaneStub({ slotKey, agentLocked, followContentWidth, busyMode, topInset, composerInput, crewmateGreeting, ...rest }: { slotKey: string; agentLocked?: boolean; followContentWidth?: boolean; busyMode?: string; topInset?: number; composerInput?: unknown; crewmateGreeting?: import('react').ReactNode } & Record<string, unknown>) {
+  function ChatPaneStub({ slotKey, agentLocked, followContentWidth, busyMode, topInset, composerInput, ...rest }: { slotKey: string; agentLocked?: boolean; followContentWidth?: boolean; busyMode?: string; topInset?: number; composerInput?: unknown } & Record<string, unknown>) {
     // Mount count: the New crewmate card must HIDE the pane, never unmount it.
     useEffect(() => { chatPaneMounts.count += 1 }, [])
     return (
       <div data-testid="chat-pane-stub" data-agent-locked={agentLocked ? '1' : '0'} data-follow-content-width={followContentWidth ? '1' : '0'} data-busy-mode={busyMode ?? 'split'} data-top-inset={topInset ?? ''} data-crew-composer={composerInput === CrewComposerRef.current ? '1' : '0'}>
         {slotKey}
-        {crewmateGreeting}
         {/* A static opening card is gone: no host may pass one. */}
         {'assistantWelcome' in rest && <div data-testid="assistant-welcome-stub" />}
         {/* Stands in for rendered transcript links (markdown anchors). */}
@@ -317,9 +314,6 @@ beforeEach(() => {
   resetFirstGreetingRequests()
   // The remembered member must not leak between cases.
   localStorage.clear()
-  // The page is reached only with the Crewmates preview on; the cases that
-  // pin what happens with it off turn it off themselves.
-  localStorage.setItem('mc-preview-crew', '1')
   // Nor the crewmate-created receipts (browser-session record).
   sessionStorage.clear()
   chatPaneMounts.count = 0
@@ -349,13 +343,13 @@ describe('resolveDefaultMember', () => {
     row({ name: 'beta', slug: 'beta', last_active_ts: 200 }),
   ]
 
-  it('nobody chatted -> the crewmate with the greatest last_active_ts', () => {
+  it('nobody chatted -> the mate with the greatest last_active_ts', () => {
     // Product decision (CrewMates launch review): the "pick one" landing is
     // gone — the most recently USED crewmate opens by default.
     expect(resolveDefaultMember(ordered)?.name).toBe('beta')
   })
 
-  it('a tie in last_active_ts keeps the first crewmate in `ordered`', () => {
+  it('a tie in last_active_ts keeps the first mate in `ordered`', () => {
     const tied = [
       row({ name: 'alpha', slug: 'alpha', last_active_ts: 100 }),
       row({ name: 'beta', slug: 'beta', last_active_ts: 100 }),
@@ -363,7 +357,7 @@ describe('resolveDefaultMember', () => {
     expect(resolveDefaultMember(tied)?.name).toBe('alpha')
   })
 
-  it('the built-in default crewmate is a row like any other: the newest conversation wins', () => {
+  it('the built-in default mate is a row like any other: the newest conversation wins', () => {
     const withDefault = [row({ name: 'default', slug: 'default', last_active_ts: 999 }), ...ordered]
     expect(resolveDefaultMember(withDefault)?.name).toBe('default')
     // A default-only roster is the restore effect's hero case (`hasNoCrewmates`),
@@ -371,7 +365,7 @@ describe('resolveDefaultMember', () => {
     expect(resolveDefaultMember([row({ name: 'default', slug: 'default' })])?.name).toBe('default')
   })
 
-  it('Mate is the landing while no message was exchanged with it; then it is a crewmate like any other', () => {
+  it('Mate is the landing while no message was exchanged with it; then it is a mate like any other', () => {
     const withMate = [
       row({ name: 'alpha', slug: 'alpha', last_active_ts: 50 }),
       defaultRow({ last_active_ts: 999 }),
@@ -447,7 +441,7 @@ describe('MembersPage lists conversations like a messages app', () => {
 describe('MembersPage default member, memory and URL', () => {
   const alphaBeta = () => [row({ name: 'alpha', slug: 'alpha' }), row({ name: 'beta', slug: 'beta' })]
 
-  it('a fresh visit with nothing remembered opens the most recently used crewmate', async () => {
+  it('a fresh visit with nothing remembered opens the most recently used mate', async () => {
     await renderPage([
       row({ name: 'zeta-quiet', slug: 'zeta-quiet' }),
       row({ name: 'fresh-talker', slug: 'fresh-talker', last_active_ts: 200 }),
@@ -475,7 +469,7 @@ describe('MembersPage default member, memory and URL', () => {
     expect(currentUrl()).toBe('/members?member=beta')
   })
 
-  it('opening the built-in default by link remembers it like any crewmate', async () => {
+  it('opening the built-in default by link remembers it like any mate', async () => {
     localStorage.setItem(LAST_MEMBER_KEY, 'alpha')
     await renderPage([
       row({ name: 'default', slug: 'default', last_active_ts: 900 }),
@@ -516,7 +510,7 @@ describe('MembersPage default member, memory and URL', () => {
     expect(currentUrl()).toBe('/members?member=default')
   })
 
-  it('a crewmate opened but not messaged since is the one a return lands on (#19341)', async () => {
+  it('a mate opened but not messaged since is the one a return lands on (#19341)', async () => {
     // alpha holds the newest message; the user clicked beta, sent nothing,
     // left the page, and came back. The memory, not the newest thread, decides.
     const rows = [
@@ -589,14 +583,14 @@ describe('MembersPage default member, memory and URL', () => {
     expect(api.memberThread).not.toHaveBeenCalledWith('alpha')
   })
 
-  it('a never-chatted Mate is opened ahead of a remembered crewmate', async () => {
+  it('a never-chatted Mate is opened ahead of a remembered mate', async () => {
     localStorage.setItem(LAST_MEMBER_KEY, 'alpha')
     await renderPage([defaultRow(), assistantRow({ has_dm_message: false }), row({ name: 'alpha', slug: 'alpha', last_active_ts: 99 })])
     expect(await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)).toHaveTextContent('member-mate')
     expect(currentUrl()).toBe('/members?member=mate')
   })
 
-  it('an existing user who chatted with a crewmate lands on an unseen Mate once', async () => {
+  it('an existing user who chatted with a mate lands on an unseen Mate once', async () => {
     await renderPage([
       defaultRow(),
       assistantRow(),
@@ -658,16 +652,6 @@ describe('MembersPage default member, memory and URL', () => {
     expect(api.memberThread).not.toHaveBeenCalledWith('mate')
   })
 
-  it('with the Crewmates preview off, opening the page neither lands on Mate nor asks for its welcome', async () => {
-    localStorage.setItem('mc-preview-crew', '0')
-    localStorage.setItem(LAST_MEMBER_KEY, 'alpha')
-    await renderPage([defaultRow(), assistantRow({ has_dm_message: false }), row({ name: 'alpha', slug: 'alpha' })])
-    expect(await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)).toHaveTextContent('member-alpha')
-    expect(api.memberThread).not.toHaveBeenCalledWith('mate')
-    // Only Mate's open thread ever asks, and Mate was never opened.
-    expect(api.memberGreet).not.toHaveBeenCalled()
-  })
-
   it('an explicit member link is not hijacked by the Assistant', async () => {
     await renderPage([defaultRow(), assistantRow(), row({ name: 'alpha', slug: 'alpha' })], 'kirocrew', { route: '/members?member=alpha' })
     expect(await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)).toHaveTextContent('member-alpha')
@@ -719,7 +703,7 @@ describe('MembersPage default member, memory and URL', () => {
     expect(names()).toEqual(['beta', 'gamma', 'alpha'])
   })
 
-  it('the OPEN crewmate rising to the top is the one recency change that re-sorts', async () => {
+  it('the OPEN mate rising to the top is the one recency change that re-sorts', async () => {
     // #15276: sorted by Recent, typing into a crewmate's DM leaves the row in
     // its alphabetical place. The user's own send is not a background event — it
     // is the thing in front of them — so it is the one advance the order hold
@@ -895,7 +879,7 @@ describe('MembersPage default member, memory and URL', () => {
     expect(notice).toHaveAttribute('role', 'status')
     expect(screen.queryByTestId('chat-pane-stub')).toBeNull()
     expect(api.memberThread).not.toHaveBeenCalled()
-    await screen.findAllByText(/No crewmates yet/i)
+    await screen.findAllByText(/No mates yet/i)
     expect(screen.queryByRole('alert')).toBeNull()
     // The return to `/members` is a navigate() issued from an effect once the
     // roster has loaded; on a slow runner the notice can render a tick before
@@ -937,7 +921,7 @@ describe('MembersPage default member, memory and URL', () => {
     expect(roster().getByText('beta').closest('button')).toHaveAttribute('aria-current', 'true')
   })
 
-  it('returning to a bare /members with nothing remembered re-opens the most-recently-used crewmate, not the one left active', async () => {
+  it('returning to a bare /members with nothing remembered re-opens the most-recently-used mate, not the one left active', async () => {
     // `safeSetItem` returns false when storage is denied (a locked-down
     // embedding context, blocked cookies), so a click never persists and the
     // later read is null. Denied for this one key so every other raw read in

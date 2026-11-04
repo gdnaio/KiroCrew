@@ -12,6 +12,8 @@ from typing import Any
 
 import pytest
 
+from kiro_crew.testing.wait import async_wait_until
+
 # ---------------------------------------------------------------------------
 # Fake lark_oapi SDK -- installed into sys.modules for the duration of tests
 # ---------------------------------------------------------------------------
@@ -569,7 +571,6 @@ class TestSendReply:
         from kiro_crew.feishu.client import LarkClient
 
         client = LarkClient(app_id="a", app_secret="s")
-        # Make the reply fail
         client._lark.im.v1.message.succeed = False
         result = await client.send_reply("msg-1", "Hi")
         assert result is False
@@ -736,8 +737,12 @@ class TestSyncReply:
         from kiro_crew.feishu.client import LarkClient
 
         client = LarkClient(app_id="a", app_secret="s")
-        # Should not raise
-        client._sync_reply("msg-1", "text")
+        client._sync_reply("msg-1", "回复 text")
+        # The request the client built: addressed to the message, with the text
+        # serialized unescaped as a `text` body.
+        (req,) = client._lark.im.v1.message.calls
+        assert req._message_id == "msg-1"
+        assert req._body._content == '{"text": "回复 text"}'
 
 
 # ---------------------------------------------------------------------------
@@ -1041,7 +1046,6 @@ class TestStart:
         assert client._thread.daemon is True
         assert client._thread.is_alive()
 
-        # Clean up: stop and join
         client._ws_client.stop()
         client._thread.join(timeout=1.0)
         assert not client._thread.is_alive()
@@ -1058,9 +1062,9 @@ class TestStart:
 
         client = LarkClient(app_id="a", app_secret="s")
         await client.start()
-        await asyncio.wait_for(
-            asyncio.to_thread(client._ws_client._started_event.wait),
-            timeout=1.0,
+        await async_wait_until(
+            client._ws_client._started_event.is_set,
+            describe=lambda: "the SDK client never started on its thread",
         )
 
         assert client._thread.is_alive()
@@ -1214,9 +1218,9 @@ class TestClose:
         try:
             client = LarkClient(app_id="a", app_secret="s")
             await client.start()
-            await asyncio.wait_for(
-                asyncio.to_thread(client._ws_client._started_event.wait),
-                timeout=1.0,
+            await async_wait_until(
+                client._ws_client._started_event.is_set,
+                describe=lambda: "the SDK client never started on its thread",
             )
 
             await client.close()

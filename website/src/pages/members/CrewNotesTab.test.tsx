@@ -42,7 +42,7 @@ beforeEach(() => {
   memberBriefing.mockReset()
 })
 
-describe('CrewNotesTab (the crewmate\'s own notes)', () => {
+describe('CrewNotesTab (the mate\'s own notes)', () => {
   it('says whose notes these are before they are read, and offers nothing to change them with', async () => {
     memberBriefing.mockResolvedValue(briefing())
     renderNotes()
@@ -58,6 +58,20 @@ describe('CrewNotesTab (the crewmate\'s own notes)', () => {
     expect(notes.querySelector('[contenteditable="true"]')).toBeNull()
   })
 
+  it('names the mate by its display name in the agent-only line, never the internal key', async () => {
+    memberBriefing.mockResolvedValue(briefing())
+    renderWithProviders(
+      <CrewNotesTab slug="oncall" member="member-oncall-1a2b" displayName="On-call" header={null} visible />,
+    )
+    const line = screen.getByTestId('member-notes-agent-only')
+    expect(line).toHaveTextContent(
+      'On-call writes these notes for itself as it works. You can read them here, but not change them.',
+    )
+    expect(line).not.toHaveTextContent('member-oncall-1a2b')
+    // The read itself stays keyed by the internal name.
+    await waitFor(() => expect(memberBriefing).toHaveBeenCalledWith('oncall', 'member-oncall-1a2b'))
+  })
+
   it('renders the briefing as markdown, dated, keyed by slug and exact name', async () => {
     memberBriefing.mockResolvedValue(briefing())
     renderNotes()
@@ -69,7 +83,7 @@ describe('CrewNotesTab (the crewmate\'s own notes)', () => {
     expect(screen.queryByTestId('member-notes-hidden')).toBeNull()
   })
 
-  it('no notes yet is an EMPTY state naming the crewmate, undated — never an error', async () => {
+  it('no notes yet is an EMPTY state naming the mate, undated — never an error', async () => {
     memberBriefing.mockResolvedValue(briefing({ text: '', updated_ts: null }))
     renderNotes()
     const empty = await screen.findByTestId('member-notes-empty')
@@ -159,7 +173,7 @@ describe('CrewNotesTab (the crewmate\'s own notes)', () => {
         readFileSync(resolve(__dirname, '../../i18n/locales/en.json'), 'utf8'),
       ) as { pages: { membersPage: { notes_error: string } } }
     ).pages.membersPage.notes_error
-    expect(notesError).not.toMatch(/crewmate['’]s/i)
+    expect(notesError).not.toMatch(/mate['’]s/i)
     expect(notesError).not.toMatch(/this [^.]*['’]s/i)
     expect(notice).toHaveTextContent(notesError)
     expect(screen.getByTestId('member-notes-agent-only')).toBeInTheDocument()
@@ -167,11 +181,11 @@ describe('CrewNotesTab (the crewmate\'s own notes)', () => {
     expect(screen.queryByTestId('member-notes-footer')).toBeNull()
   })
 
-  it('two crewmates sharing the slug: the read is refused and the tab says so in plain words', async () => {
+  it('two mates sharing the slug: the read is refused and the tab says so in plain words', async () => {
     memberBriefing.mockRejectedValue(new ApiError(409, 'briefing_slug_ambiguous'))
     renderNotes()
     const line = await screen.findByTestId('member-notes-collision')
-    expect(line).toHaveTextContent(/Two crewmates share this short name/)
+    expect(line).toHaveTextContent(/Two mates share this short name/)
     expect(screen.queryByRole('alert')).toBeNull()
     expect(screen.queryByTestId('member-notes-footer')).toBeNull()
   })

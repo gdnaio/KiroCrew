@@ -916,7 +916,6 @@ class TestAppProcess:
 
 class TestBackendLifecycle:
     def test_no_backend_returns_none(self, tmp_path, app_env):
-        # App without backend section
         src = tmp_path / "source" / "no-backend"
         src.mkdir(parents=True)
         (src / APP_MANIFEST_FILENAME).write_text(json.dumps({
@@ -935,11 +934,9 @@ class TestBackendLifecycle:
         assert ap is not None
         assert ap.port > 0
         assert ap.pid > 0
-        # Process should be in the list
         procs = list_app_processes()
         assert len(procs) == 1
         assert procs[0]["app_name"] == "backend-app"
-        # Stop it
         stopped = stop_app_backend("backend-app")
         assert stopped is True
         assert list_app_processes() == []
@@ -1050,7 +1047,7 @@ class TestBackendLifecycle:
         assert any("escapes app root" in r.message for r in caplog.records)
 
     def test_third_party_backend_refused_when_gate_off(self, tmp_path, app_env, monkeypatch, caplog):
-        # security-review finding: the apps_allow_third_party off-switch must also block
+        # The apps_allow_third_party off-switch must also block
         # the OUT-OF-PROCESS backend spawn, not just in-process module loads. A
         # file-path (third-party) backend must be refused (None, before any Popen)
         # when the switch is off.
@@ -1505,3 +1502,74 @@ class TestShellDispatch:
         manifest = get_app_manifest(name)
         assert manifest is not None
         assert bmod._start_app_backend_body(name, manifest) is None
+
+    def test_platform_refusal_names_the_exec_backend_on_non_posix(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        # The routes read this after start_app_backend's None, so it must
+        # answer exactly the spawn body's exec refusal and nothing else.
+        import kiro_crew.apps.backend as bmod
+
+        def _install(name, entry, body, **backend):
+            src = tmp_path / "source" / name
+            src.mkdir(parents=True)
+            (src / APP_MANIFEST_FILENAME).write_text(json.dumps({
+                "name": name, "version": "1.0.0",
+                "displayName": name, "description": "platform refusal test",
+                "author": "tester",
+                "backend": {"entryPoint": entry, "port": "auto", **backend},
+            }))
+            (src / entry).write_text(body)
+            install_app(src)
+
+        _install("win-exec", "run.sh", "#!/bin/sh\necho hi\n", type="exec")
+        _install("win-sh", "launch.sh", "#!/bin/sh\necho hi\n")
+        _install("win-node", "server.js", "console.log(1)\n", type="node")
+        _install("win-py", "server.py", "print(1)\n", type="python")
+
+        monkeypatch.setattr(bmod.platform_compat, "IS_POSIX", True)
+        assert bmod.exec_backend_platform_refusal("win-exec") is None
+
+        monkeypatch.setattr(bmod.platform_compat, "IS_POSIX", False)
+        for name in ("win-exec", "win-sh"):
+            reason = bmod.exec_backend_platform_refusal(name)
+            assert reason is not None
+            assert name in reason
+            assert "not supported on native Windows" in reason
+        assert bmod.exec_backend_platform_refusal("win-node") is None
+        assert bmod.exec_backend_platform_refusal("win-py") is None
+        assert bmod.exec_backend_platform_refusal("no-such-app") is None
+
+    def test_platform_refusal_screens_the_entry_before_sniffing_it(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        # The persisted manifest is read without validate(), so an edited untyped
+        # entry that escapes the root must be refused by the spawn's own file-entry
+        # screen before _is_shell_entry opens or probes it.
+        import kiro_crew.apps.backend as bmod
+        from kiro_crew.apps.manager import app_dir
+
+        name = "win-escape"
+        src = tmp_path / "source" / name
+        src.mkdir(parents=True)
+        manifest = {
+            "name": name, "version": "1.0.0",
+            "displayName": name, "description": "entry screen test",
+            "author": "tester",
+            "backend": {"entryPoint": "launch.sh", "port": "auto"},
+        }
+        (src / APP_MANIFEST_FILENAME).write_text(json.dumps(manifest))
+        (src / "launch.sh").write_text("#!/bin/sh\necho hi\n")
+        install_app(src)
+        outside = tmp_path / "outside-launch"
+        outside.write_text("#!/bin/sh\necho hi\n")
+        installed = app_dir(name) / APP_MANIFEST_FILENAME
+        manifest["backend"]["entryPoint"] = str(outside)
+        installed.write_text(json.dumps(manifest))
+
+        def _no_sniff(entry):  # pragma: no cover - must not be reached
+            raise AssertionError(f"sniffed an unscreened entry: {entry}")
+
+        monkeypatch.setattr(bmod, "_is_shell_entry", _no_sniff)
+        monkeypatch.setattr(bmod.platform_compat, "IS_POSIX", False)
+        assert bmod.exec_backend_platform_refusal(name) is None

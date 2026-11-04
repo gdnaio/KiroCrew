@@ -23,6 +23,7 @@ from kiro_prerequisite_helpers import _FakeRuntime, _make_executable, _no_audit
 from kiro_crew import kiro_prerequisite as prerequisite_module
 from kiro_crew.dashboard.kiro_readiness import kiro_session_ready
 from kiro_crew.kiro_prerequisite import KiroPrerequisiteService, ProcessResult
+from kiro_crew.testing.wait import await_until
 
 
 class TestKiroPrerequisiteWorkflowReadinessLatch:
@@ -502,7 +503,7 @@ class TestKiroPrerequisiteWorkflowReadinessLatch:
 
         task = service.warm_up()
         assert task is not None
-        await asyncio.wait_for(probe_started.wait(), timeout=1)
+        await await_until(probe_started, what="the warm-up probe starting")
 
         await service.close()
 
@@ -1045,9 +1046,13 @@ class TestKasRecordsFirstRunSetup:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, installed: bool
     ) -> None:
         # agent.kas_bundle on, and NO kiro-cli anywhere on this host: the route
-        # never runs kiro-cli, so the marker must follow the installed engine --
-        # and nothing may try to spawn the absent binary while deciding.
-        from kiro_crew.agent_sdk import kas_bundle
+        # never runs kiro-cli, so the marker must follow the engine -- installed,
+        # or installable by the first spawn -- and nothing may try to spawn the
+        # absent binary while deciding. Here the host cannot run the engine, so
+        # only an installed one completes setup.
+        from kiro_crew.agent_sdk import backend_install, kas_bundle
+
+        monkeypatch.setattr(backend_install, "_engine_installable_here", lambda: False)
 
         calls: list[tuple[str, list[str]]] = []
 

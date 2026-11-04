@@ -55,37 +55,30 @@ def test_rewrite_agents_signature_is_pinned_to_fingerprint_inputs() -> None:
         "pooling_enabled",
         # Fingerprinted through ``LaunchApprovals.digest``.
         "approvals",
+        # Fingerprinted as the ``mate_sources`` input.
+        "mate_source_dir",
     }
 
 
 # --- Ambient-read tripwire -------------------------------------------------
 #
 # The signature pin above catches new *parameters*; this scan catches new
-# *ambient reads* — env vars, config-loader lookups, home/cwd resolution —
-# consulted inside the rewrite pass without a signature change. An ambient
-# read that affects the output but is absent from the fingerprint yields
-# silently stale overlays, so every read reaching the pass must be a conscious
-# decision: either fingerprinted or documented output-neutral.
+# *ambient reads* (env vars, config lookups, home/cwd) inside the rewrite pass.
+# One that affects the output but is absent from the fingerprint yields stale
+# overlays, so each read must be fingerprinted or documented output-neutral.
 #
-# Scope: top-level functions in ``rewriter.py`` and its ``rewriter_*`` owner
-# modules only. ``defs`` is built from their module bodies, so a method on a class
-# or a helper in another module is NOT scanned — the tripwire covers the in-module helper graph, not everything the
-# pass can transitively touch. A NEW entry point added to the pass must also be
-# added to ``_REWRITE_PASS_ROOTS`` to be covered.
+# Scope: top-level functions in ``rewriter.py`` and its ``rewriter_*`` modules
+# only; methods and other modules are NOT scanned. A NEW entry point to the pass
+# must be added to ``_REWRITE_PASS_ROOTS``.
 #
-# Each allowlist entry is (enclosing top-level function, channel). Env reads
-# with a literal key carry the variable name (``os.environ:PATH``), so a new
-# variable read in an already-listed function still trips. On a failure,
-# classify before touching this list:
-#   * NEW only            -> a genuinely new read. Output-affecting: add it to
-#     ``_rewrite_inputs_fingerprint`` AND an invalidation test in this file.
-#     Output-neutral: document why in the fingerprint docstring (see the
-#     ``forward_declared_env`` precedent). Then extend this allowlist.
-#   * same channel NEW in one function and STALE in another -> a MOVED read
-#     (refactor). Re-key the entry to the new function; do NOT change the
-#     fingerprint — a redundant key would force a full rewrite for every
-#     existing user on upgrade.
-#   * STALE only          -> the read is gone; prune the entry.
+# Each entry is (enclosing top-level function, channel); env reads with a literal
+# key carry the name (``os.environ:PATH``). On a failure:
+#   * NEW only -> output-affecting: add it to ``_rewrite_inputs_fingerprint`` plus
+#     an invalidation test; output-neutral: document it in the fingerprint
+#     docstring (see ``forward_declared_env``). Then extend this allowlist.
+#   * NEW in one function, STALE in another -> a moved read. Re-key the entry; do
+#     NOT change the fingerprint, or every user gets a full rewrite on upgrade.
+#   * STALE only -> the read is gone; prune the entry.
 _AMBIENT_READ_ALLOWLIST = frozenset(
     {
         # The fingerprint builder reading its own declared inputs.
@@ -546,6 +539,48 @@ def test_pre_governed_passthrough_schema_forces_regeneration(
     before = rewrite_counter["n"]
     _rewrite(tmp_path)
     assert rewrite_counter["n"] == before + 2
+
+
+def test_a_kept_overlay_from_before_the_vendor_denylist_drops_the_vendor_stub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A schema 10 overlay can hold a stub for a credential vendor.
+
+    Before the vendors joined ``UNPOOLABLE_SERVERS`` an operator could list one
+    in ``stub_servers`` and the rewriter wrapped it. The denylist is not a
+    fingerprint input, so with every input unchanged a kept overlay would keep
+    that stub, and its shared backend would run outside every chat sandbox. The
+    schema bump is what rejects such an overlay on the next boot.
+    """
+    from mcp_gateway_rewriter_fingerprint_helpers import _CMD
+
+    from kiro_crew.mcp_gateway import rewriter_spec
+    from kiro_crew.mcp_gateway.rewriter_launch import _WRAPPER_MARKER
+
+    src = tmp_path / "agents"
+    src.mkdir()
+    (tmp_path / "settings").mkdir()
+    (tmp_path / "settings" / "mcp.json").write_text(json.dumps({"mcpServers": {}}))
+    (src / "agent-0.json").write_text(
+        json.dumps({"name": "agent-0", "mcpServers": {"creds-agent": {"command": _CMD}}})
+    )
+    overlay = tmp_path / "mcp-gateway" / "agents" / "agent-0.json"
+
+    def vendor_entry() -> dict[str, Any]:
+        return json.loads(overlay.read_text())["mcpServers"]["creds-agent"]
+
+    stub_servers = frozenset({"creds-agent"})
+    with monkeypatch.context() as patch:
+        # The pass as it ran before this change: schema 10, empty denylist.
+        patch.setattr(rewriter, "_FINGERPRINT_SCHEMA", 10)
+        patch.setattr(rewriter_spec, "UNPOOLABLE_SERVERS", frozenset())
+        _rewrite(tmp_path, stub_servers=stub_servers)
+    assert vendor_entry().get(_WRAPPER_MARKER) is True  # pooled before
+
+    # Same inputs, current schema and denylist: the overlay must be rebuilt.
+    _rewrite(tmp_path, stub_servers=stub_servers)
+    assert _WRAPPER_MARKER not in vendor_entry()
+    assert vendor_entry()["command"] == _CMD
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows executable casing")

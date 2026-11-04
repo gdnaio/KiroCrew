@@ -3,7 +3,7 @@
 The dispatch chain stays in ``cli.main``, where the lazy-import ratchet and the boot-order
 pins read it, while the arguments come from the ``cli_parser_*`` registrars. These tests run
 the real ``main`` -- the parser, the prologue and the chain -- for every command but
-``gateway`` (``test_cli.py``'s lock-refusal and ``--seed`` tests drive that branch
+``gateway`` (``test_cli_main_entry.py``'s lock-refusal and ``--seed`` tests drive that branch
 in-process), with the boot steps and the command's handler replaced by recorders, and pin
 which handler each command reaches and with what.
 """
@@ -335,12 +335,11 @@ def test_computer_forwards_its_remaining_arguments(
         (("update",), "_update", ((), {"force": False})),
         (("update", "--force"), "_update", ((), {"force": True})),
         (("update", "approve"), "_update_approve", ((), {})),
-        (("file-delivery", "approve"), "_file_delivery_approve", ((), {})),
         (("stop", "--port", "7001"), "_stop", ((7001,), {"expect_pid": None})),
         (("restart", "--port", "7002"), "_restart", ((7002,), {})),
         (("gateway-pid",), "_gateway_pid", ((), {})),
     ],
-    ids=["update", "update-force", "update-approve", "file-delivery", "stop", "restart", "pid"],
+    ids=["update", "update-force", "update-approve", "stop", "restart", "pid"],
 )
 def test_a_gateway_control_command_reaches_its_server_handler(
     booted: list[str],

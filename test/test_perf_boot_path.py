@@ -54,9 +54,10 @@ def _probe(snippet: str) -> dict:
     # parse_dashboard_url honours KIROCREW_PORT; keep the probe deterministic.
     env.pop("KIROCREW_PORT", None)
     proc = subprocess.run(
-        [sys.executable, "-c", snippet],
+        [sys.executable, "-X", "utf8", "-c", snippet],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         env=env,
         timeout=120,
     )
@@ -106,7 +107,12 @@ class TestGatewayUpdateCheckIsBackgrounded:
         )
         # Dedented, so the body reads the same whether the method is defined in the
         # class body or composed from a gateway_runtime owner.
-        shutdown_src = textwrap.dedent(inspect.getsource(GatewayOrchestrator._shutdown))
+        assert "self._stop_services_and_sessions(" in textwrap.dedent(
+            inspect.getsource(GatewayOrchestrator._shutdown)
+        )
+        shutdown_src = textwrap.dedent(
+            inspect.getsource(GatewayOrchestrator._shutdown)
+        ) + textwrap.dedent(inspect.getsource(GatewayOrchestrator._stop_services_and_sessions))
         assert "update_task = self._update_check_task" in shutdown_src
         # Cancelled with the dashboard-started policy applies, as one set.
         assert "installer_tasks.add(update_task)" in shutdown_src

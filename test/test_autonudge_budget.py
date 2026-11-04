@@ -33,6 +33,11 @@ from kiro_crew.autonudge import (
 from kiro_crew.monitoring.decision import monitor_budget_reason
 from kiro_crew.monitoring.models import MonitorBudgets
 
+#: Lost-run ceiling for synchronization the test itself must release. It is a
+#: hang guard whose expiry fails at the awaited line, never a performance
+#: assertion, and is at most half the repository's ``--timeout=120``.
+_LOST_RUN_SECS = 30.0
+
 
 @pytest.mark.asyncio
 async def test_max_cycles_deactivates(svc, monkeypatch):
@@ -661,7 +666,9 @@ async def test_revival_runs_a_fresh_budget_and_a_running_save_keeps_the_old_one(
 
     async def settle(loop_id: str) -> None:
         # A loop the timer re-stops cancels its own task; the count below is the verdict.
-        await asyncio.gather(svc._timers[loop_id], return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(svc._timers[loop_id], return_exceptions=True), timeout=_LOST_RUN_SECS
+        )
 
     capped = await svc.add(slot_key="chat-1-301", message="go", idle_secs=15, max_cycles=1)
     await settle(capped.id)
@@ -720,7 +727,9 @@ async def test_a_bare_revival_keeps_the_count_so_a_reconciler_cannot_mint_a_fres
     await svc.start()
 
     async def settle(loop_id: str) -> None:
-        await asyncio.gather(svc._timers[loop_id], return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(svc._timers[loop_id], return_exceptions=True), timeout=_LOST_RUN_SECS
+        )
 
     capped = await svc.add(slot_key="research-c1", message="go", idle_secs=15, max_cycles=1)
     await settle(capped.id)
@@ -981,10 +990,6 @@ async def test_stop_sentinel_keeps_the_record_finished(svc, tmp_path, monkeypatc
     wrote it, and nothing announces a stop-short (``expired``)."""
     import kiro_crew.autonudge as _an
 
-    async def _nosleep(_secs):
-        return None
-
-    monkeypatch.setattr(_an.asyncio, "sleep", _nosleep)
     events: list[str] = []
     svc.subscribe(lambda ev, lp: events.append(ev))
     await svc.start()
@@ -995,7 +1000,9 @@ async def test_stop_sentinel_keeps_the_record_finished(svc, tmp_path, monkeypatc
     sentinel.write_text("halt")
     svc._cancel_timer(loop.id)
     with caplog.at_level(logging.WARNING, logger="kiro_crew.autonudge"):
-        await svc._timer(loop)
+        # delay=0: the timer's own sleep is a single loop turn, so nothing is
+        # patched and the stdlib asyncio.sleep stays the worker's.
+        await svc._timer(loop, delay=0)
     kept = svc.get_by_slot("chat-1-123")
     assert kept is not None and kept.id == loop.id
     assert kept.active is False

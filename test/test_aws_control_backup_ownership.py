@@ -296,6 +296,75 @@ class TestListRemoteBackups:
         assert result["others"] == 0
         assert result["installs"][0]["id"] == mine
 
+    def test_the_newest_archives_are_listed_past_the_first_page(self):
+        """Keys sort oldest first and a page holds 500, so page one alone hid the newest."""
+        mine = backup.install_identity()["id"]
+        self.folders = {mine}
+        keys = [f"snapshots/{mine}/2025{i:06d}T000000Z-abc.tar.gz" for i in range(600)]
+        rows = [{"key": key, "modified": key.rsplit("/", 1)[-1][:15]} for key in keys]
+
+        def fake_list(profile, region, bucket, section, sub, token="", *, account):
+            if sub != f"snapshots/{mine}":
+                return {"files": [], "folders": [], "nextToken": ""}
+            if not token:
+                return {"files": rows[:500], "folders": [], "nextToken": "page-2"}
+            assert token == "page-2"
+            return {"files": rows[500:], "folders": [], "nextToken": ""}
+
+        with mock.patch.object(backup.storage, "list_section", side_effect=fake_list):
+            result = backup.list_remote_backups("p", "us-west-2", "bkt", account=ACCOUNT)
+
+        listed = [row["key"] for row in result[backup.KIND_SNAPSHOT]]
+        assert listed[0] == keys[-1]
+        assert listed == list(reversed(keys))[:20]
+
+    def test_a_listing_stopped_at_the_page_cap_says_so(self, monkeypatch):
+        """Past the cap the unread keys are the newest; the answer must not look complete."""
+        mine = backup.install_identity()["id"]
+        self.folders = {mine}
+        monkeypatch.setattr(backup, "_MAX_LISTING_PAGES", 2)
+
+        def fake_list(profile, region, bucket, section, sub, token="", *, account):
+            if sub != f"snapshots/{mine}":
+                return {"files": [], "folders": [], "nextToken": ""}
+            n = int(token or "0")
+            row = {"key": f"{sub}/2025{n:06d}T000000Z-abc.tar.gz", "modified": f"2025{n:06d}"}
+            return {"files": [row], "folders": [], "nextToken": str(n + 1)}
+
+        with mock.patch.object(backup.storage, "list_section", side_effect=fake_list):
+            result = backup.list_remote_backups("p", "us-west-2", "bkt", account=ACCOUNT)
+
+        assert result["archives_truncated"] == [backup.KIND_SNAPSHOT]
+        assert len(result[backup.KIND_SNAPSHOT]) == 2
+
+    def test_a_complete_listing_is_not_marked_truncated(self):
+        mine = backup.install_identity()["id"]
+        self.folders = {mine}
+
+        def fake_list(profile, region, bucket, section, sub, token="", *, account):
+            return {"files": [], "folders": [], "nextToken": ""}
+
+        with mock.patch.object(backup.storage, "list_section", side_effect=fake_list):
+            result = backup.list_remote_backups("p", "us-west-2", "bkt", account=ACCOUNT)
+
+        assert result["archives_truncated"] == []
+
+    def test_a_repeating_listing_token_stops_the_walk(self):
+        mine = backup.install_identity()["id"]
+        self.folders = {mine}
+        calls: list[str] = []
+
+        def fake_list(profile, region, bucket, section, sub, token="", *, account):
+            calls.append(sub)
+            return {"files": [], "folders": [], "nextToken": "same" if "/" in sub else ""}
+
+        with mock.patch.object(backup.storage, "list_section", side_effect=fake_list):
+            backup.list_remote_backups("p", "us-west-2", "bkt", account=ACCOUNT)
+
+        # Per kind: one root page, then this install's prefix twice (first page and
+        # the one that hands the same token back).
+        assert calls.count(f"snapshots/{mine}") == 2
+
     def test_a_legacy_archive_is_never_claimed_as_this_installs(self):
         # Backward compatibility with a bite: pre-namespace archives keep being
         # listed, but as unknown origin. Claiming them would re-create the exact
@@ -429,10 +498,20 @@ class TestInstallIdentity:
         # two installs the first time a second account is connected.
         assert backup.read_state()[backup.INSTALL_KEY]["id"] == first["id"]
 
-    def test_the_id_is_not_the_telemetry_install_id(self):
+    def test_the_id_is_not_the_telemetry_install_id(self, tmp_path, monkeypatch):
         # Reusing `beacon.install_id()` would materialise a TELEMETRY identity on
         # a host that opted out of telemetry, because that function creates the
         # file it reads. The technique is worth copying; the value is not.
+        from kiro_crew import beacon
+        from kiro_crew.config.loader import config_dir
+
+        # Unpatched, minting the backup id leaves no telemetry id file behind.
+        identity = backup.install_identity()
+        assert backup._INSTALL_ID_RE.match(identity["id"])
+        assert not (config_dir() / beacon.INSTALL_ID_FILE).exists()
+        # A second fresh mint, with the telemetry reader patched to catch any call.
+        monkeypatch.setattr(backup, "_state_path", lambda: tmp_path / "second.json")
+        backup._fallback_identity.clear()
         with mock.patch("kiro_crew.beacon.install_id") as beacon_id:
             backup.install_identity()
         beacon_id.assert_not_called()

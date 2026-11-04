@@ -18,7 +18,9 @@ if TYPE_CHECKING:
         VALID_MEMORY_MODES,
         _body_err_code,
         _sel,
+        body_int,
         bytes_to_mb_figure,
+        default_session_folder_choosable,
         knowledge_ceiling_bytes,
         link_pattern_url_ok,
         logger,
@@ -82,7 +84,6 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "merge_queued_messages",
             "default_memory_mode",
             "widget_density",
-            "use_builtin_browser",
             "verbosity",
             "quick_send",
             "session_grid",
@@ -91,10 +92,13 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "link_patterns",
             "mcp_app_panel",
             "auto_open_git_panel",
+            "side_panel_always_open",
+            "side_panel_pin_summary",
             "folder_suggestions_enabled",
             "topic_tags_enabled",
             "session_card_source_links",
             "session_folder_root",
+            "default_session_folder",
             "model_picker_hidden_models_add",
             "model_picker_hidden_models_remove",
         }
@@ -110,8 +114,11 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "jira_hosts",
             "github_hosts",
             "bitbucket_server_hosts",
+            "gerrit_hosts",
             "social_share_enabled",
+            "social_share_sites",
             "decisions_enabled",
+            "browse_enabled",
             "model_picker_hidden_models",
             "model_picker_configured",
             "upload_max_mb",
@@ -202,7 +209,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
         try:
             if "restore_window_minutes" in body:
                 updates["restore_window_minutes"] = max(
-                    0, min(1440, int(body["restore_window_minutes"]))
+                    0, min(1440, body_int(body["restore_window_minutes"]))
                 )
         except (TypeError, ValueError):
             _sel().log_tool_invocation(
@@ -306,25 +313,6 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     status=400,
                 )
             updates["link_patterns"] = cleaned
-        # Apply ONLY when it is the sole submitted setting. The Browser panel
-        # sends it alone; the Chat settings panel PUTs the whole config object
-        # from its own (possibly stale) cache, and applying it on that path would
-        # let a Chat-panel save silently revert a toggle another client changed
-        # (lost update).
-        if body.keys() == {"use_builtin_browser"}:
-            val = body["use_builtin_browser"]
-            if not isinstance(val, bool):
-                _sel().log_tool_invocation(
-                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
-                )
-                return web.json_response(
-                    {
-                        "error": "use_builtin_browser must be a boolean",
-                        "code": "invalid_use_builtin_browser",
-                    },
-                    status=400,
-                )
-            updates["use_builtin_browser"] = val
         if "verbosity" in body:
             # An older client may still send the retired ``ultra``; store
             # what it now means instead of rejecting the write. Spelled out
@@ -438,6 +426,34 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     status=400,
                 )
             updates["auto_open_git_panel"] = val
+        if "side_panel_always_open" in body:
+            val = body["side_panel_always_open"]
+            if not isinstance(val, bool):
+                _sel().log_tool_invocation(
+                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
+                )
+                return web.json_response(
+                    {
+                        "error": "side_panel_always_open must be a boolean",
+                        "code": "invalid_side_panel_always_open",
+                    },
+                    status=400,
+                )
+            updates["side_panel_always_open"] = val
+        if "side_panel_pin_summary" in body:
+            val = body["side_panel_pin_summary"]
+            if not isinstance(val, bool):
+                _sel().log_tool_invocation(
+                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
+                )
+                return web.json_response(
+                    {
+                        "error": "side_panel_pin_summary must be a boolean",
+                        "code": "invalid_side_panel_pin_summary",
+                    },
+                    status=400,
+                )
+            updates["side_panel_pin_summary"] = val
         if "session_card_source_links" in body:
             val = body["session_card_source_links"]
             if not isinstance(val, bool):
@@ -486,6 +502,39 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                         status=400,
                     )
                 updates["session_folder_root"] = resolved
+        if "default_session_folder" in body:
+            val = body["default_session_folder"]
+            if not isinstance(val, str):
+                _sel().log_tool_invocation(
+                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
+                )
+                return web.json_response(
+                    {
+                        "error": "default_session_folder must be a folder ID or empty",
+                        "code": "invalid_default_session_folder",
+                    },
+                    status=400,
+                )
+            val = val.strip()
+            # Same round-trip rule as session_folder_root: an unchanged value is
+            # not a choice, so a folder deleted since it was chosen cannot make an
+            # unrelated toggle save fail. Creation ignores a missing folder anyway.
+            if val != cfg.dashboard.default_session_folder:
+                if val and not await default_session_folder_choosable(request.app["state"], val):
+                    _sel().log_tool_invocation(
+                        session_key="dashboard",
+                        tool_name="dashboard_config_write",
+                        outcome="failure",
+                        error="invalid_default_session_folder",
+                    )
+                    return web.json_response(
+                        {
+                            "error": "default_session_folder must name one of your folders",
+                            "code": "invalid_default_session_folder",
+                        },
+                        status=400,
+                    )
+                updates["default_session_folder"] = val
         if "model_picker_hidden_models_add" in body:
             hidden_model_add, error_response = _validated_hidden_model_list(
                 "model_picker_hidden_models_add"
@@ -634,6 +683,11 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
     from kiro_crew.decisions.capability import denied_sides
 
     social_share_denied = await asyncio.to_thread(social_share.is_share_denied)
+    # Which share sites the dialog may offer (the policy's ``sites`` list). Not
+    # read when the entry itself is withdrawn: no site could be offered then.
+    share_sites = (
+        [] if social_share_denied else await asyncio.to_thread(social_share.permitted_sites)
+    )
     # Same shape, same reason: the Decisions feature-preview card is drawn only when
     # the ceiling permits the seam, and this endpoint is the only place the dashboard
     # can learn that. Presentation, not the control -- the consent PUT and the gate's
@@ -644,6 +698,12 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
     # Both rows evaluated in one hop, each audited once, never short-circuited.
     hosted_denied, local_denied = await asyncio.to_thread(denied_sides)
     decisions_denied = hosted_denied and local_denied
+    # Same again for the browser: Settings -> Browser and the live card show the
+    # policy line instead of their controls. Presentation only; every browser route
+    # and the engine refuse on their own (``browser_harness/governance.py``).
+    from kiro_crew.browser_harness.governance import browse_denied_async
+
+    browse_denied = await browse_denied_async(audit=False)
     return web.json_response(
         {
             "restore_sessions": cfg.dashboard.restore_sessions,
@@ -651,14 +711,16 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "merge_queued_messages": cfg.dashboard.merge_queued_messages,
             "default_memory_mode": cfg.dashboard.default_memory_mode,
             "widget_density": cfg.dashboard.widget_density,
-            "use_builtin_browser": cfg.dashboard.use_builtin_browser,
             "verbosity": cfg.dashboard.verbosity,
             "quick_send": cfg.dashboard.quick_send,
             "session_grid": cfg.dashboard.session_grid,
             "mcp_app_panel": cfg.dashboard.mcp_app_panel,
             "auto_open_git_panel": cfg.dashboard.auto_open_git_panel,
+            "side_panel_always_open": cfg.dashboard.side_panel_always_open,
+            "side_panel_pin_summary": cfg.dashboard.side_panel_pin_summary,
             "session_card_source_links": cfg.dashboard.session_card_source_links,
             "session_folder_root": cfg.dashboard.session_folder_root,
+            "default_session_folder": cfg.dashboard.default_session_folder,
             "tail_fork_enabled": cfg.dashboard.tail_fork_enabled,
             "link_previews": cfg.dashboard.link_previews,
             "folder_suggestions_enabled": cfg.dashboard.folder_suggestions_enabled,
@@ -678,6 +740,8 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "github_hosts": list(cfg.dashboard.github_hosts),
             # And for Bitbucket Server, which has no public default host at all.
             "bitbucket_server_hosts": list(cfg.dashboard.bitbucket_server_hosts),
+            # And for Gerrit, likewise recognized only through its allowlist.
+            "gerrit_hosts": list(cfg.dashboard.gerrit_hosts),
             # Read-only: the per-file upload ceiling (`dashboard.upload_max_mb`).
             # Both composers pre-check against it and name it in their refusal;
             # the upload handlers enforce it again server-side.
@@ -694,10 +758,18 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             # withdraws the "Share as image" menu entry; there is no toggle behind
             # it, so nothing here is writable.
             "social_share_enabled": not social_share_denied,
+            # Read-only: the share site ids (`x`, `linkedin`) the ceiling permits.
+            # The dialog draws only these buttons and re-reads this list before it
+            # opens a site.
+            "social_share_sites": share_sites,
             # Read-only: the `capabilities.decisions` governance answer. False hides
             # the Decisions (Jev) feature-preview card; the owner's own switch is
             # the keystone behind `/api/decisions/consent`, never a field here.
             "decisions_enabled": not decisions_denied,
+            # Read-only: the `capabilities.browse` governance answer. False makes
+            # Settings -> Browser and the live browser card say browsing is off by
+            # policy, with no install or takeover control.
+            "browse_enabled": not browse_denied,
             # Read-write (unlike the host allowlists above): a rule only changes
             # how this dashboard RENDERS text -- it grants no fetch and no CLI
             # any authority -- so the settings editor may manage it.

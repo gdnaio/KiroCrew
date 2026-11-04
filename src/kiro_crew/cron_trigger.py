@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import urllib.error
@@ -9,10 +10,41 @@ import urllib.request
 from pathlib import Path
 
 from kiro_crew.instances import run_marker
-from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew.loopback_http import deadline_expired, loopback_urlopen
 
 _JOB_ID_RE = re.compile(r"[a-f0-9]{6,12}")
 _TIMEOUT_SECS = 10  # endpoint returns immediately after starting execution
+# An error body is a small JSON object; reading more than this is never needed.
+_ERROR_BODY_READ_BYTES = 4096
+# Longest server reason shown to the user; longer text is cut with an ellipsis.
+_ERROR_REASON_MAX_CHARS = 200
+
+
+def _http_error_reason(err: urllib.error.HTTPError) -> str:
+    """Return the gateway's own reason from an error response, or ``""``.
+
+    Only the JSON ``error`` string (or, without one, the ``code`` string) is
+    used, so an HTML or other non-JSON body is never shown. Control
+    characters are dropped and the text is capped at
+    ``_ERROR_REASON_MAX_CHARS`` (ASCII ellipsis, so any console encoding
+    can print it).
+    """
+    try:
+        raw = err.read(_ERROR_BODY_READ_BYTES)
+        body = json.loads(raw)
+    except (OSError, ValueError, TypeError, http.client.HTTPException):
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    reason = body.get("error")
+    if not isinstance(reason, str) or not reason.strip():
+        reason = body.get("code")
+    if not isinstance(reason, str):
+        return ""
+    reason = " ".join("".join(ch if ch.isprintable() else " " for ch in reason).split())
+    if len(reason) > _ERROR_REASON_MAX_CHARS:
+        reason = reason[: _ERROR_REASON_MAX_CHARS - 3].rstrip() + "..."
+    return reason
 
 
 def trigger_cron_job(job_id: str, port: int, secret_path: Path) -> tuple[bool, str]:
@@ -76,6 +108,14 @@ def trigger_cron_job(job_id: str, port: int, secret_path: Path) -> tuple[bool, s
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return False, f"Job not found: {job_id}"
+        reason = _http_error_reason(e)
+        if reason:
+            return False, f"Error: HTTP {e.code}: {reason}"
         return False, f"Error: HTTP {e.code}"
-    except (urllib.error.URLError, OSError):
+    except (urllib.error.URLError, OSError) as e:
+        # A timeout means the gateway took the trigger and is still working, so
+        # it is up but busy, not gone. The trigger POST is not idempotent, so
+        # the message does not invite a blind retry.
+        if deadline_expired(e):
+            return False, "Error: gateway is busy (up but did not answer); the trigger may have run"
         return False, "Error: cannot reach gateway. Is `kirocrew gateway` running?"

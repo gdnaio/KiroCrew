@@ -22,6 +22,7 @@ from kiro_crew.agent_sdk.drivers.acp_turn_vocab import (
     EVENT_STEER_CONSUMED,
     EVENT_TEXT_CHUNK,
     EVENT_TOOL_CALL,
+    EVENT_TOOL_RESULT,
     AcpError,
     LLMEvent,
     LLMProvider,
@@ -32,7 +33,7 @@ from kiro_crew.agent_sdk.drivers.acp_vocab import (
     STOP_REASON_TIMEOUT,
     AcpTimeoutError,
 )
-from kiro_crew.hooks import fire_tool_hooks, get_global_hook_store
+from kiro_crew.hooks import fire_tool_hooks, get_global_hook_store, unattended_turn
 from kiro_crew.llm_helpers_parts.backend_errors import (
     _PROMPT_BUSY_DELAY,
     _PROMPT_BUSY_RETRIES,
@@ -48,6 +49,7 @@ from kiro_crew.llm_helpers_parts.model_fallback import (
     FALLBACK_CANDIDATE_ATTEMPTS,
     FALLBACK_STORY_ATTR,
     TURN_FALLBACK_ATTR,
+    ActiveModelLine,
     FallbackState,
     advance_fallback_candidate,
     first_advertised_fallback,
@@ -110,15 +112,17 @@ async def stream_and_collect(
     on_steer_consumed: Callable[[str], None] | None = None,
     on_complete: Callable[[LLMEvent], None] | None = None,
     on_compaction: Callable[[LLMEvent], None] | None = None,
-    on_tool_gate: Callable[[str, bool, bool], None] | None = None,
+    on_tool_gate: Callable[[str, bool, bool, str], None] | None = None,
     retry_transient: bool = True,
     max_turns: int | None = None,
     session_key: str = "",
     agent: str = "",
     app: str = "",
+    unattended: bool = False,
     model_fallback: bool = False,
     fallback_models: Sequence[str] = (),
     allow_image: bool = True,
+    undelivered_watch_key: str = "",
 ) -> str:
     """Stream a message through an LLM provider and collect the full response.
 
@@ -150,7 +154,7 @@ async def stream_and_collect(
             prompts carried, and this is how a caller learns of it. Raising from
             the callback is swallowed.
         on_tool_gate: Optional callback invoked once per tool permission
-            decision with ``(tool_title, approved, security_blocked)``. Lets a
+            decision with ``(tool_title, approved, security_blocked, reason)``. Lets a
             caller tell "the model did work" apart from "every tool the model
             attempted was blocked" — a distinction the returned text cannot
             carry, because a model whose tools were all refused still returns
@@ -158,12 +162,16 @@ async def stream_and_collect(
             unconditional deny checks (sensitive path, sensitive bash, a deny
             pattern); a governance ``TOOL_DENY`` and an unattended-approval
             timeout are refusals that say nothing about the job, so they arrive
-            with ``approved=False`` and ``security_blocked=False``.
+            with ``approved=False`` and ``security_blocked=False``. ``reason`` is
+            the refusal text the audit row recorded (for a deny pattern it names
+            the rule that matched), empty for an approval: without it an
+            unattended caller can only say that a call was refused, not why.
             Delivered when the attempt settles, not mid-stream, and decisions
             from an abandoned retry attempt are discarded: they describe work
-            the final turn never did. ``tool_title`` is LLM-authored: redact it
-            before display or persistence. Raising from the callback is
-            swallowed; observing a gate decision must never fail the turn.
+            the final turn never did. ``tool_title`` and ``reason`` can echo
+            LLM-authored text: redact them before display or persistence. Raising
+            from the callback is swallowed; observing a gate decision must never
+            fail the turn.
         retry_transient: When True (default), transient backend errors are
             retried in-place with bounded backoff. Set False from callers that
             already own an outer transient-retry loop, so the inner arm doesn't
@@ -182,6 +190,11 @@ async def stream_and_collect(
             it can only look up a profile it has been told the name of; with all
             three empty it applies the ceiling alone. ``REJECT_ALL`` runs no
             tools. Every other policy consults the gate before an approval.
+        unattended: The turn runs with nobody watching (cron, heartbeat, a
+            monitor wake). Each gate consultation runs under
+            ``hooks.unattended_turn``, so a governance evaluation that raises
+            refuses the call instead of allowing it. ``False`` (default) keeps
+            the attended behavior.
         fallback_models: Ordered chain of model ids tried when the same-model
             transient budget exhausts on a throttle/capacity error (Case 2.75).
             Empty (the default) disables the chain — behavior is byte-for-byte
@@ -192,10 +205,20 @@ async def stream_and_collect(
             a later call on the same provider probes one primary restore.
         allow_image: ``False`` sends every attempt text-only (see
             ``LLMProvider.stream``), for a prompt that is text ABOUT a session.
+        undelivered_watch_key: The session key the caller authenticated for this
+            turn, used only to record a dispatched worker's work-tool call the
+            harness never delivered
+            (:class:`kiro_crew.undelivered_call_watch.UndeliveredCallWatch`).
+            Empty watches nothing.
 
     Returns:
         The complete response text.
     """
+    _undelivered_watch = None
+    if undelivered_watch_key:
+        from kiro_crew.undelivered_call_watch import UndeliveredCallWatch
+
+        _undelivered_watch = UndeliveredCallWatch(undelivered_watch_key, provider)
     transient_attempts = 0
     _model_fallback_attempted = False
     attempt = 0
@@ -210,6 +233,11 @@ async def stream_and_collect(
     # contract, but activity from that attempt remains sticky for a later
     # transient error.
     _turn_tool_activity = False
+    # Read the served model before the restore probe below can move it: the caller
+    # built *message* on the model serving now, and every attempt re-sends it through
+    # this, so a restore, a fallback swap or a rejected-model retry is stated in the
+    # prompt's [ACTIVE MODEL] line instead of the model that served at build time.
+    _active_line = ActiveModelLine(message, provider)
     # Sticky-restore probe (§restore policy): if an earlier turn on this
     # provider fell back, try ONCE to move back to the primary before this
     # turn streams. Quiet on success (log only); a still-throttled primary
@@ -234,7 +262,7 @@ async def stream_and_collect(
         # abandoned attempt describe work the final turn never did. Committing them
         # would let a refusal from a discarded attempt outvote a clean retry and fail
         # a healthy job.
-        gate_this_attempt: list[tuple[str, bool, bool]] = []
+        gate_this_attempt: list[tuple[str, bool, bool, str]] = []
         # Tool calls that reached the gate, and tool calls that actually ran.
         # A tool auto-approved upstream never raises a permission request, so it
         # executes without a gate decision: correlating the two by
@@ -247,12 +275,19 @@ async def stream_and_collect(
         # baseline an attempt that was billed and then failed is invisible.
         attempt_stats_before = _billing_stats(provider)
         try:
+            message = _active_line.current()
             events = (
                 provider.stream(message)
                 if allow_image
                 else provider.stream(message, allow_image=False)
             )
             async for event in events:
+                if _undelivered_watch is not None:
+                    # A dispatched worker's report the harness never delivered.
+                    if event.kind == EVENT_TOOL_CALL:
+                        _undelivered_watch.on_call(event)
+                    elif event.kind == EVENT_TOOL_RESULT:
+                        await _undelivered_watch.on_result(event)
                 if event.kind == EVENT_TEXT_CHUNK:
                     result_text += event.text
                     if on_chunk:
@@ -262,22 +297,25 @@ async def stream_and_collect(
                     # security block is distinguishable from a governance denial
                     # or an unattended-approval timeout. Only the former says
                     # anything about the job itself.
-                    _decision: list[tuple[str, str]] = []
-                    approved = await _resolve_permission(
-                        provider,
-                        event,
-                        approval_policy,
-                        hooks,
-                        on_tool_approval,
-                        session_key=session_key,
-                        agent=agent,
-                        app=app,
-                        on_decision=lambda outcome, mech: _decision.append((outcome, mech)),
-                    )
+                    _decision: list[tuple[str, str, str]] = []
+                    with unattended_turn(unattended):
+                        approved = await _resolve_permission(
+                            provider,
+                            event,
+                            approval_policy,
+                            hooks,
+                            on_tool_approval,
+                            session_key=session_key,
+                            agent=agent,
+                            app=app,
+                            on_decision=lambda outcome, mech, why: _decision.append(
+                                (outcome, mech, why)
+                            ),
+                        )
                     if on_tool_gate:
-                        _mech = _decision[-1][1] if _decision else ""
+                        _mech, _why = _decision[-1][1:] if _decision else ("", "")
                         gate_this_attempt.append(
-                            (event.title or "", approved, _mech.startswith("always_deny"))
+                            (event.title or "", approved, _mech.startswith("always_deny"), _why)
                         )
                         if event.tool_call_id:
                             gate_decided_ids.add(event.tool_call_id)
@@ -429,7 +467,7 @@ async def stream_and_collect(
             # ATTEMPTS), advance on transient failure, propagate non-transient
             # immediately (the classifier gate above already ensures that).
             # Empty chain ⇒ this block is inert and Case 3 surfaces the error
-            # exactly as before this feature existed.
+            # directly.
             #
             # ``not _turn_tool_activity`` is load-bearing over and above
             # ``not result_text``: a tool call can complete an EXTERNAL
@@ -563,9 +601,9 @@ async def stream_and_collect(
                 for consumed_text in consumed_this_attempt:
                     on_steer_consumed(consumed_text)
             if not retrying and on_tool_gate:
-                for gate_title, gate_approved, gate_blocked in gate_this_attempt:
+                for gate_title, gate_approved, gate_blocked, gate_reason in gate_this_attempt:
                     try:
-                        on_tool_gate(gate_title, gate_approved, gate_blocked)
+                        on_tool_gate(gate_title, gate_approved, gate_blocked, gate_reason)
                     except Exception:
                         # A caller's bookkeeping must never abort the turn.
                         logger.debug("on_tool_gate callback failed", exc_info=True)
@@ -578,7 +616,7 @@ async def stream_and_collect(
                     if _exec_id and _exec_id in gate_decided_ids:
                         continue
                     try:
-                        on_tool_gate(_exec_title, True, False)
+                        on_tool_gate(_exec_title, True, False, "")
                     except Exception:
                         logger.debug("on_tool_gate callback failed", exc_info=True)
 
@@ -589,6 +627,7 @@ async def stream_and_collect_json(
     *,
     approval_policy: ToolApprovalPolicy = ToolApprovalPolicy.AUTO_APPROVE,
     hooks: HookManager | None = None,
+    on_chunk: Callable[[str], None] | None = None,
     model_fallback: bool = False,
     allow_image: bool = True,
 ) -> dict | None:
@@ -602,6 +641,7 @@ async def stream_and_collect_json(
         message,
         approval_policy=approval_policy,
         hooks=hooks,
+        on_chunk=on_chunk,
         model_fallback=model_fallback,
         allow_image=allow_image,
     )

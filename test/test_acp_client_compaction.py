@@ -8,7 +8,9 @@ import pytest
 from acp_client_helpers import _native_projection_for_fake_processes  # noqa: F401 - fixture
 from acp_client_helpers import _pin_the_installed_kiro_cli_version  # noqa: F401 - fixture
 
+from kiro_crew.acp import client_turn as client_turn_mod
 from kiro_crew.acp.client import AcpClient
+from kiro_crew.testing.clock import ManualClock
 
 
 class TestCompactionResetsContextStats:
@@ -341,6 +343,10 @@ class TestCompactionFailureTurnBudget:
 
         monkeypatch.setattr(acp_client, "_COMPACTION_FAILED_TURN_BUDGET", 0.3)
         monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.02)
+        # The budget and the turn deadline read the product's monotonic clock, so
+        # the stream advances that clock instead of sleeping in real time.
+        clock = ManualClock()
+        clock.install(monkeypatch, client_turn_mod)
 
         client = AcpClient(work_dir=tmp_path)
         client._turn_done.clear()
@@ -348,9 +354,9 @@ class TestCompactionFailureTurnBudget:
         client._handle_compaction_status(self._failed_msg())
 
         async def _steady_stream(timeout: float = 0.0):
-            # flake-ok: pre-existing 50 ms pacing in the stubbed stream; tracked for a de-flake pass
-            # nosemgrep: kirocrew.test-sleep-as-barrier -- pre-existing pacing inside the stubbed stream; tracked for a de-flake pass
-            await asyncio.sleep(0.05)
+            # Each frame lands 50 ms after the previous one on the manual clock,
+            # so the silence the budget measures never exceeds 50 ms.
+            clock.advance(0.05)
             return JsonRpcMessage(method=METHOD_METADATA, params={})
 
         client._read_message = _steady_stream
@@ -492,7 +498,8 @@ class TestCompactionFailureTurnBudget:
                 # The consumer holds this frame past the WHOLE budget — the
                 # shape of a human answering an approval card slowly.
                 parked = True
-                await asyncio.sleep(0.3)
+                # The assertion below measures from the end of this deliberate park.
+                await asyncio.sleep(0.3)  # flake-ok: the consumer's park is the stimulus under test
                 resumed_at = time.monotonic()
         ended_at = time.monotonic()
 
@@ -718,24 +725,24 @@ class TestCompactionFailureIsTransient:
             }
         )
 
-    def test_a_4xx_is_not_transient(self):
-        """A validation or auth failure is answered by fixing the request, not
-        by sending it again."""
+    @pytest.mark.parametrize(
+        "frame",
+        [
+            # A validation or auth failure is answered by fixing the request,
+            # not by sending it again.
+            pytest.param({"error": {"httpStatusCode": 400}}, id="a_4xx_is_not_transient"),
+            pytest.param({"status": {"type": "failed"}}, id="a_bare_failure_is_not_transient"),
+            # ``bool`` is an ``int`` subclass, so a True under this key would
+            # otherwise compare as 1 — and 1 is not a status code at all.
+            pytest.param(
+                {"error": {"httpStatusCode": True}}, id="a_boolean_is_not_read_as_a_status_code"
+            ),
+        ],
+    )
+    def test_not_transient(self, frame):
         from kiro_crew.acp.client import compaction_failure_is_transient
 
-        assert not compaction_failure_is_transient({"error": {"httpStatusCode": 400}})
-
-    def test_a_bare_failure_is_not_transient(self):
-        from kiro_crew.acp.client import compaction_failure_is_transient
-
-        assert not compaction_failure_is_transient({"status": {"type": "failed"}})
-
-    def test_a_boolean_is_not_read_as_a_status_code(self):
-        """``bool`` is an ``int`` subclass, so a True under this key would
-        otherwise compare as 1 — and 1 is not a status code at all."""
-        from kiro_crew.acp.client import compaction_failure_is_transient
-
-        assert not compaction_failure_is_transient({"error": {"httpStatusCode": True}})
+        assert not compaction_failure_is_transient(frame)
 
     def test_the_reason_and_the_verdict_read_the_same_frame(self):
         """Both readers are driven off one walker, so the reason a row DISPLAYS

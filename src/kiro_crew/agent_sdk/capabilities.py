@@ -61,6 +61,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_NATIVE_TODOS,
+    ACP_BACKENDS_REMOTE_MCP_OAUTH,
     model_registry_namespace,
 )
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_ACP, PROVIDER_CLAUDE_CODE
@@ -158,21 +159,21 @@ class SessionCapabilities:
     #: Whether this harness interprets ``/todos`` as its native task-list command.
     #:
     #: This is deliberately narrower than general slash-command transport: the
-    #: kiro family has a native slash RPC but does not implement this command.
+    #: kiro-cli has a native slash RPC but does not implement this command.
     #: Unknown and newly registered backends remain False until they opt in.
     supports_native_todos: bool
 
     #: Whether an agent spec's ``"tools": []`` is honoured as a total ban -- no
     #: MCP server AND no harness-native tool -- on this backend.
     #:
-    #: True for kiro-cli/KAS (native) and for opencode/goose, whose mirror-only
-    #: allowlist gap is closed by ``AcpClient._deny_zero_tools`` at the permission
-    #: layer. False for claude, whose routing is declared but not enforced by this
-    #: core -- an inherited ``~/.claude`` pre-approval can skip
-    #: ``session/request_permission`` entirely, so the refusal never runs. False
-    #: for codex, whose sessions are served by ``AcpRuntime``, which carries no
-    #: zero-tool refusal at all. False for pi and deepseek, which have no mirror
-    #: and so no channel that computes ``zero_tools`` for them. A consumer that
+    #: True for kiro-cli/KAS (native) and for opencode/goose/deepseek/pi, whose
+    #: harness-native tools are refused by ``AcpClient._deny_zero_tools`` at the
+    #: permission layer (pi has no mirror; its ``zero_tools`` is read beside its
+    #: member mounts from the same spec parse). False for claude, whose routing is
+    #: declared but not enforced by this core -- an inherited ``~/.claude``
+    #: pre-approval can skip ``session/request_permission`` entirely, so the refusal
+    #: never runs. False for codex, whose sessions are served by ``AcpRuntime``,
+    #: which carries no zero-tool refusal at all. A consumer that
     #: spawns a zero-tool agent (the knowledge/research pool) asks this before
     #: trusting a resolved backend, rather than enumerating identities itself.
     honors_zero_tool_ban: bool
@@ -189,6 +190,16 @@ class SessionCapabilities:
     #: resolved backend on.
     acp_client_spawnable: bool
 
+    #: Whether a remote MCP entry's ``oauth`` block reaches the engine, so a
+    #: provider whose OAuth client is pre-registered (no dynamic client
+    #: registration) can sign in on this backend.
+    #:
+    #: False on KAS: its agent schema has no slot for the block, and the engine
+    #: falls back to registering a client the provider refuses. The Connections
+    #: page reads it to mark those providers kiro-cli only rather than offer a
+    #: Connect that cannot finish.
+    honors_remote_mcp_oauth: bool
+
 
 def capabilities_for(backend: str) -> SessionCapabilities:
     """The capabilities of *backend*, fail-closed for an id this build cannot name.
@@ -204,18 +215,17 @@ def capabilities_for(backend: str) -> SessionCapabilities:
         model_id_namespace=model_registry_namespace(backend),
         resolves_model_from_advertised_list=backend in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
         effort_via_config_option=backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
-        # The config option wins for a member of both sets: KAS sits in the
-        # kiro-family set but answers ``_kiro.dev/commands/execute`` with -32603
-        # (kiro-cli 2.28.0), so its effort travels only as ``effortLevel``.
-        effort_via_slash_command=(
-            backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS
-            and backend not in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
-        ),
+        # The two effort channels are disjoint sets, so a harness is told to use
+        # at most one. KAS is in neither the command set nor this answer: it
+        # refuses ``_kiro.dev/commands/execute`` with -32603, and its effort
+        # travels only as ``effortLevel``.
+        effort_via_slash_command=backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS,
         compacts_inline=backend in ACP_BACKENDS_INLINE_COMPACTION,
         crew_fires_spec_hooks=backend in ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS,
         supports_native_todos=backend in ACP_BACKENDS_NATIVE_TODOS,
         honors_zero_tool_ban=backend in ACP_BACKENDS_HONOR_ZERO_TOOL_BAN,
         acp_client_spawnable=backend in ACP_BACKENDS_ACP_CLIENT_SPAWNABLE,
+        honors_remote_mcp_oauth=backend in ACP_BACKENDS_REMOTE_MCP_OAUTH,
     )
 
 
@@ -244,6 +254,7 @@ UNKNOWN_BACKEND_CAPABILITIES = SessionCapabilities(
     supports_native_todos=False,
     honors_zero_tool_ban=False,
     acp_client_spawnable=False,
+    honors_remote_mcp_oauth=False,
 )
 
 

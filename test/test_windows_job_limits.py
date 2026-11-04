@@ -30,6 +30,7 @@ import time
 import pytest
 
 from kiro_crew import platform_compat, sandbox
+from kiro_crew.testing.wait import wait_until
 
 _WINDOWS_ONLY = pytest.mark.skipif(
     not platform_compat.IS_WINDOWS, reason="Job objects are Windows-only"
@@ -113,10 +114,11 @@ class TestApplyJobLimits:
         pin. The security property is that unbounded forking stops.
         """
         child = subprocess.Popen(
-            [sys.executable, "-c", _MEMBER_SRC],
+            [sys.executable, "-X", "utf8", "-c", _MEMBER_SRC],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             creationflags=platform_compat._SUBPROCESS_NO_WINDOW,
         )
         try:
@@ -185,9 +187,10 @@ class TestSuspendedSpawnHandshake:
         child might simply have been running the whole time.
         """
         child = subprocess.Popen(
-            [sys.executable, "-c", "print('RAN', flush=True)"],
+            [sys.executable, "-X", "utf8", "-c", "print('RAN', flush=True)"],
             stdout=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             creationflags=(
                 platform_compat.CREATE_NEW_PROCESS_GROUP | platform_compat.CREATE_SUSPENDED
             ),
@@ -201,9 +204,10 @@ class TestSuspendedSpawnHandshake:
 
     def test_assign_while_suspended_then_resume_runs_the_child(self) -> None:
         child = subprocess.Popen(
-            [sys.executable, "-c", "print('RAN', flush=True)"],
+            [sys.executable, "-X", "utf8", "-c", "print('RAN', flush=True)"],
             stdout=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             creationflags=(
                 platform_compat.CREATE_NEW_PROCESS_GROUP | platform_compat.CREATE_SUSPENDED
             ),
@@ -653,9 +657,11 @@ class TestPythonLauncherHops:
             assert outcome.failure == "timeout", outcome
             assert pid_file.is_file(), "the interpreter never started, so the test measured nothing"
             child_pid = int(pid_file.read_text())
-            deadline = time.monotonic() + 10
-            while platform_compat.pid_exists(child_pid) and time.monotonic() < deadline:
-                time.sleep(0.1)
+            wait_until(
+                lambda: not platform_compat.pid_exists(child_pid),
+                timeout=10,
+                describe=lambda: f"interpreter {child_pid} is still alive",
+            )
             assert not platform_compat.pid_exists(
                 child_pid
             ), f"interpreter {child_pid} outlived its redirector"

@@ -11,6 +11,7 @@ or hanging provider must degrade to a per-source error, never take down the poll
 import asyncio
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -481,12 +482,12 @@ class TestEvidenceRedaction(unittest.IsolatedAsyncioTestCase):
         leaky = Evidence(
             source="x",
             kind="logs",
-            title="alarm AKIAIOSFODNN7EXAMPLE tripped",
+            title="alarm glpat-IOSFODNN7EXAMPLE tripped",
             body="ok",
         )
         registry.register_evidence_source(_FakeEvidence("x", [leaky]))
         out = await registry.gather_evidence(_signal(), EvidenceBudget())
-        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", out[0].title)
+        self.assertNotIn("glpat-IOSFODNN7EXAMPLE", out[0].title)
         self.assertIn("tripped", out[0].title)  # redaction, not truncation
 
     async def test_body_is_truncated_to_budget(self):
@@ -497,17 +498,17 @@ class TestEvidenceRedaction(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(out[0].body), 100)
 
     async def test_aws_keys_are_redacted_not_just_bearer_tokens(self):
-        """Log lines are where AKIA-shaped keys turn up by accident."""
+        """Log lines are where glpat-shaped keys turn up by accident."""
         registry = OpsProviderRegistry()
         leaky = Evidence(
             source="x",
             kind="logs",
             title="t",
-            body="AccessDenied for AKIAIOSFODNN7EXAMPLE calling sts:AssumeRole",
+            body="AccessDenied for glpat-IOSFODNN7EXAMPLE calling sts:AssumeRole",
         )
         registry.register_evidence_source(_FakeEvidence("x", [leaky]))
         out = await registry.gather_evidence(_signal(), EvidenceBudget())
-        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", out[0].body)
+        self.assertNotIn("glpat-IOSFODNN7EXAMPLE", out[0].body)
 
     async def test_budget_holds_even_when_redaction_expands_the_body(self):
         """Redaction runs BEFORE the cap, so markers cannot push past the budget.
@@ -518,13 +519,13 @@ class TestEvidenceRedaction(unittest.IsolatedAsyncioTestCase):
         model's context, so it has to bound the text actually emitted.
         """
         registry = OpsProviderRegistry()
-        body = " ".join(["AKIAIOSFODNN7EXAMPLE"] * 200)
+        body = " ".join(["glpat-IOSFODNN7EXAMPLE"] * 200)
         registry.register_evidence_source(
             _FakeEvidence("x", [Evidence(source="x", kind="logs", title="t", body=body)])
         )
         out = await registry.gather_evidence(_signal(), EvidenceBudget(max_bytes=1000))
         self.assertLessEqual(len(out[0].body), 1000)
-        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", out[0].body)
+        self.assertNotIn("glpat-IOSFODNN7EXAMPLE", out[0].body)
 
     async def test_config_flag_accepts_what_an_operator_would_type(self):
         """`include_insufficient_data` compared against the literal string "true".
@@ -768,6 +769,71 @@ class TestEvidenceRedaction(unittest.IsolatedAsyncioTestCase):
             "an adapter's gather() must be invoked only from gather_evidence, "
             "which is where redaction happens",
         )
+
+
+class _ThreadRecordingAdapter:
+    """Records which thread ran ``configured()``.
+
+    The real adapters' ``configured()`` reads ``config.json``, checks the secret
+    store and walks ``PATH``, so it must not run on the event-loop thread.
+    """
+
+    def __init__(self, adapter_id: str, ready: bool = True):
+        self.id = adapter_id
+        self.display_name = adapter_id
+        self._ready = ready
+        self.configured_threads: list[int] = []
+
+    def configured(self) -> bool:
+        self.configured_threads.append(threading.get_ident())
+        return self._ready
+
+    async def poll(self) -> list[Signal]:
+        return []
+
+    async def on_shift(self) -> ShiftStatus:
+        return ShiftStatus(on_shift=False)
+
+    async def gather(self, signal: Signal, budget: EvidenceBudget) -> list[Evidence]:
+        return []
+
+
+class TestConfiguredChecksRunOffTheLoop(unittest.IsolatedAsyncioTestCase):
+    """The three fan-outs ask every adapter ``configured()`` on a worker thread."""
+
+    def _assert_off_loop(self, adapter: _ThreadRecordingAdapter) -> None:
+        loop_thread = threading.get_ident()
+        self.assertTrue(adapter.configured_threads, "configured() was never asked")
+        self.assertNotIn(loop_thread, adapter.configured_threads)
+
+    async def test_poll_all_checks_configured_off_the_loop(self):
+        registry = OpsProviderRegistry()
+        ready = _ThreadRecordingAdapter("ready")
+        idle = _ThreadRecordingAdapter("idle", ready=False)
+        registry.register_signal_source(ready)
+        registry.register_signal_source(idle)
+        _signals, errors = await registry.poll_all()
+        self.assertEqual(errors, {})
+        self._assert_off_loop(ready)
+        self._assert_off_loop(idle)
+        # Only the configured source is polled and recorded.
+        self.assertEqual(set(registry.poll_health()), {"ready"})
+
+    async def test_resolve_shift_checks_configured_off_the_loop(self):
+        registry = OpsProviderRegistry()
+        rotation = _ThreadRecordingAdapter("rota")
+        registry.register_rotation_source(rotation)
+        status = await registry.resolve_shift()
+        self.assertFalse(status.on_shift)
+        self.assertFalse(status.unknown)
+        self._assert_off_loop(rotation)
+
+    async def test_gather_evidence_checks_configured_off_the_loop(self):
+        registry = OpsProviderRegistry()
+        evidence = _ThreadRecordingAdapter("logs")
+        registry.register_evidence_source(evidence)
+        self.assertEqual(await registry.gather_evidence(_signal(), EvidenceBudget()), [])
+        self._assert_off_loop(evidence)
 
 
 class _FakeSink:

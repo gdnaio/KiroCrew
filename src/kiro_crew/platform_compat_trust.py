@@ -502,8 +502,16 @@ def traversed_components_and_links(
     return [Path(component) for component in visited], [Path(link) for link in links]
 
 
-def _group_shared_with_another_account(gid: int) -> Optional[str]:
+def _group_shared_with_another_account(gid: int, *, trust_root: bool = False) -> Optional[str]:
     """Why group ``gid`` admits an account other than this one, or ``None`` if it does not.
+
+    When *trust_root* is true, root and the accounts that can become root by
+    default do not count as another account. Root already controls root-owned
+    components accepted by that caller, so group membership adds no writer outside
+    its trust boundary. On macOS the accounts that can become root by default are
+    the members of group ``admin``, because stock sudoers lets them use sudo: its
+    supplementary members and every account whose primary group it is. When that
+    group cannot be read, nobody beyond root counts as trusted.
 
     A group-writable directory is a foreign writer's door only when the GROUP holds
     somebody else. A host with user-private groups leaves ordinary directories
@@ -542,12 +550,31 @@ def _group_shared_with_another_account(gid: int) -> Optional[str]:
         me = pwd.getpwuid(os.geteuid()).pw_name
     except (KeyError, OSError):
         return f"group {entry.gr_name!r}, which cannot be compared to this account"
+    trusted_names = {me}
+    if trust_root:
+        try:
+            trusted_names.add(pwd.getpwuid(0).pw_name)
+        except (KeyError, OSError):
+            return f"group {entry.gr_name!r}, which cannot be compared to root"
+        if sys.platform == "darwin":
+            try:
+                admin = grp.getgrnam("admin")
+                admins = {
+                    name
+                    for g in [admin, *grp.getgrall()]
+                    if g.gr_gid == admin.gr_gid
+                    for name in g.gr_mem
+                }
+                admins |= {p.pw_name for p in pwd.getpwall() if p.pw_gid == admin.gr_gid}
+            except (KeyError, OSError):
+                admins = set()
+            trusted_names |= admins
     try:
         same_gid = [g for g in grp.getgrall() if g.gr_gid == gid]
     except OSError:
         return f"group {entry.gr_name!r}, whose entries this host will not enumerate"
     members = {name for g in [entry, *same_gid] for name in g.gr_mem}
-    supplementary = sorted(members - {me})
+    supplementary = sorted(members - trusted_names)
     if supplementary:
         return f"group {entry.gr_name!r}, shared with {len(supplementary)} other account(s)"
     try:
@@ -556,7 +583,15 @@ def _group_shared_with_another_account(gid: int) -> Optional[str]:
         everyone = []
     if not any(person.pw_name == me for person in everyone):
         return f"group {entry.gr_name!r}, whose membership this host will not enumerate"
-    primary = sorted({p.pw_name for p in everyone if p.pw_gid == gid and p.pw_name != me})
+    primary = sorted(
+        {
+            p.pw_name
+            for p in everyone
+            if p.pw_gid == gid
+            and p.pw_name != me
+            and not (trust_root and (getattr(p, "pw_uid", None) == 0 or p.pw_name in trusted_names))
+        }
+    )
     if primary:
         return f"group {entry.gr_name!r}, the primary group of {len(primary)} other account(s)"
     return None
@@ -573,8 +608,13 @@ _NO_ACL_ERRNOS = frozenset(
 )
 
 
-def _acl_admits_another_account(node: Path, mine: int) -> Optional[str]:
+def _acl_admits_another_account(
+    node: Path, mine: int, *, trust_root: bool = False
+) -> Optional[str]:
     """Why ``node``'s POSIX access ACL lets another account write it, or ``None``.
+
+    When *trust_root* is true, root members of named ACL groups are inside the
+    caller's trust boundary. Named uid 0 entries remain trusted for every caller.
 
     With an extended ACL the mode's group bits show the ACL mask, so a named entry
     can give a peer write access behind a group bit that looks private. Only an
@@ -605,14 +645,24 @@ def _acl_admits_another_account(node: Path, mine: int) -> Optional[str]:
         if tag == _ACL_USER and ident not in (mine, 0):
             return f"an ACL entry for another account (uid {ident})"
         if tag == _ACL_GROUP:
-            shared = _group_shared_with_another_account(ident)
+            shared = (
+                _group_shared_with_another_account(ident, trust_root=True)
+                if trust_root
+                else _group_shared_with_another_account(ident)
+            )
             if shared is not None:
                 return f"an ACL entry for {shared}"
     return None
 
 
-def group_write_admits_another_account(path: Path, gid: int) -> Optional[str]:
+def group_write_admits_another_account(
+    path: Path, gid: int, *, trust_root: bool = False
+) -> Optional[str]:
     """Whom the group write bit on *path* admits besides this account, or ``None``.
+
+    When *trust_root* is true, membership of root and of the accounts that can
+    become root by default, on macOS the ``admin`` group's members, does not count
+    as another account. The default preserves the trust policy used by existing callers.
 
     *gid* is the group *path* belongs to, its ``st_gid``. ``None`` means the bit
     admits this account alone, so a trust question may count it as the owner's own
@@ -640,6 +690,9 @@ def group_write_admits_another_account(path: Path, gid: int) -> Optional[str]:
     the link rule runs only on Linux.
     """
     mine = os.geteuid()
+    if trust_root:
+        acl = _acl_admits_another_account(path, mine, trust_root=True)
+        return acl or _group_shared_with_another_account(gid, trust_root=True)
     return _acl_admits_another_account(path, mine) or _group_shared_with_another_account(gid)
 
 
@@ -807,6 +860,41 @@ def trusted_system_path() -> str | None:
     return os.pathsep.join(_TRUSTED_SYSTEM_BIN_DIRS)
 
 
+def desktop_launcher_available() -> bool:
+    """Whether this host can open a file manager right now.
+
+    :func:`reveal_in_file_manager` and :func:`open_with_default_app` answer
+    ``False`` without spawning anything when this does, so ``/api/reveal`` can
+    only answer a clipboard copy there. That is the ordinary state of a headless
+    Linux host, which is also where a browser reaching the gateway through an
+    ``ssh -L`` tunnel lands while still counting as direct-local. The dashboard asks
+    this first so it does not offer a "Show in file manager" that can only copy.
+
+    The launcher must be present, and off macOS and Windows it must also have a
+    desktop session to open into: ``xdg-open`` hands the folder to whatever the
+    running session registered, which shows nothing unless the environment the
+    spawn inherits (:func:`_reveal_env` keeps it) names a display server. Both are
+    facts about this gateway process; no request decides either.
+
+    The launchers ask this same function, so the dashboard's answer and what a
+    click does cannot drift. It reports readiness, not a launch: a launcher that
+    is installed but refuses to run still answers ``True`` here, and its click
+    still degrades. On Windows it names the reveal's launcher; the open verb is
+    refused there whatever this says, and the dashboard already hides it on that
+    platform.
+    """
+
+    if sys.platform == "darwin":
+        return os.path.isfile("/usr/bin/open")
+    if IS_WINDOWS:
+        return os.path.isfile(r"C:\Windows\explorer.exe")
+    # The display servers a launcher reaches a desktop session through, X11 and
+    # Wayland; an empty value names neither.
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    return os.path.isfile("/usr/bin/xdg-open")
+
+
 def reveal_in_file_manager(target: str) -> bool:
     """Show *target* in the host's file manager. ``True`` if a launcher started.
 
@@ -836,14 +924,17 @@ def reveal_in_file_manager(target: str) -> bool:
 
     A launcher that is absent (or present and refusing to run — AppLocker, a
     revoked exec bit, an exhausted process table) returns ``False`` so the caller
-    can degrade rather than fail the request.
+    can degrade rather than fail the request. So does a host with nothing to open
+    into (no launcher, or on Linux no desktop session): that is
+    :func:`desktop_launcher_available`, the same answer the dashboard reads to
+    decide whether to offer the action at all.
     """
 
     env = _reveal_env()
+    if not desktop_launcher_available():
+        return False
     try:
         if sys.platform == "darwin":
-            if not os.path.isfile("/usr/bin/open"):
-                return False
             subprocess.Popen(["/usr/bin/open", "-R", target], env=env)
             return True
         # Everything else opens the CONTAINING FOLDER, never the target itself —
@@ -858,12 +949,8 @@ def reveal_in_file_manager(target: str) -> bool:
             # A literal, so the command position stays constant. The conventional
             # location is not universal, so an image that keeps Windows elsewhere
             # reads as "no file manager here" rather than spawning something else.
-            if not os.path.isfile(r"C:\Windows\explorer.exe"):
-                return False
             subprocess.Popen([r"C:\Windows\explorer.exe", folder], env=env)
             return True
-        if not os.path.isfile("/usr/bin/xdg-open"):
-            return False
         subprocess.Popen(["/usr/bin/xdg-open", folder], env=env)
         return True
     except OSError:
@@ -873,7 +960,7 @@ def reveal_in_file_manager(target: str) -> bool:
         return False
 
 
-def open_with_default_app(target: str) -> bool:
+def open_with_default_app(target: str, *, wait_for_exit: float | None = None) -> bool:
     """Launch *target* with its associated application. ``True`` if it started.
 
     Separate from :func:`reveal_in_file_manager` because it is the opposite
@@ -882,26 +969,38 @@ def open_with_default_app(target: str) -> bool:
     through the shell rather than an argv the caller can inspect, and the path
     typically arrives from a request. POSIX keeps it: ``open`` / ``xdg-open`` hand
     the file to the desktop's handler without a shell in between.
+
+    By default the launcher is not waited on, so ``True`` means only that it
+    started. With *wait_for_exit* (seconds) the launcher's exit status decides:
+    ``/usr/bin/open`` exits non-zero when no application handles the target, and
+    ``xdg-open`` exits 3 or 4 when no handler is registered. A launcher still
+    running at the deadline counts as launched, because ``xdg-open``'s generic
+    path runs the application in the foreground.
     """
 
     if IS_WINDOWS:
         return False
     env = _reveal_env()
+    # Off Windows the default-application launcher IS the file manager's (`open`
+    # on macOS, `xdg-open` elsewhere), and it needs the same desktop session.
+    if not desktop_launcher_available():
+        return False
     try:
         if sys.platform == "darwin":
-            if not os.path.isfile("/usr/bin/open"):
-                return False
-            subprocess.Popen(["/usr/bin/open", target], env=env)
-            return True
-        if not os.path.isfile("/usr/bin/xdg-open"):
-            return False
-        subprocess.Popen(["/usr/bin/xdg-open", target], env=env)
-        return True
+            proc = subprocess.Popen(["/usr/bin/open", target], env=env)
+        else:
+            proc = subprocess.Popen(["/usr/bin/xdg-open", target], env=env)
     except OSError:
         logger.warning(
             "default application did not start for %s; caller should degrade", target, exc_info=True
         )
         return False
+    if wait_for_exit is None:
+        return True
+    try:
+        return proc.wait(timeout=wait_for_exit) == 0
+    except subprocess.TimeoutExpired:
+        return True
 
 
 def _reveal_env() -> dict[str, str]:

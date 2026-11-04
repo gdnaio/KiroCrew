@@ -806,8 +806,7 @@ class TestOneEnforcementPointForEnumeratedReads:
     """Guard: both readers go through the choke point, and neither reads directly.
 
     Hardening the body read alone would leave the metadata read of the same cached
-    paths unchecked, which is how a reviewer found the sibling instead of a test.
-    This fails the build if they drift apart again.
+    paths unchecked. This fails the build if they drift apart.
     """
 
     def test_enumerated_readers_route_through_the_choke_point(self):
@@ -1147,6 +1146,26 @@ class TestTriggeredProjectSkillsReachThePrompt:
         # Defense in depth: even a caller that bypasses the split cannot render
         # a project path for the agent to follow outside the confined reader.
         assert loader.trigger_hint(["deploys"], project) == ""
+
+    def test_ownership_never_reads_a_project_skill_unconfined(self, project, tmp_path, monkeypatch):
+        """A repository's skill belongs to its repository, so the disabled-app check
+        must not read its frontmatter: that read would be unconfined."""
+        import kiro_crew.apps.manager as mgr
+
+        loader = self._project_with_triggered_skill(project, tmp_path, inject=True)
+        skill_md = project / ".kiro" / "skills" / "deploys" / "SKILL.md"
+        text = skill_md.read_text(encoding="utf-8")
+        skill_md.write_text(text.replace("name: deploys\n", "name: deploys\napp: papyrus\n"))
+        monkeypatch.setattr(mgr, "list_apps", lambda: [{"name": "papyrus", "enabled": False}])
+        unconfined = []
+        vet = loader._vet_unconfined_path
+        monkeypatch.setattr(
+            loader, "_vet_unconfined_path", lambda path: unconfined.append(path) or vet(path)
+        )
+
+        triggered = loader.get_triggered_skills("please deploy the release", project_dir=project)
+
+        assert (triggered, unconfined) == (["deploys"], [])
 
     def test_an_untrusted_project_skill_still_contributes_nothing(self, tmp_path):
         """Wiring the project through must not bypass consent."""

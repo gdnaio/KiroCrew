@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import agent as agent_mod
-from kiro_crew import agent_discovery
+from kiro_crew import agent_discovery, template_mcp_additions
 from kiro_crew.agent_files import CONDUCTOR_AGENT_FILENAME as _CONDUCTOR_AGENT_FILENAME
 from kiro_crew.agent_files import (
     LEDGER_CONDUCTOR_AGENT_FILENAME as _LEDGER_CONDUCTOR_AGENT_FILENAME,
@@ -98,6 +98,27 @@ def _conductor_mcp_servers(config: dict[str, Any]) -> dict[str, Any]:
     return narrowed
 
 
+def _merge_template_additions(config: dict[str, Any], name: str) -> None:
+    """Add the servers the user approved for the *name* template to *config*.
+
+    Called right after ``_conductor_mcp_servers`` on every conductor spec. That map
+    is rebuilt to exactly the Crew servers on every pass, so an approved server
+    cannot live in the spec file; it lives in :mod:`kiro_crew.template_mcp_additions`
+    and is merged here, ADD-only, with its ``@server`` mount in ``tools``. Nothing
+    from the record reaches ``allowedTools`` or ``autoApprove``: the added server's
+    tools prompt until the user grants them, and any grant still passes the
+    ceiling in ``auto_approve.write_governed_spec``. The deprecated alias reads its
+    successor's record (it emits the same spec).
+    """
+    added = template_mcp_additions.merge_into_spec(name, config)
+    if added:
+        agent_mod.logger.info(
+            "%s: merged approved MCP server(s) %s from the template additions record",
+            name,
+            ", ".join(added),
+        )
+
+
 # -- Every grant any release has shipped on the four conductor specs -------------
 #
 # THIS TABLE IS THE PROVENANCE. A generated conductor spec is rewritten on every
@@ -144,9 +165,11 @@ _HISTORY_CORE_VERBS: frozenset[str] = frozenset(
         "@kirocrew-core/nothing_to_do",
     }
 )
-# The dashboard verbs every conductor ships: the folder/session reads and creates,
+# The dashboard verbs every conductor shipped: the folder/session reads and creates,
 # and ``session_status``. ``chat_folder_file_self`` is listed per spec below: the
-# pipeline conductor has never shipped it.
+# pipeline conductor never shipped it. The three folder verbs are retired: a
+# dispatcher stops managing folders (rfc-crewmate-workers-under-the-crewmate.md,
+# Design 6), and the history is what lets an existing install drop them.
 _HISTORY_DASHBOARD_VERBS: frozenset[str] = frozenset(
     {
         "@kirocrew-dashboard/chat_folder_tree",
@@ -673,13 +696,19 @@ def _conductor_spec(
     # The charter already states the work-ledger flow in detail, so the shared
     # protocol block (``_conductor_prompt``) is not appended here.
     config["prompt"] = agent_mod._CONDUCTOR_SYSTEM_PROMPT
-    # The two skills this prompt names: ``goal-conductor`` carries the operating
-    # procedure it says to read first, and ``dashboard`` is how it changes the page
-    # it reports on. Mapped rather than assumed reachable: this spec is a custom
-    # template, so with no mapping its search scope is empty and neither document
-    # can be found. The alias installer emits this same body, so the alias carries
-    # the mapping too.
-    skill_resources.map_prompt_skills(config, "goal-conductor", "dashboard")
+    # The skills this prompt names: ``goal-conductor`` carries the operating
+    # procedure it says to read first, ``dashboard`` is how it changes the page
+    # it reports on, and ``widgets`` / ``living-ui`` / ``artifacts`` are how it
+    # draws the introduction and the board in the dashboard chat: the widget
+    # pointer its contract block carries on that surface
+    # (``context_assembly.agent_spec.WIDGET_BLOCK_AGENTS``) names ``widgets`` and
+    # ``artifacts``, and ``widgets`` sends a moving picture on to ``living-ui``.
+    # Mapped rather than assumed reachable: this spec is a custom template, so with
+    # no mapping its search scope is empty and no document can be found. The alias
+    # installer emits this same body, so the alias carries the mapping too.
+    skill_resources.map_prompt_skills(
+        config, "goal-conductor", "dashboard", "widgets", "living-ui", "artifacts"
+    )
     config["tools"] = [
         "execute_bash",
         "fs_read",
@@ -695,7 +724,7 @@ def _conductor_spec(
         "report",
         # Load-bearing, not decoration: with MCP Tool Search active the
         # session-control specs are deferred, so the conductor cannot reach
-        # ``session_create`` / ``chat_folder_*`` / ``monitor_start`` at all until
+        # ``session_create`` / ``monitor_start`` at all until
         # it loads them by id. Named in the prompt's tool inventory for that
         # reason, and auto-approved below so the load itself never prompts.
         "tool_search",
@@ -732,6 +761,7 @@ def _conductor_spec(
         return None
     config["allowedTools"] = granted
     config["mcpServers"] = _conductor_mcp_servers(config)
+    _merge_template_additions(config, name)
     # The KAS policy is NOT written here: the shared tail each installer writes
     # through (``auto_approve.write_governed_spec``) derives it from the FILTERED
     # grant list instead of restating it as a literal, so the rules come out
@@ -905,6 +935,7 @@ def _install_pipeline_conductor_agent(*, clean: bool = False) -> bool:
         return False
     config["allowedTools"] = granted
     config["mcpServers"] = _conductor_mcp_servers(config)
+    _merge_template_additions(config, "kirocrew-pipeline-conductor")
     agent_mod.kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
     path = agent_mod.kiro_agents_dir_path() / _PIPELINE_CONDUCTOR_AGENT_FILENAME
     # The shared tail derives the KAS policy from the filtered grant list, on the
@@ -993,6 +1024,7 @@ def _install_security_conductor_agent(*, clean: bool = False) -> bool:
         return False
     config["allowedTools"] = granted
     config["mcpServers"] = _conductor_mcp_servers(config)
+    _merge_template_additions(config, "kirocrew-security-conductor")
     agent_mod.kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
     path = agent_mod.kiro_agents_dir_path() / _SECURITY_CONDUCTOR_AGENT_FILENAME
     # The shared tail derives the KAS policy from the FILTERED grant list rather

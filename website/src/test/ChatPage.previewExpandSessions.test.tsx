@@ -16,7 +16,7 @@ import { createTestStore } from './helpers'
 import type { ChatSlot } from '../types'
 import { ThemeProvider } from '../hooks/useTheme'
 import { __resetPanelTabs } from '../hooks/usePanelTabs'
-import { sseSlots } from '../store/dashboardSlice'
+import { sseSlots, fetchSlots } from '../store/dashboardSlice'
 import { toggleActivity } from '../store/chatSlice'
 
 vi.mock('react-virtuoso', () => ({ Virtuoso: () => null }))
@@ -60,17 +60,11 @@ vi.mock('../hooks/useVoiceInput', () => ({ useVoiceInput: () => ({ recording: fa
 // cannot move it. Mock the hook with a mutable flag instead.
 let mockIsMobile = false
 vi.mock('../hooks/useIsMobile', () => ({ useIsMobile: () => mockIsMobile }))
+// Every read the page issues (this mock and `fetch` below) stays pending. These tests are about the
+// sessions toggle, which reads the store; a read that settled would only update the page after the
+// test's last assertion, and its retries keep coming for seconds, so there is no state to wait for.
 vi.mock('../api/client', () => ({
-  api: Object.fromEntries(
-    ['sessions', 'chatSlotDetail', 'createChatSlot', 'deleteChatSlot', 'resumeChatSlot',
-      'deleteSession', 'agentDetail', 'approveChatSlot', 'chatSlotAgent', 'chatSlotModel',
-      'chatSlotWorkspace', 'models', 'planFromChat', 'renameSlot',
-      'resolveApproval', 'screenshot', 'slackChannels', 'slackLink', 'spawnList',
-      'stopChatSlot', 'uploadFiles', 'voiceSynthesize', 'workspaces', 'chatSlots',
-      'notifications', 'status', 'generateTitle'].map(k => [k, vi.fn().mockResolvedValue(
-      k === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 } : {},
-    )]),
-  ),
+  api: new Proxy({}, { get: () => vi.fn(() => new Promise(() => {})) }),
 }))
 
 Object.defineProperty(window, 'matchMedia', {
@@ -81,7 +75,7 @@ Object.defineProperty(window, 'matchMedia', {
     addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
   })),
 })
-globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({}) }) as unknown as typeof fetch
+globalThis.fetch = vi.fn(() => new Promise(() => {})) as unknown as typeof fetch
 globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} } as unknown as typeof ResizeObserver
 
 import ChatPage from '../pages/ChatPage'
@@ -90,14 +84,14 @@ const setExpanded = (expanded: boolean) => act(() => {
   window.dispatchEvent(new CustomEvent('kirocrew-preview-expand', { detail: { expanded } }))
 })
 
-function renderChat({ slots = 1, strict = false }: { slots?: number; strict?: boolean } = {}) {
+function renderChat({ slots = 1, strict = false, loaded = true }: { slots?: number; strict?: boolean; loaded?: boolean } = {}) {
   const store = createTestStore()
   // The sessions toggle only renders when there is a session to show.
-  act(() => {
-    store.dispatch(sseSlots(
-      Array.from({ length: slots }, (_, i) => ({ key: `slot-${i}`, title: `Session ${i}` }) as unknown as ChatSlot),
-    ))
-  })
+  // An empty push frame before the first list is ignored as "not loaded yet",
+  // so an empty list lands the way a cold boot's REST snapshot does.
+  const rows = Array.from({ length: slots }, (_, i) => ({ key: `slot-${i}`, title: `Session ${i}` }) as unknown as ChatSlot)
+  // `loaded: false` mounts the page before any list has arrived, as a refresh does.
+  if (loaded) act(() => { store.dispatch(rows.length ? sseSlots(rows) : fetchSlots.fulfilled([], 'req')) })
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   const tree = (
     <QueryClientProvider client={queryClient}>
@@ -173,10 +167,8 @@ describe('ChatPage — sessions toggle inside preview expand mode', () => {
   })
 
   it('does not let expand mode overwrite the stored preference when the list drains to empty', () => {
-    // The force-open rule persists 'true' whenever the list is empty and
-    // unpinned. Expand mode also unpins, so without the guard, draining the list
-    // to zero inside expand mode would write 'true' over a user who chose
-    // hidden — and the restore on exit would then contradict it in the live state.
+    // Expand mode unpins the list, so draining it to zero there must neither
+    // fight the auto-hide nor write over a user who chose hidden.
     const store = renderChat()
     fireEvent.click(screen.getByRole('button', { name: 'Hide sessions sidebar' }))
     expect(localStorage.getItem('mc-sidebar-pinned')).toBe('false')
@@ -186,8 +178,10 @@ describe('ChatPage — sessions toggle inside preview expand mode', () => {
     expect(localStorage.getItem('mc-sidebar-pinned')).toBe('false')
 
     setExpanded(false)
-    // Out of expand mode the empty list is the force-open rule's business again.
-    expect(localStorage.getItem('mc-sidebar-pinned')).toBe('true')
+    // Out of expand mode the empty list is the force-open rule's business again,
+    // and that open is live only: the stored choice is not rewritten.
+    expect(screen.getByTestId('sessions-drawer')).toBeInTheDocument()
+    expect(localStorage.getItem('mc-sidebar-pinned')).toBe('false')
   })
 
   it('stops maximizing the panel once the user reopens the session list', async () => {
@@ -224,6 +218,35 @@ describe('ChatPage — sessions toggle inside preview expand mode', () => {
 
     setExpanded(false)
     expect(screen.getByTestId('sessions-drawer')).toBeInTheDocument()
+  })
+})
+
+describe('ChatPage — a hidden session list survives a page refresh', () => {
+  beforeEach(() => {
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1400 })
+    localStorage.clear()
+    __resetPanelTabs()
+  })
+
+  it('keeps the list hidden while the first slot list is still on its way', () => {
+    // A refresh mounts with an empty, not-yet-loaded list. That is not "no
+    // sessions", so the force-open rule must not open the list or store 'true'.
+    localStorage.setItem('mc-sidebar-pinned', 'false')
+    const store = renderChat({ slots: 0, loaded: false })
+    expect(screen.queryByTestId('sessions-drawer')).not.toBeInTheDocument()
+    expect(localStorage.getItem('mc-sidebar-pinned')).toBe('false')
+
+    act(() => { store.dispatch(sseSlots([{ key: 'slot-0', title: 'Session 0' } as unknown as ChatSlot])) })
+    expect(screen.queryByTestId('sessions-drawer')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Show sessions sidebar' })).toBeInTheDocument()
+    expect(localStorage.getItem('mc-sidebar-pinned')).toBe('false')
+  })
+
+  it('still opens the list for a loaded empty list without storing the open', () => {
+    localStorage.setItem('mc-sidebar-pinned', 'false')
+    renderChat({ slots: 0 })
+    expect(screen.getByTestId('sessions-drawer')).toBeInTheDocument()
+    expect(localStorage.getItem('mc-sidebar-pinned')).toBe('false')
   })
 })
 

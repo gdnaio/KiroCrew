@@ -12,7 +12,7 @@ ledger nobody read. Two pieces close the gap:
   (``autonudge_authz.authorize_and_add_nudge``). A loop the system stopped
   counts as none and is replaced; an active loop is never displaced or
   stacked; a loop a person stopped is kept and the arm is refused with
-  ``user-stopped``. A refusal is logged at WARNING and never fails the bind.
+  ``user-stopped``. A refusal is logged at WARNING and never fails the bind; the shutdown refusal a dispatch racing the gateway's teardown meets is logged at DEBUG instead.
   The loop is tagged ``default_patrol``: the conductor's own later
   ``monitor_start`` replaces it rather than meeting a 409.
 * :func:`has_active_patrol` -- read by ``work_ledger_read`` to flag each open
@@ -23,9 +23,17 @@ Provenance: the arm is EXTERNAL -- no ``initiator_slot_key``. The bind route
 knows which session called it, not which turn: a cron injection, an app-driven
 turn or a sub-agent sharing the slot sends the same ``X-Session-Key`` as the
 session's own turn, and only the session-directive consumer can tell them apart.
-So a crew/member conductor's slot refuses this arm as it refuses any outside
-arm; the refusal is logged and the ``unpatrolled`` flag carries the signal.
-The armed message is fixed text authored here, not agent input.
+So a crew conductor's slot refuses this arm as it refuses any outside arm; the
+refusal is logged and the ``unpatrolled`` flag carries the signal.
+
+A crewmate's (``member``) thread is the one exception, and only for this arm:
+when the dispatch route ATTESTS its caller (:func:`attested_caller_slot`: the
+transport vouches for the session key and the session's execution record is a
+member's) and the slot is that caller's own thread, the authorizer admits this
+fixed patrol and nothing else (``autonudge_authz.admits_member_default_patrol``).
+A turn sharing the thread can still make the dispatch call, so the arm carries
+no agent input: the message, the watch and the bounds are fixed text and numbers
+authored here.
 """
 
 from __future__ import annotations
@@ -42,6 +50,10 @@ PATROL_MAX_CYCLES = 300
 PATROL_MAX_RUNTIME_SECS = 86400
 
 PATROL_WATCH = "work-ledger"
+
+#: The ``caller`` this module arms under, and the only one a member slot admits
+#: as an outside arm.
+PATROL_CALLER = "conductor-patrol"
 
 PATROL_MESSAGE = (
     "Conductor patrol (armed by the gateway when you dispatched work and had no "
@@ -116,6 +128,62 @@ def nudge_slot_for(state: Any, conductor_key: str) -> str | None:
     except Exception:  # noqa: BLE001 - a slot-table read must not fail the caller
         logger.debug("slot lookup failed for %s", key, exc_info=True)
         return None
+
+
+def is_fixed_patrol_payload(loop: Any) -> bool:
+    """Whether a stored *loop* still carries exactly the fixed default patrol.
+
+    The fire-time guard reads this before a default-patrol grant admits a wake on
+    a crewmate's thread: the loop store is agent-writable, so the grant covers the
+    fixed text and watch it was given for, not whatever the row holds later. Every
+    field a wake's text or subject is built from must be the fixed one.
+    """
+    monitor = getattr(loop, "monitor", None)
+    return (
+        getattr(loop, "default_patrol", False) is True
+        # Gated, as armed: an ungated row would hand delivery to the structured
+        # monitor controller, whose envelope carries text this grant never covered.
+        and getattr(loop, "gate", False) is True
+        and getattr(loop, "message", None) == PATROL_MESSAGE
+        and not getattr(loop, "banner", "")
+        and not getattr(loop, "judge", None)
+        and monitor is not None
+        and getattr(monitor, "kind", None) == PATROL_WATCH
+        and not getattr(monitor, "wake_instructions", "")
+    )
+
+
+async def attested_caller_slot(request: Any, state: Any) -> str:
+    """The binding key of the member thread this dispatch request comes from, or "".
+
+    Answers non-blank only when both hold:
+
+    * the transport attests the request's ``X-Session-Key`` (the Unix-socket peer
+      check or the signed per-session token, ``member_memory_auth.session_key_is_attested``),
+      read through ``member_request_scope`` -- the header alone is never enough;
+    * that session's execution record names a member (``selection_kind == "member"``).
+
+    The answer is derived from the attested session alone, not from the ledger the
+    route wrote to. ``admits_member_default_patrol`` then compares it with the
+    patrol's target slot, so the patrol lands only on the caller's own thread.
+    Never raises: any failure is "".
+    """
+    try:
+        from kiro_crew import session_ledger
+        from kiro_crew.dashboard.handlers._shared import member_request_scope
+
+        scope = await member_request_scope(request)
+        execution = scope.execution
+        if not scope.verified or not scope.session or execution is None:
+            return ""
+        if getattr(execution, "selection_kind", "") != "member":
+            return ""
+        # Derived from the ATTESTED session alone, never from *conductor_key*, so the
+        # authorizer's own-thread check compares two independent values.
+        return nudge_slot_for(state, session_ledger.ledger_key(scope.session)) or ""
+    except Exception:  # noqa: BLE001 - an unattested caller is simply not admitted
+        logger.debug("patrol caller attestation failed", exc_info=True)
+        return ""
 
 
 def _stopped_row_is_replaceable(loop: Any) -> bool:
@@ -206,6 +274,7 @@ async def ensure_patrol(
     *,
     has_ledger: bool = True,
     source: str = "work-ledger-bind",
+    attested_caller: str = "",
 ) -> tuple[str, str]:
     """Leave the conductor's slot with a work-ledger patrol, or say why not.
 
@@ -223,6 +292,10 @@ async def ensure_patrol(
     A caller with no work ledger (*has_ledger* False, which the caller reads
     through the store's own route seam) gets nothing armed (``no-ledger``): the
     watch would read nothing and fire on its timer for a day.
+
+    *attested_caller* is what :func:`attested_caller_slot` answered for the
+    dispatch request, or "". It lets a crewmate's own thread take this patrol;
+    any other slot ignores it.
 
     Never raises: every failure is logged and answered as an outcome, because
     the dispatch that called this has already committed.
@@ -256,6 +329,7 @@ async def ensure_patrol(
             rearm = True
         from kiro_crew.autonudge import is_channel_key
         from kiro_crew.autonudge_authz import authorize_and_add_nudge
+        from kiro_crew.autonudge_service.model import SERVICE_SHUTTING_DOWN_MESSAGE
         from kiro_crew.monitoring.models import MonitorCreationSurface
 
         _armed, error, status = await authorize_and_add_nudge(
@@ -270,7 +344,7 @@ async def ensure_patrol(
             gate=True,
             # The audit tag: which dispatch route armed this patrol.
             source=source,
-            caller="conductor-patrol",
+            caller=PATROL_CALLER,
             # Create-only: a loop that appeared since the read above wins, and
             # nothing is ever stacked beside it. Stopped-row displacement only for
             # the system-stopped row above.
@@ -279,6 +353,9 @@ async def ensure_patrol(
             # The tag that lets the conductor's own ``monitor_start`` replace this
             # loop instead of meeting a 409 (``NudgeLoop.default_patrol``).
             default_patrol=True,
+            # Admits this arm on the caller's OWN member thread only; "" (any
+            # caller the route could not attest) admits nothing extra.
+            attested_caller_slot_key=attested_caller,
             creation_surface=(
                 MonitorCreationSurface.CHANNEL
                 if is_channel_key(slot)
@@ -289,6 +366,18 @@ async def ensure_patrol(
         logger.warning("conductor patrol arm failed for %s", conductor_key, exc_info=True)
         return REFUSED, REASON_ARM_FAILED
     if error is not None:
+        if (
+            status == 503
+            and error == SERVICE_SHUTTING_DOWN_MESSAGE
+            and getattr(svc, "accepting_mutations", True) is False
+        ):
+            # The gateway is shutting down: ``add`` returned its canonical admission
+            # refusal after closure. Other 503s (audit or credential outages) remain
+            # warnings even when they race the same closed-admission window.
+            logger.debug(
+                "conductor patrol not armed for %s: auto-nudge is shutting down", conductor_key
+            )
+            return REFUSED, _refusal_reason(state, slot, status)
         logger.warning(
             "conductor patrol arm refused for %s: %s [status %s]", conductor_key, error, status
         )

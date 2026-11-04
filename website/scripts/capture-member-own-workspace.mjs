@@ -28,7 +28,7 @@ const OUT = process.argv[3] || '../temp-screenshots/member-own-workspace'
 mkdirSync(OUT, { recursive: true })
 
 const OWN = 'Its own workspace (created automatically)'
-const HINT = 'Pick an existing workspace only to share files with another crewmate.'
+const HINT = 'Pick an existing workspace only to share files with another mate.'
 
 // A crewmate created by the new path: its record names the workspace the
 // server allocated for it.
@@ -89,7 +89,7 @@ async function newPage(theme, scene, viewport = { width: 1440, height: 1100 }) {
   await page.waitForSelector('[data-capture-root]')
   // With a thread open (`done`) the roster heading is hidden; its header is the ready signal.
   if (scene === 'done') await page.getByTestId('member-thread-header').waitFor()
-  else await page.getByText('Crewmates', { exact: true }).first().waitFor()
+  else await page.getByText('Mates', { exact: true }).first().waitFor()
   return page
 }
 
@@ -116,7 +116,7 @@ for (const theme of ['dark', 'light']) {
     const page = await newPage(theme, 'empty')
     const dlg = await openDialog(page)
     await dlg.getByLabel('Name').fill('Radar')
-    await dlg.getByLabel('What it looks after').fill('Triage new GitHub issues every morning')
+    await dlg.getByLabel('Goal', { exact: true }).fill('Triage new GitHub issues every morning')
     await dlg.getByTestId('crewmate-create-advanced-toggle').click()
     const adv = dlg.getByTestId('crewmate-create-advanced')
     await adv.waitFor()

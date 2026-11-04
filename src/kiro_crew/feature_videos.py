@@ -20,15 +20,13 @@ That makes ELIGIBILITY deterministic:
   asset, or a hosted clip the background pass has downloaded and sha256-verified.
   Nothing the browser plays has bytes this gateway did not check first.
 
-WHICH of several equally-eligible clips gets shown is RANDOM (:func:`select_next`).
-Not because order starves a clip — it does not, since a verdict is permanent and
-each launch retires the clip it showed, so a fixed order reaches the whole library
-too. The draw is about the LIBRARY rather than one install: publication order is
-the same for everyone, so a deterministic pick shows every install the same first
-clip, and the newest entry is the last thing anybody sees. Drawing uniformly
-spreads first impressions across the set, which is what makes early feedback on a
-new clip arrive at all. Nothing about ELIGIBILITY is random, so a video the user
-has retired, or one for a feature they already use, still cannot appear.
+The one place a clip is shown is the video card at the top of the dashboard's
+Explore panel. ``GET /api/feature-videos/library`` lists every eligible clip, and
+the card draws one of them at random and keeps that pick for the page session.
+Random, because publication order is the same for
+everyone: a fixed pick would show every install the same first clip. Nothing about
+ELIGIBILITY is random, so a video the user has retired, or one for a feature they
+already use, still cannot appear.
 
 Both statuses a user can record (``seen`` / ``dismissed``) are PERMANENT. There
 is no snooze, because a feature intro is not a recurring nudge: once it has been
@@ -41,10 +39,10 @@ same-origin. There is deliberately no third shape: handing the browser a CDN url
 would play bytes the sha256 pin never saw and follow redirects the gateway's own
 opener refuses, so an uncached hosted clip is simply not offered until the
 download pass has landed it. A verified manifest REPLACES the bundled catalog
-(:func:`_offer_pool`), so on the launch where a manifest has arrived but no clip
-has landed yet, nothing is offered: the download runs in the background, and the
-next launch shows what it landed. That is the deliberate trade — one quiet launch,
-never a clip whose bytes this gateway did not check.
+(:func:`eligible_offers`), so while a manifest has arrived but no clip has landed
+yet, nothing is offered: the download runs in the background, and the card shows
+what it landed once it has. That is the deliberate trade — a short wait, never a
+clip whose bytes this gateway did not check.
 """
 
 from __future__ import annotations
@@ -54,11 +52,12 @@ import json
 import logging
 import math
 import os
-import random
+import re
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -67,8 +66,9 @@ from aiohttp import web
 import kiro_crew
 from kiro_crew import feature_videos_cache as cache_mod
 from kiro_crew import feature_videos_manifest as manifest_mod
+from kiro_crew.agent_files import ASSISTANT_MEMBER_NAME
 from kiro_crew.apps.version import parse_version
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, read_bytes_with_retry, replace_with_retry
 from kiro_crew.config.loader import KiroCrewConfig, config_local_path, config_path, read_config_text
 from kiro_crew.config.paths import config_dir
 from kiro_crew.dashboard.handlers._shared import (
@@ -76,6 +76,7 @@ from kiro_crew.dashboard.handlers._shared import (
     _is_restricted_session,
     read_bounded_json,
 )
+from kiro_crew.platform_compat import restrict_to_owner
 from kiro_crew.sel import sel
 from kiro_crew.tips_allowlist import TIP_DOC_ALLOWLIST
 
@@ -206,6 +207,12 @@ def validate_asset_path(value: object) -> str:
     return ""
 
 
+#: A dashboard-internal route a milestone starter opens (``milestones.py``):
+#: lowercase path segments and an optional flat query. No scheme, host, ``//`` or
+#: ``..``, so a catalog value can only move the user inside this dashboard.
+_CTA_ROUTE_RE = re.compile(r"(/[a-z0-9-]+)+(\?[a-z0-9_-]+=[a-z0-9_-]+(&[a-z0-9_-]+=[a-z0-9_-]+)*)?")
+
+
 def _entry_is_valid(entry: VideoEntry) -> bool:
     """Whether *entry* is safe to offer. Logs the reason when it is not."""
     reason = ""
@@ -297,13 +304,12 @@ def offerable() -> tuple[VideoEntry, ...]:
     """The entries that may be SHOWN: valid, and with both media files on disk.
 
     "Asset shipped" is a precondition of "on offer", enforced here rather than
-    trusted to the client. The dialog opens on the JSON answer alone and its
-    ``<video>`` is ``preload="none"``, so nothing is fetched -- and no media error
-    can fire -- until the user presses play. An entry whose clip is not shipped
-    would therefore open a dialog around a blank player, and the natural "Got it"
-    writes a PERMANENT verdict, retiring the real intro before anyone saw it.
-    Dropping such an entry here keeps it on offer for the launch after its clip
-    lands, which is the recoverable outcome.
+    trusted to the client. The Explore card shows on the JSON answer alone and
+    fetches nothing until the user presses Watch. An entry whose clip is not
+    shipped would show a card around a blank player, and the natural Close writes
+    a PERMANENT verdict, retiring the real clip before anyone saw it. Dropping such
+    an entry here keeps it on offer once its clip lands, which is the recoverable
+    outcome.
     """
     kept: list[VideoEntry] = []
     for entry in catalog():
@@ -376,6 +382,16 @@ def _probe_artifacts_nonempty() -> bool:
     return False
 
 
+def _probe_mate_missing() -> bool:
+    """True when the first Mate is gone from the roster.
+
+    The milestone rows that open Mate's chat read this (``available_when``): an
+    operator who deleted Mate (it is never re-created) would be sent to a roster
+    notice about a member that is gone. The deletion itself is left alone.
+    """
+    return ASSISTANT_MEMBER_NAME not in KiroCrewConfig.load().agents
+
+
 def _probe_sel_event_seen(tool_name: str) -> bool:
     """True when the audit log carries a recent row naming *tool_name*.
 
@@ -389,6 +405,117 @@ def _probe_sel_event_seen(tool_name: str) -> bool:
             continue
         if row.get("operation") == tool_name:
             return True
+    return False
+
+
+#: Terminal execution outcomes only: permission grants and invocation starts do
+#: not establish that the feature was used successfully.
+_SEL_OK_OUTCOMES = frozenset({"completed", "success"})
+
+
+def _probe_sel_event_ok(tool_name: str) -> bool:
+    """True only for a terminal execution success, never a permission decision.
+
+    Milestone backfill must not credit an approved, started, denied or failed call
+    as a feature the user successfully used.
+    """
+    if not tool_name:
+        return False
+    for row in sel().recent(limit=_SEL_PROBE_LIMIT):
+        if not isinstance(row, dict):
+            continue
+        if row.get("operation") == tool_name and row.get("outcome") in _SEL_OK_OUTCOMES:
+            return True
+    return False
+
+
+def _probe_sel_directive_ok(tool_name: str) -> bool:
+    """True when the audit log carries a session directive *tool_name* that applied.
+
+    For directive tools such as ``monitor_start``, whose MCP call answers
+    "requested" (a ``completed`` row) before the gateway decides; only the
+    gateway's own ``mcp-directive`` row with outcome ``success`` says it applied.
+    """
+    if not tool_name:
+        return False
+    for row in sel().recent(limit=_SEL_PROBE_LIMIT):
+        if not isinstance(row, dict):
+            continue
+        if (
+            row.get("operation") == tool_name
+            and row.get("source") == "mcp-directive"
+            and row.get("outcome") == "success"
+        ):
+            return True
+    return False
+
+
+def _probe_channel_connected(name: str) -> bool:
+    """True when messaging channel *name* is set up on this install.
+
+    Answers only "connected or not", with the same test ``GET /api/slack/config``
+    reports as ``configured``. The credential values are compared with ``""``
+    and never returned or logged. Only Slack is wired; any other name is False.
+    """
+    if name != "slack":
+        return False
+    from kiro_crew.config.loader import (
+        CRED_OWNER_ID,
+        CRED_SLACK_APP_TOKEN,
+        CRED_SLACK_BOT_TOKEN,
+    )
+
+    # propagate=False: a post-boot read must not re-seed os.environ.
+    creds = KiroCrewConfig.load().load_credentials(propagate=False)
+    return all(
+        bool(creds.get(key, ""))
+        for key in (CRED_SLACK_BOT_TOKEN, CRED_SLACK_APP_TOKEN, CRED_OWNER_ID)
+    )
+
+
+def _probe_mate_thread_has_user_turn() -> bool:
+    """True when the first Mate's persistent pinned chat holds a human message.
+
+    Validates the bounded header before reading roles and human-turn markers
+    (``history_schema.HUMAN_TURN_META_KEY``). Content is never kept; stops at the
+    first hit. Restricted or unreadable headers count nothing.
+    """
+    from kiro_crew.history_derivation import (
+        TRANSCRIPT_HEADER_MAX_BYTES,
+        memory_mode_from_header_line,
+    )
+    from kiro_crew.history_files import transcript_stem
+    from kiro_crew.history_schema import HUMAN_TURN_META_KEY
+    from kiro_crew.jsonl_util import bounded_raw_records
+    from kiro_crew.members import read_dm_binding
+
+    binding = read_dm_binding(ASSISTANT_MEMBER_NAME)
+    if not binding:
+        return False
+    path = (
+        config_dir() / "sessions" / f"{transcript_stem('dashboard_' + binding['slot_key'])}.jsonl"
+    )
+    try:
+        with path.open("rb") as fh:
+            header = fh.readline(TRANSCRIPT_HEADER_MAX_BYTES)
+            if memory_mode_from_header_line(header) != "persistent":
+                return False
+            # Bounded: the transcript is agent-writable, so one huge record
+            # must not be read whole.
+            for line in bounded_raw_records(fh, path, label="mate probe"):
+                if b'"user"' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(row, dict) or row.get("role") != "user":
+                    continue
+                meta = row.get("meta")
+                if isinstance(meta, dict) and meta.get(HUMAN_TURN_META_KEY) is True:
+                    return True
+    except OSError:
+        return False
     return False
 
 
@@ -427,12 +554,17 @@ def _probe_config_key_set(dotted: str) -> bool:
 _PROBES: dict[str, Callable[[], bool]] = {
     "tips_feedback_exists": _probe_tips_feedback_exists,
     "artifacts_nonempty": _probe_artifacts_nonempty,
+    "mate_missing": _probe_mate_missing,
+    "mate_thread_has_user_turn": _probe_mate_thread_has_user_turn,
 }
 
 #: Probes taking one argument, keyed by the part before the first ``:``.
 _PARAM_PROBES: dict[str, Callable[[str], bool]] = {
     "sel_event_seen": _probe_sel_event_seen,
     "config_key_set": _probe_config_key_set,
+    "sel_event_ok": _probe_sel_event_ok,
+    "sel_directive_ok": _probe_sel_directive_ok,
+    "channel_connected": _probe_channel_connected,
 }
 
 
@@ -515,7 +647,7 @@ def load_state() -> FeatureVideoState:
     """
     path = _state_path()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, RecursionError):
         # RecursionError is neither an OSError nor a ValueError: json.loads
         # raises it on JSON nested past the interpreter's recursion limit. Our
@@ -531,6 +663,72 @@ def load_state() -> FeatureVideoState:
     raw = data.get("videos")
     if not isinstance(raw, dict):
         return FeatureVideoState()
+    return _state_from_rows(raw)
+
+
+class FeatureVideoStateUnreadable(Exception):
+    """The state file cannot be read or set aside, so a write would replace it."""
+
+
+def _load_state_for_update() -> FeatureVideoState:
+    """The read :func:`record_status` saves from.
+
+    :func:`load_state` degrades for readers, where it re-offers a clip at worst. A
+    write cannot start from that answer: the empty state would be saved over every
+    row still in the file. Here a file that cannot be decoded or parsed as a
+    ``{"videos": {...}}`` object is moved aside to ``<name>.corrupt-<utc>`` with a
+    warning first, and the write starts from an empty state with the old bytes kept.
+    When the read itself fails, or the move does, the write raises
+    :class:`FeatureVideoStateUnreadable` and the file stays as it is.
+    """
+    path = _state_path()
+    try:
+        data = json.loads(read_bytes_with_retry(path).decode("utf-8-sig"))
+    except FileNotFoundError:
+        return FeatureVideoState()
+    except OSError as e:
+        # A read that fails says nothing about the bytes, which may be good state:
+        # moving it aside would re-offer every clip, so the write is refused instead.
+        raise FeatureVideoStateUnreadable(
+            f"{path} could not be read ({e}); not saving over it"
+        ) from e
+    except (ValueError, RecursionError) as e:
+        _set_aside_state(path, e)
+        return FeatureVideoState()
+    raw = data.get("videos") if isinstance(data, dict) else None
+    if not isinstance(raw, dict):
+        _set_aside_state(path, "no videos object")
+        return FeatureVideoState()
+    return _state_from_rows(raw)
+
+
+def _set_aside_state(path: Path, reason: object) -> None:
+    """Move an unreadable state file to ``<name>.corrupt-<utc>`` before a save."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    aside = path.with_name(f"{path.name}.corrupt-{stamp}")
+    # The sidecar keeps the state file's owner-only contract (see save_state), so the
+    # file is locked down before it is renamed. A lockdown failure warns: keeping the
+    # bytes from the save matters more than their mode.
+    try:
+        restrict_to_owner(path)
+    except OSError:
+        logger.warning("could not restrict %s to its owner", path.name, exc_info=True)
+    try:
+        replace_with_retry(path, aside)
+    except OSError as e:
+        raise FeatureVideoStateUnreadable(
+            f"{path} could not be read ({reason}) or moved aside ({e}); not saving over it"
+        ) from e
+    logger.warning(
+        "feature video state %s could not be read (%s); moved it to %s before saving",
+        path,
+        reason,
+        aside.name,
+    )
+
+
+def _state_from_rows(raw: dict[object, object]) -> FeatureVideoState:
+    """Keep each row whose key is a string and whose status is a valid one."""
     videos: dict[str, dict[str, object]] = {}
     for key, row in raw.items():
         if not isinstance(key, str) or not isinstance(row, dict):
@@ -569,10 +767,12 @@ def record_status(video_id: str, status: str) -> None:
     Load, mutate, save under :data:`_state_write_lock`: the three steps are one
     transaction, and two tabs recording different videos concurrently would
     otherwise both read the same bytes and the later save would drop the earlier
-    video's row — offering an already-dismissed clip again.
+    video's row — offering an already-dismissed clip again. The load is strict for
+    the same reason: a state file that exists but cannot be read is moved aside
+    rather than saved over.
     """
     with _state_write_lock:
-        st = load_state()
+        st = _load_state_for_update()
         st.videos[video_id] = {"status": status, "ts": time.time()}
         save_state(st)
 
@@ -602,13 +802,15 @@ def _version_ok(min_version: str, running: str) -> bool:
 
 #: How many recently-offered ids stay acceptable for a verdict. Bounded because
 #: this is the ONE thing keeping the state file's key set closed: a verdict may name
-#: a known clip or one of the last few offered, and nothing else. 64 is far more
-#: than the one dialog a user can have open, and small enough that the set cannot
-#: become a store.
-_ISSUED_ID_LIMIT = 64
+#: a known clip or one of the last few offered, and nothing else. It holds at
+#: least one whole library answer (a manifest carries at most
+#: ``_MAX_ENTRIES`` clips), so listing the library never evicts an id it just
+#: offered, and every id in it came from a shipped catalog or a signed manifest,
+#: so the set cannot become a store.
+_ISSUED_ID_LIMIT = max(64, manifest_mod._MAX_ENTRIES)
 
-#: Ids ``/next`` has handed out, newest last. A clip can leave the catalog between
-#: ``/next`` and the user's click — a background manifest refresh replaces the
+#: Ids ``/library`` has handed out, newest last. A clip can leave the catalog between
+#: ``/library`` and the user's click — a background manifest refresh replaces the
 #: catalog, and the clip they are looking at may not be in the new one. Without this
 #: the feedback POST answers 400 and the verdict is DISCARDED, so the permanent
 #: "do not show me this again" the user just expressed is lost and the clip returns.
@@ -621,7 +823,7 @@ _issued_lock = threading.Lock()
 
 
 def _remember_issued(video_id: str) -> None:
-    """Record that ``/next`` offered *video_id*, evicting the oldest past the cap."""
+    """Record that ``/library`` offered *video_id*, evicting the oldest past the cap."""
     if not video_id:
         return
     with _issued_lock:
@@ -641,14 +843,6 @@ def _forget_issued(video_id: str) -> None:
     """Drop *video_id* once its verdict is recorded — the row on disk supersedes it."""
     with _issued_lock:
         _issued_ids.pop(video_id, None)
-
-
-#: The selector's randomness source, as an instance rather than the ``random``
-#: module functions, so a test can pin it (``monkeypatch.setattr(fv, "_rng",
-#: random.Random(0))``) without reseeding global randomness for everything else
-#: in the process. Not ``secrets``: which intro clip plays is not a secret, and a
-#: CSPRNG here would imply it was.
-_rng = random.Random()
 
 
 @dataclass(frozen=True)
@@ -727,9 +921,9 @@ def _hosted_offers(manifest: "manifest_mod.VideoManifest") -> tuple[Offer, ...]:
     browser fetches itself, would play bytes the sha256 pin never checked and
     follow redirects the gateway's own opener refuses; the manifest's signature
     and host pin would then be guarding the metadata while the media went
-    unverified. The manifest replaces the bundled catalog, so a launch on which
-    nothing has landed yet offers nothing; the pass runs in the background and
-    the next launch shows what it landed.
+    unverified. The manifest replaces the bundled catalog, so while nothing has
+    landed yet nothing is offered; the pass runs in the background and the
+    Explore card shows what it landed once it has.
     """
     cached: list[Offer] = []
     for entry in manifest.entries:
@@ -769,30 +963,20 @@ def _eligible(offer: Offer, st: FeatureVideoState, running_version: str) -> bool
     return not any(probe_fires(signal) for signal in offer.used_when)
 
 
-def _offer_pool(running_version: str) -> tuple[Offer, ...]:
-    """Every clip eligible right now. Blocking (reads state, stats files).
+def eligible_offers(running_version: str) -> tuple[Offer, ...]:
+    """Every clip eligible right now, for the Explore card. Blocking (reads
+    state, stats files).
 
     One place decides which catalog is in force. A verified manifest REPLACES the
     static catalog rather than extending it: mixing them would offer a bundled
     clip and its hosted successor as two videos, and a user retiring one would
     still be shown the other. The cost is stated in the module docstring: a
-    manifest whose clips have not landed yet offers nothing that launch.
+    manifest whose clips have not landed yet offers nothing until they do.
     """
     st = load_state()
     current = cache_mod.feature_video_cache().current_manifest()
     offers = _bundled_offers() if current is None else _hosted_offers(current)
     return tuple(o for o in offers if _eligible(o, st, running_version))
-
-
-def select_next(running_version: str) -> "Offer | None":
-    """One eligible clip at random, or None. Blocking — call off the loop.
-
-    Every candidate is on disk already, so the pick costs no egress and no
-    spinner. Within the pool the pick is uniform — see the module docstring for
-    why order stopped being the right rule once the library grew.
-    """
-    pool = _offer_pool(running_version)
-    return _rng.choice(pool) if pool else None
 
 
 def known_video_ids() -> set[str]:
@@ -817,44 +1001,36 @@ def _enabled() -> bool:
     return bool(KiroCrewConfig.load().dashboard.feature_videos_enabled)
 
 
-async def api_feature_videos_next(request: web.Request) -> web.Response:
-    """GET /api/feature-videos/next — the next intro clip to play, or null.
+async def api_feature_videos_library(request: web.Request) -> web.Response:
+    """GET /api/feature-videos/library — every clip the Explore card may show.
 
-    Returns ``{"video": <offer-without-used_when> | null, "enabled": <bool>}``,
-    where the offer's ``src`` is same-origin: every clip offered is on this
-    machine already.
+    Returns ``{"videos": [<offer-without-used_when>, ...], "enabled": <bool>}``.
+    Every offer's ``src`` is same-origin, because every clip offered is on this
+    machine already. The card draws one at random and keeps it for the page
+    session; an empty list hides the card.
 
-    ``enabled`` is reported even when it is false, rather than a 204: the
-    settings panel and the modal both need to tell "the operator turned this
-    off" apart from "nothing left to show", and a bodiless response cannot.
-
-    Nothing about downloads is reported here. Whether this install may pull clip
-    bytes decides what the background pass lands, never what this route offers,
-    and the settings panel reads it from ``/status``. The frontend's
-    ``FeatureVideoNext.download_enabled`` is optional, and absent reads as off.
+    ``enabled`` is the ``dashboard.feature_videos_enabled`` kill switch. With it
+    off the list is empty, and the flag says why.
     """
     state: DashboardState = request.app["state"]
     loop = asyncio.get_running_loop()
-
     enabled = await loop.run_in_executor(None, _enabled)
-    if not enabled:
-        return web.json_response({"video": None, "enabled": False})
 
-    # A temporary or incognito session shows no intro. The modal records
-    # permanent state for the whole instance, and a session the user opened
-    # precisely so it would leave no trace must not write that — the same reason
-    # tips do not fetch in a temporary session.
-    if _is_restricted_session(state, request):
-        return web.json_response({"video": None, "enabled": True})
+    # A temporary or incognito session shows no clip. The card records permanent
+    # state for the whole instance, and a session the user opened precisely so it
+    # would leave no trace must not write that — the same reason tips do not
+    # fetch in a temporary session.
+    if not enabled or _is_restricted_session(state, request):
+        return web.json_response({"videos": [], "enabled": enabled})
 
-    entry = await loop.run_in_executor(None, select_next, kiro_crew.__version__)
-    if entry is not None:
-        # The catalog can change under the open dialog, so the id is remembered
+    offers = await loop.run_in_executor(None, eligible_offers, kiro_crew.__version__)
+    for offer in offers:
+        # The catalog can change under the open card, so the id is remembered
         # until its verdict lands (:data:`_issued_ids`). Otherwise a refresh between
         # here and the user's click makes the feedback POST a 400 and throws away a
         # verdict they will not be asked for again.
-        _remember_issued(entry.id)
-    return web.json_response({"video": entry.payload() if entry else None, "enabled": True})
+        _remember_issued(offer.id)
+    return web.json_response({"videos": [o.payload() for o in offers], "enabled": enabled})
 
 
 async def api_feature_videos_status(request: web.Request) -> web.Response:
@@ -878,7 +1054,7 @@ async def api_feature_videos_status(request: web.Request) -> web.Response:
     Only ``state`` is history. It is gated by ``_blocks_reads_session`` rather
     than ``_is_restricted_session``: that is the product's own read/write split,
     not a looser gate — incognito withholds WRITES, and a temporary session
-    withholds reads as well. ``/next`` uses the broader predicate because reaching
+    withholds reads as well. ``/library`` uses the broader predicate because reaching
     it leads to a permanent write, while this route only reads, so an incognito
     session still renders its own settings panel and only a read-blocking session
     is served an empty map.
@@ -921,13 +1097,13 @@ async def api_feature_videos_feedback(request: web.Request) -> web.Response:
 
     Both statuses are terminal: there is no snooze, so a recorded video is never
     offered again. The id must name a known clip (:func:`known_video_ids`, the union
-    of the static catalog and the current manifest) OR one ``/next`` offered
+    of the static catalog and the current manifest) OR one ``/library`` offered
     recently (:data:`_issued_ids`) — an id from neither is a client bug, and
     accepting it would let an unbounded set of keys accumulate in the state file
     forever. Those two checks together are the only id validation, and both are
     strictly tighter than any length or shape bound.
 
-    The second check exists because the catalog can change under an open dialog: a
+    The second check exists because the catalog can change under an open card: a
     background manifest refresh replaces it, and without this check the
     user's verdict on the clip in front of them would 400 and be discarded — after
     which the clip comes back, which is the one thing a permanent verdict promises
@@ -961,7 +1137,7 @@ async def api_feature_videos_feedback(request: web.Request) -> web.Response:
 
     # The write side needs the SAME gate the read side has, not just a symmetric
     # gesture: this is where the permanent, instance-wide row is actually
-    # created, so gating only /next would leave the trace a restricted session
+    # created, so gating only /library would leave the trace a restricted session
     # exists to avoid one POST away. Reported as success because nothing the
     # client did was wrong — the session simply keeps no state.
     if _is_restricted_session(state, request):

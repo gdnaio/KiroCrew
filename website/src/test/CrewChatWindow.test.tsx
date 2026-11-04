@@ -16,6 +16,34 @@ import { MemoryRouter } from 'react-router-dom'
 import { createTestStore } from './helpers'
 import type { RootState } from '../store'
 
+// jsdom has no MediaRecorder, so the real flag reads false and hides the mic:
+// pin it. The engine stays real; its endpoint callback is kept so a test can
+// fire the verdict that auto-submits a dictation.
+const voiceHooks = vi.hoisted(() => ({ onEndpoint: null as (() => void) | null }))
+vi.mock('../hooks/useVoiceInput', async () => {
+  const actual = await vi.importActual<typeof import('../hooks/useVoiceInput')>('../hooks/useVoiceInput')
+  return {
+    ...actual,
+    voiceInputSupported: true,
+    useVoiceInput: (...args: Parameters<typeof actual.useVoiceInput>) => {
+      voiceHooks.onEndpoint = args[1]?.onEndpoint ?? null
+      return actual.useVoiceInput(...args)
+    },
+  }
+})
+// Seam on the composer's Voice atom: counts the window's `disarmForSend` over
+// the real hook, so a send that stops ending live dictation fails a test.
+const voiceSeam = vi.hoisted(() => ({ disarmForSend: vi.fn() }))
+vi.mock('../chat-core/composer/useComposerVoice', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../chat-core/composer/useComposerVoice')>()
+  return {
+    ...actual,
+    useComposerVoice: (host: Parameters<typeof actual.useComposerVoice>[0]) => {
+      const cv = actual.useComposerVoice(host)
+      return { ...cv, disarmForSend: () => { voiceSeam.disarmForSend(); cv.disarmForSend() } }
+    },
+  }
+})
 const mocks = vi.hoisted(() => ({
   crewPeerGet: vi.fn(), crewPeerPost: vi.fn(), listInstances: vi.fn(), instancesCapabilities: vi.fn(),
   // The LOCAL slot routes. A crew window must never reach them: on a remote
@@ -42,6 +70,7 @@ import {
   openCrewWindow, closeCrewWindow, useCrewWindow, reloadCrewWindowForTest, writeCrewDraft,
   capsRetryInterval,
 } from '../pages/chat/crew-window/crewWindowStore'
+import { crewModePreviewOn } from './crewModePreview'
 
 class FakeEventSource {
   static all: FakeEventSource[] = []
@@ -125,8 +154,10 @@ beforeEach(() => {
   slotRow = { key: 'k1', title: 'Build fix', running: false, interrupted: false }
   detail = { running: false, messages: [{ role: 'user', content: 'hi', ts: 't1' }, { role: 'assistant', content: 'hello', ts: 't2' }] }
   mocks.listInstances.mockResolvedValue({ instances: [{ id: 'cd-1', name: 'devbox' }] })
+  // The slot read asks the peer for `?crew=all`, so a Crew Mode root's crew
+  // members are in the list the window picks its row from.
   mocks.crewPeerGet.mockImplementation((_id: string, path: string) =>
-    Promise.resolve(path === 'api/chat/slots' ? [{ key: 'other' }, slotRow] : detail))
+    Promise.resolve(path === 'api/chat/slots?crew=all' ? [{ key: 'other' }, slotRow] : detail))
   mocks.crewPeerPost.mockResolvedValue({ ok: true })
   mocks.instancesCapabilities.mockResolvedValue({ version_match: true, version: '0.9.0', local_version: '0.9.0' })
   mocks.instancesApprovalState.mockResolvedValue({ yolo: false })
@@ -134,7 +165,8 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  closeCrewWindow()
+  // Host subscribes to the store while the tree is still mounted here (RTL unmounts after this hook).
+  act(() => { closeCrewWindow() })
   vi.unstubAllGlobals()
   vi.clearAllMocks()
 })
@@ -152,6 +184,42 @@ describe('CrewChatWindow', () => {
     expect(mocks.approveChatSlot).not.toHaveBeenCalled()
   })
 
+  // The window mounts the shared Composer root, so the mic shows as it does in
+  // a local chat. Without the root ChatInput has no voice slice and no mic.
+  it('offers voice input in the composer', async () => {
+    detail = { running: false, messages: [{ role: 'user', content: 'hi', ts: 't1' }] }
+    renderWindow()
+    expect(await screen.findByRole('button', { name: /^Voice input/ })).toBeInTheDocument()
+  })
+
+  // The window does not own the push-to-talk key (the main composer does), so
+  // its mic must not name the key: pressing it would dictate elsewhere.
+  it('does not name the push-to-talk key on its mic', async () => {
+    detail = { running: false, messages: [{ role: 'user', content: 'hi', ts: 't1' }] }
+    renderWindow()
+    const mic = await screen.findByRole('button', { name: 'Voice input' })
+    expect(mic).toHaveAttribute('title', 'Voice input')
+    expect(mic).not.toHaveAttribute('aria-keyshortcuts')
+  })
+
+  // #23928: the dock is the local page's bare box, not a band of its own. A band
+  // wrapper fails the children assertion (it is not a `dock-inert` wrapper); a
+  // notices column without `empty:hidden` fails the column assertion.
+  it('floats the composer in the local dock shape, with an empty notices column that takes no room', async () => {
+    renderWindow()
+    // Connected: until the version read lands, the column carries the offline line.
+    const box = await screen.findByRole('textbox', PEER_ROW_WAIT)
+    await waitFor(() => expect(box).not.toBeDisabled())
+    const dock = screen.getByTestId('crew-window-dock')
+    expect(dock.className).toContain('pointer-events-none')
+    expect(dock.className).not.toMatch(/border-t|py-/)
+    expect([...dock.children].map(c => c.className)).toEqual(['dock-inert', 'relative z-10 dock-inert'])
+    const notices = screen.getByTestId('crew-window-notices')
+    expect(notices.className).toContain('empty:hidden')
+    await waitFor(() => expect(notices.childElementCount).toBe(0))
+    expect(within(dock.children[1] as HTMLElement).getByRole('textbox')).toBeTruthy()
+  })
+
   it('keeps Stop reachable while an approval is pending', async () => {
     slotRow = { ...slotRow, running: true, pending_approval_info: { origin: 'native', request_id: '7', request_mid: 'm-7', tool: 'shell' } }
     detail = { running: true, messages: [{ role: 'user', content: 'hi', ts: 't1' }, permissionRow('7')] }
@@ -160,6 +228,47 @@ describe('CrewChatWindow', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Stop generation' }))
     await waitFor(() => expect(posted()).toContainEqual(['api/chat/slots/k1/stop', undefined]))
   })
+
+  // The header must never leak the internal slot key. An untitled session shows
+  // a localized label; once a title arrives it replaces the label. Reverting the
+  // `|| key` fallback fails the first assertion (the raw key would show instead).
+  it('shows a localized label, not the slot key, for an untitled session, and swaps in a title once it arrives', async () => {
+    slotRow = { key: 'k1', title: '', running: false, interrupted: false }
+    detail = { running: false, messages: [{ role: 'user', content: 'hi', ts: 't1' }] }
+    renderWindow()
+    // The header reads the untitled label, and the routing key never appears there.
+    expect(await screen.findByText('Untitled session', {}, PEER_ROW_WAIT)).toBeTruthy()
+    expect(screen.queryByText('k1')).toBeNull()
+    // Once resolved, the "On devbox" subtitle names the crew under the label.
+    expect(screen.getByText('On devbox')).toBeTruthy()
+    // A title arriving on the live slot feed replaces the label; routing is unchanged.
+    await waitFor(() => expect(FakeEventSource.all.length).toBeGreaterThan(0))
+    const es = FakeEventSource.all[0]
+    act(() => es.emit('slots', [{ ...slotRow, title: 'Named now' }]))
+    expect(await screen.findByText('Named now')).toBeTruthy()
+    expect(screen.queryByText('Untitled session')).toBeNull()
+  })
+
+  // When the slot/detail reads are gated off (version mismatch) they never
+  // resolve, so there is no title to trust. The header falls back to the crew's
+  // own name — never the raw key, and never a false "Untitled session" for what
+  // may be a titled session we simply could not read, and never a blank header.
+  it('falls back to the crew name, not the slot key, while a session title could not be read', async () => {
+    slotRow = { key: 'k1', title: '', running: false, interrupted: false }
+    detail = { running: false, messages: [] }
+    mocks.instancesCapabilities.mockResolvedValue({ version_match: false, version: '0.8.0', local_version: '0.9.0' })
+    renderWindow()
+    // The version-mismatch notice confirms the gated (unresolved) state is active.
+    await screen.findByText(/runs .* but this machine runs/, {}, PEER_ROW_WAIT)
+    // The header title span shows the crew name, not the label and not the key.
+    const titleEl = document.querySelector('span.font-semibold.min-w-0')
+    expect(titleEl?.textContent).toBe('devbox')
+    // The "On devbox" subtitle is dropped here: it would only repeat the title.
+    expect(screen.queryByText('On devbox')).toBeNull()
+    expect(screen.queryByText('Untitled session')).toBeNull()
+    expect(screen.queryByText('k1')).toBeNull()
+  })
+
 
   it('makes the covered local pane inert, so an unseen local approval is unreachable', async () => {
     const store = createTestStore({
@@ -191,6 +300,8 @@ describe('CrewChatWindow', () => {
         .mockResolvedValueOnce({ version_match: false, version: '', local_version: '0.9.0' })
         .mockResolvedValue({ version_match: true, version: '0.9.0', local_version: '0.9.0' })
       renderWindow()
+      // The tunnel-down answer reads as a mismatch; its notice is the first frame that answer renders.
+      await screen.findByText(/runs .* but this machine runs/, {}, PEER_ROW_WAIT)
       await waitFor(() => expect(mocks.instancesCapabilities).toHaveBeenCalledTimes(1))
       expect(mocks.crewPeerGet).not.toHaveBeenCalled()
       await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
@@ -278,6 +389,32 @@ describe('CrewChatWindow', () => {
     expect(box).toHaveValue('')
   })
 
+  // A dictation that auto-submits mid-turn must pick steer the way Enter does;
+  // a bare send() would only queue it behind the running turn.
+  it('steers the PEER\'s running turn when dictation auto-submits', async () => {
+    slotRow = { ...slotRow, running: true }
+    renderWindow()
+    const box = await screen.findByRole('textbox', { name: 'Message the agent on devbox…' })
+    await screen.findByRole('button', { name: 'Stop generation' }, PEER_ROW_WAIT)
+    fireEvent.change(box, { target: { value: 'say it out loud' } })
+    expect(voiceHooks.onEndpoint).toBeTypeOf('function')
+    await act(async () => { voiceHooks.onEndpoint?.() })
+    await waitFor(() => expect(posted()).toContainEqual(['api/chat?ws=1', { message: 'say it out loud', slot: 'k1', steer: true }]))
+  })
+
+  // A send ends live streaming dictation before the box is cleared; without
+  // it the next partial rebuilds the sent text in the empty composer.
+  it('ends live dictation when the window sends', async () => {
+    renderWindow()
+    const box = await screen.findByRole('textbox', { name: 'Message the agent on devbox…' })
+    await waitFor(() => expect(box).not.toBeDisabled())
+    voiceSeam.disarmForSend.mockClear()
+    fireEvent.change(box, { target: { value: 'spoken words' } })
+    fireEvent.keyDown(box, { key: 'Enter' })
+    await waitFor(() => expect(posted()).toContainEqual(['api/chat?ws=1', { message: 'spoken words', slot: 'k1' }]))
+    expect(voiceSeam.disarmForSend).toHaveBeenCalledTimes(1)
+  })
+
   it('queues a mid-turn message on the PEER with the other-action chord', async () => {
     slotRow = { ...slotRow, running: true }
     renderWindow()
@@ -287,6 +424,94 @@ describe('CrewChatWindow', () => {
     fireEvent.keyDown(box, { key: 'Enter', ctrlKey: true })
     // No steer flag: the peer queues a send that lands mid-turn.
     await waitFor(() => expect(posted()).toContainEqual(['api/chat?ws=1', { message: 'after this', slot: 'k1' }]))
+  })
+
+  it('shows a message the PEER queued behind its running turn as a queued card', async () => {
+    slotRow = { ...slotRow, running: true }
+    renderWindow()
+    const box = await screen.findByRole('textbox', { name: 'Message the agent on devbox…' })
+    await screen.findByRole('button', { name: 'Stop generation' }, PEER_ROW_WAIT)
+    expect(screen.queryByTestId('queue-card')).toBeNull()
+    // The peer accepts the send and holds it in the slot's queue; the
+    // re-read after the send returns that entry.
+    mocks.crewPeerPost.mockImplementation(async () => {
+      detail = { ...detail, queue: [{ id: 'q-1', content: 'after this' }] }
+      return { ok: true, queued: true, queue_id: 'q-1' }
+    })
+    fireEvent.change(box, { target: { value: 'after this' } })
+    fireEvent.keyDown(box, { key: 'Enter', ctrlKey: true })
+    const card = await screen.findByTestId('queue-card', {}, PEER_ROW_WAIT)
+    expect(card).toHaveTextContent('after this')
+    // Read-only: a cancel or edit here would act on no peer route.
+    expect(screen.queryByRole('button', { name: /cancel/i })).toBeNull()
+    // The drain lands the row in the transcript and the card retires.
+    detail = { ...detail, queue: [], messages: [...(detail.messages as object[]), { role: 'user', content: 'after this', ts: 't3' }] }
+    FakeEventSource.all[FakeEventSource.all.length - 1].emit('chat_message', { slot: 'k1' })
+    await waitFor(() => expect(screen.queryByTestId('queue-card')).toBeNull(), PEER_ROW_WAIT)
+  })
+
+  it('shows a final reply that lands while an earlier re-read is still in flight (#25803)', async () => {
+    renderWindow()
+    await screen.findByText('hello', {}, PEER_ROW_WAIT)
+    // A slow tunnel: the next detail read answers with the transcript AS OF
+    // ITS START, and only when released.
+    let release: (() => void) | null = null
+    mocks.crewPeerGet.mockImplementation((_id: string, path: string) => {
+      if (path === 'api/chat/slots?crew=all') return Promise.resolve([{ key: 'other' }, slotRow])
+      const snapshot = detail
+      if (release) return Promise.resolve(snapshot)
+      return new Promise(resolve => { release = () => resolve(snapshot) })
+    })
+    const es = FakeEventSource.all[FakeEventSource.all.length - 1]
+    // The window throttles its re-read; the clock is stepped past that
+    // throttle, so no step waits on wall time.
+    vi.useFakeTimers()
+    try {
+      // A tool row finishes: its re-read starts and is held on the tunnel.
+      es.emit('chat_message', { slot: 'k1' })
+      await act(() => vi.advanceTimersByTimeAsync(1000))
+      expect(release).not.toBeNull()
+      // The final reply lands on the peer while that read is still in flight,
+      // and its own re-read fires before the first one answers.
+      detail = { ...detail, messages: [...(detail.messages as object[]), { role: 'assistant', content: 'final reply', ts: 't3' }] }
+      es.emit('chat_message', { slot: 'k1' })
+      await act(() => vi.advanceTimersByTimeAsync(1000))
+    } finally {
+      vi.useRealTimers()
+    }
+    release!()
+    expect(await screen.findByText('final reply', {}, PEER_ROW_WAIT)).toBeTruthy()
+  })
+
+  it('follows many frames during one held re-read with a single extra read', async () => {
+    renderWindow()
+    await screen.findByText('hello', {}, PEER_ROW_WAIT)
+    const detailPath = 'api/chat/slots/k1?limit=200'
+    let release: (() => void) | null = null
+    mocks.crewPeerGet.mockImplementation((_id: string, path: string) => {
+      if (path === 'api/chat/slots?crew=all') return Promise.resolve([{ key: 'other' }, slotRow])
+      if (release) return Promise.resolve(detail)
+      return new Promise(resolve => { release = () => resolve(detail) })
+    })
+    mocks.crewPeerGet.mockClear()
+    const detailReads = () => mocks.crewPeerGet.mock.calls.filter(c => c[1] === detailPath).length
+    const es = FakeEventSource.all[FakeEventSource.all.length - 1]
+    vi.useFakeTimers()
+    try {
+      es.emit('chat_message', { slot: 'k1' })
+      await act(() => vi.advanceTimersByTimeAsync(1000))
+      expect(detailReads()).toBe(1)
+      // Several frames land while that read is held, each past the throttle.
+      for (let i = 0; i < 4; i++) {
+        es.emit('chat_message', { slot: 'k1' })
+        await act(() => vi.advanceTimersByTimeAsync(1000))
+      }
+      expect(detailReads()).toBe(1)
+      await act(async () => { release!(); await vi.advanceTimersByTimeAsync(1000) })
+      expect(detailReads()).toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('puts a refused steer back into the composer', async () => {
@@ -326,7 +551,7 @@ describe('CrewChatWindow', () => {
     detail = { ...detail, running: true }
     renderWindow()
     const footer = await screen.findByTestId('chat-footer', {}, PEER_ROW_WAIT)
-    expect(within(footer).getByText('Killing…').className).toContain('text-danger')
+    expect(within(footer).getByText('Force stopping…').className).toContain('text-danger')
     expect(screen.queryByText('Stopping…')).toBeNull()
   })
 
@@ -748,12 +973,15 @@ describe('CrewChatWindow', () => {
     // through the store-free default instead of reading this hub's own state.
     const ids = createTranscriptRenderers({}).map(r => r.id)
     // A guide offer row reads the local guide store, which a peer's window has none of.
-    const decided = new Set([...PEER_SAFE_ROWS, 'workflow_run_tool', 'subagent_run_tool', 'file', 'conversation_card'])
+    // An elicitation card answers through THIS hub's slot route; the peer's ask lives
+    // on the peer, so the window leaves it to the SDK default, which draws it read-only.
+    const decided = new Set([...PEER_SAFE_ROWS, 'workflow_run_tool', 'subagent_run_tool', 'file', 'conversation_card', 'elicitation'])
     expect(ids.filter(id => !decided.has(id))).toEqual([])
     const crew = createCrewWindowRenderers({ instanceId: 'cd-1', key: 'k1', name: 'devbox', canRewind: () => false, onRewind: () => {}, rewindDisabled: false }).map(r => r.id)
     expect(crew).not.toContain('workflow_run_tool')
     expect(crew).not.toContain('subagent_run_tool')
     expect(crew).not.toContain('conversation_card')
+    expect(crew).not.toContain('elicitation')
   })
 
   it('draws a peer code fence copy-only, with no Run into this machine', async () => {
@@ -858,7 +1086,7 @@ describe('CrewChatWindow', () => {
     slotRow = { ...slotRow, model: 'claude-opus', reasoning_effort: 'high' }
     let fail = true
     mocks.crewPeerGet.mockImplementation((_id: string, path: string) => (
-      path === 'api/chat/slots' ? Promise.resolve([slotRow])
+      path === 'api/chat/slots?crew=all' ? Promise.resolve([slotRow])
         : path.endsWith('/selection-capabilities') ? (fail ? Promise.reject(new Error('peer unreachable')) : Promise.resolve({ known: true, effort_supported: true, effort_levels: ['low', 'high'] }))
           : Promise.resolve(detail)))
     renderWindow()
@@ -890,7 +1118,7 @@ describe('CrewChatWindow', () => {
     slotRow = { ...slotRow, model: 'claude-opus', reasoning_effort: 'high' }
     let known = false
     mocks.crewPeerGet.mockImplementation((_id: string, path: string) => Promise.resolve(
-      path === 'api/chat/slots' ? [slotRow]
+      path === 'api/chat/slots?crew=all' ? [slotRow]
         : path.endsWith('/selection-capabilities') ? (known ? { known: true, effort_supported: true, effort_levels: ['low', 'high'] } : { known: false })
           : detail))
     renderWindow()
@@ -899,6 +1127,17 @@ describe('CrewChatWindow', () => {
     known = true
     await waitFor(() => expect(screen.getByTestId('composer-model-chip')).toHaveTextContent('High'), { timeout: 8000 })
   }, 15000)
+
+  it('offers Regenerate on the newest reply when a taken-back steer follows it', async () => {
+    detail = { running: false, messages: [
+      { role: 'user', content: 'hi', ts: 't1' },
+      { role: 'assistant', content: 'hello', ts: 't2' },
+      { role: 'user', content: '', ts: 't3', meta: { steer: true, steerState: 'retracted' } },
+    ] }
+    renderWindow()
+    const reply = await screen.findByTestId('crew-window-assistant', {}, PEER_ROW_WAIT)
+    expect(within(reply).getByRole('button', { name: 'Regenerate response' })).toBeTruthy()
+  })
 
   it('offers Regenerate on the newest reply even when a compaction notice follows it', async () => {
     detail = { running: false, messages: [
@@ -913,7 +1152,7 @@ describe('CrewChatWindow', () => {
   it('shows a refused effort pick on the window itself', async () => {
     slotRow = { ...slotRow, model: 'claude-opus', reasoning_effort: 'high' }
     mocks.crewPeerGet.mockImplementation((_id: string, path: string) => Promise.resolve(
-      path === 'api/chat/slots' ? [slotRow]
+      path === 'api/chat/slots?crew=all' ? [slotRow]
         : path.endsWith('/selection-capabilities') ? { known: true, effort_supported: true, effort_levels: ['low', 'high'] }
           : detail))
     mocks.instancesCapabilities.mockResolvedValue({
@@ -1136,3 +1375,6 @@ describe('CrewChatWindow', () => {
     expect(FakeEventSource.all[0].close).toHaveBeenCalled()
   })
 })
+
+// Last, after the file's own hooks that clear localStorage: Crew Mode is a feature preview.
+crewModePreviewOn()

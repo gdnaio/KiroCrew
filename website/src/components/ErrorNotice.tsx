@@ -1,16 +1,20 @@
-import type { ComponentType, ReactNode } from 'react'
+import type { AriaAttributes, ComponentType, ReactNode } from 'react'
 import { useSyncExternalStore } from 'react'
 import { AlertTriangle, Sparkles, X } from 'lucide-react'
 import AskAgentButton, { handoffErrorToAgent } from './AskAgentButton'
 import { isGatewayConnected, subscribeGatewayConnected, type ErrorReport } from '../utils/errorReport'
 
 import { i18nT } from '../i18n/t'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 import { withOriginLink } from './withOriginLink'
 
 export type ErrorNoticeMenuItemComponent = ComponentType<{
+  offline?: boolean
   title?: string
   disabled?: boolean
   'aria-describedby'?: string
+  'aria-disabled'?: AriaAttributes['aria-disabled']
+  'aria-label'?: string
   onSelect?: (event: Event) => void
   children?: ReactNode
 }>
@@ -92,6 +96,7 @@ export type ErrorNoticeNoHandoff =
     askAgent?: never
     askAgentLabel?: never
     onHandoff?: never
+    onStage?: never
   }
 
 /**
@@ -130,6 +135,7 @@ export default function ErrorNotice({
   scrollMessage = false,
   footer,
   onHandoff,
+  onStage,
   className = '',
   messageClassName = '',
   messageTooltip,
@@ -248,6 +254,14 @@ export default function ErrorNotice({
    * as a dead button. Ignored when `askAgent` is off.
    */
   onHandoff?: () => void
+  /**
+   * Stages the error's hand-off prompt in a composer the caller owns, in place
+   * of the fresh-chat hand-off: for a surface bound to THIS chat's remote
+   * workspace, which a fresh chat's agent could not reach. Nothing navigates.
+   * Unset (every other caller), the hand-off opens a fresh chat as before.
+   * Ignored when `askAgent` is off.
+   */
+  onStage?: (prompt: string) => void
   className?: string
   /**
    * Classes for the `message` span only — e.g. `font-mono` when the message is
@@ -281,6 +295,10 @@ export default function ErrorNotice({
    */
   showIcon?: boolean
 } & ErrorNoticeNoHandoff) {
+  // Subscribes to language switches: a parent compiled by the React Compiler
+  // caches this element while its props are unchanged, so without its own
+  // subscription the notice would keep the previous language's text.
+  useLanguageGeneration()
   if (!message) return null
   // The secondary line: smaller than the title, lighter than the lead, but still
   // the alert's own colour -- it is the failure's text, demoted, not a caption.
@@ -307,6 +325,7 @@ export default function ErrorNotice({
             report={report}
             message={message}
             onHandoff={onHandoff}
+            onStage={onStage}
             label={askAgentLabel}
           />
         )}
@@ -377,6 +396,7 @@ export default function ErrorNotice({
               report={report}
               message={message}
               onHandoff={onHandoff}
+              onStage={onStage}
               label={askAgentLabel}
             />
           </div>
@@ -387,6 +407,7 @@ export default function ErrorNotice({
           report={report}
           message={message}
           onHandoff={onHandoff}
+          onStage={onStage}
           label={askAgentLabel}
           className="mt-[1px]"
         />

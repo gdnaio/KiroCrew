@@ -36,7 +36,7 @@ CONFIG_RESERVED_TOP_KEYS: frozenset = frozenset({"meta", "agent_template_pane", 
 # round-trip instead of being silently dropped.
 #
 # INVARIANT: this set must equal the top-level keys to_dict() emits (guarded by
-# test_config_extra_sections_roundtrip's parity test). It is the *emitted* set,
+# test_known_sections_equals_emitted_sections). It is the *emitted* set,
 # not merely the *parsed* set: a section this core parses into a field must ALSO
 # be emitted by to_dict() to be listed here — otherwise it would be excluded
 # from _extra_sections capture yet dropped by to_dict(), losing it on save().
@@ -75,15 +75,19 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "mcp",
         "taskrunner",
         "watchdog",
+        "work_ledger",
+        "power",
         "resource_limits",
         "messaging",
         "cron_history",
         "decisions",
+        "browser",
         "knowledge",
         "heartbeat",
         "monitoring",
         "skills",
         "session_summary",
+        "session_environments",
         "telemetry",
         "snapshot_dir",
         "timezone",
@@ -152,9 +156,41 @@ _SECTION_KEYS_DELIBERATELY_DROPPED: dict = {
     "agent": frozenset({"dangerouslySkipPermissions", "yolo", "conductor_skill"}),
     # RENAMED: knowledge.auto_add_documents was auto_ingest_doc_links;
     # sections._read_auto_add_documents still reads the old spelling.
-    "knowledge": frozenset({"auto_ingest_doc_links"}),
+    # RETIRED: auto_discover_folder, auto_discover_dirname,
+    # auto_ingest_chunk_budget, auto_register_project_docs and max_sources all
+    # configured the automatic folder-registration paths, which are gone, so
+    # nothing reads any of them. They are not renames of a surviving
+    # field, so preserving them keeps dead settings in the file and lets the
+    # close-match warning offer an unrelated field (e.g.
+    # folder_ingest_chunk_budget) as a correction.
+    "knowledge": frozenset(
+        {
+            "auto_ingest_doc_links",
+            "auto_discover_folder",
+            "auto_discover_dirname",
+            "auto_ingest_chunk_budget",
+            "auto_register_project_docs",
+            "max_sources",
+        }
+    ),
     # RETIRED: the out-of-band installs the removed local STT providers needed.
     "stt": frozenset({"whisper_path", "mlx_model", "parakeet_model", "device"}),
+    # RETIRED: the built-in browser panel toggle and the browser CLI live-view
+    # port pin went with the agent browser they configured; the browser tool has
+    # one driver now. Named once at load (warn_retired_section_keys) so an
+    # operator who set them learns the setting is gone, then dropped on save.
+    "dashboard": frozenset({"use_builtin_browser", "browser_view_port"}),
+    # RETIRED: the Settings -> Browser first-run step list it hid is gone (the
+    # gateway installs the engine on its own). Only pre-release builds wrote it,
+    # so it is dropped on save without a load-time warning.
+    "browser": frozenset({"first_run_dismissed"}),
+}
+
+#: The RETIRED subset of ``_SECTION_KEYS_DELIBERATELY_DROPPED`` worth ONE load-time
+#: warning: keys an operator set by hand whose feature is gone. A renamed key is
+#: still honoured under its old spelling, so it is not listed here.
+_RETIRED_SECTION_KEYS_WARNED: dict = {
+    "dashboard": frozenset({"use_builtin_browser", "browser_view_port"}),
 }
 
 
@@ -254,6 +290,27 @@ def warn_misspelled_section_keys(data: dict, cfg: object) -> None:
             "Config: unrecognized keys inside known sections, kept in the file but "
             "not in effect: %s",
             "; ".join(hints),
+        )
+
+
+def warn_retired_section_keys(data: dict) -> None:
+    """One WARNING naming retired keys still present in the loaded document.
+
+    The keys are inert (nothing reads them) and the next ``save()`` drops them
+    (:data:`_SECTION_KEYS_DELIBERATELY_DROPPED`); this line is the only notice
+    an operator who set one gets. Silent when none is present.
+    """
+    found: list[str] = []
+    for section, keys in sorted(_RETIRED_SECTION_KEYS_WARNED.items()):
+        raw = data.get(section)
+        if not isinstance(raw, dict):
+            continue
+        found.extend(f"{section}.{key}" for key in sorted(keys) if key in raw)
+    if found:
+        logger.warning(
+            "Config: %s no longer exist and are ignored; they are dropped from "
+            "config.json on the next save",
+            ", ".join(found),
         )
 
 

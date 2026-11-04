@@ -4,6 +4,7 @@ import type { ResizeInfo } from '../../utils/resizeImage'
 import type { SendMode } from '../../pages/chat/ChatSettings'
 import type { AutomationRecord } from '../../monitoring/automation'
 import type { PasteBlock } from '../../utils/pasteTokens'
+import type { ComposerActionItem } from '../../composerActions/composerActionRegistry'
 import type { FileKind } from '../FilePickerMenu'
 import type { PromptHistoryItem } from '../composerPromptHistory'
 import type { ApprovalModeRemote } from '../ApprovalModePicker'
@@ -13,6 +14,19 @@ import type { MemorySource } from '../../lib/agentMemorySource'
    and re-exports `ComposerBusyMode`; the owners under this directory take the
    props they need as their own parameters, a few by indexed access
    (`ChatInputProps['onFileSelect']`). */
+/** Who holds the typing lease that locks this composer (`ChatInputProps.typingLock`). */
+export interface ComposerTypingLockView {
+  holderName: string
+  holderInitials: string
+  /** The holder took the lease over from this user: the banner says so. */
+  tookOver?: boolean
+  /** Shows Take over on the banner (Shared Crew preview only). */
+  onTakeOver?: () => void
+  takeOverPending?: boolean
+  /** A failed takeover, shown under the banner with the agent hand-off. */
+  takeOverError?: string
+}
+
 /** Busy-composer send affordance — see `ChatInputProps.busyMode`. */
 export type ComposerBusyMode = 'split' | 'steer-only' | 'responsive'
 
@@ -82,6 +96,11 @@ export interface ChatInputProps {
    * the host asks the gateway to prioritize the message, never stops locally. */
   busyMode?: ComposerBusyMode
   disabled?: boolean
+  /** Set while another collaborator holds the session's typing lease: the box
+   *  turns read-only (the draft in it is kept, and focus with it), the button
+   *  row gives way to a banner naming who is typing, and only Stop and Steer
+   *  stay for a running turn. Cleared the moment the lease ends. */
+  typingLock?: ComposerTypingLockView | null
   placeholder?: string
   /** Shown instead of the default "Stopping…" while `disabled` is set, naming
    *  why the composer is locked. */
@@ -223,12 +242,22 @@ export interface ChatInputProps {
    * `useAnchoredTriggerRect`.
    */
   onAgentClick?: (rect: DOMRect, trigger?: HTMLElement) => void
+  /** Shown where the agent chip sits when the session has no agent picker (a
+   *  Crew Mode chat's conductor is Crew Mode's to choose): a label, not a control. */
+  agentBadge?: React.ReactNode
   /** `composerHadFocus` is whether the message editor held focus when the chip
    *  was pressed, read before the press moved focus onto the chip. The picker
    *  uses it to hand focus back to the editor after a pick, and only then: a
    *  user who was not typing does not get the composer focused under them. */
   onModelClick?: (rect: DOMRect, trigger?: HTMLElement, composerHadFocus?: boolean) => void
   onProjectClick?: (rect: DOMRect, trigger?: HTMLElement) => void
+  /** Session Environment chip for this slot (`SessionEnvironmentChip`). It owns
+   *  its own separated shelf group and renders nothing until profiles exist. */
+  environmentSlot?: string | null
+  /** App-contributed composer actions (contributes.composerActions in app.json):
+   *  rows in the "+" menu whose app offers text the composer inserts as visible
+   *  text, refused when it holds anything the composer would resolve. */
+  composerActions?: readonly ComposerActionItem[]
   /** App-contributed session controls (contributes.sessionControls in app.json). */
   sessionControls?: {
     key: string
@@ -254,6 +283,7 @@ export interface ChatInputProps {
   contextPct?: number
   contextUsedTokens?: number
   contextWindowTokens?: number
+  derivePctFromUsed?: boolean
   showContextPct?: boolean
   /** Show used/window token counts in the inline context readout. */
   showContextTokens?: boolean
@@ -297,6 +327,8 @@ export interface ChatInputProps {
   approvalMode?: string
   /** The approval-mode picker drives another machine's session (crew window). */
   approvalModeRemote?: ApprovalModeRemote
+  /** Drawn directly right of the approval-mode picker (the mid-chat Ultra Mode chip). */
+  afterApprovalMode?: React.ReactNode
   reasoningEffort?: string
   /** True when `reasoningEffort` is the configured default rather than a
    *  per-slot pick. Only the chip's hover / accessible name says so: outside
@@ -396,7 +428,7 @@ export interface ChatInputProps {
    *  Composer preference; pass it only to override that (e.g. mobile). */
   sendOnEnter?: SendMode
   /** Follow-up options from assistant message */
-  followUpOptions?: string[]
+  followUpOptions?: readonly string[]
   /** Options the user has picked (visual highlight in FollowUpBar) */
   followUpPicked?: Set<string>
   /** Select a follow-up option — handler toggles text in input (see ChatPage wiring).

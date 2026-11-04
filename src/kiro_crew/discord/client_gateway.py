@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
+from kiro_crew.discord.client_rest import _coerce_float
+
 if TYPE_CHECKING:
     from kiro_crew.discord.client import DiscordClient
 
@@ -54,6 +56,22 @@ _WS_HEARTBEAT_SECS = 60.0
 # curve so a repeating clean close cannot hot-loop. Mirrors WebexClient and
 # WeComClient, which carry the same guard for the same reason.
 _MIN_HEALTHY_CONN_SECS = 5.0
+
+# Close code for every close that means "reconnect and resume". Discord ends
+# the session on a 1000 or 1001 close, so the RESUME that follows fails and the
+# events sent in the gap are lost. Any other code keeps the session resumable;
+# 4000 is Discord's own "unknown error, reconnect" code, which the close-code
+# classification in ``_run_connection`` treats as recoverable. A real shutdown
+# (``DiscordClient.close``) keeps aiohttp's default 1000 on purpose.
+_RESUME_CLOSE_CODE = 4000
+
+# Bounds on HELLO's ``heartbeat_interval`` (seconds). Discord sends 41.25s; the
+# value goes straight to ``asyncio.sleep``, where NaN never returns and zero or a
+# negative spins the loop, so a value that is missing, non-finite or not positive
+# falls back to Discord's documented interval, and the rest is clamped.
+_DEFAULT_HEARTBEAT_SECS = 41.25
+_MIN_HEARTBEAT_SECS = 1.0
+_MAX_HEARTBEAT_SECS = 300.0
 
 
 # Gateway opcodes.
@@ -192,7 +210,21 @@ async def _run_connection(self: DiscordClient) -> None:
             try:
                 async for raw in ws:
                     if raw.type == aiohttp.WSMsgType.TEXT:
-                        await self._handle_frame(ws, json.loads(raw.data))
+                        # One bad frame costs that frame, not the connection:
+                        # escaping here would land in _gateway_loop's
+                        # catch-all and reconnect. Log metadata only, never
+                        # the body.
+                        try:
+                            frame = json.loads(raw.data)
+                        except json.JSONDecodeError:
+                            frame = None
+                        if not isinstance(frame, dict):
+                            logger.warning(
+                                "Discord gateway: dropping non-object frame (%d bytes)",
+                                len(raw.data),
+                            )
+                            continue
+                        await self._handle_frame(ws, frame)
                     elif raw.type in (
                         aiohttp.WSMsgType.CLOSED,
                         aiohttp.WSMsgType.CLOSE,
@@ -242,13 +274,21 @@ async def _run_connection(self: DiscordClient) -> None:
             self._notify_state(False, f"reconnecting (close {close_code or 'none'})")
 
 
+def _heartbeat_interval_secs(hello: Any) -> float:
+    """HELLO's ``heartbeat_interval`` (milliseconds) as a bounded sleep in seconds."""
+    raw = hello.get("heartbeat_interval") if isinstance(hello, dict) else None
+    millis = _coerce_float(raw)
+    if millis is None or millis <= 0:
+        return _DEFAULT_HEARTBEAT_SECS
+    return min(max(millis / 1000.0, _MIN_HEARTBEAT_SECS), _MAX_HEARTBEAT_SECS)
+
+
 async def _handle_frame(self: DiscordClient, ws: Any, frame: dict) -> None:
     op = frame.get("op")
     if frame.get("s") is not None:
         self._seq = frame["s"]
     if op == _OP_HELLO:
-        interval = float(frame["d"]["heartbeat_interval"]) / 1000.0
-        self._start_heartbeat(ws, interval)
+        self._start_heartbeat(ws, _heartbeat_interval_secs(frame.get("d")))
         if self._session_id and self._resume_url:
             await ws.send_json(
                 {
@@ -267,13 +307,13 @@ async def _handle_frame(self: DiscordClient, ws: Any, frame: dict) -> None:
     elif op == _OP_HEARTBEAT_ACK:
         self._hb_acked = True
     elif op == _OP_RECONNECT:
-        await ws.close()
+        await ws.close(code=_RESUME_CLOSE_CODE)
     elif op == _OP_INVALID_SESSION:
         if not frame.get("d"):
             self._session_id = ""
             self._seq = None
         await asyncio.sleep(1.0 + random.random() * 4.0)  # per docs
-        await ws.close()
+        await ws.close(code=_RESUME_CLOSE_CODE)
     elif op == _OP_DISPATCH:
         self._on_dispatch(frame.get("t") or "", frame.get("d") or {})
 
@@ -315,7 +355,7 @@ async def _heartbeat_loop(self: DiscordClient, ws: Any, interval: float) -> None
         while not self._closed and not ws.closed:
             if not self._hb_acked:
                 logger.warning("Discord gateway heartbeat not acked — reconnecting")
-                await ws.close()
+                await ws.close(code=_RESUME_CLOSE_CODE)
                 return
             self._hb_acked = False
             await ws.send_json({"op": _OP_HEARTBEAT, "d": self._seq})
@@ -331,7 +371,7 @@ async def _heartbeat_loop(self: DiscordClient, ws: Any, interval: float) -> None
         # loop reconnects instead of carrying a heartbeat-less connection.
         logger.warning("Discord heartbeat loop failed — recycling connection", exc_info=True)
         try:
-            await ws.close()
+            await ws.close(code=_RESUME_CLOSE_CODE)
         except Exception:
             logger.debug("Discord heartbeat close failed", exc_info=True)
 

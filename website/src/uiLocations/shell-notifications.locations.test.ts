@@ -43,7 +43,6 @@ const page = (entry: string, requires: Req[]): P => ({ surface: 'notifications',
 type Expect = { kind: string; labelKey: string; aliasKeys?: string[]; source: string; en: string; zh: string; placements: P[] }
 
 const EXPECTED: Record<string, Expect> = {
-  'shell.developer': { kind: 'button', labelKey: 'app.developer', source: APP_SRC, en: 'Developer', zh: '开发者', placements: railAndMenu('developer_mode') },
   'shell.terminal': { kind: 'toggle', labelKey: 'app.terminal', source: APP_SRC, en: 'Terminal', zh: '终端', placements: railAndMenu('terminal_enabled') },
   // The docked terminal panel's ⋯ menu and its dock-position item (side by side).
   'shell.terminal-more': {
@@ -89,7 +88,7 @@ const EXPECTED: Record<string, Expect> = {
     placements: [shell('menu', ['shell.notifications'], [cond('has_unread_notifications')])],
   },
   'notifications.clear-all': {
-    kind: 'button', labelKey: 'components.notifications.notificationFeed.clear_all_notifications', source: FEED_SRC, en: 'Clear all notifications?', zh: '清除所有通知？',
+    kind: 'button', labelKey: 'components.notifications.notificationFeed.clear_all_notifications', source: FEED_SRC, en: 'Clear all notifications', zh: '清除所有通知',
     placements: [shell('menu', ['shell.notifications'], [cond('has_notifications')])],
   },
   'notifications.page-mark-all-read': {
@@ -97,8 +96,8 @@ const EXPECTED: Record<string, Expect> = {
     source: FEED_SRC, en: 'All', zh: '全部', placements: [page('toolbar', [cond('has_unread_notifications')])],
   },
   'notifications.page-clear-all': {
-    kind: 'button', labelKey: 'components.notifications.notificationFeed.clear', aliasKeys: ['components.notifications.notificationFeed.clear_all_notifications'],
-    source: FEED_SRC, en: 'Clear', zh: '清除', placements: [page('toolbar', [cond('has_notifications')])],
+    kind: 'button', labelKey: 'components.notifications.notificationFeed.clear_all', aliasKeys: ['components.notifications.notificationFeed.clear_all_notifications'],
+    source: FEED_SRC, en: 'Clear all', zh: '全部清除', placements: [page('toolbar', [cond('has_notifications')])],
   },
   'notifications.detail.mark-unread': {
     kind: 'button', labelKey: 'components.notifications.notificationDetailPanel.mark_unread', source: DETAIL_SRC, en: 'Mark unread', zh: '标为未读',

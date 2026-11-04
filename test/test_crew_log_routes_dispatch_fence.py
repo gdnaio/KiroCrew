@@ -127,7 +127,7 @@ def test_every_crew_log_off_refusal_names_the_env_file_the_gateway_reads(
         "mcp_ledger": mcp_ledger,
     }[refusal]
     source = inspect.getsource(module)
-    if refusal == "crew_store":  # a mirror facade: its code is in the owners it lists
+    if refusal in ("crew_store", "work_ledger"):  # mirror facades: code is in their owners
         source += "".join(inspect.getsource(importlib.import_module(o)) for o in module._OWNERS)
     assert "~/.kiro/crew/.env" not in source
     assert "env_file_display()" in source
@@ -289,32 +289,21 @@ class TestTheDispatchFence:
     ):
         """MUTATION-SENSITIVE: the scan's fault bit reaches the refusal SITE, not the caller.
 
-        The conductor really did dispatch the grandchild, transitively, and the
-        grandchild's own log is intact -- nothing about this request is out of scope.
-        What breaks the chain is the CHILD in the middle: its announce record is
-        present and cannot be read as an entry, so the scan drops that unit's record
-        and the walk finds no node for its slot. ``dispatched_by`` answers False for a
-        missing node whatever put it there, so the only thing that can tell a real
-        absence of lineage from an edge the scan never read is the flag the reading
-        carries.
+        The grandchild really was dispatched and its log is intact. What breaks the
+        chain is the CHILD in the middle: its announce record cannot be read, so the
+        walk finds no node for its slot, and only the reading's flag tells a real
+        absence of lineage from an edge the scan never read.
 
-        What the caller is told is DELIBERATELY the same either way. This door passes
-        the requested unit as the scan's ``preferred``, and a named unit's own read
-        fault feeds the scan's flag, so a caller-visible distinction would let a
+        The caller is told the same either way: a visible distinction would let a
         guessed id that exists-and-is-unreadable be told apart from one that does not
-        exist -- an existence oracle on the boundary this fence exists to keep closed.
-        So the assertion is on the OPERATOR's record: the refusal site says the scan
-        was incomplete, and the wire says only "out of scope".
+        exist, an existence oracle on this boundary. So the assertion is on the
+        OPERATOR's record: the refusal site logs that the scan was incomplete, and the
+        wire says only "out of scope". Reverting ``dispatch_view`` to
+        ``SessionTree.records()`` drops the fault bit and reddens it.
 
-        Reverting ``dispatch_view`` to ``SessionTree.records()`` reddens it: that
-        accessor drops the fault bit, ``view.incomplete`` is then False, and nothing
-        is logged -- the refusal goes out with no account of why the tree was short.
-
-        The damage is planted as BYTES rather than monkeypatched, because this is the
-        non-transient case: a log is append-only, so a line that cannot be read as an
-        entry stays unreadable for the life of the file, and the scanner caches that
-        verdict. A patched read would exercise the transient case and leave the one
-        that never clears unpinned.
+        The damage is planted as BYTES, not monkeypatched: a log is append-only, so an
+        unreadable line stays unreadable and the scanner caches that verdict. A patched
+        read would exercise only the transient case.
         """
         _flag_on(monkeypatch)
         _dispatch_tree()
@@ -389,6 +378,11 @@ class TestTheDispatchFence:
         from kiro_crew.crew_log import read as crew_log_read
 
         crew_log_read._TREE._heads.clear()
+        # The first request seeded the session tree projection from the intact log;
+        # drop it so the second request reads the damaged store as a new process does.
+        from kiro_crew.crew_log import session_tree_projection
+
+        session_tree_projection.reset_for_tests()
 
         short = _as_conductor(
             f"/api/crew-log/units/{GRANDCHILD_UNIT}/page", match={"unit": GRANDCHILD_UNIT}

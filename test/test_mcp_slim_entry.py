@@ -78,6 +78,50 @@ def test_mcp_server_module_skips_gateway_stack(module: str, tmp_path: Path) -> N
     assert not loaded & set(HEAVY), sorted(loaded & set(HEAVY))
 
 
+#: Application subsystems a started-but-uncalled ``mcp-dashboard`` must not load.
+#: A Codex thread launches the server from the operator's own config and may
+#: never call it, so whatever the start imports is paid by every such helper.
+DASHBOARD_START_UNUSED = (
+    "kiro_crew.mcp_core",
+    "kiro_crew.history",
+    "kiro_crew.knowledge",
+    "kiro_crew.skills",
+    "kiro_crew.messaging",
+    "kiro_crew.session",
+    "kiro_crew.cron",
+    "kiro_crew.apps.bridges",
+)
+
+
+def test_dashboard_start_skips_unused_application_subsystems(tmp_path: Path) -> None:
+    """The real start-up path, ``slim_server(["mcp-dashboard"])``, in a fresh interpreter.
+
+    It runs every import the server makes before it reads stdin, including the
+    installed-app config-key scan. The first tool call imports ``mcp_core``.
+    """
+    (tmp_path / "home").mkdir()
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json, sys\n"
+            "from kiro_crew.mcp_entry import slim_server\n"
+            "assert slim_server(['mcp-dashboard']) is not None\n"
+            "print(json.dumps(sorted(sys.modules)))",
+        ],
+        env=_child_env(tmp_path, KIROCREW_PROJECT_DIR=str(tmp_path)),
+        cwd=str(tmp_path),
+        capture_output=True,
+        **UTF8_TEXT,
+        timeout=120,
+        check=False,
+    )
+    assert out.returncode == 0, out.stderr
+    loaded = set(json.loads(out.stdout.strip().splitlines()[-1]))
+    assert "kiro_crew.mcp_dashboard" in loaded
+    assert not loaded & set(DASHBOARD_START_UNUSED), sorted(loaded & set(DASHBOARD_START_UNUSED))
+
+
 def test_slim_entry_module_scope_imports_nothing_from_the_package(tmp_path: Path) -> None:
     # Only the package root (whose __init__ is stdlib-only) may be present.
     probe = _loaded_after(
@@ -409,12 +453,15 @@ def test_full_cli_keeps_registry_scan_off_the_gateway_readiness_path() -> None:
     guard = cli_src.index('\n    if args.command != "gateway":\n')
     prime = cli_src.index("\n        prime_extension_config_keys()\n")
     first_load = cli_src.index("\n    _setup_cli_logging(args.command, args.verbose)\n")
-    gateway_loop = cli_src.index("\n            asyncio.run(_gateway(**gw_kwargs))\n")
+    gateway_loop = cli_src.index(
+        "\n            asyncio.run(_gateway(**gw_kwargs), loop_factory=gateway_loop_factory())\n"
+    )
     assert guard < prime < first_load < gateway_loop
 
 
 def test_slim_servers_match_the_cli_dispatch() -> None:
     import importlib
+    import re
 
     for command, (module, func) in mcp_entry.SLIM_SERVERS.items():
         assert callable(getattr(importlib.import_module(module), func)), command
@@ -422,6 +469,13 @@ def test_slim_servers_match_the_cli_dispatch() -> None:
     for command, (module, func) in mcp_entry.SLIM_SERVERS.items():
         assert f'"{command}"' in cli_src
         assert module in cli_src, module
+    # And the other way: every server cli.main dispatches by name starts slim too,
+    # so a new `elif args.command == "mcp-<name>":` branch cannot quietly fall back
+    # to importing the whole CLI on every agent session.
+    dispatched = set(re.findall(r'elif args\.command == "(mcp-[a-z-]+)":', cli_src))
+    assert dispatched, "cli.main's mcp-* dispatch was not found"
+    slim = set(mcp_entry.SLIM_SERVERS)
+    assert dispatched == slim, sorted(dispatched ^ slim)
 
 
 def test_mcp_guide_answers_initialize_without_the_gateway_stack(tmp_path: Path) -> None:
@@ -484,3 +538,49 @@ def test_mcp_guide_answers_initialize_without_the_gateway_stack(tmp_path: Path) 
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=30)
+
+
+def _deny_stat_under(monkeypatch: pytest.MonkeyPatch, denied: Path) -> None:
+    """Make ``stat`` under *denied* fail with EPERM, as a sandbox-masked mount does."""
+    import errno
+
+    real_stat = os.stat
+
+    def _stat(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(path).startswith(str(denied)):
+            raise PermissionError(errno.EPERM, "Operation not permitted", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", _stat)
+
+
+def test_project_dir_walk_skips_an_ancestor_that_answers_eperm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A CWD that resolves under a masked mount must not crash MCP start-up:
+    the denied ancestor counts as "no checkout here" and detection moves on to
+    the saved file."""
+    masked = tmp_path / "masked"
+    cwd = masked / "home" / "lg"
+    cwd.mkdir(parents=True)
+    checkout = tmp_path / "checkout"
+    for marker in project_dir.PROJECT_MARKERS:
+        (checkout / marker).mkdir(parents=True)
+    saved = tmp_path / "project_dir"
+    saved.write_text(str(checkout), encoding="utf-8")
+    monkeypatch.chdir(cwd)
+    _deny_stat_under(monkeypatch, masked.resolve())
+    assert project_dir.detect_project_dir(lambda: saved) == str(checkout)
+    assert project_dir.detect_project_dir(lambda: tmp_path / "missing") is None
+
+
+def test_project_dir_saved_file_that_answers_eperm_counts_as_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    denied = tmp_path / "denied"
+    denied.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    _deny_stat_under(monkeypatch, denied.resolve())
+    assert project_dir.detect_project_dir(lambda: denied.resolve() / "project_dir") is None

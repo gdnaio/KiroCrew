@@ -39,12 +39,14 @@ import { MOBILE_BREAKPOINT } from './useIsMobile'
 import { isEditableTarget } from '../utils/editableTarget'
 import { closeShownCrewWindow, crewWindowShown } from '../pages/chat/crew-window/crewWindowStore'
 import { stepTurn } from '../pages/chat/turnStep'
+import { noteEscapeStoppedSpeech } from '../utils/speechStopKey'
 
 /** Shortcuts scoped to the session on screen (see the crew-window guard). */
 const CREW_WINDOW_SCOPED: ReadonlySet<string> = new Set([
   'close-chat', 'focus-input', 'focus-approval',
   'cycle-agent', 'cycle-prev-agent', 'cycle-reasoning', 'cycle-prev-reasoning',
   'cycle-approval', 'cycle-prev-approval', 'cycle-model', 'cycle-prev-model',
+  'pop-out-session',
 ])
 
 /**
@@ -250,8 +252,14 @@ export const SHORTCUT_LABEL_KEY: Record<string, string> = {
   'chat-8': 'hooks.useKeyboardShortcuts.jump_to_chat',
   'chat-9': 'hooks.useKeyboardShortcuts.jump_to_chat',
   'chat-letters': 'hooks.useKeyboardShortcuts.jump_to_chat_letters',
-  'chat-prev': 'hooks.useKeyboardShortcuts.previous_chat',
-  'chat-next': 'hooks.useKeyboardShortcuts.next_chat',
+  // The Alt+arrow rows name their focus rule: the handler leaves those chords
+  // to a focused text field (word-jump / paragraph movement on macOS), so
+  // without it the list advertises a chord that silently does nothing in the
+  // composer. The bracket chat rows below are the twin that works while
+  // typing, and keep the plain label; turn-prev/turn-next carry the rule in
+  // their own (unshared) catalog values.
+  'chat-prev': 'hooks.useKeyboardShortcuts.previous_chat_outside_text_fields',
+  'chat-next': 'hooks.useKeyboardShortcuts.next_chat_outside_text_fields',
   'chat-prev-bracket': 'hooks.useKeyboardShortcuts.previous_chat',
   'chat-next-bracket': 'hooks.useKeyboardShortcuts.next_chat',
   'chat-mru': 'hooks.useKeyboardShortcuts.last_visited_chat_mru',
@@ -283,6 +291,8 @@ export const SHORTCUT_LABEL_KEY: Record<string, string> = {
   'cycle-model': 'hooks.useKeyboardShortcuts.cycle_model',
   'cycle-prev-model': 'hooks.useKeyboardShortcuts.previous_model',
   'toggle-focus-mode': 'hooks.useKeyboardShortcuts.toggle_focus_mode',
+  // Reused: the chat header button this chord fires.
+  'pop-out-session': 'pages.chatPage.pop_out_session_to_its_own_window',
   // Reused: the ChatInput control this chord fires.
   'optimize-prompt': 'components.chatInput.optimize_prompt',
   'edit-last-message': 'hooks.useKeyboardShortcuts.edit_last_message',
@@ -720,10 +730,14 @@ interface UseKeyboardShortcutsOpts {
    *  panel if needed. Same ownership and unbound-when-undefined rule as
    *  `onToggleTerminal`. */
   onNewTerminal?: () => void
+  /** Pop the active session out to its own window, or focus that window when it
+   *  is already out. Left undefined in a window that has no pop-out control (a
+   *  popout or an embedded pane), which leaves the chord to the browser. */
+  onPopOutSession?: () => void
   disabled?: boolean
 }
 
-export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, onNewTerminal, disabled }: UseKeyboardShortcutsOpts) {
+export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, onNewTerminal, onPopOutSession, disabled }: UseKeyboardShortcutsOpts) {
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
   const guardedHistoryStep = useGuardedHistoryStep()
@@ -817,7 +831,7 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       // the leaked flag would blur the composer with no refocus AND silently
       // eat the NEXT pointer-driven switch's autofocus.
       if (isMacPlatform() && key !== activeSlot) releaseComposerForKeyboardSwitch()
-      dispatch(switchSlot({ key, announceOnMissing: true }))
+      dispatch(switchSlot({ key, announceOnMissing: true, gesture: true }))
       navigate('/chat')
     }
 
@@ -850,6 +864,9 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
     // trap is unarmed (post-reload) and unmount a dirty editor. Narrow
     // viewports claim the chord and do nothing.
     if ((hit === 'history-back' || hit === 'history-forward') && isInput) hit = null
+    // With no pop-out control in this window, or no session to pop out, ⌘O /
+    // Ctrl+O stays with the browser.
+    if (hit === 'pop-out-session' && (!onPopOutSession || !activeSlot)) hit = null
 
     if (ctrlDigits && e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey) {
       const jumpIdx = jumpIndexForCode(code)
@@ -988,6 +1005,9 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
         'cycle-model': () => onCycleModel?.(),
         'cycle-prev-model': () => onCyclePrevModel?.(),
         'toggle-focus-mode': () => onToggleFocusMode?.(),
+        // ⌘O / Ctrl+O: the chat header's pop-out button, for the active
+        // session. A held chord's auto-repeat is not another press.
+        'pop-out-session': () => { if (!e.repeat) onPopOutSession?.() },
         // Focus the pending tool-approval row. Firing while typing is safe HERE
         // ONLY BECAUSE IT MOVES FOCUS AND NOTHING ELSE — the decision still costs
         // a second, deliberate press on a control the user can now see is
@@ -1007,7 +1027,12 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
         // collapsed, which outlives a reload.
         'focus-input': () => queryComposerOrExpand(focusComposerElement),
         // ⌘N / Ctrl+N (alias Option/Alt+Shift+N): new session.
-        'new-chat': () => onNewChat(),
+        // A held chord's auto-repeat is not another press: without this
+        // filter, holding the keys creates one session per repeat tick. The
+        // repeat is still claimed (preventDefault below), so the browser's own
+        // binding does not fire either. Two separate presses are two requests
+        // and still make two sessions.
+        'new-chat': () => { if (!e.repeat) onNewChat() },
         // ⌘W / Ctrl+W (alias Option/Alt+Shift+W): close the current session —
         // same semantics as the header-menu / sidebar close (gated by
         // confirmCloseSession, dispatches deleteSlot, and a session with live work
@@ -1147,7 +1172,7 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       navigate(panelMap[code])
       return
     }
-  }, [dispatch, navigate, guardedHistoryStep, appStore, onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, panelToggleActions, disabled, enabled, ctrlDigits, panelBindings, bindings])
+  }, [dispatch, navigate, guardedHistoryStep, appStore, onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, onPopOutSession, panelToggleActions, disabled, enabled, ctrlDigits, panelBindings, bindings])
 
   // Escape stops in-progress voice read-back. CAPTURE phase so it runs before the command palette's bubble-phase Escape
   // handler, which stopPropagation()s and would otherwise close the palette while
@@ -1166,6 +1191,9 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       if (e.key !== 'Escape') return
       const { voicePlaying, voicePreparing } = appStore.getState().chat
       if (!voicePlaying && !voicePreparing) return
+      // Spent on speech: the composer's Escape-to-stop gate reads this and
+      // leaves the running turn alone (utils/speechStopKey.ts, #22315).
+      noteEscapeStoppedSpeech(e)
       window.dispatchEvent(new Event('voice-stop'))
     }
     document.addEventListener('keydown', onEsc, true)

@@ -16,8 +16,10 @@ import socket
 import aiohttp
 import pytest
 
+from kiro_crew.auth.login.builder_id import StartUrlRejectedError
 from kiro_crew.auth.login.portal import PortalAuthError, wait_for_callback
 from kiro_crew.auth.service import (
+    InvalidStartUrlError,
     KasLoginService,
     LoopbackUnavailableError,
     UnknownIdentityError,
@@ -32,6 +34,7 @@ from kiro_crew.dashboard.handlers.kas_login import (
     api_kas_login_poll,
     api_kas_login_status,
 )
+from kiro_crew.testing.wait import await_until
 
 
 class _FakeState:
@@ -91,6 +94,10 @@ class _StubService(KasLoginService):
             raise UnknownIdentityError(replaces)
         if provider_str == "facebook":
             raise ValueError(provider_str)
+        if start_url == "malformed":
+            raise InvalidStartUrlError("Start URL must use https.")
+        if start_url == "refused-by-aws":
+            raise StartUrlRejectedError("AWS did not accept the start URL.")
         return {
             "login_id": "lid-1",
             "user_code": "ABCD",
@@ -214,6 +221,20 @@ async def test_begin_device_missing_and_unknown_provider():
     assert _body(resp)["code"] == "invalid_provider"
 
 
+@pytest.mark.parametrize("start_url", ["malformed", "refused-by-aws"])
+@pytest.mark.asyncio
+async def test_begin_device_bad_start_url_is_a_coded_400_with_the_reason(start_url):
+    """Whether Crew or AWS refuses the start URL, the form gets a 400 it can fix
+    with the reason as the message, not a 502 that reads as an outage."""
+    resp = await api_kas_login_begin_device(
+        _FakeRequest(_StubService(), {"provider": "idc", "start_url": start_url})
+    )
+    assert resp.status == 400
+    body = _body(resp)
+    assert body["code"] == "invalid_start_url"
+    assert "start url" in body["error"].lower()
+
+
 @pytest.mark.asyncio
 async def test_begin_device_malformed_json_is_400():
     resp = await api_kas_login_begin_device(_FakeRequest(_StubService(), None))
@@ -234,6 +255,21 @@ async def test_poll_ok_and_missing_and_unknown():
     resp = await api_kas_login_poll(_FakeRequest(_StubService(), {"login_id": "gone"}))
     assert resp.status == 404
     assert _body(resp)["code"] == "unknown_login_id"
+
+
+@pytest.mark.asyncio
+async def test_poll_answers_a_sign_out_during_the_login_as_the_begin_409():
+    """The code the service returns when a sign-out (this gateway's or a shell's)
+    landed while the login was pending must not reach the card as a plain
+    terminal answer -- that path restarts the provider on the device flow."""
+
+    class _SignedOut(_StubService):
+        async def poll_device(self, login_id):
+            return {"status": "error", "code": "signed_out_during_login"}
+
+    resp = await api_kas_login_poll(_FakeRequest(_SignedOut(), {"login_id": "lid-1"}))
+    assert resp.status == 409
+    assert _body(resp)["code"] == "signed_out_during_login"
 
 
 @pytest.mark.asyncio
@@ -467,7 +503,7 @@ async def test_wait_for_callback_returns_query_fields():
     task = asyncio.create_task(wait_for_callback(sock, port, "st-1", timeout_secs=10))
     await asyncio.sleep(0.05)  # let the listener start
     await _hit(port, "/oauth/callback", {"login_option": "google", "code": "c1", "state": "st-1"})
-    result = await asyncio.wait_for(task, timeout=5)
+    result = await await_until(task, timeout=5)
     assert result["login_option"] == "google"
     assert result["code"] == "c1"
     assert result["state"] == "st-1"
@@ -480,7 +516,7 @@ async def test_wait_for_callback_accepts_signin_path():
     task = asyncio.create_task(wait_for_callback(sock, port, "st-2", timeout_secs=10))
     await asyncio.sleep(0.05)
     await _hit(port, "/signin/callback", {"login_option": "github", "code": "c2", "state": "st-2"})
-    result = await asyncio.wait_for(task, timeout=5)
+    result = await await_until(task, timeout=5)
     assert result["path"] == "/signin/callback"
 
 
@@ -491,7 +527,7 @@ async def test_wait_for_callback_state_mismatch_raises():
     await asyncio.sleep(0.05)
     await _hit(port, "/oauth/callback", {"login_option": "google", "code": "c", "state": "evil"})
     with pytest.raises(PortalAuthError, match="state mismatch"):
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task, timeout=5)
 
 
 @pytest.mark.asyncio
@@ -501,7 +537,7 @@ async def test_wait_for_callback_portal_error_raises():
     await asyncio.sleep(0.05)
     await _hit(port, "/oauth/callback", {"error": "access_denied", "state": "st"})
     with pytest.raises(PortalAuthError, match="access_denied"):
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task, timeout=5)
 
 
 @pytest.mark.asyncio

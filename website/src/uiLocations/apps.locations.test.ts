@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'vitest'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
+import { readPageFamily } from '../test/pageFamily'
 
 interface Req { kind: string; value?: string; location?: string; when?: string; id?: string }
 interface Placement { surface_id: string; route: string; parent_ids: string[]; entry_kind: string; requires: Req[] }
@@ -17,7 +18,7 @@ const byId = new Map(index.locations.map(l => [l.id, l]))
 const src = (rel: string) => fs.readFileSync(path.resolve(__dirname, rel), 'utf-8')
 const DISCOVER_SRC = src('../pages/apps/DiscoverPage.tsx')
 const LIBRARY_SRC = src('../pages/apps/LibraryPage.tsx')
-const DETAIL_SRC = src('../pages/AppDetailPage.tsx')
+const DETAIL_SRC = readPageFamily('AppDetailPage')
 const TILE_SRC = src('../pages/apps/LaunchpadTile.tsx')
 const SOURCES_SRC = src('../components/appstore/SourcesPopover.tsx')
 const REGISTRY_SRC = src('../components/RegistryManager.tsx')
@@ -120,7 +121,9 @@ describe('apps area locations', () => {
     const disable = DETAIL_SRC.split('\n').filter(l => l.includes("handleAction('disable')"))
     expect(disable.length).toBe(2)
     expect(disable.filter(l => l.includes("uiLocation('apps.detail.disable')")).length).toBe(1)
-    const uninstall = DETAIL_SRC.split('\n').filter(l => l.includes("handleAction('uninstall')"))
+    // Buttons only: a disabled self-managed app also offers Uninstall as an
+    // overflow menu item, which carries no marker.
+    const uninstall = DETAIL_SRC.split('\n').filter(l => l.includes("handleAction('uninstall')") && l.includes('<Btn'))
     expect(uninstall.length).toBe(2)
     expect(uninstall.filter(l => l.includes("uiLocation('apps.detail.uninstall')")).length).toBe(1)
     // Update is drawn once for self-managed apps and once for the rest.

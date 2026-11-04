@@ -41,7 +41,7 @@ import pytest
 from test_sandbox_launcher_program import identity, launch, payload, refusal, rendered_payload
 from test_sandbox_mount_pinned_target import _Bed, _Libc, _run, _window_bed
 
-from kiro_crew import sandbox, sandbox_launcher_program
+from kiro_crew import sandbox, sandbox_launcher, sandbox_launcher_program
 
 program = sandbox_launcher_program
 
@@ -257,7 +257,7 @@ _OPEN_CALL = re.compile(r"os\.open\(\s*([^,]+),\s*([^\n]*?)\)", re.S)
 
 def _program_source() -> str:
     """The launcher program a spawn runs, minus only its one plan substitution."""
-    return Path(program.__file__).read_text(encoding="utf-8")
+    return sandbox_launcher.launcher_program_source()
 
 
 def _launcher_protected_opens(script: str) -> list[tuple[str, str]]:
@@ -278,8 +278,8 @@ def test_every_protected_name_resolution_takes_a_no_follow_first_look() -> None:
     resolves protected names through ONE helper, that helper's first look does
     not follow, and it can be handed an identity to compare against. A resolution
     added anywhere else, or a first look that starts following again, fails this
-    without anyone maintaining a list of sites. Read off the program module, which
-    is the launcher a spawn runs with its plan substituted in.
+    without anyone maintaining a list of sites. Read off the program module and its
+    parts, which is the launcher a spawn runs with its plan substituted in.
     """
     script = _program_source()
 
@@ -370,11 +370,11 @@ def test_a_link_replaced_while_it_is_being_resolved_refuses(
     bed, store = _stow_bed(tmp_path)
     store_id, decoy_id = identity(store), identity(bed.decoy_dir)
     carried = _observed(bed.ssh)
-    state = _swap_the_link_during_the_follow(monkeypatch, bed.ssh, bed.decoy_dir)
+    with monkeypatch.context() as mp:
+        state = _swap_the_link_during_the_follow(mp, bed.ssh, bed.decoy_dir)
 
-    ran = _run(tmp_path, bed=bed, occupants=carried)
+        ran = _run(tmp_path, bed=bed, occupants=carried)
 
-    monkeypatch.undo()
     assert state["fired"], "the swap never ran, so this proved nothing"
     targets = ran.libc.target_ids()
     assert decoy_id not in targets, "the resolution followed the swapped entry to the decoy"
@@ -467,12 +467,12 @@ def test_control_the_shipped_source_refuses_both_substitutions(
     """
     bed = _Bed(tmp_path)
     carried = _observed(bed.ssh)
-    _substitute_link_at(monkeypatch, bed.ssh, bed.decoy_dir)
-    decoy_refusal = _run(tmp_path, bed=bed, occupants=carried).refusal
-    assert decoy_refusal is not None, "the decoy substitution was not refused"
-    assert "DIFFERENT object" in decoy_refusal
+    with monkeypatch.context() as mp:
+        _substitute_link_at(mp, bed.ssh, bed.decoy_dir)
+        decoy_refusal = _run(tmp_path, bed=bed, occupants=carried).refusal
+        assert decoy_refusal is not None, "the decoy substitution was not refused"
+        assert "DIFFERENT object" in decoy_refusal
 
-    monkeypatch.undo()
     other = tmp_path / "second"
     other.mkdir()
     bed2 = _Bed(other)

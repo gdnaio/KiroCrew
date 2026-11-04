@@ -27,6 +27,7 @@ import {
 import Clickable from '../../../../components/Clickable'
 import ErrorNotice from '../../../../components/ErrorNotice'
 import { useImeGuard } from '../../../../hooks/useImeGuard'
+import { usePointerMotion } from '../../../../hooks/usePointerMotion'
 import type { ChatMessage } from '../shared/types'
 import { applyTheme, type ThemeId } from '../shared/themes'
 import { formatShortcut } from '../shared/shortcut'
@@ -106,6 +107,9 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
   const MAX_LOADED = 200 // safety cap — prevents DOM from growing unbounded
   const [input, setInput] = useState('')
   const [cmdIdx, setCmdIdx] = useState(0) // highlighted command in autocomplete
+  // Hover moves the highlight only on real pointer motion, so the reset to row 0 on
+  // each keystroke survives a pointer resting over the menu.
+  const cmdPointerMoved = usePointerMotion(input.startsWith('/'))
   const [editingTs, setEditingTs] = useState<string | null>(null)
   const [isAtBottom, setIsAtBottom] = useState(true)
   const [screenshot, setScreenshot] = useState<string | null>(null)
@@ -406,12 +410,18 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
         // The bridge answers untyped rows, so the shape is asserted per FIELD here
         // rather than trusted wholesale: the filter is what guarantees `role` is one
         // of the two this panel renders, and a row missing a timestamp gets 0.
+        // The server row id (`meta.mid`) is kept so a patch frame for a row loaded
+        // here still finds it (see the `_patch` branch below).
         const mapped = history
           .filter((m) => m.role === 'user' || m.role === 'assistant')
-          .map((m, i): ChatMessage => ({
-            id: `hist-${i}`, role: m.role as ChatMessage['role'], content: m.content as string,
-            timestamp: (m.timestamp as number) || 0,
-          }))
+          .map((m, i): ChatMessage => {
+            const mid = (m.meta as { mid?: unknown } | null | undefined)?.mid
+            return {
+              id: `hist-${i}`, role: m.role as ChatMessage['role'], content: m.content as string,
+              timestamp: (m.timestamp as number) || 0,
+              ...(typeof mid === 'string' && mid ? { meta: { mid } } : {}),
+            }
+          })
         setAllHistory(mapped)
         setMessages(mapped.slice(-INITIAL_HISTORY))
         wasNearBottomRef.current = true
@@ -481,6 +491,20 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
       if (typeof retractId === 'string') {
         setMessages((prev: ChatMessage[]) => prev.filter(m => m.id !== retractId))
         setAllHistory((prev: ChatMessage[]) => prev.filter(m => m.id !== retractId))
+        return
+      }
+      // A patch frame: new content for a committed row, named by the server
+      // row id (`meta.mid`) the row carries, from its own frame or from the
+      // history load. The gateway gives back the last run of text it held across
+      // a tool call or approval prompt this way. Like a retraction it carries no
+      // renderable role.
+      const patchMid = (msg as { _patch?: unknown })._patch
+      if (typeof patchMid === 'string') {
+        const content = String(msg.content ?? '')
+        const patch = (prev: ChatMessage[]) => prev.map(m =>
+          (m as { meta?: { mid?: unknown } }).meta?.mid === patchMid ? { ...m, content } : m)
+        setMessages(patch)
+        setAllHistory(patch)
         return
       }
       if (msg.role) {
@@ -942,7 +966,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
               }
             }} style={{
               marginLeft: 'auto', background: 'var(--accent)', border: 'none', borderRadius: 6,
-              padding: '3px 10px', color: '#fff', fontSize: 11, fontWeight: 600,
+              padding: '3px 10px', color: 'var(--accent-text)', fontSize: 11, fontWeight: 600,
               cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0,
             }}>{i18nT('apps.mochi.gateway.start_btn')}</button>
           )}
@@ -983,7 +1007,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
                 try { await api?.resetMochi?.(); setMessages([]); setAllHistory([]) } finally { setActionLoading(false); setShowResetConfirm(false) }
               }} style={{
                 background: 'var(--danger)', border: 'none', borderRadius: 6,
-                padding: '5px 12px', color: '#fff', fontSize: 12, fontWeight: 600,
+                padding: '5px 12px', color: 'var(--danger-fg, #fff)', fontSize: 12, fontWeight: 600,
                 cursor: actionLoading ? 'wait' : 'pointer', opacity: actionLoading ? 0.6 : 1,
               }}>{actionLoading ? '...' : i18nT('apps.mochi.reset.confirm')}</button>
             </div>
@@ -1050,7 +1074,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
                 try { await api?.deleteHistory?.(); setMessages([]); setAllHistory([]) } finally { setActionLoading(false); setShowClearConfirm(false) }
               }} style={{
                 background: 'var(--danger)', border: 'none', borderRadius: 6,
-                padding: '5px 12px', color: '#fff', fontSize: 12, fontWeight: 600,
+                padding: '5px 12px', color: 'var(--danger-fg, #fff)', fontSize: 12, fontWeight: 600,
                 cursor: actionLoading ? 'wait' : 'pointer', opacity: actionLoading ? 0.6 : 1,
               }}>{actionLoading ? '...' : i18nT('apps.mochi.deleteHistory.confirm')}</button>
             </div>
@@ -1096,8 +1120,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
           ) : null}
         </div>
 
-        {/* Message items — normal flow */}
-        {messages.map((msg) => (
+        {/* Message items — normal flow. An assistant row committed with no text
+            yet is not drawn: all of its text is a run the gateway holds across
+            the tool call or approval prompt after it, and it arrives as a patch
+            (the dashboard hides the same row). */}
+        {messages.filter((msg) => msg.role !== 'assistant' || msg.content).map((msg) => (
           <div key={msg.id} style={{ padding: '3px 10px', display: 'flex', flexDirection: 'column' }}>
             <Bubble message={msg} onOption={sendText} onImageClick={openLightboxCb}
               animate={!msg.id.startsWith('hist-')}
@@ -1160,7 +1187,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
           }} style={{
             background: 'var(--danger)', border: 'none',
             borderRadius: 14, padding: '4px 10px', fontSize: 10, fontWeight: 600,
-            color: '#fff', cursor: 'pointer', pointerEvents: 'auto',
+            color: 'var(--danger-fg, #fff)', cursor: 'pointer', pointerEvents: 'auto',
             display: 'flex', alignItems: 'center', gap: 4,
             boxShadow: '0 2px 8px var(--shadow)',
             transition: 'opacity 0.15s',
@@ -1367,7 +1394,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
                   display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                   background: i === cmdIdx ? 'var(--bg-input)' : 'transparent',
                 }}
-                onMouseEnter={() => setCmdIdx(i)}
+                onMouseMove={e => { if (cmdPointerMoved(e)) setCmdIdx(i) }}
               >
                 <code style={{ color: 'var(--accent)', fontSize: 11 }}>{c.cmd}</code>
                 <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>{i18nT(SLASH_DESC_KEY[c.cmd])}</span>

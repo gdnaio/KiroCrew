@@ -15,7 +15,7 @@ import json
 from enum import Enum
 from typing import Any
 
-from kiro_crew.dashboard.slot_queue_repository import ATTACHMENT_META_KEYS
+from kiro_crew.dashboard.slot_queue_repository import ATTACHMENT_META_KEYS, source_channels_of
 from kiro_crew.dashboard.state import (
     BUSY_RECOVERY_PREFIX,
     COMPACTION_RECOVERY_PREFIX,
@@ -216,6 +216,12 @@ EMPTY_TURN_NOTICE_KIND = "empty_turn"
 #: notice of any kind (the "crewmate chat draws messages only" decision record).
 SPEC_HOOKS_NOTICE_KIND = "spec_hooks"
 
+#: ``meta.kind`` of the session-start notice that says Crew's tools are off in
+#: this session because a settings file Crew does not govern holds its path.
+#: Sessions draws it; crewmate chat drops it (``crewmateBubbles.isCrewmateChatRow``)
+#: for the same reason as :data:`SPEC_HOOKS_NOTICE_KIND`.
+SEED_DECLINED_NOTICE_KIND = "seed_declined"
+
 
 #: Row-level kind for the terminal `error` row a prompt-time MODEL ENTITLEMENT
 #: rejection produces ("Your account does not have access to model 'X'"), so
@@ -273,9 +279,21 @@ SESSION_START_FAILED_KIND = "session_start_failed"
 #: window are not carried over.
 CONTEXT_OVERFLOW_KIND = "context_overflow"
 
+#: Row-level kind for the terminal `error` row the provider's MANY-IMAGE PIXEL
+#: cap produces: an image already in the native history is larger than 2000px on
+#: its longest edge, and once a conversation holds many images one oversized
+#: image rejects the whole turn (the ``image_dimension_wedge`` tag
+#: ``_raise_acp_error`` sets). A retry, a Resume or another model re-sends the
+#: same history and fails the same way -- but UNLIKE a context overflow this is
+#: recoverable WITHOUT losing turns: the card swaps Resume for "Repair images and
+#: resume", which stops the slot's kiro-cli (releasing the transcript lock),
+#: downscales the oversized images in place (``session_image_repair``), and
+#: re-issues the interrupted turn against the repaired conversation.
+IMAGE_REPAIR_KIND = "image_repair"
+
 #: Row-level kind for the terminal `error` row a refused app-owned agent turn
 #: produces (``apps.manager.app_command_agent_refusal``: the app's agent is
-#: shadowed, ambiguous or not installed), and for a session start whose agent has
+#: reserved, ambiguous or not installed), and for a session start whose agent has
 #: no definition at all (``AcpAgentUnavailable``, typically a disabled app's
 #: Crew Member). A retry re-runs the same check against the same files, so the
 #: frontend withholds Resume on this row and the composer does not urge it; the
@@ -297,6 +315,7 @@ KIRO_CLI_MISSING_KIND = "kiro_cli_missing"
 #: text will not have the kind tag and will correctly classify as plain input.
 SUBAGENT_COMPLETION_KIND = "subagent_completion"
 CRON_NOTIFICATION_KIND = "cron_notification"
+
 #: An embedded MCP App's ui/message delivery (SEP-1865 return channel) — see
 #: ``dashboard.handlers.mcp_apps.api_mcp_apps_message``. System injection like
 #: the two above: app-authored, never user speech, must break user-message
@@ -455,6 +474,13 @@ STEER_POSSIBLY_DELIVERED_NOTE = (
 #: behind the children would turn that choice into a Queue they never picked.
 STEER_INTENT_META = "steer_intent"
 
+#: Queue-entry meta key: this entry is an AUTOMATION steer (a work-ledger wake)
+#: that the running turn ended before taking. Its value is the row's
+#: ``meta.nudge`` (``{"cycle", "loop_id"}``). The drain writes the entry as a
+#: ``nudge`` row instead of a ``user`` row, and the entry drains alone: merged,
+#: its text would be glued onto the human's own queued words in one row.
+AUTOMATION_STEER_META = "automation_steer"
+
 
 def releases_past_subagent_hold(item: dict) -> bool:
     """Whether the sub-agent hold lets *item* drain while children still run.
@@ -500,14 +526,41 @@ def _stamped_turn_actor(item: dict) -> Any:
     return meta.get(TURN_ACTOR_META_KEY, "") if isinstance(meta, dict) else ""
 
 
+def teardown_hold_active(state, slot) -> bool:
+    """Whether a deferred conversation discard holds *slot*'s queue.
+
+    A deferred project reset is not a cause: every turn consumes it before it
+    acquires a session (``_turn_admit``), so no prompt reaches the stale session,
+    and a reset whose key has no session declines on every call and would park
+    the queue for good.
+
+    Nor is a wake's discard while a question or approval is pending. That
+    discard waits for the card to clear, and only the person's answer, run as a
+    turn, clears it, so holding the answer would hold the discard for good.
+    """
+    if slot._pending_discard_conversation_key is None:
+        return False
+    if not getattr(slot, "_pending_discard_from_wake", False):
+        return True
+    # deferred: session_directive_apply loads autonudge and the monitor stack at
+    # import, which this leaf module must not pull into every importer.
+    from kiro_crew.dashboard.session_directive_apply import _slot_has_pending_interaction
+
+    return not _slot_has_pending_interaction(state, slot)
+
+
 def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
     """Drain the queue: merge non-cron messages or pop the first one.
 
     A merge run stops at a system injection, at an attachment-bearing entry
     (see :func:`carries_attachments`), at a possibly-delivered steer
-    (``STEER_POSSIBLY_DELIVERED_META``) and where the stamped turn actor
-    changes, so an app's queued send never folds into the user's own words; an
-    entry that starts no run pops alone.
+    (``STEER_POSSIBLY_DELIVERED_META``), at a requeued automation steer
+    (:data:`AUTOMATION_STEER_META`), at an entry a decision steered
+    (``meta.decisions_strip``) and where the stamped turn actor
+    changes, so an app's queued send never folds into the user's own words, and
+    where the stamped source channels change, so a turn admission refuses for one
+    channel never carries another message with it; an entry that starts no run
+    pops alone.
     """
     if merge_enabled and len(slot._queue) > 1:
         to_merge: list[dict] = []
@@ -518,9 +571,18 @@ def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
                 # Its note speaks for one message; merged, it would vouch that
                 # messages never written to any pipe may already have run.
                 or (item.get("meta") or {}).get(STEER_POSSIBLY_DELIVERED_META)
+                # Automation text, never folded into a person's row.
+                or (item.get("meta") or {}).get(AUTOMATION_STEER_META)
+                # A decision's receipt names one message; a merged row has one meta.
+                or (item.get("meta") or {}).get("decisions_strip")
             ):
                 break
             if to_merge and _stamped_turn_actor(item) != _stamped_turn_actor(to_merge[0]):
+                break
+            # Admission judges a turn by every source channel its entries carry,
+            # so entries from different channels (or one with none) never share a
+            # turn: a refusal of one channel's words must not take another's.
+            if to_merge and source_channels_of(item) != source_channels_of(to_merge[0]):
                 break
             to_merge.append(item)
         if len(to_merge) > 1:
@@ -531,8 +593,8 @@ def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
     return item["content"], [item]
 
 
-def _dequeue_next_system_message(slot) -> tuple:
-    """Pop the first queued entry the sub-agent hold releases, leaving plain
+def _dequeue_next_system_message(slot, *, system_only: bool = False) -> tuple:
+    """Pop the first queued entry the hold in force releases, leaving plain
     user messages queued.
 
     Implements the (always-on) queue-during-subagents behavior: while background
@@ -542,9 +604,17 @@ def _dequeue_next_system_message(slot) -> tuple:
     and so is a steer that fell back to the queue
     (:func:`releases_past_subagent_hold`). Returns ``(content, [item])`` for the
     drained item, or ``(None, [])`` when only held (user) messages remain queued.
+
+    ``system_only`` narrows that to :func:`is_system_injection_item`, for the
+    conversation-discard hold. The steer exemption is a choice about not waiting
+    for children; it says nothing about WHICH conversation answers, so a steer
+    that degraded into a queue entry must not drain into a conversation the
+    person asked to drop. The successor's own admission consume does not allow
+    discards, so nothing downstream would catch it.
     """
+    release = is_system_injection_item if system_only else releases_past_subagent_hold
     for i, item in enumerate(slot._queue):
-        if releases_past_subagent_hold(item):
+        if release(item):
             popped = slot.queue_pop(i)
             return popped["content"], [popped]
     return None, []

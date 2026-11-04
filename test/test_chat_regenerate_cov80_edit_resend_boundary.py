@@ -22,6 +22,7 @@ from chat_regenerate_cov80_helpers import state_fixture  # noqa: F401
 from chat_regenerate_cov80_helpers import _client, _make_regen_app
 
 from kiro_crew.dashboard.chat_regenerate import api_chat_slot_edit_resend
+from kiro_crew.testing.wait import async_wait_until
 
 # ── edit-resend: the prospective copy must not touch the live slot ──
 # ``copy.copy`` is shallow, so reassigning ``messages`` alone leaves every other
@@ -388,11 +389,9 @@ async def test_edit_resend_abort_hands_a_diverted_send_to_the_queue_drain(state)
                 "/api/chat/slots/s1/edit-resend", json={"index": 0, "content": "edited"}
             )
             assert resp.status == 503
-            for _ in range(50):
-                if drain.await_count:
-                    break
-                # flake-ok: pre-existing 20 ms pacing of a 50-pass poll for the queue-drain hand-off, whose assert below fails loudly, moved verbatim; tracked for a de-flake pass
-                await asyncio.sleep(0.02)
+            await async_wait_until(
+                lambda: drain.await_count, describe=lambda: "the queue drain was never handed off"
+            )
 
     drain.assert_awaited_once()
     run.assert_not_awaited()
@@ -681,19 +680,26 @@ async def test_edit_resend_refuses_the_commit_when_the_slot_is_replaced(state) -
     slot.append("assistant", "answer")
     slot.drain()
     original_messages = list(slot.messages)
+    # Same name, different object -- as a close-and-recreate produces. Built
+    # up front on the loop; the save stub below only swaps the map entry, so
+    # no slot construction runs on the executor thread.
+    replacement = state.get_or_create_slot("s2")
 
-    async def _replacing_discard(key, **kwargs):
-        # Same name, different object -- as a close-and-recreate produces.
-        state._slots["s1"] = state.get_or_create_slot("s2")
+    def _replacing_save(*args, **kwargs):
+        # The swap lands while the durable write is in flight: after the
+        # helper's dispatch verify (which would refuse a replacement that is
+        # already published) and before the commit adoption, which is exactly
+        # the window the commit-target re-check owns.
+        state._slots["s1"] = replacement
         return True
 
-    state.sessions.discard_conversation = AsyncMock(side_effect=_replacing_discard)
+    state.sessions.discard_conversation = AsyncMock(return_value=True)
     run = AsyncMock()
 
     with (
         patch(
             "kiro_crew.dashboard.chat_persistence._save_slot_to_history",
-            MagicMock(return_value=True),
+            MagicMock(side_effect=_replacing_save),
         ),
         patch("kiro_crew.dashboard.chat_regenerate._run_chat", new=run),
     ):

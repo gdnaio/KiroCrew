@@ -20,7 +20,7 @@ import type {
   ContextMenuOpenContext as FileTreeContextMenuOpenContext,
 } from '@pierre/trees'
 import { FileTree, useFileTree } from '@pierre/trees/react'
-import { AtSign, Download, FileDiff, FolderDot, FolderLock, FolderOpen, Undo2 } from 'lucide-react'
+import { AtSign, Download, FileDiff, FolderDot, FolderLock, FolderOpen, Undo2, Upload } from 'lucide-react'
 import { api } from '../api/client'
 import { ApiError } from '../api/apiError'
 import ErrorNotice from '../components/ErrorNotice'
@@ -120,15 +120,20 @@ function expandedDirectoriesOf(
  *  anchor, the outside-click wash, and open/close (the portal root's
  *  `data-file-tree-context-menu-root` marker is the library's documented way to
  *  keep a portaled surface counting as "inside"); this renders only the item
- *  list: the built-in "Add to chat" action, plus any row an installed app
- *  contributes for the `tree-context` surface (row click already opens a file,
- *  so the menu deliberately carries no Open duplicate). Every action closes the
- *  menu itself so focus returns to the row. */
-function TreeContextMenu({ item, context, root, onAddToContext, contribItems, onError }: {
+ *  list: the built-in "Add to chat" action, the built-in "Upload
+ *  files…" action (DIRECTORY rows only), plus any
+ *  row an installed app contributes for the `tree-context` surface (row click
+ *  already opens a file, so the menu deliberately carries no Open duplicate).
+ *  Every action closes the menu itself so focus returns to the row. */
+function TreeContextMenu({ item, context, root, onAddToContext, onUploadRequest, contribItems, onError }: {
   item: FileTreeContextMenuItem
   context: FileTreeContextMenuOpenContext
   root: string
   onAddToContext?: (absPath: string, kind: TreeEntryKind) => void
+  /** Right-click "Upload files…" on a directory row: hands the host the
+   *  ABSOLUTE directory path so it can open the OS file picker and upload
+   *  the selection into it. Absent → the row is not rendered. */
+  onUploadRequest?: (absDirPath: string) => void
   /** Contributed `tree-context` rows, resolved by the PARENT (which already holds
    *  the `['apps']` query) and passed down. Deliberately a prop rather than a hook
    *  call here: this component mounts inside Pierre's context-menu slot, and a
@@ -175,6 +180,11 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
     context.close()
     run()
   }
+  // "Upload files…" renders only on a directory row, and only when the host
+  // supplied the handler: this same component instance answers every row the
+  // tree opens a menu for, and a FILE row must never show the directory-only
+  // upload action even when the host wired it for other rows.
+  const showUpload = isDir && !!onUploadRequest
   // Focus the first item on open. Pierre's own open path calls `item.focus()`
   // on the tree ROW, never on this slotted content, so a keyboard user who
   // opens the menu (Shift+F10 / the ContextMenu key) would otherwise be left
@@ -193,13 +203,15 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
       ?? menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]'))?.focus()
   }, [])
   // The shared role="menu" keyboard contract (#6231). The item count is no longer
-  // fixed: the built-in row is gated on `onAddToContext` and an installed app may
-  // contribute any number of rows its `when` admits, so this menu can hold one row
-  // or several and the arrows do real navigation whenever it holds more than one.
-  // Honouring the contract per-surface-by-item-count is how surfaces drift anyway —
-  // an arrow inside an open menu must be consumed rather than scrolling the tree
-  // behind it, Tab must stay contained (#2533), and IME composition keys must not
-  // reach the menu at all, all true whatever the count. `enabled: true`
+  // fixed: the built-in "Add to chat" row is gated on `onAddToContext`, the
+  // built-in "Upload files…" row is gated on `onUploadRequest` AND a directory
+  // row, and an installed app may contribute any number of rows its `when`
+  // admits — so this menu can hold one row or several and the arrows do real
+  // navigation whenever it holds more than one. Honouring the contract
+  // per-surface-by-item-count is how surfaces drift anyway — an arrow inside
+  // an open menu must be consumed rather than scrolling the tree behind it,
+  // Tab must stay contained (#2533), and IME composition keys must not reach
+  // the menu at all, all true whatever the count. `enabled: true`
   // unconditionally because Pierre only mounts this component while the menu is open.
   // focusFirstOnOpen: false — the firstItemRef effect above already owns focus
   // entry (it must, because Pierre focuses the tree ROW, not this slotted
@@ -280,14 +292,15 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
     }
   }, [context])
   // Render nothing rather than an empty bordered popup: with no host row, no
-  // Download (a directory), AND no app row that its `when` admits for this
-  // node, there is nothing to show and no menuitem for the focus effect to land
-  // on.
+  // Download (a directory with no upload handler), no upload row (absent
+  // handler, or a file row), AND no app row that its `when` admits for this
+  // node, there is nothing to show and no menuitem for the focus effect to
+  // land on.
   // A file row also carries a built-in Download (retrieve the bytes onto the
   // machine running the browser). Directories do not: the ask is file rows
   // only, and /api/file-download serves a single file, not a folder.
   const canDownload = !isDir
-  if (!hasBuiltinChatRow && !canDownload && rows.length === 0) return null
+  if (!hasBuiltinChatRow && !canDownload && !showUpload && rows.length === 0) return null
   return <OverlayPortal>
     <div
       ref={menuRef}
@@ -326,9 +339,8 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
         </div>
       )}
       {/* Built-in Download for a file row. Streams the raw bytes through the
-          SAME /api/file-download path the viewer's Download uses, so the
-          endpoint's credential scan runs before any byte reaches the browser; a
-          refusal is surfaced through the tree's error notice, never bypassed.
+          SAME /api/file-download path the viewer's Download uses; a failure is
+          surfaced through the tree's error notice.
           Its ref is `firstItemRef` only when there is no Add-to-chat row above
           it to own focus entry. */}
       {canDownload && (
@@ -342,6 +354,24 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
         >
           <Download className="lucide-inline text-muted" />
           {i18nT('pages.chat.fileBrowserRail.ctx_download')}
+        </div>
+      )}
+      {/* Built-in Upload for a directory row: hands the absolute directory
+          path to the host, which opens the OS file picker and POSTs to
+          /api/directory-upload. Directory rows only (mutually exclusive with
+          Download above, which is file-only), so the firstItemRef handoff
+          cannot collide. */}
+      {showUpload && (
+        <div
+          ref={hasBuiltinChatRow ? undefined : firstItemRef}
+          role="menuitem"
+          tabIndex={-1}
+          className={itemCls}
+          onClick={activate(() => onUploadRequest?.(abs))}
+          onKeyDown={activate(() => onUploadRequest?.(abs))}
+        >
+          <Upload className="lucide-inline text-muted" />
+          {i18nT('pages.chat.fileBrowserRail.ctx_upload_files')}
         </div>
       )}
       {/* App-contributed rows (contributes.fileMenuItems, surface 'tree-context').
@@ -364,7 +394,7 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
         return (
           <div
             key={`${mi.app}:${mi.id}`}
-            ref={!hasBuiltinChatRow && !canDownload && idx === 0 ? firstItemRef : undefined}
+            ref={!hasBuiltinChatRow && !canDownload && !showUpload && idx === 0 ? firstItemRef : undefined}
             role="menuitem"
             tabIndex={-1}
             className={itemCls}
@@ -422,7 +452,7 @@ function dedupeTreePaths(paths: string[]): string[] {
 /** Open loaded folders one whole-tree poll re-reads, at most. */
 const FOLDER_REREADS_PER_POLL = 3
 
-export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext, searchQuery, mode = 'all', selectedPath, persistExpansion = false, onOpenFolder, reveal, onRevealed }: {
+export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext, onUploadRequest, searchQuery, mode = 'all', selectedPath, persistExpansion = false, onOpenFolder, reveal, onRevealed, active = true }: {
   projectDir: string
   onFileOpen?: (absPath: string) => void
   /** Right-click "Add to context" on a row: hands the host the ABSOLUTE path
@@ -431,6 +461,10 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
    *  rendered, and the context menu opens only if an app contributes a
    *  'tree-context' row this node matches. */
   onAddToContext?: (absPath: string, kind: TreeEntryKind) => void
+  /** Right-click "Upload files…" on a DIRECTORY row: hands the host the
+   *  ABSOLUTE directory path so it can open the OS file picker and upload the
+   *  selection into it. Absent → no upload row on any menu. */
+  onUploadRequest?: (absDirPath: string) => void
   /** Forwarded into the tree's search session (null clears it). */
   searchQuery?: string | null
   /** 'all' renders the full workspace; 'changed' renders only the files with
@@ -454,6 +488,10 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   /** Called once a reveal has been acted on, so the host can clear it: a
    *  remount (a mode toggle) must not replay it over the user's later collapse. */
   onRevealed?: () => void
+  /** Whether the user can see the tree. False stops every read it makes, for
+   *  a host that keeps it mounted while hidden; true again re-reads what is
+   *  stale. Defaults to true. */
+  active?: boolean
 }) {
   // Whether any app contributes a 'tree-context' row at all — gates whether the
   // tree wires a context menu (per-node `when` filtering happens in the menu).
@@ -463,10 +501,13 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   // inside it would unmount with the thing that raised it.
   const [actionError, setActionError] = useState<string | null>(null)
   const qc = useQueryClient()
+  // `active` gates by `enabled`, not by the poll settings alone: a disabled
+  // observer keeps its data and asks for nothing, not a poll, not a window
+  // focus, and becoming enabled again re-reads a stale query once.
   const { data: baseTree, dataUpdatedAt: baseTreeUpdatedAt } = useQuery({
     queryKey: ['project-tree', projectDir],
     queryFn: () => api.projectTree(projectDir),
-    enabled: !!projectDir,
+    enabled: !!projectDir && active,
     // No poll while the read is failing: `api.projectTree` runs under a deadline, so a
     // wedged gateway would otherwise be re-walked every interval for as long as the tree
     // is mounted, each pass rejecting on the same deadline. A failed read recovers through
@@ -484,7 +525,7 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   const { data: status, error: statusError } = useQuery({
     queryKey: ['git-status', projectDir],
     queryFn: () => api.projectGitStatus(projectDir),
-    enabled: !!projectDir && (mode === 'changed' || !!baseTree?.repo),
+    enabled: !!projectDir && active && (mode === 'changed' || !!baseTree?.repo),
     refetchInterval: 5_000,
     refetchOnWindowFocus: true,
   })
@@ -512,7 +553,7 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
     queries: (mode === 'all' ? loadedFolders : []).map(folder => ({
       queryKey: ['project-tree', projectDir, 'dir', folder],
       queryFn: () => api.projectTree(projectDir, folder) as Promise<FolderListing>,
-      enabled: !!projectDir,
+      enabled: !!projectDir && active,
       retry: false,
       staleTime: 10_000,
     })),
@@ -589,12 +630,13 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
       return next
     })
   }, [evict])
-  // Child folder rows of each CUT folder, for the lazy load below: a chain row
-  // reports the expansion of its last folder only. Built for the cut folders
-  // alone, so it stays small however large the listing is.
+  // Child folder rows of each folder listed on request (cut by the cap, or a
+  // nested repository), for the lazy load below: a chain row reports the
+  // expansion of its last folder only. Built for those folders alone, so it
+  // stays small however large the listing is.
   const childDirectoriesRef = useRef<Map<string, string[]>>(new Map())
   childDirectoriesRef.current = useMemo(() => {
-    const cut = new Set((tree?.truncatedDirectories ?? []).filter(Boolean))
+    const cut = new Set([...(tree?.truncatedDirectories ?? []), ...(tree?.nestedRepoDirectories ?? [])].filter(Boolean))
     const map = new Map<string, string[]>()
     if (cut.size === 0) return map
     for (const raw of tree?.directories ?? []) {
@@ -607,6 +649,20 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   const truncatedDirectoriesRef = useRef<Set<string>>(new Set())
   truncatedDirectoriesRef.current = new Set(tree?.truncatedDirectories ?? [])
   const truncatedDirectoriesKey = (tree?.truncatedDirectories ?? []).join('\n')
+  // The folders whose own listing is fetched when they are opened: the ones
+  // the cap cut, and the nested repositories the project's listing cannot see
+  // inside. Only the first kind is a cut (badge, state row, folder tab).
+  const lazyFoldersRef = useRef<Set<string>>(new Set())
+  lazyFoldersRef.current = new Set([...(tree?.truncatedDirectories ?? []), ...(tree?.nestedRepoDirectories ?? [])])
+  const lazyFoldersKey = [...lazyFoldersRef.current].join('\n')
+  // The subset of those that are nested repositories. A cut folder keeps a
+  // state row beneath it, so the tree holds it open across the listing that
+  // lands; a nested repository has no row, so the folder is open over nothing
+  // and the reset that folds its listing in would close it (the expansion is
+  // only remembered once the visible row count changes). It is re-opened once
+  // its own listing has landed, as a chain row's folder is below.
+  const nestedRepoFoldersRef = useRef<Set<string>>(new Set())
+  nestedRepoFoldersRef.current = new Set(tree?.nestedRepoDirectories ?? [])
   // The folders the server could not read, for the notice above the tree and
   // the marker on each such folder's row. The root's own marker (`.`) is not a
   // folder of the listing and has its whole-panel state; every other entry is a
@@ -1036,6 +1092,29 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
       model.resetPaths(paths)
     }
   }, [ready, paths, pathsKey, model, remembersExpansion, projectDir, searching])
+  // A host that keeps the tree mounted while hidden skips the restore above on
+  // return, since the payload is unchanged, while another tree of the same
+  // project may have opened or closed folders in the shared memory meanwhile.
+  // Left alone, this model's next expand would write its stale set back over
+  // theirs. So a tree shown again first matches the memory, folder by folder:
+  // only a folder that differs moves, which leaves the scroll position alone
+  // when nothing changed.
+  const shownRef = useRef(active)
+  useLayoutEffect(() => {
+    const returned = active && !shownRef.current
+    shownRef.current = active
+    if (!returned || !ready || !remembersExpansion || searching) return
+    const dirs = payloadDirsRef.current
+    if (!dirs) return
+    const remembered = new Set(recallExpandedPaths(projectDir))
+    for (const dir of dirs) {
+      const item = model.getItem(dir) as { isExpanded?: () => boolean; expand?: () => void; collapse?: () => void } | null
+      if (!item || typeof item.isExpanded !== 'function') continue
+      const open = item.isExpanded()
+      if (remembered.has(dir) && !open) item.expand?.()
+      else if (!remembered.has(dir) && open) item.collapse?.()
+    }
+  }, [active, ready, remembersExpansion, searching, model, projectDir])
   useEffect(() => {
     model.setGitStatus(statusEntries)
   }, [statusEntries, model])
@@ -1183,13 +1262,14 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   }, [model, root])
 
   // Lazy per-folder loading. The whole listing stops at its row cap
-  // and names the folders the cut reached; expanding one of those asks for its
-  // own listing, which the merge above folds into the rendered tree. The root
+  // and names the folders the cut reached, and names the nested repositories it
+  // cannot see inside; expanding one of those asks for its own listing, which
+  // the merge above folds into the rendered tree. The root
   // (`""`) is never a row to expand -- the host's search reaches past it.
   useEffect(() => {
     if (mode !== 'all') return
     // Nothing to watch on a whole listing: no subscription at all.
-    if (![...truncatedDirectoriesRef.current].some(Boolean)) return
+    if (![...lazyFoldersRef.current].some(Boolean)) return
     const isOpen = (path: string) => {
       const item = model.getItem(path) as { isExpanded?: () => boolean } | null
       return !!item && typeof item.isExpanded === 'function' && item.isExpanded()
@@ -1200,7 +1280,7 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
       // so a cut folder also counts as open when a folder beneath it is.
       const children = childDirectoriesRef.current
       const evicted = evictedRef.current
-      for (const folder of truncatedDirectoriesRef.current) {
+      for (const folder of lazyFoldersRef.current) {
         if (!folder) continue
         const open = isOpen(folder)
         const chainOpen = !open && (children.get(folder) ?? []).some(isOpen)
@@ -1209,19 +1289,28 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
           if (!open && !chainOpen) evicted.delete(folder)
           continue
         }
-        if (open) loadFolder(folder)
-        else if (chainOpen) {
+        if (open) {
+          loadFolder(folder)
+          // No state row holds a nested repository open (see above): ask for
+          // it to be re-opened once its listing has landed.
+          if (nestedRepoFoldersRef.current.has(folder)) {
+            setPendingExpand(prev => (prev.includes(folder) ? prev : [...prev, folder]))
+          }
+        } else if (chainOpen) {
           // Opened through its chain row: once its own listing splits the
           // chain, the folder itself must stay open, or the rows it brought
           // land under a collapsed folder.
           loadFolder(folder)
           setPendingExpand(prev => (prev.includes(folder) ? prev : [...prev, folder]))
+        } else if (nestedRepoFoldersRef.current.has(folder)) {
+          // Closed again before its listing landed: it must not open itself.
+          setPendingExpand(prev => (prev.includes(folder) ? prev.filter(f => f !== folder) : prev))
         }
       }
     }
     check()
     return model.subscribe(check)
-  }, [model, mode, loadFolder, truncatedDirectoriesKey])
+  }, [model, mode, loadFolder, lazyFoldersKey])
 
   // Each whole-tree poll that lands also re-reads the loaded folders that are
   // OPEN: inside a folder past the cap the whole listing cannot see a file the
@@ -1276,7 +1365,9 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
     onRevealedRef.current?.()
   }, [reveal, mode, loadFolder])
   useLayoutEffect(() => {
-    if (!pendingReveal || !ready) return
+    // A hidden tree holds the reveal until it is shown, so it neither moves
+    // nor takes focus while another tab is selected.
+    if (!pendingReveal || !ready || !active) return
     let target = pendingReveal
     if (!model.getItem(target)) {
       // The folder's own listing can settle without giving it a row (git
@@ -1306,7 +1397,7 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
     model.getItem(target)?.select()
     setPendingReveal(null)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pendingReveal, ready, pathsKey, model, folderListingsKey, retryFolders.join('\n')])
+  }, [pendingReveal, ready, active, pathsKey, model, folderListingsKey, retryFolders.join('\n')])
 
   // Row context menu. Ref-backed so the callback identity stays stable across
   // handler/prop changes (Pierre re-reads it only when the menu opens) while
@@ -1314,6 +1405,8 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   // query, so it must come through the ref too.
   const onAddToContextRef = useRef(onAddToContext)
   onAddToContextRef.current = onAddToContext
+  const onUploadRequestRef = useRef(onUploadRequest)
+  onUploadRequestRef.current = onUploadRequest
   const rootRef = useRef(root)
   rootRef.current = root
 
@@ -1398,6 +1491,7 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
           context={ctx}
           root={rootRef.current}
           onAddToContext={onAddToContextRef.current}
+          onUploadRequest={onUploadRequestRef.current}
           contribItems={treeItemsRef.current}
           onError={setActionError}
         />
@@ -1704,8 +1798,9 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
         // Always wired: a file row now always carries a built-in Download, so
         // the menu is useful for every file even with no host and no app rows.
         // The per-node `TreeContextMenu` still renders NOTHING (returns null) for
-        // a node with no action — a directory with no host and no app row — so a
-        // right-click there opens no bordered popup despite the menu being wired.
+        // a node with no action — a directory with no host, no upload handler and
+        // no app row — so a right-click there opens no bordered popup despite the
+        // menu being wired.
         renderContextMenu={renderContextMenu}
       />
     </div>

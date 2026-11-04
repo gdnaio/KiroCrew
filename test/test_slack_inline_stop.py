@@ -3,8 +3,8 @@
 Covers:
 - build_working_blocks (blocks.py)
 - session_task_card End button (blocks.py)
-- _handle_inline_stop denied/allowed/idle paths (interactions.py)
-- _handle_session_end key fallback (interactions.py)
+- _handle_inline_stop denied/allowed/idle paths (interactions_sessions.py)
+- _handle_session_end key fallback (interactions_sessions.py)
 """
 
 from __future__ import annotations
@@ -94,27 +94,23 @@ class TestSessionTaskCard:
         resume_btn = [b for b in buttons if "Resume" in b["text"]["text"]]
         assert len(resume_btn) == 1
 
-    def test_active_status_emoji(self):
+    @pytest.mark.parametrize(
+        ("status", "emoji"),
+        [
+            pytest.param("active", "🟢", id="test_active_status_emoji"),
+            pytest.param("paused", "⏸️", id="test_paused_status_emoji"),
+        ],
+    )
+    def test_status_emoji(self, status, emoji):
         blocks = session_task_card(
             idx=0,
             key="s",
             title="T",
             agent="a",
-            status="active",
+            status=status,
             messages=[],
         )
-        assert "🟢" in blocks[0]["title"]
-
-    def test_paused_status_emoji(self):
-        blocks = session_task_card(
-            idx=0,
-            key="s",
-            title="T",
-            agent="a",
-            status="paused",
-            messages=[],
-        )
-        assert "⏸️" in blocks[0]["title"]
+        assert emoji in blocks[0]["title"]
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +146,31 @@ def setup_interactions(mock_orch, monkeypatch):
     return interactions
 
 
+@pytest.fixture
+def audit(tmp_path, monkeypatch):
+    """A real, synchronous security event log under tmp_path, read back by the tests."""
+    from kiro_crew import sel as sel_mod
+
+    monkeypatch.setattr(sel_mod.SecurityEventLog, "_instance", None)
+    monkeypatch.setattr(sel_mod.SecurityEventLog, "_initialized", False)
+    (tmp_path / "sel").mkdir()
+    log = sel_mod.SecurityEventLog(base_dir=tmp_path / "sel", sync=True)
+    # Leave the process singleton unset so no other caller is handed this log.
+    monkeypatch.setattr(sel_mod.SecurityEventLog, "_instance", None)
+    monkeypatch.setattr(sel_mod.SecurityEventLog, "_initialized", False)
+    return log
+
+
+def _rows(audit) -> list[tuple[str, str, str]]:
+    """``(operation, caller, outcome)`` of each stored row, oldest first."""
+    return [(e["operation"], e["caller_identity"], e["outcome"]) for e in reversed(audit.recent())]
+
+
+def _ended(audit) -> list[tuple[str, str]]:
+    """``(operation, resources)`` of each stored row, oldest first."""
+    return [(e["operation"], e["resources"]) for e in reversed(audit.recent())]
+
+
 class TestHandleInlineStop:
     @pytest.mark.asyncio
     async def test_denied_for_non_owner(self, setup_interactions, mock_orch):
@@ -163,11 +184,15 @@ class TestHandleInlineStop:
             mock_sel.return_value.log_tool_invocation = MagicMock()
             await interactions._handle_inline_stop(payload, action, "C1", "ts1", "U_OTHER")
 
-        # stop_turn should NOT be called
         mock_orch.sessions.stop_turn.assert_not_called()
+        mock_sel.return_value.log_api_access.assert_called_once()
+        audit = mock_sel.return_value.log_api_access.call_args.kwargs
+        assert audit["caller"] == "U_OTHER"
+        assert audit["outcome"] == "denied"
+        assert audit["resources"] == "sess-key"
 
     @pytest.mark.asyncio
-    async def test_allowed_soft_stop(self, setup_interactions, mock_orch):
+    async def test_allowed_soft_stop(self, setup_interactions, mock_orch, audit):
         """Owner clicks stop → stop_turn called, on_soft callback invoked."""
         interactions = setup_interactions
 
@@ -182,8 +207,8 @@ class TestHandleInlineStop:
         action = {"value": "my-session"}
 
         with patch("kiro_crew.slack.interactions.sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            mock_sel.return_value.log_tool_invocation = MagicMock()
+            mock_sel.return_value.log_api_access = MagicMock(wraps=audit.log_api_access)
+            mock_sel.return_value.log_tool_invocation = MagicMock(wraps=audit.log_tool_invocation)
             await interactions._handle_inline_stop(payload, action, "C1", "msg_ts", "U_OWNER")
 
         # Immediate feedback: "Stopping..."
@@ -192,9 +217,13 @@ class TestHandleInlineStop:
         mock_orch.slack.update_message.assert_any_call("C1", "msg_ts", text="⏹ Execution stopped.")
         # SEL tool invocation logged
         mock_sel.return_value.log_tool_invocation.assert_called_once()
+        assert _rows(audit) == [
+            ("slack.inline_stop", "U_OWNER", "allowed"),
+            ("inline_stop", "my-session", "soft"),
+        ]
 
     @pytest.mark.asyncio
-    async def test_hard_stop_callback(self, setup_interactions, mock_orch):
+    async def test_hard_stop_callback(self, setup_interactions, mock_orch, audit):
         """Hard stop invokes on_hard callback with reset message."""
         interactions = setup_interactions
 
@@ -208,13 +237,17 @@ class TestHandleInlineStop:
         action = {"value": "sess-x"}
 
         with patch("kiro_crew.slack.interactions.sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            mock_sel.return_value.log_tool_invocation = MagicMock()
+            mock_sel.return_value.log_api_access = MagicMock(wraps=audit.log_api_access)
+            mock_sel.return_value.log_tool_invocation = MagicMock(wraps=audit.log_tool_invocation)
             await interactions._handle_inline_stop(payload, action, "C1", "ts1", "U_OWNER")
 
         mock_orch.slack.update_message.assert_any_call(
             "C1", "ts1", text="⛔ Execution stopped — session reset."
         )
+        assert _rows(audit) == [
+            ("slack.inline_stop", "U_OWNER", "allowed"),
+            ("inline_stop", "sess-x", "hard"),
+        ]
 
     @pytest.mark.asyncio
     async def test_idle_outcome_shows_nothing_running(self, setup_interactions, mock_orch):
@@ -255,6 +288,8 @@ class TestHandleInlineStop:
             mock_sel.return_value.log_tool_invocation = MagicMock()
             await interactions._handle_inline_stop(payload, action, "C1", "ts1", "U_OWNER")
             assert mock_orch.sessions.stop_turn.await_args.kwargs.get("force") is None
+            # The decline was shown, so the presser's repeat is armed.
+            assert sl._stop_declined_markers != {}
             await interactions._handle_inline_stop(payload, action, "C1", "ts1", "U_OWNER")
             assert mock_orch.sessions.stop_turn.await_args.kwargs["force"] is True
             assert mock_orch.sessions.stop_turn.await_args.kwargs["preserve_queue"] is True
@@ -284,20 +319,21 @@ class TestHandleInlineStop:
         sl._stop_declined_markers.clear()
 
     @pytest.mark.asyncio
-    async def test_no_session_key_returns_early(self, setup_interactions, mock_orch):
+    async def test_no_session_key_returns_early(self, setup_interactions, mock_orch, audit):
         """Empty session key → SEL 'invalid' log, no stop_turn."""
         interactions = setup_interactions
         payload = {"user": {"id": "U_OWNER"}}
         action = {"value": ""}
 
         with patch("kiro_crew.slack.interactions.sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            mock_sel.return_value.log_tool_invocation = MagicMock()
+            mock_sel.return_value.log_api_access = MagicMock(wraps=audit.log_api_access)
+            mock_sel.return_value.log_tool_invocation = MagicMock(wraps=audit.log_tool_invocation)
             await interactions._handle_inline_stop(payload, action, "C1", "ts1", "U_OWNER")
 
         mock_orch.sessions.stop_turn.assert_not_called()
         mock_sel.return_value.log_api_access.assert_called_once()
         assert mock_sel.return_value.log_api_access.call_args[1]["outcome"] == "invalid"
+        assert _rows(audit) == [("slack.inline_stop", "U_OWNER", "invalid")]
 
 
 # ---------------------------------------------------------------------------
@@ -307,55 +343,65 @@ class TestHandleInlineStop:
 
 class TestHandleSessionEnd:
     @pytest.mark.asyncio
-    async def test_end_by_session_id(self, setup_interactions, mock_orch):
-        """Session end uses find_key_by_sid to resolve the key."""
+    @pytest.mark.parametrize(
+        ("found_key", "has_session", "value", "removed"),
+        [
+            # find_key_by_sid resolves the key.
+            pytest.param(
+                "resolved-key", False, "sid-abc", "resolved-key", id="test_end_by_session_id"
+            ),
+            # find_key_by_sid misses, so the value is tried as a direct session key.
+            pytest.param(
+                None, True, "direct-key", "direct-key", id="test_end_falls_back_to_direct_key"
+            ),
+        ],
+    )
+    async def test_end_resolves_key(
+        self, setup_interactions, mock_orch, found_key, has_session, value, removed, audit
+    ):
         interactions = setup_interactions
-        mock_orch.sessions.find_key_by_sid = MagicMock(return_value="resolved-key")
-        mock_orch.sessions.has_session = MagicMock(return_value=False)
+        mock_orch.sessions.find_key_by_sid = MagicMock(return_value=found_key)
+        mock_orch.sessions.has_session = MagicMock(return_value=has_session)
         mock_orch.sessions.remove = AsyncMock()
         mock_orch.consolidator = None
         payload = {"user": {"id": "U_OWNER"}, "response_url": ""}
-        action = {"value": "sid-abc"}
+        action = {"value": value}
 
         with patch("kiro_crew.slack.interactions.sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
+            mock_sel.return_value.log_api_access = MagicMock(wraps=audit.log_api_access)
             await interactions._handle_session_end(payload, action, "C1", "ts1", "U_OWNER")
 
-        mock_orch.sessions.remove.assert_called_once_with("resolved-key")
+        mock_orch.sessions.find_key_by_sid.assert_called_once_with(value)
+        mock_orch.sessions.remove.assert_called_once_with(removed)
+        assert _ended(audit) == [("slack.session_end", value)]
 
     @pytest.mark.asyncio
-    async def test_end_falls_back_to_direct_key(self, setup_interactions, mock_orch):
-        """When find_key_by_sid returns None, falls back to has_session(value)."""
-        interactions = setup_interactions
-        mock_orch.sessions.find_key_by_sid = MagicMock(return_value=None)
-        mock_orch.sessions.has_session = MagicMock(return_value=True)
-        mock_orch.sessions.remove = AsyncMock()
-        mock_orch.consolidator = None
-        payload = {"user": {"id": "U_OWNER"}, "response_url": ""}
-        action = {"value": "direct-key"}
-
-        with patch("kiro_crew.slack.interactions.sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            await interactions._handle_session_end(payload, action, "C1", "ts1", "U_OWNER")
-
-        mock_orch.sessions.remove.assert_called_once_with("direct-key")
-
-    @pytest.mark.asyncio
-    async def test_end_rejected_for_non_owner(self, setup_interactions, mock_orch):
+    async def test_end_rejected_for_non_owner(self, setup_interactions, mock_orch, caplog):
         """Non-owner cannot end sessions."""
         interactions = setup_interactions
         mock_orch.sessions.remove = AsyncMock()
+        mock_orch.sessions.find_key_by_sid = MagicMock(return_value="some-key")
         payload = {"user": {"id": "U_OTHER"}, "response_url": ""}
         action = {"value": "some-key"}
 
+        caplog.set_level("WARNING", logger="kiro_crew.slack.interactions")
         with patch("kiro_crew.slack.interactions.sel") as mock_sel:
             mock_sel.return_value.log_api_access = MagicMock()
             await interactions._handle_session_end(payload, action, "C1", "ts1", "U_OTHER")
 
+        rejections = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "kiro_crew.slack.interactions" and "session_end rejected" in r.getMessage()
+        ]
+        assert rejections == ["session_end rejected: non-owner U_OTHER"]
+        mock_orch.sessions.find_key_by_sid.assert_not_called()
         mock_orch.sessions.remove.assert_not_called()
+        mock_sel.return_value.log_api_access.assert_not_called()
+        mock_orch.slack.update_message.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_end_with_consolidator(self, setup_interactions, mock_orch):
+    async def test_end_with_consolidator(self, setup_interactions, mock_orch, audit):
         """Session end triggers consolidator before removal."""
         interactions = setup_interactions
         mock_orch.sessions.find_key_by_sid = MagicMock(return_value="key-1")
@@ -367,11 +413,16 @@ class TestHandleSessionEnd:
         action = {"value": "sid-with-consol"}
 
         with patch("kiro_crew.slack.interactions.sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
+            mock_sel.return_value.log_api_access = MagicMock(wraps=audit.log_api_access)
             await interactions._handle_session_end(payload, action, "C1", "ts1", "U_OWNER")
 
         mock_orch.consolidator.consolidate_session.assert_called_once_with("key-1")
         mock_orch.sessions.remove.assert_called_once_with("key-1")
+        # The consolidation is audited against the resolved key, not the raw value.
+        assert _ended(audit) == [
+            ("slack.session_end", "sid-with-consol"),
+            ("consolidate_session_slack_end", "key-1"),
+        ]
 
     @pytest.mark.asyncio
     async def test_end_updates_message_when_no_response_url(self, setup_interactions, mock_orch):

@@ -49,7 +49,7 @@ The single enforcement point for non-resumability is one tuple entry. `"subagent
 | Gateway restart | `_reconcile_orphans` (`subagent_manager/monitoring.py`, `_reconcile_orphans_impl`) identity-verifies the child PID, terminates it, tombstones `gateway_restart`, deletes its kiro session files, notifies the parent | Nothing partial is recoverable |
 | Retention | `mark_delivered` schedules folder pruning after `agent.subagent_result_ttl_secs` (default 3600, `config/sections_agent.py` `AgentConfig.subagent_result_ttl_secs`) | Within an hour of success nothing recoverable remains |
 
-The control surfaces match. `spawn_run` / `spawn_sub_agents` / `spawn_list` / `spawn_status` (`mcp_core.py:228,357,288,318`) plus seven routes under `/api/spawn` (`dashboard/server.py:652-660`: create, lost, list, status, delete, retry, clear-all) can start, watch, cancel, and re-run-if-failed. None reads a run as structured messages; none sends into one.
+The control surfaces match. `spawn_run` / `spawn_sub_agents` / `spawn_list` / `spawn_status` (`mcp_core.py:228,357,288,318`) plus seven routes under `/api/spawn` (registered by `_register_mcp_routes` in `dashboard/server_runtime/mcp_routes.py`: create, lost, list, status, delete, retry, clear-all) can start, watch, cancel, and re-run-if-failed. None reads a run as structured messages; none sends into one.
 
 The dashboard has real surfacing as of #658 / #751 / #752: a persistent inline `SubagentRunCard` in the parent transcript, the side-panel Subagents tab, a sidebar count, a nav-rail activity dot, and spawn-approval rows. All of it is anchored to the parent's live turn state — the inline card rehydrates from the tool message's persisted output, the panel from live WS events.
 
@@ -105,7 +105,7 @@ Records are written by a dedicated `ConversationLog` rooted at `~/.kiro/crew/sub
 Two placement decisions, both load-bearing:
 
 - **Not the chat sessions directory.** `ConversationLog.list_sessions` globs every `*.jsonl` in its root with no prefix filter (`ConversationLog.list_sessions`), and that listing has ten call sites across nine modules — `GET /api/sessions` and `api_sessions_clear` (`dashboard/handlers/sessions_parts/history_reads.py` `api_sessions`, `dashboard/handlers/sessions_parts/delete_routes.py` `_clearable_history_keys`), the `list_sessions` MCP tool (`mcp_tools/sessions.py`, `list_sessions`), slot rehydration (`dashboard/chat_persistence.py:326,476`), chat handlers (`dashboard/chat_handlers.py`), folders (`dashboard/chat_folders.py:130`), followup suggestions (`suggestions.py:96`), artifact companion-session resolution (`_collect_session_docs` in `dashboard/handlers/artifacts_parts/session_documents.py`), and `sync_bridge.py:28` — plus in-class use by `search_sessions` (`ConversationLog.search_sessions`), which is how `search_chat_history` reaches it. Writing records there publishes every run to all of them on day one and puts records inside `api_sessions_clear`'s blast radius.
-- **A sibling of `subagents/`, not a child.** `subagent_persistence` treats every child directory of `_SUBAGENTS_DIR` as a run id (`list_orphans` at `subagent_persistence.py:224-241`, `read_state(d.name)` at `:236`), and `"records"` is a legal id, so `delete_agent_folder("records")` would `rmtree` the store.
+- **A sibling of `subagents/`, not a child.** `subagent_persistence` treats every child directory of `_SUBAGENTS_DIR` as a run id (`list_orphans` in `subagent_persistence_tombstones.py`, which calls `read_state(d.name)`), and `"records"` is a legal id, so `delete_agent_folder("records")` would `rmtree` the store.
 
 Record rows use the existing schema. `tools` carries tool **names in order** (`append` types it `list[str]`, `ConversationLog.append`); per-call arguments and results are out of scope for v1 (Open question 3).
 
@@ -130,14 +130,14 @@ Record rows use the existing schema. `tools` carries tool **names in order** (`a
 
 ### Retaining the resume material
 
-The run's sid, cwd, provider, and agent go into the **record's metadata** — not into `SessionMap` at spawn. `SessionMap.set` rewrites the whole map file on every call (`session_map.py:178-195`), so one entry per run would make spawning O(n); and `SessionMap.get` self-prunes entries whose kiro session `.json` is missing or whose `.jsonl` is under 10 bytes (`session_map.py:124-167`). A map entry is written once, at promotion.
+The run's sid, cwd, provider, and agent go into the **record's metadata** — not into `SessionMap` at spawn. `SessionMap.set` rewrites the whole map file on every call (`session_map.py:178-195`), so one entry per run would make spawning O(n); and `SessionMap.get` self-prunes entries whose kiro session `.json` is missing or whose `.jsonl` is under 10 bytes (`session_map.py::SessionMap.get`). A map entry is written once, at promotion.
 
 Keeping the kiro session files means touching **four** unlink sites:
 
 | Unlink site | Reached by |
 |---|---|
 | `AcpSessionHandle._cleanup_transcript`, via `AcpSessionHandle.destroy()` | the session-sharing arm — the default — through `AcpSessionProvider.shutdown` (`acp/session_provider.py:173`) from `subagent_manager/run_lifecycle.py`'s `_teardown_run_session_impl` |
-| `AcpSessionProvider.cleanup_session` (`acp/session_provider.py:180-200`) | `SessionManager._safe_cleanup` |
+| `AcpSessionProvider.cleanup_session` (`acp/session_provider.py::AcpSessionProvider.cleanup_session`) | `SessionManager._safe_cleanup` |
 | `AcpProvider.cleanup_session` (`providers/acp_lifecycle.py`) | `SessionManager._safe_cleanup` |
 | `_cleanup_session_files_sync` (`subagent_persistence.py:293`) | tombstone prune (`:280`) and orphan reconcile (`_reconcile_orphans_impl`) |
 
@@ -167,7 +167,7 @@ Surfaced as a "Continue as chat" action on the record view and the inline `Subag
 
 Records are served read-only by their own routes (`GET /api/spawn/{id}/record` and a records list) and rendered as a record view, reachable from the inline `SubagentRunCard`, the Subagents panel, and by URL. Read access is **workspace-global**, consistent with chat history — an explicit decision, not a default inherited from `spawn_status` (`api_spawn_status` in `dashboard/messaging_api/run_views.py`), whose only fence is `_spawn_scope_refusal`: it limits an internal caller to the runs its own session started.
 
-Records are deliberately **not** dashboard slots. `_ChatSlot.to_dict` emits `"surface": self.mode` as a forward-compat alias (`_ChatSlot.to_dict` in `dashboard/state_parts/slot_transcript.py`), so there is no independent surface to assign; `_persist_open_slots` + `restore_open_slots` would rehydrate a record as an ordinary writable slot across a restart; and read-only would be a client-side fiction while the chat send path (`POST /api/chat`, `dashboard/server.py:1660`, slot in the request body) stayed reachable for the id. Consequently no change is needed to the three hard-coded surface **filter predicates** (`filteredSlots` / `isChatPageSurface` in `ChatPage.tsx`, `dashboardSlice.ts:280-292`, `deleteSlot` in `chatSlice.ts`); the sidebar records section is additive in `ChatSidebar.tsx`.
+Records are deliberately **not** dashboard slots. `_ChatSlot.to_dict` emits `"surface": self.mode` as a forward-compat alias (`_ChatSlot.to_dict` in `dashboard/state_parts/slot_transcript.py`), so there is no independent surface to assign; `_persist_open_slots` + `restore_open_slots` would rehydrate a record as an ordinary writable slot across a restart; and read-only would be a client-side fiction while the chat send path (`POST /api/chat`, registered by `register` in `dashboard/routes/chat.py`, slot in the request body) stayed reachable for the id. Consequently no change is needed to the three hard-coded surface **filter predicates** (`filteredSlots` / `isChatPageSurface` in `ChatPage.tsx`, `dashboardSlice.ts:280-292`, `deleteSlot` in `chatSlice.ts`); the sidebar records section is additive in `ChatSidebar.tsx`.
 
 ## Migration plan
 

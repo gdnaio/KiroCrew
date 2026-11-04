@@ -42,8 +42,11 @@ if TYPE_CHECKING:
         _is_slack_ts,
         _sel,
         _send_to_channel_target,
+        _vet_app_messaging,
+        body_not_object_error,
         build_options_blocks,
         dashboard_slot_key,
+        effective_request_app,
         format_overflow,
         generate_token,
         logger,
@@ -53,6 +56,8 @@ if TYPE_CHECKING:
         redact_for_display,
         remember_slack_options,
         slack_options_owner_key,
+        slot_history_key,
+        string_field_error,
     )
 
 
@@ -62,8 +67,9 @@ def _redact_all(value: str) -> str:
     ``redact_for_display`` re-runs its redactor over each normalised form, so it
     needs the pair behind a single call rather than two sequential passes.
     """
-    value, _ = redact_exfiltration_urls(value)
-    value, _ = redact_credentials(value)
+    from kiro_crew.security import redact
+
+    value = redact(value)
     return value
 
 
@@ -140,6 +146,26 @@ def _resolve_session_target(
     # don't have the "dashboard:" prefix
     slot_key = job.session_key.removeprefix("dashboard:")
     return slot_key, job.name
+
+
+def _publishing_session_meta(state: DashboardState, session_key: str) -> dict[str, str] | None:
+    """The ``slot`` and ``history_key`` a bell note published by *session_key* links back to.
+
+    *session_key* must be the publisher's attested key (``attributable_session_key``),
+    never a request field, so a note can only name the session that published it. Only
+    the publisher's own slot counts: the banner treats a note whose ``slot`` is the chat
+    on screen as already shown there, which holds for the session that wrote it and for
+    no other, so a cron run with no tab of its own does not borrow its creator's.
+    ``history_key`` is the slot's transcript key, which is what resuming the session after
+    its tab closes needs: the bare slot name names no transcript. A slot the dashboard
+    does not hold yields ``None``: the note then carries no link rather than one to a
+    session the dashboard cannot show.
+    """
+    slot_key = dashboard_slot_key(session_key)
+    slot = state.get_slot(slot_key) if slot_key else None
+    if slot is None:
+        return None
+    return {"slot": slot_key, "history_key": slot_history_key(slot)}
 
 
 def _session_link_blocks(url: str) -> list[dict[str, Any]]:
@@ -274,8 +300,16 @@ async def api_delete_message(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
-    channel = body.get("channel", "").strip()
-    ts = body.get("ts", "").strip()
+    not_object = body_not_object_error(body)
+    if not_object is not None:
+        return not_object
+    channel = body.get("channel", "")
+    ts = body.get("ts", "")
+    for field, value in (("channel", channel), ("ts", ts)):
+        not_string = string_field_error(field, value)
+        if not_string is not None:
+            return not_string
+    channel, ts = channel.strip(), ts.strip()
     if not channel or not ts:
         return web.json_response({"error": "channel and ts required"}, status=400)
     slack = state.slack_client
@@ -285,8 +319,9 @@ async def api_delete_message(request: web.Request) -> web.Response:
         await slack.delete_message(channel, ts)
     except Exception as e:
         safe_error = str(e).split("\n")[0][:200]
-        safe_error, _ = redact_credentials(safe_error)
-        safe_error, _ = redact_exfiltration_urls(safe_error)
+        from kiro_crew.security import redact
+
+        safe_error = redact(safe_error)
         return web.json_response({"error": f"Delete failed: {safe_error}"}, status=502)
     return web.json_response({"ok": True})
 
@@ -323,6 +358,9 @@ async def api_update_message(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    not_object = body_not_object_error(body)
+    if not_object is not None:
+        return not_object
     channel = body.get("channel", "")
     if not isinstance(channel, str):
         return web.json_response(
@@ -434,8 +472,9 @@ async def api_update_message(request: web.Request) -> web.Response:
         await slack.update_message(channel, ts, text, blocks)
     except Exception as e:
         safe_error = str(e).split("\n")[0][:200]
-        safe_error, _ = redact_credentials(safe_error)
-        safe_error, _ = redact_exfiltration_urls(safe_error)
+        from kiro_crew.security import redact
+
+        safe_error = redact(safe_error)
         return web.json_response(
             {"error": f"Update failed: {safe_error}", "code": "update_failed"}, status=502
         )
@@ -492,7 +531,14 @@ async def _read_send_message(
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
-    text = body.get("text", "").strip()
+    not_object = body_not_object_error(body)
+    if not_object is not None:
+        return not_object
+    text = body.get("text", "")
+    not_string = string_field_error("text", text)
+    if not_string is not None:
+        return not_string
+    text = text.strip()
     if not text:
         return web.json_response({"error": "text required"}, status=400)
     title = body.get("title", "Agent Message")
@@ -577,11 +623,23 @@ async def _read_send_message(
         # send naming no session) degrades to the host sentinel inside the leg.
         addressed_caller = body.get("caller_session", "") if request.get("internal_auth") else ""
         return await _send_to_channel_target(
-            state, addressed_channel, target_id, text, caller_session=addressed_caller
+            state,
+            addressed_channel,
+            target_id,
+            text,
+            caller_session=addressed_caller,
+            # Off the attested token or the calling session's owner, never the
+            # body, so it is not gated on ``internal_auth`` like the key above.
+            request_app=effective_request_app(state, request),
         )
 
-    target_channel = body.get("channel", "").strip()
-    target_user = body.get("user", "").strip()
+    target_channel = body.get("channel", "")
+    target_user = body.get("user", "")
+    for field, value in (("channel", target_channel), ("user", target_user)):
+        not_string = string_field_error(field, value)
+        if not_string is not None:
+            return not_string
+    target_channel, target_user = target_channel.strip(), target_user.strip()
     unfurl_links = body.get("unfurl_links")
     unfurl_media = body.get("unfurl_media")
     if (unfurl_links is not None and not isinstance(unfurl_links, bool)) or (
@@ -772,8 +830,9 @@ def _proactive_source_line(
     else:
         return ""
     name = " ".join(str(name).split())
-    name, _ = redact_exfiltration_urls(name)
-    name, _ = redact_credentials(name)
+    from kiro_crew.security import redact
+
+    name = redact(name)
     if len(name) > _SOURCE_NAME_MAX:
         name = name[: _SOURCE_NAME_MAX - 1].rstrip() + "…"
     return f"Sent by {kind}: {name}" if name else ""
@@ -806,12 +865,13 @@ async def _deliver_send_message_fallback(
     attribution_session: str,
     is_cron_caller: bool,
     send_to_slack: bool,
+    request_app: str = "",
 ) -> None:
     """Deliver a send no origin session took: the bell, then a channel or Slack.
 
     Each leg records what it reached on *outcome* as it goes.
     """
-    from kiro_crew.security import redact_credentials, redact_exfiltration_urls  # noqa: F811
+    from kiro_crew.security import redact
 
     # Snapshot before the suffix below: that sentence describes the BELL's
     # delivery, and a channel post is a real delivery, not the
@@ -821,8 +881,7 @@ async def _deliver_send_message_fallback(
     # path for one, not an edge case.
     channel_text = text
     if target_session and job_name:
-        safe_name, _ = redact_exfiltration_urls(job_name)
-        safe_name, _ = redact_credentials(safe_name)
+        safe_name = redact(job_name)
         title = f"⏰ {safe_name}"
         text += "\n\n_(session closed — delivered as notification)_"
     # Only an attested, non-app caller's key names the publishing crewmate
@@ -830,7 +889,16 @@ async def _deliver_send_message_fallback(
     member = await asyncio.to_thread(member_identity_for_session, attribution_session)
     # A message that offers [OPTIONS:] asks the user to choose, so it is not muted.
     publisher = None if options else attribution_session or None
-    state.notify("agent", title, text, member=member, publisher_session=publisher)
+    # The link back to the sender stays even then: a question is where it is needed most.
+    session_meta = _publishing_session_meta(state, attribution_session)
+    state.notify(
+        "agent",
+        title,
+        text,
+        meta=session_meta,
+        member=member,
+        publisher_session=publisher,
+    )
     # No widget on either channel path, so a parsed [OPTIONS:] trailer is
     # re-attached as a numbered list rather than dropped: the user still
     # learns the choices exist and can answer by typing one. Built from the
@@ -844,6 +912,19 @@ async def _deliver_send_message_fallback(
     source_line = _proactive_source_line(
         state, caller_session, declared_session, is_cron_caller=is_cron_caller
     )
+    # The calling app's own messaging grant, asked once for whichever egress leg
+    # below would run (the route lets at most one of them take a send). A refusal
+    # sends on none of them, and answers 403 like a refused channel DM.
+    if channel_target or channel_type or (send_to_slack and state.slack_client):
+        app_refusal = await asyncio.to_thread(
+            _vet_app_messaging,
+            request_app,
+            caller_session if is_cron_caller else declared_session,
+        )
+        if app_refusal:
+            outcome.channel_code = "channel_not_permitted"
+            outcome.channel_detail = app_refusal
+            return
     if channel_target:
         outcome.sent_channel, outcome.channel_code, outcome.channel_detail = (
             await _deliver_channel_dm(
@@ -1215,12 +1296,14 @@ def _send_message_response(
     channel_type: str,
 ) -> web.Response:
     """The answer to a send whose legs have run: a failure, or where it was delivered."""
-    from kiro_crew.security import redact_credentials, redact_exfiltration_urls  # noqa: F811
+    from kiro_crew.security import redact
 
     if outcome.channel_code:
-        safe_detail, _ = redact_credentials(outcome.channel_detail)
-        safe_detail, _ = redact_exfiltration_urls(safe_detail)
-        detail = f"{channel_target} delivery failed: {safe_detail}"
+        safe_detail = redact(outcome.channel_detail)
+        # The app-messaging refusal sets a code on the channel_type and Slack legs
+        # too, which carry no channel_target, so name whichever leg it was.
+        named_leg = channel_target or channel_type or "slack"
+        detail = f"{named_leg} delivery failed: {safe_detail}"
         # Both responses are spelled out inline, with a literal status and a
         # literal body, rather than sharing a hoisted dict or computing the
         # status. `test_error_code_contract` ratchets BOTH of those shapes for the
@@ -1242,8 +1325,7 @@ def _send_message_response(
             {"ok": False, "error": unconfirmed, "code": outcome.channel_code}, status=502
         )
     if outcome.slack_attempted and not outcome.sent_slack:
-        safe_error, _ = redact_credentials(outcome.slack_error)
-        safe_error, _ = redact_exfiltration_urls(safe_error)
+        safe_error = redact(outcome.slack_error)
         # An unknown outcome says so, so the caller checks the conversation
         # instead of sending a message that may already be there.
         if outcome.slack_failure == "unconfirmed":

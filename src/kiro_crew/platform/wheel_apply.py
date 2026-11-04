@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import functools
 import logging
 import os
 import shutil
@@ -49,7 +48,7 @@ from kiro_crew import platform_compat
 
 # The module, not its names: every engine call resolves at call time, so a test
 # (or a caller) that patches ``wheel_engine`` patches this path too.
-from kiro_crew.platform import wheel_engine
+from kiro_crew.platform import release_apply, wheel_engine
 from kiro_crew.platform.wheel_engine import (
     FAILURE_TEXT_CHARS,
     ApplyCancel,
@@ -259,6 +258,15 @@ def snapshot_memory_before_update() -> tuple[int, str]:
     return copied, (f"{failed} store(s) not copied" if failed > 0 else "")
 
 
+def snapshot_refusal(failure: str) -> str:
+    """What an operator is told when the pre-update copy did not land."""
+    return (
+        f"Pre-update memory snapshot failed: {failure}. Not updating: the store would be "
+        "rewritten with no fresh copy of it. Check the log for the reason, then repair "
+        "it: kirocrew memory backups"
+    )
+
+
 def memory_snapshot_hook(progress: Callable[[str], None]) -> Callable[[], None]:
     """The engine's ``before_promote`` step: copy memory, or refuse the promotion."""
 
@@ -267,11 +275,7 @@ def memory_snapshot_hook(progress: Callable[[str], None]) -> Callable[[], None]:
 
         copied, failure = snapshot_memory_before_update()
         if failure:
-            raise WheelUpdateSnapshotFailed(
-                f"Pre-update memory snapshot failed: {failure}. Not updating: the store "
-                "would be rewritten with no fresh copy of it. Check the log for the "
-                "reason, then repair it: kirocrew memory backups"
-            )
+            raise WheelUpdateSnapshotFailed(snapshot_refusal(failure))
         newest = memory_backup.newest_backup()
         where = f"; default store copies in {newest.parent}" if newest is not None else ""
         progress(f"Memory snapshot: {copied} store(s) copied{where}")
@@ -545,8 +549,14 @@ async def run_wheel_apply(
     artifact_base: str,
     state: DashboardState | None = None,
     held_lock_fd: int | None = None,
+    refuse_if_unattended_off: bool = False,
 ) -> WheelApplyOutcome:
     """Run one shadow apply on the update worker and report how it ended.
+
+    *refuse_if_unattended_off* is for a routine install nobody asked for: it is
+    refused at the swap, as ``deferred``, when the security policy has turned
+    unattended installs off since the caller decided to install. A person's
+    approve and a floor's mandatory update leave it False.
 
     ``busy`` at once, without queueing, when this process already runs one,
     unless the caller holds the update lock (*held_lock_fd*, a lock it took with
@@ -584,8 +594,26 @@ async def run_wheel_apply(
         loop.call_soon_threadsafe(_arm_deadline)
         _push("pulling", f"Applying update to v{version}…")
 
-    call = functools.partial(
-        wheel_engine.apply_wheel_update,
+    snapshot = memory_snapshot_hook(lambda message: _push("building", message))
+
+    def _refuse_if_unattended_turned_off() -> None:
+        if refuse_if_unattended_off:
+            from kiro_crew.platform.update_governance import unattended_apply_allowed
+
+            if not unattended_apply_allowed():
+                raise WheelUpdateNotReady("the security policy turned off unattended installs")
+
+    def _before_promote() -> None:
+        # Read at the swap, after the download and build: before the memory copy
+        # so a refused install spends none, and after it so a policy that landed
+        # while it ran still decides. The engine promotes next with no wait.
+        _refuse_if_unattended_turned_off()
+        snapshot()
+        _refuse_if_unattended_turned_off()
+
+    # The release, not the wheel: the new version's KAS engine is installed
+    # before the stable link flips (release_apply).
+    release = release_apply.WheelRelease(
         channel=channel,
         feed_base=feed_base,
         artifact_base=artifact_base,
@@ -594,9 +622,12 @@ async def run_wheel_apply(
         cancel=cancel,
         on_locked=_on_locked,
         preflight=check_memory_ready,
-        before_promote=memory_snapshot_hook(lambda message: _push("building", message)),
+        before_promote=_before_promote,
         held_lock_fd=held_lock_fd,
     )
+
+    def call() -> Path:
+        return release_apply.apply_release(release)
 
     def _apply_and_release() -> Path:
         try:
@@ -672,6 +703,7 @@ __all__ = [
     "run_wheel_apply",
     "shown_failure_text",
     "snapshot_memory_before_update",
+    "snapshot_refusal",
     "stop_wheel_applies",
     "userns_reattach_after_apply",
     "userns_reattach_needed",

@@ -70,6 +70,12 @@ The electron-builder configuration lives in
   `rpm.depends` needs no such thing but uses entirely different names
   (`gtk3`, `nss`, `alsa-lib`). Both lists are verified against a real
   `apt-get install` / `dnf` resolution by `scripts/smoke-linux-packages.sh`.
+  Both lists name libgbm (`libgbm1` / `mesa-libgbm`) because the desktop
+  binary links `libgbm.so.1` and no other entry requires it: Ubuntu 24.04,
+  Debian 12 and Amazon Linux 2023 bring it in only as a recommendation or weak
+  dependency, which a minimal install skips, and on Ubuntu 22.04 nothing brings
+  it in. Without it the app installs but cannot start.
+  `website/electron/test/packaging.test.js` pins both entries.
 - `build.files` is an explicit per-file allowlist, not a glob: electron-builder
   packs exactly those paths into `app.asar` at the same relative location, plus
   `package.json` and the production `node_modules`. The four lifecycle facades
@@ -126,9 +132,14 @@ subcommand the app uses. The Windows build administratively extracts the
 upstream MSI without installing it or writing PATH/registry state, then stages
 `kiro-cli.exe` plus the four Visual C++ runtime DLLs it imports
 (`vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`, `msvcp140_1.dll`),
-copied from the build host's `System32`; a build host without the Visual C++
-2015-2022 x64 redistributable fails the build with that instruction. DirectML
-(`directml.dll`) is left to the host, where desktop Windows supplies it.
+taken from Microsoft's Visual C++ 2015-2022 x64 redistributable and never from
+the build host. `packaging/vc-runtime-pin.json` pins that installer's immutable
+download URL, its sha256 and each DLL's sha256; `packaging/vc_runtime.py`
+unpacks the four without running the installer, fails the build on any
+mismatch, and records the version in `VC-RUNTIME-VERSION` beside
+`BUNDLED-VERSION`. DirectML (`directml.dll`) is deliberately not bundled: it is
+an OS component on desktop Windows, the same dependency upstream's own
+installer has, so a Windows Server Core build host must supply it.
 `kiro_cli.bundled_kiro_cli_entry` owns
 the platform split. The release is pinned in two files that travel together:
 `packaging/kiro-cli-version`
@@ -141,10 +152,12 @@ only document naming sha256s — for `latest` alone, so a pinned build fetches t
 pinned version's own artifact URL and verifies it against the committed sha: it
 never reads the mutable manifest, a hotfix rebuild of an older tag keeps working
 after upstream releases, and a version bump without matching sha lines fails
-closed with the bump procedure in the error. The two pin files have no reader
-in a default release: only a `BUNDLE_KIRO_CLI=1` build reads them (the Docker
-image resolves kiro-cli from the upstream `latest` manifest on its own), and
-they stay in the tree for that opt-in. `KIRO_CLI_VERSION=latest`
+closed with the bump procedure in the error. The Docker image reads the same two
+files: `docker/Dockerfile` bind-mounts them from the build context (admitted by
+`.dockerignore`), installs that version's Linux zip after checking it against
+its `kirocli-<arch>-linux.zip` sha line, and never reads the manifest, and
+`publish-docker.yml` labels the image with the pinned version. A
+`BUNDLE_KIRO_CLI=1` desktop build reads them too. `KIRO_CLI_VERSION=latest`
 resolves the manifest instead and takes the version and sha it names, for a local
 build that wants the newest release (still sha256-verified). Bumping both files,
 after testing against the new release, is the whole procedure for
@@ -238,15 +251,24 @@ back at build time through the same reader the gateway uses
 (`installed_bundle(root=…)`), so a tree the reader would reject is a build
 error, not a refusal on the user's first prompt.
 
-Layout mirrors the backend trees. A universal macOS build stages one root per
-architecture, `backend-dist/kas-arm64/` and `backend-dist/kas-x64/` (Node ships
-no universal binary; the engine's own JS is shared), a single-arch build stages
-`backend-dist/kas/`. Each root holds `<version>/{bundle,node,install.json}` plus
-a `BUNDLED-VERSION` file beside the version directory. The Electron shell
-(`gateway-env.js`, `bundledKasEnvironment`) reads that file and the install
-record beside it, and exports the root as `KIROCREW_BUNDLED_KAS_DIR` — the
-arch-suffixed root first, the unsuffixed one second, never a root for another
-architecture. It runs nothing at boot: the route is off by default, the build
+Every build stages one root, `backend-dist/kas/`, holding
+`<version>/{bundle,node,install.json}` plus a `BUNDLED-VERSION` file beside the
+version directory. A universal macOS build stages the engine once: its tarball
+is already `darwin-universal`, and `kas_bundle.make_universal_node` fetches the
+other architecture's pinned Node build and `lipo -create`s both into one Mach-O
+at the record's `node_bin` path, probing each slice through `arch -arm64` /
+`arch -x86_64`. The universal build then runs `kas_bundle.trim_for_shipping`:
+the Node distribution keeps only its binary and `LICENSE` (the engine never
+spawns the distribution's npm, npx or corepack), and the engine loses its C/C++
+sources, headers, source maps and web-tree-sitter's debug build. No reader
+re-hashes the extracted tree, so the record stays valid. A single-arch build
+stages the tree untrimmed, exactly as `kirocrew kas install` lays it down. The
+universal staged tree holds only regular files and directories; the universal
+macOS build fails on any symlink or hardlink in it, because the signing service
+refuses a universal bundle with shared trees.
+The Electron shell (`gateway-env.js`, `bundledKasEnvironment`) reads
+`BUNDLED-VERSION` and the install record beside it, and exports the root as
+`KIROCREW_BUNDLED_KAS_DIR` for either architecture. It runs nothing at boot: the route is off by default, the build
 already probed the staged Node, and a copy that cannot run on this machine
 fails at session spawn, only for a user who turned the switch on. A build
 without the payload or a source checkout exports nothing, and the backend then
@@ -267,6 +289,24 @@ with, the same precedence `KIROCREW_KIRO_BIN` has over the bundled kiro-cli.
 the app`), the status payload carries `installed.bundled`, and the Settings card
 names where each copy came from: "KAS engine … (included with the app)" for the
 app's copy, "KAS engine … (installed by you)" for the data home's.
+
+The hand-off is asserted against a shipped app, not only the build's staging
+directory. The macOS smoke (`scripts/smoke-macos-install.sh`) checks the
+`backend-dist/kas/` root in the INSTALLED tree, launches the REAL app, and reads
+the gateway child's environment back: `KIROCREW_BUNDLED_KAS_DIR` must name that
+root, and the installed `kirocrew kas status`, run with that environment against
+the smoke's empty data home, must report `installed: KAS <version> … (built into
+the app)` with its `engine:` row inside the root. The Windows smoke
+(`scripts/smoke-windows-install.ps1`) boots the gateway from the installed
+interpreter rather than through the shell, so it checks the same layout under
+`resources\backend-dist\kas\` (`BUNDLED-VERSION` and the install record), then
+sets `KIROCREW_BUNDLED_KAS_DIR` itself the way the shell does and runs the
+installed `kirocrew kas status` with it, asserting the same two rows.
+`BUNDLE_KAS=0` in the smoke's environment skips these assertions with a logged
+line: an opted-out build stages no root for the shell to export. Only the macOS
+smoke reads the shell's export off a real gateway child, so a build whose root
+electron-builder moved or dropped fails there rather than on an opted-in user's
+first prompt.
 
 Bundling the engine does not turn the route on: `agent.kas_bundle` keeps its
 default (off) on every platform while the route is in shadow testing, and the
@@ -425,6 +465,15 @@ x64 gate doubles as proof the bundle runs under Rosetta. In
 `backend-dist/**` (single-arch Mach-O files inside a universal app are
 intentional there), and `extraResources` ships the `backend-dist/` directory
 wholesale so single- and dual-backend layouts both package.
+
+**The universal update zip must stay under 1 GiB.** The Squirrel.Mac inside every
+installed app (Electron 43 and 44.0–44.6) downloads the update zip into one
+buffer that doubles as it grows; past 1 GiB it asks for 2 GiB, Electron's
+allocator refuses, and the app dies mid-update. The installed app's updater does
+the install, so only the artifact's size protects its users. `build-desktop.sh`
+logs the universal `*-mac.zip` size and fails the build at or over 1000 MiB,
+leaving room for what signing and notarization add. Shrink the payload rather
+than raise the ceiling.
 
 > **Renaming `backend-dist/` is load-bearing at runtime.** The backend detects
 > "am I the bundled interpreter?" via
@@ -609,9 +658,9 @@ same way). Key details:
   fast-path (see `docs/system-specs/modules/cli.md`), so the import probe is
   the half that resolves the chain.
 - **Local dictation runtime bundled** — supported desktop builds include
-  `pywhispercpp`, the platform `imageio-ffmpeg` executable used for compressed
-  recordings, and all transitive runtime dependencies. The macOS Intel backend
-  installs no `imageio-ffmpeg`; the Intel app uses a system FFmpeg. The build
+  `pywhispercpp`, the platform's pinned audio-only FFmpeg executable
+  (`stt.decoder`) used for compressed recordings, and all transitive runtime dependencies. The macOS Intel backend
+  installs no decoder; the Intel app uses a system FFmpeg. The build
   imports the recognizer and executes the exact packaged decoder before
   publishing — and
   distinguishes a decoder that fails to AUTHENTICATE, which fails the build, from
@@ -642,7 +691,17 @@ local SSH forward to a remote gateway looks like, is reused only when a remote
 crew is recorded for that port; otherwise the supervisor refuses it
 (`foreign-holder`) and the gateway-failure dialog offers **Add Remote Crew**
 (see [The gateway-failure dialog](#the-gateway-failure-dialog)). Adopting an
-unattributed holder would post this machine's local secret to it. Before
+unattributed holder would post this machine's local secret to it. On Windows a
+holder is attributed by the executable path the launch resolver selected. A
+source or pip venv's gateway listens from the venv's base interpreter (its
+`Scripts\python.exe` is a redirector), which every Python program can run, so
+that interpreter counts only when it is the one the venv's `pyvenv.cfg` names,
+its argv0 names that interpreter or the venv's redirector, its script is
+exactly that venv's `Scripts\kirocrew.exe`, and a server subcommand follows
+(`windowsVenvBaseInterpreterLaunches` in
+[`windows-port.js`](../../website/electron/windows-port.js)). Like every
+Windows rule here, this attributes by command line: it does not tell apart a
+process of the same account that copies that exact command line. Before
 reusing a same-family local gateway on a fixed-path POSIX install, the shell
 checks whether its sole listener is running from this app's current bundled
 backend path. If that bundled gateway reports an older version than the app,
@@ -866,6 +925,16 @@ handles terminate observed descendants without trusting recycled PIDs. Cleanup
 finishes before the gateway permits a retry.
 Hosting setup in the gateway provides one implementation and one UI for the
 desktop app, local browser, remote browser, Linux, and Windows.
+
+The desktop app adds one exit to that screen for a user who will only use crews
+on other machines: **Connect to a crew on another machine** opens the
+remote-crew form, and saving it stops the gateway this app started, saves the
+crew for the launch port, turns "Run a local gateway" off and reconnects the
+main window to the crew, so that crew's own setup runs where its agents will
+(`runtime/gateway/remote-switch.js`). The link shows only in the main window and
+only while the port's gateway is this app's own child; an adopted gateway is not
+the app's to stop. If the gateway does not stop, nothing is saved and the app
+keeps using it. The way back is the failure dialog's Start Local Gateway, below.
 
 ### The gateway-failure dialog
 
@@ -1176,7 +1245,9 @@ it).
   `%LOCALAPPDATA%\Kiro-Cli` — so an already-running gateway does not depend on
   inheriting an installer-updated `PATH`.
 - [`window-lifecycle.js`](../../website/electron/window-lifecycle.js) hides the
-  app to the tray on window close; the composition root delegates quit-time
+  app to the tray on window close, or quits through the same path as the Quit
+  menu item when the user chose that (`closeAction` in the app's own config,
+  decided by [`close-action.js`](../../website/electron/close-action.js)); the composition root delegates quit-time
   gateway teardown to the supervisor, which performs the graceful shutdown and
   signal escalation contract. On POSIX,
   [`gateway-stop.js`](../../website/electron/gateway-stop.js) lists the child's
@@ -1514,9 +1585,23 @@ ones the packager never reads). The body is optional JSON:
 {
   "managedBy": "your package manager's name",
   "checkCommand": "the command that prints an available version",
-  "updateCommand": "the command that applies it"
+  "updateCommand": "the command that applies it",
+  "relaunchPath": "optional: the executable to relaunch after a successful apply"
 }
 ```
+
+`relaunchPath` is for an install whose launch path changes with each version,
+such as a version-pinned payload behind a stable launch link. After a
+successful apply the app normally calls Electron's `app.relaunch()`, which
+re-runs the path the app was started as. A macOS app opened from the Dock was
+started as its version's own payload path, so it came back on the version the
+apply had just replaced, and the dashboard kept offering Restart to update
+([#22774](https://github.com/kirodotdev/KiroCrew/issues/22774)). With
+`relaunchPath` set, the app relaunches that executable instead, with the same
+arguments. The value must be absolute or start with `~/`, which is the
+account's home read from the account entry, not from `HOME`. Anything else is
+ignored. A `relaunchPath` that is not on disk at relaunch time falls back to
+the bare relaunch, because relaunching a missing file brings nothing back.
 
 A marker without `updateCommand` turns the updater off, and About shows the
 "updates are managed by …" message naming `managedBy`. A marker with
@@ -1542,7 +1627,12 @@ commands honored must install the resources directory root-owned.
 
 On the managed path the app treats a `checkCommand` that exits 0 and prints a
 version as an available update. With the app's update switch on, it then runs
-`updateCommand` on the next quit.
+`updateCommand` on the next quit. Windows shutdown, restart and sign-out end the
+app without a quit, so on Windows the app shows a "Kiro Crew update ready"
+notice at session end instead, telling the user to quit from the tray to
+install. It never runs `updateCommand` then: Windows gives the app a few seconds,
+and an apply cut short can leave a half-installed app. The notice appears only
+while the update switch is still on, and not once an install has started.
 
 **A package manager's own update pause holds only if the check command honours
 it**: on this managed lane while the app's update switch is on, and on the
@@ -1574,7 +1664,8 @@ KIROCREW_MANAGED_INSTALL_MARKER=/path/to/marker.json bash packaging/build-deskto
 ```
 
 `build-desktop.sh` validates the file (a JSON object of string fields
-`managedBy` / `updateCommand` / `checkCommand`, under 8 KiB, with an
+`managedBy` / `updateCommand` / `checkCommand`, plus an optional absolute or
+`~/` `relaunchPath`, under 8 KiB, with an
 `updateCommand` — a marker that disables updates while offering none fails the
 build rather than shipping silently) and copies it to
 `website/electron/EXTERNALLY-MANAGED`, which electron-builder packs **into

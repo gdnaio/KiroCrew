@@ -666,6 +666,81 @@ async def test_the_send_records_its_admission_before_the_rpc_suspends(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_a_steered_peer_text_the_turn_never_echoes_requeues_with_its_admission(tmp_path):
+    """The RPC accepted the steer, then the turn ended before `steering_consumed`.
+
+    Accepting the write is not consumption: the text stays pending and the
+    teardown requeues it. The delivery tail must retain the admission until that
+    decision, or the requeued entry has no containment baseline and the drain
+    checks it against every currently held constraint.
+
+    Mutation guard: pop `_steer_admissions` unconditionally in the steered tail of
+    `steer_into_running_turn` and the requeued entry loses its containment stamp.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _busy(_peer_target(state, "chat-2", caller))
+    text = "accepted but never echoed"
+
+    client = MagicMock()
+    client.supports_steer = True
+    client.steer = AsyncMock(return_value=True)
+    target._acp_client = client
+
+    out = await sc.send_to_target(
+        state,
+        caller_session_key=_key(caller),
+        target="chat-2",
+        message=text,
+        steer=True,
+    )
+    assert out["steered"] is True
+    (pending,) = target._pending_steers
+    assert sc.QUEUED_CONTAINMENT_META_KEY in target._steer_admissions[pending]
+
+    # The turn ends with no echo.
+    cr._requeue_unconsumed_steers(state, target)
+
+    entry = next(q for q in target._queue if q["content"] == pending)
+    assert sc.QUEUED_CONTAINMENT_META_KEY in entry["meta"]
+    assert entry.get("_directive_user_origin") is not True, "a peer's text is not the human's"
+    assert target._steer_admissions == {}, "the requeue copies and releases it"
+    assert target._steer_user_origin == {} and target._steer_channel_origin == {}
+
+
+@pytest.mark.asyncio
+async def test_a_consumed_steer_releases_its_held_admission(tmp_path):
+    """The other exit: the echo settles the steer, so nothing requeues it and the
+    held admission must not outlive it."""
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _busy(_peer_target(state, "chat-2", caller))
+
+    client = MagicMock()
+    client.supports_steer = True
+    client.steer = AsyncMock(return_value=True)
+    target._acp_client = client
+
+    await sc.send_to_target(
+        state,
+        caller_session_key=_key(caller),
+        target="chat-2",
+        message="consumed by the turn",
+        steer=True,
+    )
+    (pending,) = target._pending_steers
+    assert pending in target._steer_admissions
+
+    cr._settle_consumed_steers(target, f"<user_message>\n{pending}\n</user_message>", state)
+
+    assert target._pending_steers == []
+    assert target._steer_admissions == {}
+    assert target._steer_user_origin == {} and target._steer_channel_origin == {}
+    cr._requeue_unconsumed_steers(state, target)
+    assert not [q for q in target._queue if q["content"] == pending]
+
+
+@pytest.mark.asyncio
 async def test_a_requeued_steer_with_no_recorded_admission_carries_no_baseline(tmp_path):
     """No stamp means no containment key, not a slot read at teardown.
 
@@ -979,3 +1054,37 @@ def test_send_refuses_an_empty_or_oversized_message(tmp_path):
             )
         )
     assert long_exc.value.code == "message_too_long"
+
+
+@pytest.mark.asyncio
+async def test_a_send_names_its_peer_origin_to_the_session_entry_point(tmp_path, monkeypatch):
+    """The peer path hands its text to `session_deliver.deliver` with a `peer` origin.
+
+    A steer that the client cannot take asks for a steer first, then falls back
+    to the queue arm with `steer=False` and the sender's address on the entry.
+    """
+    from kiro_crew.dashboard import session_deliver
+
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _busy(_peer_target(state, "chat-2", caller))
+    real = session_deliver.deliver
+    calls: list[tuple[str, bool, bool]] = []
+
+    async def _recording(st, slot, text, origin, **kwargs):
+        calls.append((origin.kind, origin.steer, kwargs.get("queue_meta") is not None))
+        return await real(st, slot, text, origin, **kwargs)
+
+    monkeypatch.setattr(session_deliver, "deliver", _recording)
+
+    out = await sc.send_to_target(
+        state,
+        caller_session_key=_key(caller),
+        target="chat-2",
+        message="route me",
+        steer=True,
+    )
+
+    assert out["steered"] is False and out["started"] is False
+    assert calls == [("peer", True, False), ("peer", False, True)]
+    assert any("route me" in q.get("content", "") for q in target._queue)

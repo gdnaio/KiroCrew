@@ -56,10 +56,10 @@ function setupApi(over: Loose = {}) {
 
 /** Wait for the active card (its tab strip) to be on screen. */
 async function waitForActive() {
-  await waitFor(() => expect(screen.getByRole('button', { name: /Inspector/i })).toBeInTheDocument())
+  await waitFor(() => expect(screen.getByRole('radio', { name: /Inspector/i })).toBeInTheDocument())
 }
 
-const tab = (name: RegExp) => screen.getByRole('button', { name })
+const tab = (name: RegExp) => screen.getByRole('radio', { name })
 
 /** Matches the `<p>` footer lines ("Showing N of M", "Showing N events"). */
 const footer = (re: RegExp) => (_: string, el: Element | null) =>
@@ -447,7 +447,7 @@ describe('VectorMemoryCard — Audit tab', () => {
 
     // One filter button per distinct event_type, plus All.
     await user.click(screen.getByRole('button', { name: 'injection_block' }))
-    await waitFor(() => expect(screen.getByText(footer(/Showing 1 events \(4 total\)/))).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(footer(/Showing 1 event \(4 total\)/))).toBeInTheDocument())
     expect(screen.queryByText('terse')).not.toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'All' }))
@@ -463,7 +463,7 @@ describe('VectorMemoryCard — Audit tab', () => {
     await waitFor(() => expect(screen.getByText(footer(/Showing 4 events$/))).toBeInTheDocument())
 
     await user.click(screen.getByRole('button', { name: 'consolidation_skip' }))
-    await waitFor(() => expect(screen.getByText(footer(/Showing 1 events/))).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(footer(/Showing 1 event\b/))).toBeInTheDocument())
 
     vi.mocked(api.vectorEvents).mockResolvedValue({ events: [AUDIT_ROWS[0]] } as never)
     await user.click(tab(/^Semantic$/))
@@ -889,7 +889,7 @@ describe('VectorMemoryCard — embedding setup progress', () => {
 
     await act(async () => { await vi.advanceTimersByTimeAsync(2100) })
     await act(async () => { await vi.advanceTimersByTimeAsync(0) })
-    expect(screen.getByRole('button', { name: /Inspector/i })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: /Inspector/i })).toBeInTheDocument()
 
     const settled = vi.mocked(api.vectorEmbeddingStatus).mock.calls.length
     await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
@@ -934,7 +934,7 @@ describe('VectorMemoryCard — embedding setup progress', () => {
     const afterTransition = vi.mocked(api.vectorEmbeddingStatus).mock.calls.length
     await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
     expect(vi.mocked(api.vectorEmbeddingStatus).mock.calls.length).toBeGreaterThan(afterTransition)
-    expect(screen.getByRole('button', { name: /Inspector/i })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: /Inspector/i })).toBeInTheDocument()
     unmount()
   })
 

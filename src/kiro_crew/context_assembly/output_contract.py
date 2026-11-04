@@ -179,6 +179,14 @@ def _build_ui_language_section(cfg: "KiroCrewConfig") -> str:
 # messaging channel would silently leave the user with no record of what
 # changed. Only the tool-vs-shell distinction stays with the model (clause (a)
 # below): the runtime cannot see HOW a file was changed.
+#
+# The fence contract is stated in both variants and again in prompt.md's
+# Output Format: a custom agent gets these rules without prompt.md, and a
+# minimal-context run gets prompt.md without these rules.
+_FENCE_RULE = (
+    "Each opening and closing ``` stands alone on its line, and a blank line "
+    "follows a closing fence.\n"
+)
 _DIFF_RULE_DASHBOARD = (
     "File changes and diff blocks: edits made through the BUILT-IN "
     "file-editing tools already render as structured diff cards in this "
@@ -189,7 +197,8 @@ _DIFF_RULE_DASHBOARD = (
     "`+++ new_path` headers and an `@@` hunk line; use /dev/null for new "
     "files / deletions — the headers let the dashboard's diff viewer link to "
     "the file), because no card is rendered for those.\n"
-    "When a substantive report, synthesis, or results table is NOT your turn's "
+    + _FENCE_RULE
+    + "When a substantive report, synthesis, or results table is NOT your turn's "
     "final message (more tool calls or messages follow it), end that message "
     "with <!-- keep-visible --> as its final line. The dashboard transcript's "
     "collapse-all mode shows only the turn's last substantive message and folds "
@@ -209,7 +218,7 @@ _DIFF_RULE_CHANNEL = (
     "(use /dev/null for new files / deletions). This surface renders no tool "
     "cards, so your message text is the only place the user can see what "
     "changed. No exceptions — even single-line changes MUST get a diff "
-    "block.\n"
+    "block.\n" + _FENCE_RULE
 )
 
 
@@ -262,17 +271,43 @@ _CRITICAL_RULES_TAIL = (
 
 # The dashboard variant is the module's canonical block: tests and the
 # marker-neutralization prefix check treat "a critical-rules block" as one of
-# these two fixed strings, so both stay module constants (never templated).
+# the fixed strings in _CRITICAL_RULES_VARIANTS, so every variant stays a
+# module constant (never templated).
 _CRITICAL_RULES = _CRITICAL_RULES_HEAD + _DIFF_RULE_DASHBOARD + _CRITICAL_RULES_TAIL
 
 
 _CRITICAL_RULES_CHANNEL = _CRITICAL_RULES_HEAD + _DIFF_RULE_CHANNEL + _CRITICAL_RULES_TAIL
 
 
+# A sub-agent's reply is read by the parent agent that spawned it, not drawn in
+# a UI, so it gets no [OPTIONS:] buttons, keep-visible marker, file-viewer or
+# link-chip clauses, and no per-edit diff mandate (the parent can read the
+# files). It keeps the rules that still help a machine reader: valid fences,
+# absolute paths, and the gender rule.
+_CRITICAL_RULES_SUBAGENT = (
+    _CRITICAL_RULES_HEAD
+    + "Your reply goes to the agent that started you, not to a person in a chat "
+    "UI. Do not add [OPTIONS: ...] lines, <!-- keep-visible --> markers or other "
+    "UI markup.\n"
+    "When you change files, name each changed file by its absolute path.\n"
+    + _FENCE_RULE
+    + "When referencing file paths, ALWAYS use the absolute path, never a "
+    "relative path or bare filename.\n"
+    "Do not assume anyone's gender. When you have not been told a person's "
+    "pronouns, refer to them by name or with singular they/them.\n"
+    "[END CRITICAL RULES]\n\n"
+)
+
+
+# Every fixed critical-rules block. Callers that must recognise the trusted
+# block as a prefix (marker neutralization, essentials splice) test this tuple.
+_CRITICAL_RULES_VARIANTS = (_CRITICAL_RULES, _CRITICAL_RULES_CHANNEL, _CRITICAL_RULES_SUBAGENT)
+
+
 # Runtime sources whose transcript renders tool-call cards (and therefore the
-# inline diff card). Everything else — messaging channels, cron, subagent,
-# background, CLI — gets the hard diff-block mandate: their only file-change
-# display is the message text itself.
+# inline diff card). Sub-agents get their own variant. Everything else —
+# messaging channels, cron, background, CLI — gets the hard diff-block
+# mandate: their only file-change display is the message text itself.
 
 
 def _critical_rules_for(session_key: str | None, runtime_source: str | None) -> str:
@@ -289,4 +324,8 @@ def _critical_rules_for(session_key: str | None, runtime_source: str | None) -> 
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
 
     source = ctx._resolve_runtime_source(session_key or "", runtime_source)
-    return _CRITICAL_RULES if source == "dashboard" else _CRITICAL_RULES_CHANNEL
+    if source == "dashboard":
+        return _CRITICAL_RULES
+    if source == "subagent":
+        return _CRITICAL_RULES_SUBAGENT
+    return _CRITICAL_RULES_CHANNEL

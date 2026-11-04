@@ -260,7 +260,9 @@ class TestWhatDashboardFieldsReturns:
 
     def test_every_field_carries_its_full_schema(self) -> None:
         rows = {row["field"]: row for row in self._listing()["fields"]}
-        manifest = json.loads((BUILTIN / "project-report/manifest.json").read_text())
+        manifest = json.loads(
+            (BUILTIN / "project-report/manifest.json").read_text(encoding="utf-8")
+        )
         for name, spec in manifest["fields"].items():
             # `upkeep` is prose for the crewmate's upkeep skill, not part of the shape.
             want = {k: v for k, v in spec.items() if k not in ("source", "upkeep")}
@@ -328,7 +330,9 @@ class TestTheTurnBlock:
         # crewmate that adopted nothing; the block must not describe a page nobody sees.
         block = dashboard_agentic.turn_block("code-reviewer")
         assert "shows the suggestions page" in block, block
-        assert "dashboard_apply" in block
+        # The block rides every turn: progress goes on a page, built when there is
+        # work to report.
+        assert "when you have work to report, build your page" in " ".join(block.split())
         # Writes to the default would land on a page nobody sees: no fields, no upkeep.
         assert "Fields you write" not in block
         assert "Upkeep:" not in block

@@ -16,6 +16,7 @@ from apps_registry_coverage_helpers import _explicit_registry_execution_admissio
 from apps_registry_coverage_helpers import cache_dir_fixture  # noqa: F401
 
 from kiro_crew.apps import registry
+from kiro_crew.testing.wait import finished
 
 # ---------------------------------------------------------------------------
 # Characterization: behaviour a structural move of this module must not change
@@ -50,9 +51,8 @@ class TestCacheFilenamesAreFrozen:
     _ROOT = Path("/registry-cache")
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- the class's own cache-root pin, moved verbatim; no test in the class calls monkeypatch.undo()
-    def _root(self, monkeypatch):
-        monkeypatch.setattr(registry, "_manifest_cache_dir", lambda: self._ROOT)
+    def _root(self, _floor_monkeypatch):
+        _floor_monkeypatch.setattr(registry, "_manifest_cache_dir", lambda: self._ROOT)
 
     def test_a_manifest_file_is_keyed_by_the_full_normalized_coordinates(self):
         entry = {
@@ -232,7 +232,10 @@ class TestTimeoutsAreReadWhereTheyAreUsed:
         monkeypatch.setattr(registry, "_KILL_GRACE_PERIOD", 0)
         proc = _NeverExits()
         # Bounded well below the real 5 s grace, so an inert patch fails here.
-        await asyncio.wait_for(registry._kill_process_group(proc), timeout=2)
+        await asyncio.wait_for(
+            registry._kill_process_group(proc),
+            timeout=2,  # flake-ok: the 2 s bound IS the assertion; an inert _KILL_GRACE_PERIOD patch waits the real 5 s grace
+        )
         assert reaped == [proc]
 
     @pytest.mark.asyncio
@@ -273,7 +276,8 @@ class TestTimeoutsAreReadWhereTheyAreUsed:
         monkeypatch.setattr(registry, "_kill_process_group", _kill)
         monkeypatch.setattr(registry, "_CLONE_TIMEOUT", 0.01)
         log: list[str] = []
-        result = await asyncio.wait_for(
+        # Bounded well below the real 60 s clone timeout, so an inert patch fails here.
+        result = await finished(
             registry._git_fetch_branch(
                 "https://github.com/acme/demo-app.git",
                 "main",
@@ -282,9 +286,17 @@ class TestTimeoutsAreReadWhereTheyAreUsed:
                 clone_env={},
                 sandbox_mode="strict",
             ),
-            timeout=5,
+            "fetch cut off by the clone timeout",
+            timeout=5,  # flake-ok: the 5 s bound IS the assertion; an inert _CLONE_TIMEOUT patch waits the real 60 s
         )
-        assert result == {"ok": False, "name": "demo-app", "error": "git fetch failed (exit 124)"}
+        assert result == {
+            "ok": False,
+            "name": "demo-app",
+            "error": (
+                "git fetch failed (exit 124): timed out; "
+                "check your network and proxy settings (HTTPS_PROXY, NO_PROXY)"
+            ),
+        }
         assert len(killed) == 1 and isinstance(killed[0], _NeverExits)
         assert "timed out" in log
         assert not dest.exists(), "a destination this call created is discarded on failure"

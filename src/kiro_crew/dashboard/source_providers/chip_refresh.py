@@ -336,7 +336,7 @@ async def _refresh_check_status(url: str, on_update: _CheckUpdateCallback | None
         # `checks` section: a degraded read must not erase a glyph the cache
         # already knows — but a SUCCESSFUL rollup with zero checks (no marker)
         # must still be allowed to clear a stale one.
-        status = {**status, "ci": previous[1]["ci"]}
+        status = chip_status.carry_known_ci(status, previous[1])
     # Re-read the cache AFTER the provider await. The turn-boundary design makes
     # a concurrent full fetch the COMMON case: on `chat_done` the client
     # invalidates the detail payload (starting a full fetch) at the same moment
@@ -411,6 +411,19 @@ async def _refresh_check_status(url: str, on_update: _CheckUpdateCallback | None
         chip_status._queue_check_update(on_update)
 
 
+def _normalized_merge_field(value: object) -> str:
+    """A plugin-supplied merge field in the shared vocabulary, or ``""`` when not a short string.
+
+    The vocabulary is open (GitLab's ``detailed_merge_status`` values pass
+    through unmapped), so the discipline is the one every chip field gets: a
+    short string, redacted like the rest. ``_record_merge_state`` then keeps
+    only a settled answer.
+    """
+    if not isinstance(value, str) or len(value) > 32:
+        return ""
+    return str(sanitize._redact_provider_data(value))
+
+
 async def _fetch_check_status(url: str) -> dict[str, str] | None:
     # Refresh the self-managed GitLab allowlist off the event loop before any
     # URL validation reads the cached snapshot.
@@ -437,15 +450,38 @@ async def _fetch_check_status(url: str) -> dict[str, str] | None:
             raise plugins._plugin_setup_error(plugin, exc) from exc
         if not isinstance(status, dict):
             return None
-        # Same redaction and key discipline as a built-in read: only the two
-        # fields the chip renders survive, and each must be a short string.
+        # Same redaction and key discipline as a built-in read: only the fields
+        # the chip renders survive, and each must be a short string.
+        # ``ciPending`` survives only for a provider in ``CI_PENDING_PROVIDERS``,
+        # the providers ``status_from_full_payload`` projects it for, so the
+        # chip read and the write-through agree; for any other plugin it is
+        # dropped. The merge pair passes through as the built-in reads record
+        # it: a provider whose full payload carries the pair writes it into the
+        # chip cache, and the keep-known rule below carries a recorded pair
+        # forward whenever a refresh omits it, so a chip read that could not
+        # answer the pair would pin the full fetch's verdict until the next
+        # full fetch. Only the normalized vocabulary is admitted.
         projected = sanitize._redact_provider_data(
             {
                 key: value
                 for key, value in status.items()
-                if key in {"ci", "state"} and isinstance(value, str) and len(value) <= 32
+                if key in {"ci", "state", projection.CI_PENDING_KEY}
+                and isinstance(value, str)
+                and len(value) <= 32
             }
         )
+        projection._record_merge_state(
+            projected,
+            _normalized_merge_field(status.get("mergeable")),
+            _normalized_merge_field(status.get("mergeStateStatus")),
+        )
+        # The marker only means something beside a failed rollup.
+        if (
+            plugin.id not in projection.CI_PENDING_PROVIDERS
+            or projected.get("ci") != "failed"
+            or projected.get(projection.CI_PENDING_KEY) != "1"
+        ):
+            projected.pop(projection.CI_PENDING_KEY, None)
         return projected or None
     if ref.provider == "github":
         # The rollup is read separately from the core fields: `gh` resolves a
@@ -491,15 +527,12 @@ async def _fetch_check_status(url: str) -> dict[str, str] | None:
                 # `_github_rollup_read`), so the chip glyph cannot disagree
                 # with the panel's own rollup — a superseded CANCELLED row must
                 # not paint either red.
-                buckets = [check["bucket"] for check in checks]
-                ci = projection._rollup_ci(buckets)
-                if ci is not None:
-                    result["ci"] = ci
+                projection._record_ci(result, checks)
         raw_state = str(data.get("state") or "").upper()
         state = projection._project_state(raw_state, draft=bool(data.get("isDraft")))
         if state is not None:
             result["state"] = state
-        chip_status._record_merge_state(result, *github._github_merge_state(data))
+        projection._record_merge_state(result, *github._github_merge_state(data))
         return result or None
     project = quote(ref.project, safe="")
     details = await runner._run_json(
@@ -518,7 +551,7 @@ async def _fetch_check_status(url: str) -> dict[str, str] | None:
         )
         if state is not None:
             result["state"] = state
-        chip_status._record_merge_state(result, *gitlab._gitlab_merge_state(details))
+        projection._record_merge_state(result, *gitlab._gitlab_merge_state(details))
         # head_pipeline is the MR's own HEAD pipeline and ships with this same
         # payload, so the common case needs one provider call like GitHub does.
         head = details.get("head_pipeline")

@@ -75,6 +75,10 @@ The endpoint returns the enriched note on success, including resolved source, fu
 
 `DashboardState._deliver_note` redacts the note, applies settings, appends it to the in-memory log, broadcasts it, and queues `_persist_notification`. On a running event loop, delivery appends and rewrite mutations share `_notification_io_executor`, a single-worker executor; `DashboardState._rewrite_notifications_async` awaits rewrites for delete, acknowledgement, unacknowledgement, clear, and acknowledge-all paths. Submission order is load-bearing: a rewrite queued after an append cannot be overtaken, preventing deleted rows from reappearing. Snapshot copies prevent later loop-side mutations from changing the data being serialized. `test_dashboard.py::test_deliver_note_offloads_persist_on_running_loop` and `::test_ack_persists_durably_before_return` cover these guarantees; synchronous callers persist inline.
 
+A `meta` value is merged onto the note with every NaN or infinite float, at any depth, read as `null` (`bus._finite_json`): the push route parses with plain `json.loads`, which accepts both, and one stored as is makes the feed response JSON no browser can parse. `test_notification_meta_nonfinite.py` pins it.
+
+`POST /api/notifications/unack` on a cron note takes back the one `acked_items` entry that note's `POST /api/crons/<id>/ack` added, and nothing else. The cron ack gives that entry a fresh id, kept beside it in the job's `acked_item_ids` (aligned by position; written to the store only once some entry has one), and records only the job id and that id under the note's internal `_cron_ack_item` key, never the summary text. The unack hands the id to `unack_job_async(job_id, ack_id)`, which removes exactly that entry: not the job's newest, not a later entry with an equal summary, and nothing at all once the entry has aged out of the job's last 20 or when the ids no longer belong to the items: the job saves a digest of `acked_items` beside the ids (`acked_item_ids_digest`), and a writer that changed the items without the ids, such as an older build, leaves a digest that does not match, so the ids then name no entry. A note's ack and unack run one at a time (`cron_note_transition`), so the already-recorded check, the store write and the record update are one step and a double click adds one entry; a repeat ack re-acks the notification without appending. The record is cleared only once the unack has run, so a busy or unreadable store keeps it for the next unack (`dashboard/cron_note_ack.py`). A note read from the bell or by ack-all added no entry, so its unack leaves the job alone. `test_cron_note_unack_pairing.py` pins it.
+
 ## Testing
 
 `test/test_notifications_push.py` covers app-token authorization, manifest channel enforcement, bounded/chunked bodies, rate-limit and refund semantics, falsy valid fields, signing-payload coverage, lazy registration, and sink/persistence failure paths. `test/test_dashboard.py` covers persistence, load-time redaction, ordered executor persistence, and durable rewrite behavior. `test/test_notification_settings.py` covers settings persistence, protected channels, sink application, badge behavior, and settings APIs.
@@ -85,9 +89,11 @@ Channels register lazily on the first push to each declared channel. App lifecyc
 
 System channels are fixed in `notifications.bus.SYSTEM_CHANNELS`, including `system.monitor` (see Per-channel settings). A legacy `DashboardState.notify(kind, ...)` call maps `kind` to `system.<kind>`, falling back to `system.agent`, unless the caller passes `channel=`. `payload_from_legacy` raises `NotificationValidationError` when that override names anything but a system channel, and `NotificationCoordinator.notify` drops such a note with a warning; `test_monitor_notice_channel.py::TestLegacyChannelOverride` pins the override and the rejection.
 
+An approval prompt in a dashboard chat that expires unanswered also posts one `system.agent` bell note (`kind` `agent`, title `turn_dispatch.APPROVAL_EXPIRED_NOTE_TITLE`, body `format_approval_expired_note`) from the runner's timeout branch, so someone who is not looking at the session learns the turn went on without the tool. The body names the tool and the session's display title, never the prompt's agent-authored text, and `meta.slot` gives the detail panel its open-session action. It is not `kind` `approval`, which the feed renders with live Approve and Reject buttons. It carries no `publisher_session`, so a muted session's expiry still notifies. A no-budget decline, where nothing was asked, posts none. `test_dashboard_approval_window.py` pins all three.
+
 ## Per-channel settings
 
-`notifications.settings.ChannelSettings` is state-owned, writes atomically, and loads an invalid settings file as empty defaults. `ChannelSettings.apply` runs in `DashboardState._deliver_note` before append and broadcast, so disk and clients receive the same user view while `NotificationBus` remains policy-free.
+`notifications.settings.ChannelSettings` is state-owned, writes atomically, and loads an invalid settings file as empty defaults. The file is parsed with `user_json.loads_user_json`, so a UTF-8 BOM reads. After a failed load the first `update` reads the file again; if it still fails, the file is renamed to `notification_settings.json.corrupt-<UTC stamp>` with a WARNING before the write, so no write replaces mutes it never read. `test_notification_settings_unreadable.py` pins it. `ChannelSettings.apply` runs in `DashboardState._deliver_note` before append and broadcast, so disk and clients receive the same user view while `NotificationBus` remains policy-free.
 
 - A muted non-protected channel remains in history but receives `silenced: true` and passive priority. `test_apply_mute_forces_passive_and_silenced` and `test_muted_channel_excluded_from_badge` pin the visibility and badge invariant.
 - A priority override replaces the effective producer or channel priority.
@@ -98,17 +104,33 @@ Settings import writes the file through two more paths. `parse_imported_settings
 
 `system.monitor` is a system channel for the gateway's monitoring-loop stop and finish notices. `GatewayOrchestrator._notify_nudge_expired` emits them through `DashboardState.notify(..., channel=MONITOR_CHANNEL)`, and the note keeps the legacy `kind` `agent`. The channel shares the `system.agent` default priority and is not protected. `ChannelSettings._seed_monitor_from_agent` runs at construction: a settings mapping with no `system.monitor` key receives an in-memory copy of its `system.agent` entry, so a boot never writes the file and a fresh install with no stored `system.agent` entry seeds nothing. The next `update()` persists the copy. Every `update()` write keeps a `system.monitor` key, `{}` when the channel has no settings, as the record that the seed ran; a build without this key handling rewrites every dict-valued `channel_settings` entry as-is, so the record survives a downgrade, and removing it re-runs the seed and can re-mute a channel the user unmuted. `all_settings()` omits empty entries, so the channels listing never shows `{}`. `test_notification_settings.py::TestSeedMonitorFromAgent` pins the seed, with `test_unmuted_monitor_survives_downgrade_rewrite` and `test_fresh_install_agent_mute_does_not_seed_monitor` covering the downgrade and fresh-install boundaries; `test_monitor_notice_channel.py` pins channel registration, the legacy `kind` override, notice routing and the settings listing.
 
+`system.apps` is a system channel for "an installed app has a newer version published". `apps.update_notify` emits the notes through `DashboardState.notify(..., channel="system.apps")`, keeping the legacy `kind` `update` — the spelling the gateway's own update notice uses, so a frontend filter on `note.kind` sees one name for "something can be updated". It has its own channel rather than falling back to `system.agent` so muting app-update notices does not also mute the notes agents write for a human decision; Settings → Notifications labels it "App updates" (`CHANNEL_LABELS`), because the bare id "apps" reads as every app's notifications. Default priority, not protected.
+
+`handle_registry` (`GET /api/apps/registry`) is where it runs, with the listing rows it has just built — the same rows, carrying the same `updateAvailable` and install status, that the Discover rail badge counts through `countUpdatables`. Nothing is fetched and no timer is added: the note rides the listing the store and the shell badge query already request. It runs on CATALOG rows only: when the catalog is unreachable the seed fallback answers, and its rows can name an older version than the catalog, so announcing from them would report a version that is not the newest. Two halves, because they belong in different places: `prepare_app_update_notes` reads and writes the ledger and runs off the loop, then `deliver_app_update_notes` calls `state.notify` ON the serving loop. Off the loop, the coordinator persists a note inline instead of through its FIFO executor, and a rewrite queued by a concurrent delete can then overwrite it — which the ledger, already written, would never let come back. Both halves are total, so a store response can never fail on a note.
+
+A note fires at most once per published version. `announced-app-updates.json` under the data home records the version last announced per app, and only a different version announces again. It is deliberately NOT under `cache/`, because dropping a cache is a supported repair and dropping this would re-announce the whole backlog. An entry is dropped only on evidence it is finished with — the app's row says it is no longer installed, or that the installed version has reached the one recorded. An entry whose app is merely ABSENT from a listing is kept, because absence says nothing about the app and forgetting it would announce the same version again when the row returns. A **missing** ledger is a first observation: the pending backlog is adopted silently, because a fresh install with updates waiting would otherwise open with a note per app about versions that have been out for weeks, and the badge already states that standing count. A ledger that is unreadable or of the wrong shape reads as empty instead, which fails toward one duplicate note rather than toward permanent silence. Persist before you publish: the ledger is written BEFORE any note goes out, and a ledger that cannot be written sends nothing — otherwise every later listing would read the stale ledger and announce again. A failed delivery is therefore lost rather than repeated, the same ordering and the same trade as `issue_radar`'s watcher. The whole read-modify-write runs under one exclusive lock (`announced-app-updates.lock`, beside the ledger): the store page and the shell badge query list concurrently, and two unserialized passes reading the same ledger would each write back only their own view, so the second would erase the entry the first committed and that version would announce again. A lock that cannot be taken fails closed: no note, nothing written. Only `lifecycle: "gateway"` apps are announced: an `app`- or `locked`-lifecycle app updates itself, so a note would point at an Update button the store cannot press. The note is titled `<name> <version> available`, version first so the feed's truncation takes the word rather than the version, using the app's validated name — never its display name, which on an external row is content that row's author controls and which a bell note would present as the gateway speaking. For the same reason a published version is repeated only when it is a strict semver of bounded length (`apps.update_status.publishable_version`); `9.0.0-SECURITY ALERT: …` produces no note at all. `test_app_update_notify.py` pins the once-per-version property, the first-observation adoption, the kept entry on an absent row, the unwritable-ledger silence, the locked read-modify-write and its fail-closed refusal, the catalog-only trigger, delivery on the loop thread, the skipped lifecycles and the delivery-failure ordering.
+
+`system.turn` is a system channel for "a chat turn stopped with an error the operator must act on". A turn that dies at a terminal, non-retry arm of `_run_chat` — a provider 5xx/throttle or process give-up, a content-filter refusal, a transport death, a signed-out agent — sets `turn.died_notice` to the one-line body; the turn's `finally` fires `dashboard/chat_turn/turn_reply_seams.py::_notify_turn_died` ONCE from that single choke point, so every terminal arm (stop-reason and `except` alike) rings through one site and a future arm is covered by setting the flag. A retry arm, a branch reached only on a user Stop, and the nested-turn (`_prompt_depth > 0`) arm whose parent may absorb the death all leave `died_notice` unset and stay silent; an app-owned chat (`slot._app`) is skipped, since an app owns its chat's continuation. The note is built with `payload_from_legacy(channel="system.turn", ...)` and pushed on `state.notification_bus` directly — the way every other legacy producer stacks a note (`member_message_notes`, `terminal_lifecycle`, `member_goals`), since `group_key` is a payload field the bus drops from `meta` and a second way to pass it through the adapter would be a duplicate mechanism. The legacy `kind` is `agent` — NOT `turn`, which is the frontend's conversation-ready sound category (`presetForKind`), so the channel's own mute/priority govern the sound rather than the hand-back chime. It carries `url=/chat?sid=<slot>` (the deep link), `meta={"slot": <slot>}` so the banner gate scopes to the dying chat, `group_key=turn-died:<session>` so one session's repeated deaths stack into one row, and `publisher_session=<slot key>` so a muted session's alert is delivered silenced — the honest form of "only when it is not the session in focus", without the backend tracking per-client focus. It keys on the slot, not the effective session key, because `session_is_muted` resolves the publisher through `caller_slot_key`, which matches a slot's key but never an unbound channel-born slot's `dashboard:`-prefixed session key. Default priority, not protected; Settings → Notifications labels it "Chat errors" (`CHANNEL_LABELS`), because the bare id "turn" reads as the conversation-handoff sound and "stopped" alone does not say the chat failed. `test_turn_died_notify.py` pins the channel, the schema-field `group_key` through the real bus, the slot meta, the deep link, the app-owned skip, the swallowed delivery failure and the blank-session case.
+
 Dashboard-user settings routes (in `dashboard/messaging_api/notifications.py`, beside the feed routes) expose the union of registered channels and stored settings through `api_notification_channels`; `api_notification_channel_settings` accepts mute and priority updates, clears an override for `priority: null`, and broadcasts `notification_channel_settings`.
 
 ## Agent notifications and expiration
 
 `mcp_tools.messaging.send_notification` requires a verified caller identity, applies the messaging governance gate, and denies channel-agent callers. `dashboard.handlers.messaging.api_notification_agent_push` fixes agent notes to the `system.agent` channel and server-derived source before `NotificationPayload` validation. The agent endpoint and the app push handler both await queued persistence before returning success.
 
-### Crewmate attribution
+### Link back to the publishing session
 
-A note published from a crewmate's pinned DM session carries `member: {slug, name}`. `members.member_identity_for_session` derives it from the caller's `X-Session-Key` and the slot's live `dm.json` binding, so the name is the binding's member, never the lossy slug; any other session, or a key whose binding is gone, yields no `member`. The key counts only through `members.attributable_session_key`: the request must not be an app caller (`request["app"]`), and `member_memory_auth.session_key_is_attested` must bind the key to the caller, either by the kernel peer attestation on the Unix socket (`peer_verified`) or by a signed per-session `X-Session-Token` that verifies to that key (what Kiro Crew's own pooled tool backends send on TCP loopback). A bare header is the caller's own word, so an app token, or a caller holding only the internal secret, that declares a crewmate's DM key gets an unattributed note. `api_notification_agent_push` (the `send_notification` path) and the `send_message` bell fallback in `messaging_api/proactive_send.py` both stamp it. `member` is a `NotificationPayload` schema field with a closed `{slug, name}` shape and is in `_RESERVED_NOTE_KEYS`, so neither a request body nor an app push's `meta` can attach a crewmate's identity to a note. `test_notification_crewmate_member.py` pins the derivation, the transport gate on both producers, the body and meta refusals, and both producers.
+A note from either agent route names the session that published it, so the detail panel can open it. `api_notification_agent_push` and the `send_message` bell fallback set the note's `slot` and `history_key` from `_publishing_session_meta` on the same attested key `member` uses (`members.attributable_session_key`), so an app or unattested caller gets no link and no request body can choose one. The resolver answers the key's own slot (`dashboard_slot_key`, which maps a cron run to its `cron-<id>` tab) while `DashboardState.get_slot` holds it, with that slot's transcript key (`slot_history_key`) as `history_key`, and otherwise neither. A cron run with no tab of its own does not borrow the tab of the session that created the cron: the banner treats a note whose `slot` is the focused chat as already on screen, and that chat never shows the cron's output. The fallback links a message that offers `[OPTIONS:]` choices too, although it passes no `publisher_session` for one. `NotificationDetailPanel` shows **Go to chat** while that slot is open, as it does for a heartbeat note. The chat page does not render a mate's DM thread, so both buttons on a note from one open `/members?member=<name>`, the page that thread's sidebar row opens; the name is the open slot's `agent`, or the note's `member` once the thread has closed, and the Members page holds that mate's one thread. An open thread whose slot names no mate opens the bare Members page, as its row does. Otherwise, once the slot closes, **Resume chat** resumes with the note's `history_key`, and with `slot` for a note that has none: a bare slot name names no transcript, so a dashboard chat resumed by it opens empty. A cron tab resumes from its `cron:<id>` transcript, as the History tab resumes it. While the window is focused on that chat, the banner skips the note (see Suppression). `test_notification_session_link.py` pins the resolution, the attestation gate, the body refusal, both routes and a closed session's resume; `NotificationDetailPanel.resumeHistory.test.tsx` pins the key the panel resumes with, and `NotificationDetailPanel.memberNavigation.test.tsx` pins where a mate's note opens.
 
-`website/src/components/notifications/CrewmateNoteFace.tsx` draws the attribution on `NotificationCard` (bell popover and banner), the panel `NotificationFeed` row and `NotificationDetailPanel`: the crewmate's avatar replaces the kind icon and its display label sits above the title. Face and label come from the row of `membersRosterQuery` (the Crewmates page's query, invalidated by the gateway's `refresh` frame and by every crew save) whose slug and exact name match the note's `member`; while that query loads, or when no such row exists, the kind icon renders and no label shows. When that query fails, `CrewmateRosterError` renders one inline `ErrorNotice` with a Retry that refetches the roster: in a crewmate note's detail panel, and at the top of a feed showing a crewmate note unless the selected note is a crewmate note (its open detail panel already reports it), and in the footer of the first full `NotificationBanner` card showing a crewmate note (deck shells draw no face, and the banner is suppressed while the popover or the inbox is on screen, so it never repeats their notice). The notice carries no agent hand-off because all three surfaces are overlays over a page that may hold an unsaved draft; a feed with no crewmate note never reads the roster. `NotificationCrewmateFace.test.tsx` pins these states.
+### Mate attribution
+
+A note published from a mate's pinned DM session carries `member: {slug, name}`. `members.member_identity_for_session` derives it from the caller's `X-Session-Key` and the slot's live `dm.json` binding, so the name is the binding's member, never the lossy slug; any other session, or a key whose binding is gone, yields no `member`. The key counts only through `members.attributable_session_key`: the request must not be an app caller (`request["app"]`), and `member_memory_auth.session_key_is_attested` must bind the key to the caller, either by the kernel peer attestation on the Unix socket (`peer_verified`) or by a signed per-session `X-Session-Token` that verifies to that key (what Kiro Crew's own pooled tool backends send on TCP loopback). A bare header is the caller's own word, so an app token, or a caller holding only the internal secret, that declares a mate's DM key gets an unattributed note. `api_notification_agent_push` (the `send_notification` path) and the `send_message` bell fallback in `messaging_api/proactive_send.py` both stamp it. `member` is a `NotificationPayload` schema field with a closed `{slug, name}` shape and is in `_RESERVED_NOTE_KEYS`, so neither a request body nor an app push's `meta` can attach a mate's identity to a note. `test_notification_crewmate_member.py` pins the derivation, the transport gate on both producers, the body and meta refusals, and both producers.
+
+`website/src/components/notifications/CrewmateNoteFace.tsx` draws the attribution on `NotificationCard` (bell popover and banner), the panel `NotificationFeed` row and `NotificationDetailPanel`: the mate's avatar replaces the kind icon and its display label sits above the title. Face and label come from the row of `membersRosterQuery` (the Mates page's query, invalidated by the gateway's `refresh` frame and by every crew save) whose slug and exact name match the note's `member`; while that query loads, or when no such row exists, the kind icon renders and no label shows. When that query fails, `CrewmateRosterError` renders one inline `ErrorNotice` with a Retry that refetches the roster: in a mate note's detail panel, and at the top of a feed showing a mate note unless the selected note is a mate note (its open detail panel already reports it), and in the footer of the first full `NotificationBanner` card showing a mate note (deck shells draw no face, and the banner is suppressed while the popover or the inbox is on screen, so it never repeats their notice). The notice carries no agent hand-off because all three surfaces are overlays over a page that may hold an unsaved draft; a feed with no mate note never reads the roster. `NotificationCrewmateFace.test.tsx` pins these states.
+
+### Mate messages
+
+A mate's message in its DM thread is a notification of its own: `dashboard/member_message_notes.py` publishes one note per landed turn in a member DM slot. The chat runner calls `post_turn_reply` once the turn's reply is saved, with the row ids it recorded as the turn's own replies (`_note_reply_row`, `slot._turn_reply_mids`); the note's body is the newest of those rows that is `assistant` speech (`system_notices.is_speech_row`, the predicate the thread draws by, so the bare U+200B a quiet check-in turn ends on is not a message). Two consequences: an `assistant` row the gateway wrote into the thread (a compaction notice, a cleared-conversation line, a slash command's reply, an injected workflow or cron result) is never a mate's message, and a turn that appends one reply row per model call (the text before each tool call) pings once, with its answer. A turn the user stopped, and a turn about to re-run (promise, compaction, leak or infrastructure recovery), publish nothing; the re-run's reply is the answer. Tool calls, tool results, injected, subagent and streamed rows never notify. The note goes on the `system.member` channel, labelled "Mate messages" in Settings -> Notifications. Its default priority is `passive`: the note lands in the bell feed with no banner, sound, OS toast or unread count, and the user can raise the channel (to `default` for all four) or mute it on its own there. Muting `system.agent` does not silence it. The note keeps the legacy `kind` `agent`, as `system.monitor` notes do. `member` comes from `members.member_identity_for_session` on the slot key, read off the event loop before the note is pushed back on it, and a member slot with no live binding publishes nothing. The title is the mate's name, so the card omits the small mate-name label it draws above a title that already says it (`CrewmateNoteName` with `title`), and the body is the message text (capped by `payload_from_legacy`, redacted on delivery); `url` is `/members?member=<exact name>`, `slot` names the thread, `group_key` is the slot key so one mate's messages stack, and `publisher_session` is the slot, so a muted thread's note is delivered silenced. A message the user is watching is still published; the banner decides whether to show it (see Suppression). `test_member_message_notes.py` pins the producer, the roles, rows and slots that publish nothing, the channel and its passive default, one note for a real `_run_chat` turn with a tool call between two segments, and none for a turn ending in a cancelled stop.
 
 `DashboardState.sweep_expired_notifications` removes only passive notes with a positive integer `ttl` whose parseable timestamp has elapsed; ambiguous timestamps and other priorities remain. `DashboardState` invokes the sweep while loading persisted history and before each delivery. The in-memory sweep becomes durable on a later full rewrite, so already-open clients retain an expired row until their next reload or refresh.
 
@@ -116,7 +138,10 @@ A note published from a crewmate's pinned DM session carries `member: {slug, nam
 
 `NotificationPayload.validate` accepts action entries with non-empty `id` and `label`, and validates each optional action URL at the persistence trust root. `test_notification_bus.py::test_action_count_capped` and `::test_action_field_lengths_capped` pin action bounds. URL-less actions persist but do not render; `test_action_without_url_accepted` pins that contract.
 
-`website/src/components/notifications/NotificationDetailPanel.tsx` and `NotificationFeed.tsx` render navigation actions only after `safeInternalUrl` rechecks a dashboard-internal URL. Unacknowledged approval feed rows render inline Approve and Reject that resolve through the approvals endpoint (the one-click path `rfc-local-notification-bus.md` Phase 4 shipped). Every approval row -- read or unread, because reading a pending request must not shrink it -- renders the notification body in full through the same markdown renderer and per-item error boundary as the detail panel: no slice, clamp or hidden overflow, because a control that authorizes a command must sit next to the whole command, and a truncated excerpt turns two lines into one harmless-looking line. The producer tags the command fence `approval-command` (`lib/approvalNotificationBody.ts`), a dashboard-own tag `CodeBlock` soft-wraps like `error-report`, so a line wider than the feed column wraps instead of scrolling off the edge. Both surfaces render the body with `readOnlyCode`, so the command carries a copy control but no edit affordance: `EditableCodeBlock`'s scratch editor changes only a local copy, and a pencil beside Approve would let a reader authorize the original command while looking at their edit. Every other row keeps the flattened one-line excerpt. This contract applies to the full page and bell popover, including the mac feed variant. `NotificationFeed` collapses notes sharing a `group_key` within a date group to the newest row and expands the stack on demand. `NotificationsBellButton` sends the unread attention count through `badge:set`; `electron/badge.js` clamps it before `app.setBadgeCount`.
+`website/src/components/notifications/NotificationDetailPanel.tsx` and `NotificationFeed.tsx` render navigation actions only after `safeInternalUrl` rechecks a dashboard-internal URL. Unacknowledged approval feed rows render inline Approve and Reject that resolve through the approvals endpoint (the one-click path `rfc-local-notification-bus.md` Phase 4 shipped). Every approval row -- read or unread, because reading a pending request must not shrink it -- renders the notification body in full through the same markdown renderer and per-item error boundary as the detail panel: no slice, clamp or hidden overflow, because a control that authorizes a command must sit next to the whole command, and a truncated excerpt turns two lines into one harmless-looking line. The producer tags the command fence `approval-command` (`lib/approvalNotificationBody.ts`), a dashboard-own tag `CodeBlock` soft-wraps like `error-report`, so a line wider than the feed column wraps instead of scrolling off the edge. Both surfaces render the body with `readOnlyCode`, so the command carries a copy control but no edit affordance: `EditableCodeBlock`'s scratch editor changes only a local copy, and a pencil beside Approve would let a reader authorize the original command while looking at their edit. Every other row keeps the flattened one-line excerpt. This contract applies to the full page and bell popover, including the mac feed variant. `NotificationFeed` collapses notes sharing a stack key within a date group to the newest row and expands the stack on demand, the way macOS Notification Center stacks by app. `notificationStacks.stackKeyOf` picks the key: the producer's `group_key` when it set one, else the sender -- the publishing crewmate (`member`), then the cron job (`job_id`), then the `channel` narrowed by `session_key` when present. An approval or a critical note without a `group_key` never stacks: an approval is its own decision, and a deck shows only its head's priority, so a critical failure followed by an ordinary note from the same sender would be buried under the ordinary one. A collapsed deck's ⓧ dismisses only its newest note, so the deck shrinks by one, and an expanded stack's rows also close one at a time; clearing a whole stack is the expanded header's two-press clear (or the date header's clear). An expanded stack carries a header row above its newest note, as macOS does: `stackLabelOf` names the sender (the crewmate, else a non-system app `source`, else the kind label such as "Cron Job"), and the row holds Show less and the stack's own two-step clear, which deletes every note in the stack; that clear shows the word "Clear" rather than an ⓧ and arms to "Clear this group", so it reads neither as hiding the stack nor as the inbox-wide clear-all. The head card itself carries no Show less, and in the panel variant the "N more" pill appears only on a collapsed stack. Clearing is a two-step control (`NotificationClearButton`, which forwards its ref to the `<button>` so a `uiLocation` spread registers it): the first press turns its idle glyph or label into a confirm capsule whose visible text is also its accessible name, the second clears, and pointer-leave, blur or Escape disarm it, so there is no native `confirm()`. Each date-group header carries its own clear, which deletes that group's visible rows (search and the muted disclosure decide what is visible) except its approvals, read or not, because reading one does not resolve it; they keep waiting on their own Approve/Reject; it arms to "Clear <day>", and a day holding only approvals offers no clear; the controls card's clear-all (a trash can, since an ⓧ in the sheet's top-right corner reads as "close") and the page toolbar's "Clear all" (the same trash can, with visible text, since an ⓧ "Clear" beside the search field reads as "clear the search") empty the inbox after arming to "Clear all", through `/api/notifications/clear`. `NotificationsBellButton` sends the unread attention count through `badge:set`; `electron/badge.js` clamps it before `app.setBadgeCount`.
+A failed day, stack or inbox clear, or a failed single-note dismiss (a deck's head included), shows one shared `ErrorNotice` in either feed variant, retains failed rows (restoring a dismissed row's pre-animation styles), and removes the notice after a later successful clear, unless another clear failed while that one was in flight. When a clear unmounts the focused control, focus moves to the open control of the next remaining row (else the previous one), never to `<body>`. Each deletion of a multi-note clear commits separately, so that target is held until every cleared note has left the list or the clear has settled, not dropped on an intermediate commit while the pressed control is still focused; it is dropped when every deletion failed, when the pressed control survives, or when the user has moved focus to another live element.
+
+A note detail that closes while it holds focus (its Close button, Escape, Back, or an Approve or Reject that removes the note) returns focus to the row that opened it, else the first row, else the bell in the sheet or the feed's first control on the inbox page (`components/notifications/feedFocus.ts`, used by `shell/notifications/notificationSheet.tsx` and `pages/NotificationsPage.tsx`). On the inbox page this covers the narrow layout, where the detail replaces the feed; the wide layout's side detail is not covered yet (#29175). Approve and Reject close the detail before their delete lands, so the row focus returned to is watched, and when it leaves the feed while focus is on `<body>` the first row takes it. Focus the user already moved to another live control stays there. `notificationSheet.detailCloseFocus.test.tsx` and `NotificationsPage.goneNoteFocus.test.tsx` pin it.
 
 ### Feed keyboard stepping
 
@@ -130,7 +155,9 @@ The detail panel's hand-off buttons ("Continue in Chat", and "View last result" 
 
 Settings › Notifications › "Mark sessions unread only when they need you" (`localStorage` key `mc-unread-on-attention`, default off, `hooks/unreadOnAttention.ts`) limits which `chat_message` rows mark a background session unread: with it on, only a `permission` row does, while a finished turn and a question card badge on their own paths. A row carrying the watchdog's `session_recycled` notice (`meta.notice`, written by `wire_session_recycle_callback` in `dashboard/state_parts/session_events.py` when an idle session is recycled) never marks the session unread, regardless of this opt-in: `chatMessageMarksUnread` (and `noteMemberThreadRow`) short-circuit it because the notice lands in a session that is not running and has nothing new to read. A slot's `last_ts` is its newest durable row (`slot_projection.py` skips transient roles). The unread watermark is never taken from a transient-role row, because a restarted gateway never again reports a `last_ts` that high and the badge could never clear. The client's role set (`UNSAVED_ROLES`) mirrors `dashboard/state_parts/transcript_rows.py` `_TRANSIENT_ROLES`; `test_to_dict_board_fields.py` pins the mirror.
 
-A member DM thread (`slot.mode === 'member'`, key prefix `member-`, which `slot_registry.py` reserves for that mode) is narrower in both modes: `memberThreadRowMarksUnread` badges it only on a row the crewmate wrote to the user, `assistant` or `permission`, with the opt-in still applied on top. Its `tool_call`, `tool_result`, `inject` and streaming rows never badge it: the Crewmates rail dot means "a crewmate said something to you", not "a crewmate ran a tool". `isMemberThreadSlot` reads the mode from `dashboard.slots` and falls back to the reserved prefix for a thread the list has not caught up to. Its `chat_done` is narrowed the same way (`turnCompletion.ts`): `chatStream` records every such row on the thread's running turn (`noteMemberThreadRow`, on or off screen), and the finished turn badges only when the turn delivered one (`takeMemberThreadSpoke`, which also clears the record) or paused for input (`needs_input` / a live question card). A patrol turn that only ran tools and ended quietly badges nothing. The question-card path is unchanged.
+A member DM thread (`slot.mode === 'member'`, key prefix `member-`, which `slot_registry.py` reserves for that mode) is narrower in both modes: `memberThreadRowMarksUnread` badges it only on a row the mate wrote to the user, `assistant` or `permission`, with the opt-in still applied on top. Its `tool_call`, `tool_result`, `inject` and streaming rows never badge it: the Mates rail dot means "a mate said something to you", not "a mate ran a tool". `isMemberThreadSlot` reads the mode from `dashboard.slots` and falls back to the reserved prefix for a thread the list has not caught up to. Its `chat_done` is narrowed the same way (`turnCompletion.ts`): `chatStream` records every such row on the thread's running turn (`noteMemberThreadRow`, on or off screen), and the finished turn badges only when the turn delivered one (`takeMemberThreadSpoke`, which also clears the record) or paused for input (`needs_input` / a live question card). A patrol turn that only ran tools and ended quietly badges nothing. The question-card path is unchanged.
+
+`GET /api/notifications` returns `{"notifications": [...], "unread": N}`, and `unread` is counted from the notes it returns on every read (`notification_coordinator.unread_count`): a note counts while it is not `acked`, not `passive` and not `silenced`, the bell badge's rule (`shell/topbar/shellHeader.tsx`). So an ack, Mark all read and a delete each lower it, and a restarted gateway reports the persisted feed's true count rather than zero. A relayed teammate's count covers only the notes their view returns. `test_notification_unread_count.py` pins the ack, ack-all and restart cases.
 
 ## Plain-text previews
 
@@ -183,11 +210,30 @@ Notification sound is produced entirely on the client and is independent of the
 notification feed, the bell badge, and OS notification-center toasts. The
 WebAudio layer is the **single source of sound**: `website/src/hooks/useNotificationSound.ts`
 synthesizes tones through the Web Audio API (no audio files) and is the only
-component that emits sound. The feed toast's page-context `Notification`
+component that emits a built-in sound (a theme pack's own sound is described
+under "Theme pack sounds" below). The feed toast's page-context `Notification`
 constructor (`website/src/hooks/useNativeNotification.ts`, see "OS toast"
 below) passes `silent: true`, so the OS toast never adds its own system chime
 on top of the WebAudio tone. A browser that
 ignores `silent` degrades to the prior double-sound behavior and no worse.
+
+### Theme pack sounds
+
+An active Level-2 theme pack whose sounds are on and audible (consented, not
+muted, no reduced motion) can sound a notification instead of the built-in
+tone. `ThemeExperienceLayer.tsx` publishes the pack's playable trigger names
+through `themeSound.ts:publishThemeSoundTriggers()`, and both listeners of
+`MC_NOTIFICATION_EVENT` resolve the same event through
+`useNotificationSound.ts:themeTriggerForNotification()`, so exactly one of them
+plays it. The resolution order is: a category the user set in Settings keeps its
+own sound (the pack stays silent for it); else the pack's `category:<kind>`
+trigger; else its `notification` trigger; else the built-in tone. The `all`
+fallback is not treated as a user choice, because a stored value cannot be told
+apart from the default. The allowed `category:<name>` triggers are the
+`SOUND_CATEGORIES` minus `all` (`theme_validate._THEME_AUDIO_NOTIFICATION_CATEGORIES`),
+each capped at `notification`'s 2 seconds. `themeNotificationSound.test.ts`,
+`ThemeExperienceLayer.test.tsx` and `test_theme_install_declarations.py` pin the
+order, the skipped built-in tone and the validator's allowlist and cap.
 
 ### Sound events
 
@@ -251,7 +297,7 @@ gated on catch-up, only the frame's live banner is (see Trigger below).
 ### Settings and resolution
 
 Settings persist in `localStorage` under `mc-notification-sound`
-(`{ enabled, volume, perCategory, customTones? }`). `presetForKind(kind, settings)` resolves
+(`{ enabled, volume, perCategory, customTones?, customFiles? }`). `presetForKind(kind, settings)` resolves
 the preset for a kind, in order:
 
 1. `enabled === false` → `'none'` (primary switch; WebAudio never plays).
@@ -292,11 +338,11 @@ reader goes through `loadSoundSettings`, so the load-time check is the one
 gate between a stored value and the speakers. Playback scales a custom sound by
 its loudest overlap of step gains, so it never drives the output past full
 scale. The form edits one row per tone (Pitch, Start, Length, Volume), starts
-from a two-note example, and can play the draft ("Test") before it is saved;
+from a two-note example, and can play the draft ("Play") before it is saved;
 the draft plays under a throwaway id and is never stored. Bound failures show
 as plain hints, not error banners, each under the field it is about (a name
 problem under Name, a tone bound under its row); the offending inputs get
-`aria-invalid`, and "Add sound" stays off until the user edits. A save that
+`aria-invalid`, and "Save sound" stays off until the user edits. A save that
 fails (add, delete, undo, or a sound, volume or category setting) shows through
 `ErrorNotice` with a next step (free up this site's browser storage, then try
 again), without the agent hand-off because the form holds an unsaved draft.
@@ -309,6 +355,75 @@ withdraws the Undo, and an Undo refused because the name was reused elsewhere
 is withdrawn after its hint, so no notice says a listed sound was deleted.
 Pickers label a custom sound
 "<name> (yours)". Crew avatar sounds still offer only the built-ins.
+
+#### Sound files
+
+A user can also add a sound from an audio file (the "Use an audio file" card in the
+same pane). The bytes stay in the browser: `hooks/customSoundFiles.ts` keeps
+each file in IndexedDB (database `kirocrew-notification-sounds`, store `files`)
+and playback reads it into a `blob:` URL that is revoked once the `<audio>`
+element is released, or at the latest a few seconds past the 5 s limit, so a
+platform pause that fires neither `ended` nor `error` cannot pin it. Nothing is
+uploaded to or stored by the gateway. The settings blob holds only the record
+that makes the sound pickable, under `customFiles`
+(`{ [name]: { bytes, seconds, key } }`), and a category selects it as
+`file:<name>`.
+
+Bytes are stored under a key made for each write (`newSoundFileKey`: its
+creation time, then a random id), never under the sound's name, and the record
+carries that key; a record without a well-formed key is dropped on load. Two
+adds of the same name, from two tabs or a retry, therefore write two entries,
+and each one's clean-up can only delete its own bytes.
+
+`readAudioFile` checks a picked file before it can be saved, against
+`CUSTOM_FILE_LIMITS`: at most 256 KB (checked first, so an oversized file is
+never read), then a decode by an
+`OfflineAudioContext` (which opens no output device) that proves the file plays
+and measures it exactly, at most 5 s. `validateCustomFile` holds the
+record to the same limits on add, on Undo and on every load, so a hand-edited
+or restored record past them is dropped like a tone sound. Tone sounds and
+sound files share one name space (case-insensitive) and one limit of 20,
+because both validators check against `allCustomSounds`.
+
+Adding writes the bytes first and the record second, re-checking the record
+against the settings as they are after the write: if another tab took the name
+or the last slot meanwhile, this add deletes its own bytes and saves nothing.
+Deleting a file forgets its record, with the same category clean-up and Undo as
+a tone sound, and leaves its bytes in place for that Undo. Opening the pane
+brings the two back in line (`pruneSoundFiles`): bytes no record points at are
+deleted, reading the records again before each delete, and a record whose
+bytes are not stored (settings restored from `ui-prefs.json` into another
+browser) is dropped with its categories at that opening. Until then a
+notification for a category set to it plays what that category would play
+with its file choices unset (`missingFileFallback`), so restored settings never
+silence a category. Bytes and records
+younger than `ORPHAN_GRACE_MS` (10 minutes, read from the key) are exempt from
+both, because an add in another tab writes its bytes before its record; a key
+dated further than that in the future (a clock that ran ahead, a hand-edited
+record) is not exempt, so it cannot shield a record forever. Collecting can
+still remove the bytes another tab is holding for an Undo; that Undo first
+checks the bytes are there, and when they are not it restores nothing and says
+the file is gone. Two tabs can still race inside that check (one tab's Undo
+passes it just before the other's collection runs); the record left without
+bytes is then dropped at the next opening of the pane. Undo is off while it
+runs, so a double click restores once. When IndexedDB cannot be read at all
+nothing is concluded and every record is kept; a file sound that cannot be
+read plays silence, and a connection the browser closes is reopened on the
+next call.
+
+The pane is three titled cards, each a named region. "Your sounds" lists every
+saved sound with a small "File" or "Tones" tag and its Play and Delete
+buttons. "Use an audio file" comes next, as the quicker way, then "Build from
+tones" (the tone form). Both forms use the same words on purpose (Name, Play,
+Save sound): the card title says which way the user is making a sound. In the
+file card, Save sound stays off until a picked file has passed its checks; a
+refused file's reason is shown under the picker in the danger colour, stays
+until another file is picked, and is the only thing that marks the picker
+`aria-invalid` (a limit or name problem is shown as a hint without blaming the
+file). A successful save, from either form, says "Saved <name>." with a link,
+"Choose where it plays in Per-category sounds", that opens that sub-page
+through `SettingsSubNav`'s `select`, because a saved sound is heard only once a
+category is set to it.
 
 ### Persistence and cross-surface sync
 
@@ -342,8 +457,9 @@ instance forward when the banner is clicked, posts only when its own permission
 is `granted`, and never prompts. The pane keeps its own mute, away and `silent`
 rules, so only a note it would have shown is relayed. It watches the count of unacked,
 unsilenced notes in the Redux store and, when the count grows, posts one toast
-carrying the newest note's title and flattened body, tagged with its
-`approval_id` / `job_id` / `task_id` (or `kirocrew-notif`) so a burst about
+carrying the newest note's title and flattened body, tagged with the
+gateway-stamped `tag` (else its `approval_id` / `job_id` / `task_id`, or
+`kirocrew-notif`) so a burst about
 one subject replaces rather than stacks. An `approval` frame reaches the OS
 through the feed entry the socket's approval registry
 (`website/src/hooks/websocket/approvals.ts`) dispatches for it; the socket layer
@@ -370,6 +486,56 @@ surface with its own `kirocrew-chat-done:<slot>` tag; it shares only the away
 predicate.
 
 An interactive chat's tool prompt (the chat runner's `permission` row, which has no feed note) is toasted by the socket's transcript owner `website/src/hooks/websocket/chatStream.ts` on the row's live arrival, behind the same gate as its chime (`shouldChimeOnPermissionRow`: not `resolved`, not a reconnect replay). It is on by default, posts only with the OS permission granted and while `isWindowAway()`, is `silent`, reads like the chat-complete toast (session title as the title, `Waiting for your approval: <tool>` as the body), and carries a `kirocrew-approval:<slot>:<request_id>` tag, so one pending prompt is one banner however many windows receive the row. Neither mute suppresses it, the session's own per-row mute or its creator's: a prompt is the session waiting on the user.
+
+## Web Push (closed app)
+
+Web Push is a second sink on the bus. `NotificationCoordinator.deliver` stamps
+`note["tag"] = native_notification_tag(note)` (the approval, job or task id,
+else the note timestamp, hashed when its JSON-serialized form is over 128
+bytes), runs local delivery, then calls the `web_push_fanout` hook
+(`DashboardState._fan_out_web_push`) for every note that is not silenced or
+passive. The fan-out schedules `_send_web_push_all` on the running loop; it is
+best effort and logs any failure, so a failed push never affects the note that
+already landed.
+
+- **Payload.** `_web_push_payload` builds one declarative payload
+  (`web_push: 8030` plus `notification`) that iOS and Safari 18.4+ render with no
+  service worker and that `sw.js`'s `push` handler reads on Chromium and
+  Firefox. Every string field has a budget in serialized bytes so the encrypted
+  message stays under 4096 bytes; a deep link over budget becomes `/`.
+- **One banner.** The tab toast (`useNativeNotification`) and the push banner use
+  the stamped `tag`, so a hidden tab plus a push shows one banner, and both carry
+  the note's `url` in `data.url` for `notificationclick`.
+- **Service worker.** The `push` handler skips the banner only when a visible
+  dashboard window answers its probe (`kc-push-probe` over a `MessageChannel`,
+  answered by `website/src/lib/swConnectedProbe.ts` from `dashboard.connected`)
+  with `connected: true`, since only a connected tab receives the note over the
+  WebSocket. No answer within 500 ms, `false`, or no visible dashboard shows the
+  banner, so a visible tab whose socket was refused never swallows a push.
+  `notificationclick` focuses or opens only dashboard windows. A standalone app window (`/app-windows/...`), a popout (`/popout/...`)
+  and an embed (`/embed/...`) count as neither: none renders the notification
+  banner or hosts the dashboard's routes, so none is probed or focused. Pinned by
+  `website/src/test/serviceWorkerNotificationClick.test.ts`.
+- **Sender.** `notifications/web_push.py` signs VAPID ES256 and encrypts RFC 8291
+  `aes128gcm` with `cryptography`. Its session resolves through
+  `PublicAddressResolver`, which drops every address
+  `link_unfurl.address_is_not_public` rejects. A 404 or 410 removes the
+  subscription.
+- **Stores.** The subscriptions (`push_store.py`) and the VAPID keypair
+  (`vapid_keys.py`) live in the `web-push` directory of the data home, which is
+  pre-created and masked in every sandbox and fenced from agents
+  (`sandbox_leaves.py`, `sandbox_precreate.py`, `security/paths_lists.py`).
+  A subscriptions file the load cannot use reads as empty, but a subscribe never
+  saves over it unread: one leading UTF-8 byte-order mark reads normally, a file
+  that is not usable JSON is moved to `subscriptions.json.corrupt-<utc>` first,
+  and a read that fails leaves the file alone and the subscribe raises
+  `PushStoreUnreadable`.
+- **Routes.** Owner only: `GET /api/notifications/push/vapid-public-key`,
+  `POST /api/notifications/push/subscribe` (HTTPS endpoint, vetted by
+  `link_unfurl.vet_unfurl_url`) and `POST /api/notifications/push/unsubscribe`.
+- **Client.** `usePushSubscription` and `NotificationsPushSection.tsx` drive the
+  Settings toggle. `test/test_web_push.py`, `test/test_notification_push_routes.py`
+  and `website/src/test/notificationSharedTag.test.ts` cover the contract.
 
 ## Bell sheet dismissal (client)
 
@@ -453,7 +619,17 @@ loop it.
 off; the note is passive or silenced; the bell popover is open (or closing); the
 route is `/notifications`; the note describes what is already on screen —
 `targetsCurrentView`: while the window is focused, a note whose `slot` is the
-active chat on a chat route, or whose `url` path is the current route. Opening
+active chat on a chat route, or whose `url` path is the current route. A
+mate's message (`system.member`) instead counts as on screen only when its
+`slot` is the active chat on a chat route or the thread the Members page
+registered in `lib/viewedThread`, read at arrival: its `url` is the whole
+Members page, which shows one thread at a time. A stopped-chat alert
+(`system.turn`) is on screen only when its `slot` is the active chat on a chat
+route: its `url` is `/chat?sid=<dying slot>`, so the generic `url`-path branch
+would strip the query and match the bare `/chat` route, suppressing the banner
+whenever the operator is on ANY chat page — including a different one, the case
+it exists for — so the channel short-circuits to not-on-screen there instead.
+Opening
 the popover, landing on the inbox page, or switching the preference off also
 retires every pending card.
 
@@ -471,6 +647,30 @@ vertical list of at most `BANNER_EXPANDED_MAX` (4) cards plus a "+N more in your
 inbox" line that goes to `/notifications` (through the navigation leave guard) —
 the same place the popover's "Open inbox" goes, so "inbox" names one place. On the mobile breakpoint only the newest card renders,
 full width, with its close visible at rest (no hover on touch).
+
+On the mobile breakpoint the card also goes with a sideways or upward swipe
+(`components/notifications/SwipeToDismiss.tsx`, wrapped around the card; inert on
+desktop). The gesture is touch-only and calls the same `removeNotes` the close
+control calls, so a swiped note waits unread in the bell exactly as a closed one
+does, and the close stays visible for keyboard and screen-reader users. A touch
+locks the sideways axis once it has travelled `SWIPE_DISMISS_SLOP` (10 px)
+sideways, or the upward axis once it has travelled that far up, whichever comes
+first; a touch that first drifts past `SWIPE_DISMISS_SCROLL_SLOP` (8 px) downward
+is declined for good. The wrapper is `touch-action: none`, because under `pan-y`
+the browser claims an upward drag as a scroll and cancels it (WebKit has no
+`pan-up`); this covers the card's own box only, so a finger that starts anywhere
+else still scrolls the page, and a `pointercancel` snaps the card back. The card
+follows the finger 1:1 sideways in either direction, and upward but never below
+its rest position; a release past `SWIPE_DISMISS_DISTANCE` (80 px) on the locked
+axis dismisses, a shorter one snaps back
+(`transition-transform`, none under `prefers-reduced-motion`), and the click a
+release fires is swallowed for `SWIPE_CLICK_SWALLOW_MS` (350 ms, the drawer's
+own ceiling) so a snapped-back swipe does not also open the note; a cancel arms
+no swallow, and past the window a keyboard activation goes through, since a
+touch that moved past the tap slop may fire no click at all.
+`NotificationBanner.test.tsx` ("swipe to dismiss") pins the thresholds on both
+axes, the snap-back, the axis lock, the downward decline, the cancel, the click
+swallow, the mouse and desktop no-ops and the reduced-motion class.
 
 ### Motion
 

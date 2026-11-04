@@ -110,7 +110,7 @@ import type {
 } from './types'
 import { useScrollerElement, useScrollListener, useResizeObserver } from './observers'
 import { useFollowState, usePinning, useFollowPlacementPins } from './followPolicy'
-import { useWindowState, useWindowOperations, useCoverageWatchdog, useWindowEdgeTriggers } from './windowRange'
+import { useWindowState, useWindowOperations, useCoverageWatchdog, useWindowEdgeTriggers, useTailAppendMount } from './windowRange'
 import { useShiftCapture, useShiftCompensation } from './shiftCompensation'
 import { useReadingPositionEntry, useVisibilityReplacement, useReadingPositionRestore } from './readingPosition'
 import { useHeightOwner, useRowMeasurement, useMeasurementScopeReseed } from './measurement'
@@ -251,7 +251,7 @@ export function useVirtualChat<T>(
   } = useScrollerElement(externalScrollerRef)
   const follow = useFollowState(followOutput)
   const view = useWindowState(itemCount, overscan, initialPlacement, sessionId)
-  const { windowRange, setWindowRange, windowRangeRef } = view
+  const { windowRange, setWindowRange, windowRangeRef, resolveWindowRange } = view
   // Render phase: TRIGGERS 1-7 capture the reader's row against the PREVIOUS
   // commit's DOM, and plan this commit's height retirements. The height scope
   // goes in so TRIGGER 7 sees the swap in the render that constructs the cold
@@ -260,6 +260,26 @@ export function useVirtualChat<T>(
     items, getKey, sessionId, heightScopeKey, itemCount, onTopReached, windowRange, windowRangeRef,
     scrollerRef, elIndexRef, itemsRef, getKeyRef, getStableIdRef, anchorIdOf, follow,
   })
+  // TRIGGER 1 re-base in the capture render itself. Rendering the prepend with
+  // the PREVIOUS range mounts the rows that now sit at those indices -- the
+  // oldest rows of the page that just landed -- and unmounts every row the
+  // reader is looking at, only for part 1 to move the range back a commit
+  // later and mount the reader's rows again as new nodes. Updating the range
+  // here makes React re-run this render before committing anything, so the
+  // reader's rows keep their DOM nodes and the throwaway rows never mount.
+  // The target is derived from the COMMITTED range, so the re-run is a no-op.
+  // It is compared as the setter will commit it: a retained selection range
+  // widens every write, so the raw target can differ from the committed range
+  // forever, and an update per re-run would loop until React aborts the render.
+  if (shift.shiftStageRef.current === 'awaiting-rebase' && shift.prependCountRef.current !== 0) {
+    const d = shift.prependCountRef.current
+    const base = windowRangeRef.current
+    const clampI = (i: number) => Math.max(0, Math.min(itemCount, i))
+    const target = resolveWindowRange({ start: clampI(base.start + d), end: clampI(base.end + d) })
+    shift.rebasedInRenderRef.current = true
+    if (windowRange.start !== target.start || windowRange.end !== target.end) setWindowRange(() => target)
+  }
+  useTailAppendMount({ items, getKey, itemCount, overscan, sessionId, windowRange, setWindowRange, resolveWindowRange, scrollerRef, shift, follow })
   // The committed-window mirror advances at COMMIT, right after the shift
   // capture's own baseline mirror and for the same reason: a discarded
   // concurrent attempt advancing it in render made the committing attempt's
@@ -323,7 +343,7 @@ export function useVirtualChat<T>(
   useResizeObserver({ scrollerRef, scrollerEl, elIndexRef, trailingRef, resizeObserverRef, measurement, compensation, sync, pinning, ops })
   useWindowEdgeTriggers({
     windowRange, itemCount, overscan, prefetchStartIndex, sessionId, scrollerRef, scrollerEl,
-    topSentinelRef, bottomSentinelRef, onTopReachedRef, itemsRef, setWindowRange,
+    topSentinelRef, bottomSentinelRef, onTopReachedRef, itemsRef, setWindowRange, ops,
   })
 
   // The slot-entry placement: the last layout effect that can place the reader,

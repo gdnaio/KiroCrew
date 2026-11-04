@@ -250,10 +250,11 @@ def test_a_source_moved_to_another_workspace_mid_fork_is_refused(tmp_path, monke
     with pytest.raises(sc.SessionControlError) as exc:
         _fork(state, caller, source=peer.key)
     # The containment re-check answers first, with read's own code; the frozen
-    # fork identity (which now carries the workspace) is the backstop behind it.
+    # fork identity (which now carries the workspace and the agent kind) is the
+    # backstop behind it.
     assert exc.value.code == "workspace_mismatch"
     assert set(state._slots) == before, "a refused fork leaves no child behind"
-    assert chat_fork.ForkSource.__dataclass_fields__["identity"].type.count("str") == 6
+    assert chat_fork.ForkSource.__dataclass_fields__["identity"].type.count("str") == 7
 
 
 def test_the_frozen_fork_identity_refuses_a_self_source_that_moved_workspace(tmp_path, monkeypatch):
@@ -323,6 +324,20 @@ def test_the_child_takes_the_callers_posture_and_nothing_narrower(tmp_path):
     assert child._trust is True and child._trust_reads is True
     assert not getattr(child, "_trusted_patterns", set())
     assert not getattr(child, "_trust_scope", "")
+
+
+def test_a_card_scoped_trust_is_not_carried_into_a_fork(tmp_path):
+    """A conductor card's "Trust this crew member" covers that member's own tools
+    only (``trust_carries``), so a fork it opens starts without it."""
+    state = _make_state(tmp_path)
+    caller = _seed(state, "chat-1")
+    caller._trust = True
+    caller._trust_card_scoped = True
+
+    child = state.get_slot(_fork(state, caller)["target"])
+
+    assert child._trust is False
+    assert getattr(child, "_trust_card_scoped", False) is False
 
 
 # ── the core: naming another session ────────────────────────────────────────────
@@ -721,9 +736,12 @@ class TestTheRoute:
         assert owners, "expected the server_runtime owners beside server.py"
         routes = source + "".join(path.read_text(encoding="utf-8") for path in owners)
         assert '_deferred("session_control", "api_session_control_fork")' in routes
-        # The strict set is the only one left in server.py, so its segment ends at the
-        # mixed set that follows it.
-        strict = source.split("_STRICT_INTERNAL_API_PATHS")[1].split("_MIXED_INTERNAL_API_PATHS")[0]
+        # The strict set is defined in the internal-paths data module, so its segment
+        # ends at the mixed set that follows it there.
+        paths = (Path(server_mod.__file__).parent / "server_internal_paths.py").read_text(
+            encoding="utf-8"
+        )
+        strict = paths.split("_STRICT_INTERNAL_API_PATHS")[1].split("_MIXED_INTERNAL_API_PATHS")[0]
         assert '"/api/session-control/fork",' in strict
 
 

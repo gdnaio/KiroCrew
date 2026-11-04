@@ -51,7 +51,6 @@ from kiro_crew.hooks import (
     verified_replace_file_nolink,
 )
 from kiro_crew.platform_compat import is_link_or_junction
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 from ._shared import _read_session_key
 
@@ -209,8 +208,9 @@ async def api_prompt_detail(request: web.Request) -> web.Response:
     # given, so a redacted copy must never be offered as an edit base: saving it
     # would replace the real token with the redaction marker. The write path
     # cannot detect that after the fact, so the read path says so here.
-    content, cred_hits = redact_credentials(content)
-    content, url_hits = redact_exfiltration_urls(content)
+    from kiro_crew.security import redact_with_findings
+
+    content, cred_hits, url_hits = redact_with_findings(content)
     out = dict(p)
     _redact_prompt(out)
     # Strip full filesystem path — return display-only relative path
@@ -747,8 +747,9 @@ async def _api_user_prompt_detail(request: web.Request, name: str, scope: str) -
             {"error": "file too large", "code": "content_too_large"}, status=413
         )
     body = content or ""
-    body, cred_hits = redact_credentials(body)
-    body, url_hits = redact_exfiltration_urls(body)
+    from kiro_crew.security import redact_with_findings
+
+    body, cred_hits, url_hits = redact_with_findings(body)
     # Metadata gets the same treatment as the unscoped branch: a description read
     # out of frontmatter is file content too, and can carry a token.
     out = {
@@ -960,6 +961,8 @@ async def _api_prompt_write(request: web.Request) -> web.Response:
                 # too_large means the file outgrew the cap since the edit base
                 # was read — by definition not the state the edit was based on.
                 return "conflict"
+            if outcome == "busy":
+                return "busy"
             if outcome != "ok":
                 return "write refused"
         return None
@@ -995,6 +998,16 @@ async def _api_prompt_write(request: web.Request) -> web.Response:
                 "code": "content_conflict",
             },
             status=409,
+        )
+    if err == "busy":
+        # Every check passed, but another process held the prompt file open at
+        # the final rename (Windows refuses to replace an open file). Nothing
+        # was written, and the same save can succeed once that handle closes,
+        # so this is a retryable 503, not the security refusal below.
+        _refuse(op, "error", "prompt_busy", name=name, scope=scope)
+        return web.json_response(
+            {"error": "the prompt file is open in another program; retry", "code": "prompt_busy"},
+            status=503,
         )
     if err == "write refused":
         # The writer failed closed — a hardlink, a non-regular file, an escape

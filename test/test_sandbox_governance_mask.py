@@ -179,19 +179,16 @@ class TestKeystonesAreSealedInEveryMode:
         "computer_use.json",
         "oauth_endpoints.json",
         "aws_service_consent.json",
+        # The owner's Shared Crew switch: a writable record would let an agent open
+        # the Crew to other people on its next start.
+        "shared_crew_preview.json",
         # Recorded consent to send conversation state to the external decision
         # provider. Same class: the seal is what makes "the owner consents to
         # the egress, never the agent" true.
         "decisions_consent.json",
-        # Recorded consent to deliver a scanner-flagged file. Sealing it
-        # is the load-bearing half of the whole design: the deny-list tiers can
-        # be evaded by runtime path construction, so only a kernel write denial
-        # makes "the owner consents, never the agent" true rather than merely
-        # intended.
-        "file_delivery_consent.json",
-        # Gateway-executed browser launcher. Agent shells must read and run it,
-        # but a write would choose the binary the unsandboxed gateway executes.
-        "playwright-cli",
+        # The Browser Harness prefix the unsandboxed gateway executes: a write
+        # would choose the interpreter and the Chromium the gateway runs.
+        "browser-harness",
         # The app dev-mode authorization record: sealing it is what
         # makes the operator-attestation flag unforgeable from an agent shell
         # — a sandboxed process cannot mint a grant however the toggle was
@@ -387,6 +384,9 @@ class TestSecretsAreMaskedInEveryMode:
         # Same model as ledger, two parties: the worker agent carries the full file
         # toolset, so an unmasked work-ledger lets it reach any conductor's records.
         "work-ledger",
+        # Each crewmate's rules, goals and DM binding: written by the gateway on a
+        # person's action and read by nothing in a sandbox.
+        "member-records",
         "backup",
         "browser-cookies.txt",
         "playwright-storage-state.json",
@@ -563,16 +563,21 @@ class TestTheReconciliationIsComplete:
             sandbox._CREW_CHILD_WITHHELD_LEAVES
         )
 
-    def test_the_gateway_launcher_is_a_top_level_readonly_leaf(self) -> None:
+    def test_the_browser_engine_is_a_top_level_readonly_leaf(self) -> None:
         """A nested leaf can be bypassed by renaming its writable parent.
 
         The Linux bind mount follows the moved parent, leaving the original path
         free for an agent-planted replacement. A top-level leaf has no extra
-        agent-writable ancestor inside the data home.
+        agent-writable ancestor inside the data home. The retired browser CLI's
+        ``playwright-cli`` leaf is gone with the CLI: nothing the gateway executes
+        lives there any more, and the doctor only reports a leftover directory.
         """
-        assert "playwright-cli" in sandbox._CREW_READONLY_LEAVES
-        assert "playwright-cli" in sandbox._CREW_NOFOLLOW_READONLY_DIR_LEAVES
-        assert "tools/playwright-cli" not in sandbox._CREW_READONLY_LEAVES
+        assert "browser-harness" in sandbox._CREW_READONLY_LEAVES
+        assert "browser-harness" in sandbox._CREW_NOFOLLOW_READONLY_DIR_LEAVES
+        assert "tools/browser-harness" not in sandbox._CREW_READONLY_LEAVES
+        assert "playwright-cli" not in sandbox._CREW_READONLY_LEAVES
+        assert "playwright-cli" not in sandbox._CREW_NOFOLLOW_READONLY_DIR_LEAVES
+        assert "playwright-cli" not in sandbox._CREW_CHILD_READABLE_LEAVES
 
     @pytest.mark.parametrize("mode", _MODES)
     def test_every_mode_carries_the_derived_set(self, mode: str) -> None:
@@ -727,11 +732,8 @@ class TestAppBackendOwnedLeaves:
     targets, on both platform builders, and that a default build keeps the mask.
     """
 
-    LEAVES = (
-        "workspace/md-notebook/pat",
-        "workspace/md-notebook/vaults.json",
-        "workspace/md-notebook/settings.json",
-    )
+    #: The Notes backend owns one masked DIRECTORY, which holds all three state files.
+    LEAVES = ("md-notebook-staging",)
 
     def test_the_helper_resolves_both_home_spellings(self) -> None:
         targets = sandbox.app_backend_visible_targets("md-notebook")
@@ -845,7 +847,7 @@ class TestForeignMaskShadowGuard:
         spawn and is dropped from a strict one."""
         monkeypatch.setattr(sandbox.Path, "home", staticmethod(lambda: tmp_path))
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / ".aws" / "relocated-crew"))
-        reloc = str(tmp_path / ".aws" / "relocated-crew" / "workspace" / "md-notebook" / "pat")
+        reloc = str(tmp_path / ".aws" / "relocated-crew" / "md-notebook-staging")
 
         assert reloc in sandbox.app_backend_visible_targets("md-notebook")
         assert reloc not in sandbox.app_backend_visible_targets("md-notebook", mode="strict")
@@ -1078,10 +1080,8 @@ class TestForeignMaskShadowGuard:
         # Positive first, so the absence loop below cannot pass vacuously: the
         # relocated spelling really is minted by the resolver and really does
         # trip the guard.
-        shadowed_leaf = str(
-            tmp_path / ".gnupg" / "relocated-crew" / "workspace" / "md-notebook" / "pat"
-        )
-        assert shadowed_leaf in sandbox._relocated_crew_targets(("workspace/md-notebook/pat",))
+        shadowed_leaf = str(tmp_path / ".gnupg" / "relocated-crew" / "md-notebook-staging")
+        assert shadowed_leaf in sandbox._relocated_crew_targets(("md-notebook-staging",))
         assert sandbox.carveout_shadowed_by_foreign_mask(shadowed_leaf)
 
         targets = sandbox.app_backend_visible_targets("md-notebook")
@@ -1091,7 +1091,7 @@ class TestForeignMaskShadowGuard:
         for target in targets:
             assert not target.startswith(shadowed_root), f"{target} would unmask ~/.gnupg"
         # The refusal is per-spelling: the default-home entries are still carved.
-        assert os.path.join(str(tmp_path), ".kiro/crew/workspace/md-notebook/pat") in targets
+        assert os.path.join(str(tmp_path), ".kiro/crew/md-notebook-staging") in targets
 
     def test_the_cache_site_guards_its_carveout(self) -> None:
         """`apps/backend.py` must thread the cache path through the shadow guard.

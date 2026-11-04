@@ -27,6 +27,16 @@ from kiro_crew.apps.manager import (
     registry_source_repository,
     update_app,
 )
+from kiro_crew.testing.wait import await_until, finished, wait_until
+
+#: The update's refusal for an installed `.app_secret` that is a symlink; the
+#: test pins the full sentence so a wording change is visible.
+_APP_SECRET_IS_A_LINK = (
+    "`.app_secret` in the app directory is a link; moving it aside for "
+    "the update places it outside its tree where a relative target does not "
+    "resolve and the secret is lost. Replace the link with a regular "
+    "`.app_secret` file holding the same secret, then retry the update."
+)
 
 # ---------------------------------------------------------------------------
 # _copy_app_tree — symlink / denylist / off-loop regression tests
@@ -138,8 +148,10 @@ class TestCopyAppTree:
         assert app_lifecycle_lock("app-b") is not lock_a
 
     @pytest.mark.asyncio
-    async def test_install_off_loop_does_not_block_event_loop(self, tmp_path, app_home):
-        """Heartbeat latency stays low while a many-file install runs off-loop."""
+    async def test_install_off_loop_does_not_block_event_loop(
+        self, tmp_path, app_home, monkeypatch
+    ):
+        """The heartbeat keeps running through a many-file install that runs off-loop."""
         import asyncio
         import time
 
@@ -154,23 +166,54 @@ class TestCopyAppTree:
         async def heartbeat():
             prev = time.monotonic()
             while True:
-                # flake-ok: the heartbeat's sampling interval, pre-existing shape, moved verbatim; tracked for a de-flake pass
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(
+                    0.01
+                )  # flake-ok: sampling interval; the measured gaps are the data
                 now = time.monotonic()
                 gaps.append(now - prev)
                 prev = now
 
-        # flake-ok: heartbeat task cancelled in the finally and not awaited, pre-existing shape, moved verbatim; tracked for a de-flake pass
+        # The copy runs on a worker thread and stops at every 500th file until the loop
+        # has run one more heartbeat: a loop the install blocks never gets there, and the
+        # wait fails by name.
+        copied = 0
+        checkpoints = 0
+
+        def _copy_file(source, dest):
+            nonlocal copied, checkpoints
+            copied += 1
+            if copied % 500 == 0:
+                seen = len(gaps)
+                wait_until(
+                    lambda: len(gaps) > seen,
+                    describe=lambda: f"{len(gaps)} heartbeats after {copied} files copied",
+                )
+                checkpoints += 1
+            return shutil.copy2(source, dest)
+
+        real_copytree = shutil.copytree
+
+        def _copytree(source, dest, *args, **kwargs):
+            # The top-level call names its options; the recursive calls pass them
+            # positionally, copy function included.
+            if not args:
+                kwargs.setdefault("copy_function", _copy_file)
+            return real_copytree(source, dest, *args, **kwargs)
+
+        monkeypatch.setattr(shutil, "copytree", _copytree)
+
         hb = asyncio.ensure_future(heartbeat())
         try:
             result = await asyncio.to_thread(install_app, src)
         finally:
             hb.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await await_until(hb, what="the cancelled heartbeat")
         assert result.ok, result.error
-        # The watchdog threshold is 30s; anything close to that (or even 1s)
-        # would indicate the copy ran on the loop.
-        # flake-ok: real elapsed-time ceiling on loop latency, pre-existing shape, moved verbatim; tracked for a de-flake pass
-        assert max(gaps) < 1.0
+        # The 2000 payload files alone pass four checkpoints; each one waits for a
+        # heartbeat the loop runs while the install is in flight.
+        assert checkpoints >= 4, f"the copy passed {checkpoints} checkpoints"
+        assert len(gaps) >= checkpoints
 
     def test_orphaned_partial_install_self_heals(self, tmp_path, app_home):
         """dest exists with junk but no installed metadata → fresh install wins."""
@@ -399,16 +442,20 @@ class TestCopyAppTree:
         """Concurrent installs cannot exchange their repository coordinates."""
         from kiro_crew.apps.manager import _effective_source_repository
 
+        rendezvous = asyncio.Barrier(2)
+
         async def _resolve(repository: str) -> str:
             with registry_source_repository(repository):
-                # Interleave both task contexts before copying them to workers.
-                # flake-ok: one yield that interleaves the two task contexts, pre-existing shape, moved verbatim; tracked for a de-flake pass
-                await asyncio.sleep(0)
+                # Both task contexts are open before either one is copied to a worker.
+                await rendezvous.wait()
                 return await asyncio.to_thread(_effective_source_repository, "")
 
-        first, second = await asyncio.gather(
-            _resolve("https://example.test/owner/first"),
-            _resolve("https://example.test/owner/second"),
+        first, second = await finished(
+            asyncio.gather(
+                _resolve("https://example.test/owner/first"),
+                _resolve("https://example.test/owner/second"),
+            ),
+            "both registry resolutions",
         )
 
         assert first == "https://example.test/owner/first"
@@ -712,6 +759,45 @@ class TestCopyAppTree:
         else:
             assert not os.path.lexists(secret)
         assert (dest / "ui" / "leak.js").read_text(encoding="utf-8") == "export const leak = 1;\n"
+
+    @requires_symlinks
+    def test_an_installed_app_secret_link_refuses_the_update_before_the_transaction(
+        self, tmp_path, app_home
+    ):
+        """An installed `.app_secret` that is a relative in-tree symlink (e.g.
+        `.app_secret -> state/secret`) cannot be preserved on update: the move
+        relocates the link to `.<name>-secret-tmp` beside the app directory where
+        the relative target does not resolve, so `tmp_secret.is_file()` fails
+        and the secret is silently lost.  Refused before the transaction opens:
+        the link, its target, the rest of the tree and the record are untouched."""
+        from kiro_crew.apps.manager import app_dir
+
+        src = _make_app_source(tmp_path)
+        assert install_app(src).ok
+        dest = app_dir("test-app")
+
+        # Replace the gateway-written regular file with a relative in-tree symlink.
+        (dest / "state").mkdir()
+        (dest / "state" / "secret").write_text("s3cret", encoding="utf-8")
+        secret = dest / ".app_secret"
+        secret.unlink(missing_ok=True)
+        secret.symlink_to(Path("state") / "secret")
+        assert secret.is_file()  # resolves through the link inside its tree
+        before = _read_installed("test-app")
+
+        v2 = _make_app_source(tmp_path / "v2", version="2.0.0")
+        result = update_app(v2)
+
+        assert not result.ok
+        assert result.error == _APP_SECRET_IS_A_LINK, result.error
+        assert os.path.islink(secret)
+        assert secret.read_text(encoding="utf-8") == "s3cret"  # still reachable
+        assert _read_installed("test-app") == before  # version 1.0.0, untouched
+        assert not (dest.parent / ".test-app-secret-tmp").exists()
+        # No retired tree: the transaction was never opened.
+        assert [
+            p.name for p in dest.parent.iterdir() if p.name.startswith(".test-app-update-old-")
+        ] == []
 
     def test_an_update_shipping_a_root_data_file_where_none_is_preserved_rolls_back(
         self, tmp_path, app_home

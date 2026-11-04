@@ -137,6 +137,32 @@ class TestMeetingLifecycleRoutes:
             assert resp.status == 409
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "blocker_status", [k.STATUS_ACTIVE, k.STATUS_PAUSED, k.STATUS_REVIEWING]
+    )
+    async def test_start_409_names_the_blocking_meeting(self, app, fake_sessions, blocker_status):
+        """The 409 body names the blocking meeting and its status.
+
+        Before this fix the body was ``{error, code}`` only, so the UI could not
+        say which meeting held the slot or that it was a review still open.
+        """
+        async with client_for(app) as client:
+            await _start(client, "first")
+            await client.patch(f"{BASE}/meetings/first", json={"title": "Weekly sync"})
+            if blocker_status != k.STATUS_ACTIVE:
+                resp = await client.post(
+                    f"{BASE}/meetings/first/status", json={"status": blocker_status}
+                )
+                assert resp.status == 200
+            await client.post(f"{BASE}/meetings/second/init", json={})
+            resp = await client.post(f"{BASE}/meetings/second/start", json={})
+            assert resp.status == 409
+            body = await resp.json()
+            assert body["code"] == "meeting_already_active"
+            assert body["blocking_meeting_title"] == "Weekly sync"
+            assert body["blocking_meeting_status"] == blocker_status
+
+    @pytest.mark.asyncio
     async def test_start_releases_an_abandoned_meeting_holding_the_latch(
         self, app, root: Path, fake_sessions
     ):
@@ -1034,15 +1060,12 @@ class TestTeardownLeavesNoMeetingFalselyActive:
         """Structural: dropping the live session and persisting the status must stay
         paired, so a NEW teardown path cannot reintroduce the divergence.
 
-        The first version of this test exempted any function that also called
-        `ACTIVE.set()`, reasoning that a replacement keeps the meeting live. That was
-        wrong, and a reviewer caught what it let through: `handle_start_meeting`
-        replaces the session of a DIFFERENT (expired) meeting, which is a teardown of
-        that meeting — and the exemption made the check blind to exactly the one
-        function where the pairing is easiest to miss.
+        Calling `ACTIVE.set()` is no exemption: `handle_start_meeting` replaces the
+        session of a DIFFERENT (expired) meeting, which is a teardown of that meeting,
+        and it is the function where the pairing is easiest to miss.
 
-        So there is no blanket exemption now. Every `drain_and_clear` caller must
-        persist a terminal status, `set()` or not.
+        So every `drain_and_clear` caller must persist a terminal status, `set()` or
+        not.
         """
         import ast
         import importlib

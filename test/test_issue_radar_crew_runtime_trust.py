@@ -9,7 +9,6 @@ autouse fixtures live in ``issue_radar_crew_runtime_helpers.py``.
 """
 
 import ast
-import asyncio
 import contextlib
 import inspect
 import os
@@ -38,11 +37,13 @@ from issue_radar_crew_runtime_helpers import (  # noqa: F401 -- the autouse fixt
 
 import kiro_crew.sel as sel_mod
 from kiro_crew import platform_compat
+from kiro_crew.apps import teardown
 from kiro_crew.apps.builtins.issue_radar.backend import crew_runtime as cr
 from kiro_crew.apps.builtins.issue_radar.backend import crew_store as cs
 from kiro_crew.apps.builtins.issue_radar.backend import watch as watch_mod
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.safety_override import reset_singleton, safety_override
+from kiro_crew.testing.wait import async_wait_until
 
 
 class TestTheWakesLivenessGuardIsTotal(unittest.TestCase):
@@ -258,7 +259,15 @@ class TestRevocation(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
+        # Use platform_compat.rmtree_force instead of TemporaryDirectory.cleanup
+        # so that read-only files written by the crew store (which the Windows
+        # CRT cannot unlink without first clearing the read-only attribute) do
+        # not leave the directory behind and trip the tmp-residue guard.  Also
+        # unregister the process-global slot-close hook that watchdog_cycle
+        # installs with root=self.root, so no background callback can open
+        # files in the directory while it is being removed.
+        self.addCleanup(platform_compat.rmtree_force, self._tmp.name)
+        self.addCleanup(teardown.unregister_slot_close_hook, cr.APP_NAME)
         self.root = Path(self._tmp.name)
         reset_singleton()
         self.addCleanup(reset_singleton)
@@ -354,15 +363,21 @@ class TestWatchGating(unittest.IsolatedAsyncioTestCase):
                 )
             )
             poll = use(mock.patch.object(watch, "_poll_repo", new=mock.AsyncMock()))
-            sweep = use(
-                mock.patch.object(
-                    watch.crew_runtime, "sweep_repo", new=mock.AsyncMock(return_value={})
-                )
-            )
+            use(mock.patch.object(watch.crew_runtime, "sweep_repo", new=self._recording_sweep()))
             await watch._poll_once(_app(_FakeState()))
         # Muting the bell must not stop a crew reconciling its own pull requests.
         poll.assert_not_awaited()
-        sweep.assert_awaited_once()
+        self.assertEqual(self.swept, [(OWNER, REPO, "github", "github.com")])
+
+    def _recording_sweep(self):
+        """A hand-written sweep that records the repo key ``_poll_once`` built."""
+        self.swept: list[tuple[str, str, str, str]] = []
+
+        async def _sweep(_app, key):
+            self.swept.append((key.owner, key.repo, key.provider, key.host))
+            return {}
+
+        return _sweep
 
     async def test_a_failing_new_issue_poll_still_runs_the_sweep(self):
         watch = self._watch()
@@ -383,31 +398,38 @@ class TestWatchGating(unittest.IsolatedAsyncioTestCase):
                     watch, "_poll_repo", new=mock.AsyncMock(side_effect=RuntimeError("gh down"))
                 )
             )
-            sweep = use(
-                mock.patch.object(
-                    watch.crew_runtime, "sweep_repo", new=mock.AsyncMock(return_value={})
-                )
-            )
+            use(mock.patch.object(watch.crew_runtime, "sweep_repo", new=self._recording_sweep()))
+            logs = use(self.assertLogs(watch.logger, "WARNING"))
             await watch._poll_once(_app(_FakeState()))
-        sweep.assert_awaited_once()
+        self.assertEqual(self.swept, [(OWNER, REPO, "github", "github.com")])
+        self.assertIn(
+            f"issue-radar watch failed for {OWNER}/{REPO}",
+            [r.getMessage() for r in logs.records],
+        )
 
     async def test_disabling_the_app_suspends_the_crews(self):
         watch = self._watch()
+        reset_singleton()
+        self.addCleanup(reset_singleton)
+        crew = {"id": "c_abc", "unattended": True, "enabled": True}
+        state = _FakeState()
+        slot = _FakeSlot("crew-c_abc")
+        slot._app = "issue-radar"
+        cr.sync_trust(slot, crew)
+        state._slots = {"crew-c_abc": slot}
         with contextlib.ExitStack() as stack:
             use = stack.enter_context
             use(mock.patch.object(watch, "is_app_enabled", return_value=False))
-            suspend = use(
-                mock.patch.object(
-                    watch.crew_runtime, "suspend_crews", new=mock.AsyncMock(return_value=0)
-                )
-            )
             repos = use(mock.patch.object(watch.store, "list_connected_repos"))
-            await watch._poll_once(_app(_FakeState()))
-            await watch._poll_once(_app(_FakeState()))
+            await watch._poll_once(_app(state))
+            self.assertFalse(_effectively_trusted(slot))
+            # Re-granted behind the poll's back: a second suspension would clear it.
+            cr.sync_trust(slot, crew)
+            await watch._poll_once(_app(state))
         # A disabled app stays silent — no config walk — and suspends only ONCE,
         # because nothing re-establishes trust while the app is off.
         repos.assert_not_called()
-        suspend.assert_awaited_once()
+        self.assertTrue(_effectively_trusted(slot))
 
     async def test_suspension_clears_trust_on_resident_crew_slots(self):
         reset_singleton()
@@ -444,12 +466,10 @@ class TestDisablingTheAppRevokesInline(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(platform_compat.rmtree_force, self._tmp.name)
         self.root = Path(self._tmp.name)
         reset_singleton()
         self.addCleanup(reset_singleton)
-        from kiro_crew.apps import teardown
-
         # ``watchdog_cycle`` re-registers the dismissal hook, which is process-wide
         # state; drop it again so these tests cannot change another's outcome.
         self.addCleanup(teardown.unregister_slot_close_hook, cr.APP_NAME)
@@ -857,12 +877,12 @@ class TestSelRootIsolation(unittest.IsolatedAsyncioTestCase):
             # commit retires. Retry non-blocking attempts — never a blocking
             # acquire on the event-loop thread — until the transient hold
             # clears; the budget is generous because a miss fails the test.
-            for _ in range(200):
-                if platform_compat.try_acquire_lock(fd, exclusive=True):
-                    break
-                # flake-ok: a bounded retry (200 x 50 ms) of a non-blocking lock attempt, not a barrier; pre-existing, moved verbatim
-                await asyncio.sleep(0.05)
-            else:
+            try:
+                await async_wait_until(
+                    lambda: platform_compat.try_acquire_lock(fd, exclusive=True),
+                    describe=lambda: "the writer's transient hold never cleared",
+                )
+            except AssertionError:
                 self.fail("could not stage the foreign holder on the shared root")
             try:
                 slot = _FakeSlot("crew-c_7029iso")

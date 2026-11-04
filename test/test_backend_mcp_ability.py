@@ -323,6 +323,7 @@ def test_a_mirror_whose_rulings_raise_answers_nothing_established(monkeypatch) -
     assert payload == {
         "per_tool_deny": "",
         "costs_whole_server": False,
+        "spared_servers": [],
         "ineffective": [],
     }, payload
 
@@ -337,7 +338,9 @@ def test_an_unreadable_rulings_read_is_told_apart_from_a_kind_with_no_rulings() 
     for backend, declared in PROJECTIONS.items():
         if declared.kind is ProjectionKind.MIRROR:
             continue
-        assert mcp_mod._dispositions(backend) == {}, backend
+        # A broker-only harness is handed no spec, so its one ruling is hooks.
+        expected = {"hooks": "withheld"} if declared.kind is ProjectionKind.BROKER_ONLY else {}
+        assert mcp_mod._dispositions(backend) == expected, backend
         # ... and the card still renders, because nothing about it is unknown.
         assert mcp_mod.ability_for(backend).projection == declared.kind.value, backend
 
@@ -348,20 +351,23 @@ def test_an_unreadable_rulings_read_is_told_apart_from_a_kind_with_no_rulings() 
 def test_every_reach_is_classified_as_costly_or_not() -> None:
     """A new ``PerToolDeny`` member is a failing test, not a harmless default.
 
-    Which reaches cost a WHOLE server is a judgement, and both renderers now read it
-    off this module instead of spelling a comparison each. That only holds if the
-    classification is total: a member in neither tuple would answer ``False``, which
-    reads as "switching a tool off here costs the tool" -- the claim the card exists
-    to stop being made by default.
+    Which reaches cost a WHOLE server is a judgement, and both renderers read it off
+    the reach's own declaration instead of spelling a comparison each. That only holds
+    if the classification is total: a member with no ruling would answer ``False``,
+    which reads as "switching a tool off here costs the tool" -- the claim the card
+    exists to stop being made by default. The ruling is part of each member's
+    definition, so a member that omits it does not build; this holds the shipped
+    members to an explicit ``bool`` and holds the ability to the member's own answer.
     """
-    classified = {*mcp_mod.COSTS_WHOLE_SERVER, *mcp_mod.COSTS_ONE_TOOL}
-    declared = {member.value for member in PerToolDeny}
-    assert classified == declared, (
-        "every PerToolDeny value must be in COSTS_WHOLE_SERVER (a tool-off can cost a "
-        "whole server) or in COSTS_ONE_TOOL (it costs the tool it names), and neither "
-        f"tuple may name a value the vocabulary dropped: {classified ^ declared}"
-    )
-    assert not set(mcp_mod.COSTS_WHOLE_SERVER) & set(mcp_mod.COSTS_ONE_TOOL)
+    for member in PerToolDeny:
+        assert member.costs_whole_server in (True, False), member
+        assert type(member.costs_whole_server) is bool, member
+    assert "COSTS_WHOLE_SERVER" not in vars(mcp_mod), "a second classification table"
+    assert "COSTS_ONE_TOOL" not in vars(mcp_mod), "a second classification table"
+    for backend, declared in PROJECTIONS.items():
+        got = mcp_mod.ability_for(backend).costs_whole_server
+        reach = declared.per_tool_deny
+        assert got is (reach is not None and reach.costs_whole_server), backend
 
 
 def test_every_reach_is_told_apart_by_both_costs() -> None:
@@ -417,11 +423,9 @@ def test_the_two_reaches_that_cost_a_whole_server_are_the_shipped_ones() -> None
     a third-party server. ``settings-file`` reaches the harness as a rule it reads, so
     the narrowed server stays mounted and the cost is the tool.
     """
-    assert set(mcp_mod.COSTS_WHOLE_SERVER) == {
-        PerToolDeny.WHOLE_SERVER.value,
-        PerToolDeny.PER_CALL.value,
-    }
-    assert set(mcp_mod.COSTS_ONE_TOOL) == {PerToolDeny.SETTINGS_FILE.value}
+    costly = {member for member in PerToolDeny if member.costs_whole_server}
+    assert costly == {PerToolDeny.WHOLE_SERVER, PerToolDeny.PER_CALL}
+    assert not PerToolDeny.SETTINGS_FILE.costs_whole_server
 
 
 def test_a_harness_with_no_reach_is_not_called_costly() -> None:
@@ -441,14 +445,50 @@ def test_the_classification_reaches_the_wire_for_every_shipped_harness() -> None
     """End to end: the payload's flag agrees with the reach it travels beside.
 
     The point of shipping it is that no renderer re-derives it, so the value a
-    renderer reads is asserted here against the declaration rather than against the
-    tuple alone.
+    renderer reads is asserted here against the declared reach's own ruling.
     """
     for backend in sorted(PROJECTIONS):
         payload = mcp_mod.ability_payload(backend)
-        expected = payload["per_tool_deny"] in mcp_mod.COSTS_WHOLE_SERVER
+        reach = payload["per_tool_deny"]
+        expected = any(m.costs_whole_server for m in PerToolDeny if m.value == reach)
         assert payload["costs_whole_server"] is expected, backend
         assert isinstance(payload["costs_whole_server"], bool), backend
+
+
+def test_the_spared_servers_are_the_tuple_the_mirrors_use() -> None:
+    """The tool list learns which servers keep per-tool deny from the wire.
+
+    The names must be the SAME tuple the codex and opencode mirrors attach the
+    per-call identity to, never a copy, so a server added there reaches the page
+    with no frontend edit. And only a reach that costs others whole while sparing
+    the control plane lists any: on ``settings-file`` nothing is costed whole, and
+    on ``whole-server`` nothing is spared.
+    """
+    from kiro_crew.acp import session_mcp
+    from kiro_crew.agent_sdk.backend_mcp_ability import McpAbility
+    from kiro_crew.providers.mirrors import codex, opencode
+
+    assert codex.CONTROL_PLANE_SERVERS is session_mcp.CONTROL_PLANE_SERVERS
+    assert opencode.CONTROL_PLANE_SERVERS is session_mcp.CONTROL_PLANE_SERVERS
+
+    def spared(reach: str) -> tuple:
+        return McpAbility(
+            projection="mirror", per_tool_deny=reach, withheld=(), no_channel=()
+        ).spared_servers
+
+    assert spared(PerToolDeny.PER_CALL.value) == session_mcp.CONTROL_PLANE_SERVERS
+    assert spared(PerToolDeny.WHOLE_SERVER.value) == ()
+    assert spared(PerToolDeny.SETTINGS_FILE.value) == ()
+    assert spared("") == ()
+
+    per_call = [b for b, d in PROJECTIONS.items() if d.per_tool_deny is PerToolDeny.PER_CALL]
+    assert per_call, "no harness declares the per-call reach any more"
+    for backend in sorted(PROJECTIONS):
+        listed = mcp_mod.ability_payload(backend)["spared_servers"]
+        assert isinstance(listed, list), backend
+        want = list(session_mcp.CONTROL_PLANE_SERVERS) if backend in per_call else []
+        assert listed == want, backend
+    assert mcp_mod.ability_payload(STRANGER)["spared_servers"] == []
 
 
 # ── 5. the shipped declarations, end to end ─────────────────────────────────
@@ -498,13 +538,16 @@ def test_a_kind_with_no_mirror_carries_no_per_concern_ruling() -> None:
 
     A ``native`` harness reads the spec itself and an ``external`` projection lives
     outside this folder; neither has rulings to read, and inventing a list for them
-    would be the card claiming a loss where there is none.
+    would be the card claiming a loss where there is none. A ``broker-only``
+    harness is the one exception, and only for ``hooks``: it is handed no spec, so
+    that loss is a fact (see the broker-only test below).
     """
     for backend, declared in PROJECTIONS.items():
         if declared.kind is ProjectionKind.MIRROR:
             continue
         ability = mcp_mod.ability_for(backend)
-        assert ability.withheld == (), backend
+        expected = ("hooks",) if declared.kind is ProjectionKind.BROKER_ONLY else ()
+        assert ability.withheld == expected, backend
         assert ability.no_channel == (), backend
         assert ability.per_tool_deny == "", backend
 
@@ -531,7 +574,7 @@ def test_the_payload_carries_every_field_the_panel_reads() -> None:
     payload = mcp_mod.ability_payload(
         next(b for b, d in PROJECTIONS.items() if d.kind is ProjectionKind.MIRROR)
     )
-    assert set(payload) == {"per_tool_deny", "costs_whole_server", "ineffective"}
+    assert set(payload) == {"per_tool_deny", "costs_whole_server", "spared_servers", "ineffective"}
     assert isinstance(payload["ineffective"], list)
 
 
@@ -542,6 +585,7 @@ def test_the_card_endpoint_carries_the_mcp_group() -> None:
         assert set(payload["mcp"]) == {  # type: ignore[arg-type]
             "per_tool_deny",
             "costs_whole_server",
+            "spared_servers",
             "ineffective",
         }, backend
 
@@ -561,7 +605,12 @@ def test_the_wire_carries_only_what_costs_the_reader_something() -> None:
     """
     for backend in sorted(PROJECTIONS):
         payload = mcp_mod.ability_payload(backend)
-        assert set(payload) == {"per_tool_deny", "costs_whole_server", "ineffective"}, backend
+        assert set(payload) == {
+            "per_tool_deny",
+            "costs_whole_server",
+            "spared_servers",
+            "ineffective",
+        }, backend
 
 
 def test_the_projection_kind_is_known_and_not_sent() -> None:
@@ -617,3 +666,14 @@ def test_the_reason_prose_never_reaches_the_wire() -> None:
     for backend, declared in PROJECTIONS.items():
         blob = json.dumps(mcp_mod.ability_payload(backend))
         assert declared.reason[:40] not in blob, backend
+
+
+def test_a_broker_only_harness_lists_spec_hooks_as_not_applied() -> None:
+    """pi gets no spec, and Crew does not fire its hooks, so the card must say so."""
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_PI
+
+    assert mcp_mod.ability_for(ACP_BACKEND_PI).withheld == ("hooks",)
+    assert mcp_mod.ability_payload(ACP_BACKEND_PI)["ineffective"] == ["hooks"]
+    for backend, declared in PROJECTIONS.items():
+        if declared.kind in (ProjectionKind.NATIVE, ProjectionKind.EXTERNAL):
+            assert mcp_mod.ability_payload(backend)["ineffective"] == [], backend

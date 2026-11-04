@@ -40,6 +40,7 @@ from slot_ownership_checkpoint_helpers import (  # noqa: F401 -- fixtures are re
 )
 
 from kiro_crew.dashboard.state import SlotOrigin, _ChatSlot
+from kiro_crew.testing.wait import await_until
 
 
 class TestAcquisitionAfterSetup:
@@ -125,12 +126,14 @@ class TestAcquisitionAfterSetup:
                 state.get_or_create_slot("s1", origin=SlotOrigin.USER)
             pending.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(pending, 5)
+                await await_until(pending)
             assert "s1" not in state._slots_under_construction
             assert "s1" not in state._slots
         finally:
             release.set()
-            await asyncio.wait_for(asyncio.gather(pending, return_exceptions=True), 5)
+            await await_until(
+                asyncio.gather(pending, return_exceptions=True), timeout=5, what="teardown"
+            )
             assert await asyncio.to_thread(finished.wait, 5)
 
 
@@ -244,8 +247,11 @@ class TestPostAwaitOwnership:
             assert slot._summary_turn_mark == 0
             assert await asyncio.to_thread(log.get_cached_intent_summary, "dashboard:s1") is None
 
+    # Regenerate is not here: it writes nothing before dispatching, so it holds
+    # no await after its ownership check. Its turn-end replace write is pinned to
+    # the slot (test_regenerate_swap.py).
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("route", ["regenerate", "switch-variant"])
+    @pytest.mark.parametrize("route", ["switch-variant"])
     async def test_replacement_after_history_save_cannot_dispatch_or_broadcast(
         self, state, regen_run, monkeypatch, route
     ) -> None:
@@ -315,7 +321,7 @@ class TestPostAwaitOwnership:
                 "/api/chat/slots/s1/rewind", json={"at_message_index": 0, "content": "APP-EDIT"}
             )
             assert (resp.status, await resp.json()) == (404, _NOT_FOUND)
-        await asyncio.wait_for(asyncio.gather(slot.task), 5)
+        await await_until(slot.task, what="the slot's turn")
         run.assert_not_called()
         assert state._slots["s1"].messages == []
         if phase != "cleanup":
@@ -323,7 +329,7 @@ class TestPostAwaitOwnership:
 
 
 class TestAcquisitionRecheckPlacement:
-    @pytest.mark.parametrize("handler_name", ["api_chat", "api_chat_slot_create"])
+    @pytest.mark.parametrize("handler_name", ["_api_chat_send", "api_chat_slot_create"])
     def test_no_await_between_final_recheck_and_acquisition(self, handler_name) -> None:
         import inspect
 

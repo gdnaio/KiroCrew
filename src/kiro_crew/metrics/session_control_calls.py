@@ -9,7 +9,7 @@ agents actually reach for and how often they fail.
 ``kirocrew.tool.call.duration`` cannot answer it. That instrument labels a call
 by its ACP ``tool_kind``, and an MCP-served call is labelled ``mcp`` whatever
 kind it claimed -- which is the right trade there and exactly the wrong grain
-here, because it folds all eighteen session-control verbs, every other MCP
+here, because it folds all nineteen session-control verbs, every other MCP
 server's tools, and their outcomes into one series.
 
 **Three closed attributes, no fourth.**
@@ -43,9 +43,9 @@ server's tools, and their outcomes into one series.
   answered with (:func:`outcome_for_status`), or ``error`` for a handler that
   raised.
 
-At most 19 x 16 x 2 = 608 series: nineteen ``op`` values (the eighteen named
+At most 20 x 18 x 2 = 720 series: twenty ``op`` values (the nineteen named
 verbs plus ``other``, which the registered ``revive`` and ``history`` routes
-reach), sixteen ``caller`` values and two outcomes. A backend that should not
+reach), eighteen ``caller`` values and two outcomes. A backend that should not
 carry all of them can drop ``outcome`` from its dimensions.
 
 **One count per completed call.** The emit site is a wrapper around each route
@@ -109,6 +109,7 @@ SESSION_CONTROL_OPS: Final[frozenset[str]] = frozenset(
         "set_model",
         "end_wait",
         "adopt",
+        "handoff",
         "release",
         "generate_title",
     }
@@ -125,7 +126,7 @@ CALLER_OTHER: Final[str] = "other"
 CALLER_DEFAULT: Final[str] = "default"
 
 #: ``caller`` for a crewmate's pinned DM session. Identified by the SLOT KEY's
-#: shape, never by an agent name: ``handlers/members.py`` mints a DM slot with
+#: shape, never by an agent name: ``handlers/members_thread.py`` mints a DM slot with
 #: ``agent=<the crewmate's crew name>``, so the agent field of such a session
 #: carries a user-chosen name and can only answer ``other``.
 CALLER_CREWMATE: Final[str] = "crewmate"

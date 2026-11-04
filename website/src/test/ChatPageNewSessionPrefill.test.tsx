@@ -23,10 +23,11 @@ import { render, act, waitFor, screen, fireEvent } from '@testing-library/react'
 import { store as singletonStore, type RootState } from '../store'
 import { Provider } from 'react-redux'
 import { MemoryRouter, useLocation, useNavigate } from 'react-router-dom'
-import { configureStore } from '@reduxjs/toolkit'
+import { configureStore, type Middleware } from '@reduxjs/toolkit'
+import { flushSync } from 'react-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ThemeProvider } from '../hooks/useTheme'
-import chatReducer, { switchSlot, endLocalTurn, setQuestionCard, setQuestionDraft, setFolderSuggestion, pendingQuestionFor, resolveQuestionCard } from '../store/chatSlice'
+import chatReducer, { createSlot, switchSlot, endLocalTurn, setQuestionCard, setQuestionDraft, setFolderSuggestion, pendingQuestionFor, resolveQuestionCard } from '../store/chatSlice'
 import dashboardReducer, { updateSlot } from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 import { PREFILL_STORAGE_KEY } from '../utils/navIntent'
@@ -35,6 +36,7 @@ import { loadFileDrafts, saveFileDrafts } from '../utils/chatFileDrafts'
 import { loadPasteDrafts, savePasteDrafts, __resetForTests as resetPasteDrafts } from '../utils/chatPasteDrafts'
 import { loadSessionRefDrafts, saveSessionRefDrafts, __resetSessionRefDraftsForTests as resetSessionRefs } from '../utils/chatSessionRefDrafts'
 import { formatToken } from '../utils/pasteTokens'
+import { i18nT } from '../i18n/t'
 import type { useKnowledgeFetch } from '../pages/chat/useKnowledgeFetch'
 
 let knowledgeInTest: ReturnType<typeof useKnowledgeFetch>
@@ -108,9 +110,10 @@ const NEW_SLOT = 'chat-new-1'
 
 /** `activeSlot: null` with one known session — the state a cold `/chat?new=1`
  *  load lands in, and the one where a spurious create would be visible. */
-function makeStore(targetTitle?: string, activeSlot: string | null = null) {
+function makeStore(targetTitle?: string, activeSlot: string | null = null, middleware: Middleware[] = []) {
   return configureStore({
     reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
+    middleware: getDefault => getDefault().concat(middleware),
     preloadedState: {
       dashboard: {
         status: null, connected: true, slotsLoaded: true,
@@ -144,8 +147,8 @@ function NavigationProbe() {
   return null
 }
 
-async function renderAt(route: string, targetTitle?: string, activeSlot?: string) {
-  const store = makeStore(targetTitle, activeSlot)
+async function renderAt(route: string, targetTitle?: string, activeSlot?: string, middleware?: Middleware[]) {
+  const store = makeStore(targetTitle, activeSlot, middleware)
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
   await act(async () => {
     render(
@@ -194,6 +197,49 @@ describe('ChatPage — /chat?new=1&prefill= seeds a fresh session', { timeout: 2
     expect(sessionStorage.getItem(PREFILL_STORAGE_KEY)).toBeNull()
   })
 
+  it('seeds the composer when the activation commit runs before the create caller resumes', async () => {
+    // In a browser the create's activation renders, and the slot-restore effect
+    // reads the staged prefill, before the code awaiting the create runs again.
+    // jsdom under act() runs that caller first, so a prompt staged by the caller
+    // would still reach the composer there. Committing the activation inside the
+    // dispatch reproduces the browser order.
+    const stagedAtActivation: (string | null)[] = []
+    const commitActivationNow: Middleware = () => next => action => {
+      if (!createSlot.fulfilled.match(action)) return next(action)
+      stagedAtActivation.push(sessionStorage.getItem(PREFILL_STORAGE_KEY))
+      const result = next(action)
+      flushSync(() => {})
+      return result
+    }
+    const store = await renderAt(`/chat?new=1&prefill=${encodeURIComponent(PROMPT)}`, undefined, undefined, [commitActivationNow])
+
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe(NEW_SLOT))
+    await waitFor(() => expect(composer().value).toBe(PROMPT))
+    // The seed was staged before the activation that reads it, not after.
+    expect(stagedAtActivation).toHaveLength(1)
+    expect(JSON.parse(stagedAtActivation[0] ?? 'null')).toMatchObject({ slotKey: NEW_SLOT, prompt: PROMPT })
+    expect(sessionStorage.getItem(PREFILL_STORAGE_KEY)).toBeNull()
+    expect(sendChat).not.toHaveBeenCalled()
+  })
+
+  it('still seeds the composer when sessionStorage refuses the staged prompt', async () => {
+    const setItem = Storage.prototype.setItem
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key: string, value: string) {
+      if (key === PREFILL_STORAGE_KEY) throw new DOMException('full', 'QuotaExceededError')
+      return setItem.call(this, key, value)
+    })
+    const commitActivationNow: Middleware = () => next => action => {
+      const result = next(action)
+      if (createSlot.fulfilled.match(action)) flushSync(() => {})
+      return result
+    }
+    const store = await renderAt(`/chat?new=1&prefill=${encodeURIComponent(PROMPT)}`, undefined, undefined, [commitActivationNow])
+
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe(NEW_SLOT))
+    await waitFor(() => expect(composer().value).toBe(PROMPT))
+    expect(sendChat).not.toHaveBeenCalled()
+  })
+
   it('sends nothing — the prompt waits for a human Enter', async () => {
     await renderAt(`/chat?new=1&prefill=${encodeURIComponent(PROMPT)}`)
     await waitFor(() => expect(composer().value).toBe(PROMPT))
@@ -230,7 +276,9 @@ describe('ChatPage — /chat?new=1&prefill= seeds a fresh session', { timeout: 2
 
 
 describe('App SDK chat launch intent', () => {
-  function launch(options: { message: string; slotKey?: string; autoSend?: boolean; agent?: string }) {
+  function launch(options: {
+    message: string; slotKey?: string; autoSend?: boolean; agent?: string; memoryMode?: string; sessionFolder?: boolean
+  }) {
     ;(window as Window & { __mc_chat_launch?: unknown }).__mc_chat_launch = { ...options, ts: Date.now() }
   }
 
@@ -301,6 +349,20 @@ describe('App SDK chat launch intent', () => {
     await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
     expect(sendChat.mock.calls[0]).toContain('chat-old')
     expect(createChatSlot).not.toHaveBeenCalled()
+  })
+
+  it('keeps the full resend guidance when a launched send times out, since a launch raises no strip', async () => {
+    sendChat.mockImplementation(async () => { throw new DOMException('aborted', 'AbortError') })
+    launch({ message: PROMPT, slotKey: 'chat-old' })
+    const store = await renderAt('/chat?sid=chat-old')
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+    const notice = await waitFor(() => {
+      const row = store.getState().chat.messages.find(m => m.role === 'notice' && m.meta?.deliveryNoticeFor)
+      expect(row).toBeDefined()
+      return row!
+    })
+    expect(notice.content).toBe('\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed_resend_manually'))
+    expect(screen.queryByTestId('delivery-exit-dismiss')).toBeNull()
   })
 
   it('shows a restored-answer notice on the session page after its question is gone', async () => {
@@ -535,6 +597,42 @@ describe('App SDK chat launch intent', () => {
     expect(createChatSlot).toHaveBeenCalledTimes(1)
     expect(createChatSlot.mock.calls[0]).toContain('example-agent')
     expect(sendChat).not.toHaveBeenCalled()
+  })
+
+  // `api.createChatSlot`'s positional arguments the launch shapes.
+  const CREATE_AGENT = 1, CREATE_MEMORY_MODE = 4, CREATE_SKIP_SESSION_FOLDER = 9
+
+  it('creates a new draft session with the launch memory mode and no session folder', async () => {
+    launch({ message: PROMPT, agent: 'example-agent', memoryMode: 'persistent', sessionFolder: false })
+    const store = await renderAt('/chat?new=1')
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe(NEW_SLOT))
+    await waitFor(() => expect(composer().value).toBe(PROMPT))
+    expect(createChatSlot).toHaveBeenCalledTimes(1)
+    const call = createChatSlot.mock.calls[0]
+    expect(call[CREATE_AGENT]).toBe('example-agent')
+    expect(call[CREATE_MEMORY_MODE]).toBe('persistent')
+    expect(call[CREATE_SKIP_SESSION_FOLDER]).toBe(true)
+    // A session-shaping launch is a draft: the message waits for the user.
+    expect(sendChat).not.toHaveBeenCalled()
+    expect((window as Window & { __mc_chat_launch?: unknown }).__mc_chat_launch).toBeUndefined()
+  })
+
+  it('ignores an unknown memory mode and keeps the default', async () => {
+    launch({ message: PROMPT, autoSend: false, memoryMode: 'forever' })
+    const store = await renderAt('/chat?new=1')
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe(NEW_SLOT))
+    expect(createChatSlot).toHaveBeenCalledTimes(1)
+    expect(createChatSlot.mock.calls[0][CREATE_MEMORY_MODE]).not.toBe('forever')
+    expect(createChatSlot.mock.calls[0][CREATE_SKIP_SESSION_FOLDER]).toBe(false)
+  })
+
+  it('does not apply session-shaping options to a targeted launch', async () => {
+    launch({ message: PROMPT, slotKey: 'chat-other', memoryMode: 'incognito', sessionFolder: false })
+    const store = await renderAt('/chat?sid=chat-other', 'Target notes', 'chat-old')
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-other'))
+    // Still the targeted auto-send path: the existing session keeps its mode.
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+    expect(createChatSlot).not.toHaveBeenCalled()
   })
 
   it.each([true, false])('activates another slot on a hot launch (autoSend=%s)', async (autoSend) => {

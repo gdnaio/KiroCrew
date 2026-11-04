@@ -33,12 +33,14 @@ from kiro_crew.dashboard.chat import _run_chat
 from kiro_crew.dashboard.state import _ChatSlot, parse_cls_meta, row_mid
 from kiro_crew.hooks import (
     HOOK_EVENT_PRE_TOOL_USE,
+    TOOL_ALLOW,
     TOOL_AUTO_APPROVE,
     ScriptHookResult,
     ToolHookResult,
 )
 from kiro_crew.name_grant import SHADOWED, Refusal
 from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, LLMEvent
+from kiro_crew.testing.wait import await_until, finished
 
 
 def _tool_messages(slot: _ChatSlot) -> list[dict]:
@@ -73,8 +75,8 @@ class TestApprovalModes:
         )
         try:
             with _patch_stats():
-                await asyncio.wait_for(_run_chat(state, slot, "hello"), 15)
-            await asyncio.wait_for(answer, 5)
+                await finished(_run_chat(state, slot, "hello"), "the chat turn completing")
+            await await_until(answer, what="the approval answer landing")
             assert slot._approval_futures["req-1"] is replacement
             assert slot.approval_instance("req-1") == row_mid(observed["row"])
             assert "resolved" not in parse_cls_meta(observed["row"]["cls"])
@@ -286,8 +288,8 @@ class TestApprovalModes:
         and a human/batch could resume — a call the gate denied.
 
         Checking ``request_id not in slot._approval_futures`` AFTER the turn is
-        not enough: the runner's ``finally`` (``chat_runner.py`` ~7396) pops
-        every future at end-of-turn, so the interactive path also leaves it
+        not enough: ``_on_permission_prompt``'s ``finally`` (chat_turn/permission_prompt.py) pops
+        the future it registered, so the interactive path also leaves it
         absent — the residue is identical for allow and deny. So this test
         instead OBSERVES THE REGISTRATION ITSELF by recording every key ever
         assigned to ``_approval_futures`` during the turn. On a deny that key
@@ -468,6 +470,47 @@ class TestApprovalModes:
         assert any("hook blocked" in m.get("content", "").lower() for m in msgs), (label, msgs)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "label,result_kwargs",
+        [
+            ("killed", {"exit_code": -9, "stderr": ""}),
+            ("timeout", {"exit_code": -1, "error": "Timed out after 3s"}),
+            (
+                "refused",
+                {"exit_code": 2, "refused": True, "error": "Blocked by security policy: x"},
+            ),
+        ],
+    )
+    async def test_auto_approve_allowed_when_a_spec_hook_fails_or_is_refused(
+        self, tmp_path, label, result_kwargs
+    ):
+        """An agent spec's own hook keeps kiro-cli's contract: only a delivered
+        exit 2 blocks. A refused, killed or timed-out spec hook warns and the
+        tool runs, so one broken hook cannot stop every tool call."""
+        cb = _context_builder(ToolHookResult.auto_approve())
+        hook_store = _make_hook_store()
+        hook_store.fire = AsyncMock(
+            return_value=[
+                ScriptHookResult(
+                    hook_id="spec:a1:PreToolUse:0",
+                    hook_name="a1 spec hook (PreToolUse #1)",
+                    event=HOOK_EVENT_PRE_TOOL_USE,
+                    from_spec=True,
+                    **result_kwargs,
+                )
+            ]
+        )
+        state, client = _make_state(tmp_path, context_builder=cb, hook_store=hook_store)
+        slot = _make_slot()
+        _set_stream(client, [_permission_event(), _complete_event()])
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+
+        client.approve_tool.assert_called_once()
+        client.reject_tool.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_auto_approve_allowed_when_pretooluse_hook_exits_zero(self, tmp_path):
         """Exit 0 is a delivered "allow" verdict and must still approve.
 
@@ -497,8 +540,9 @@ class TestApprovalModes:
         with _patch_stats():
             await _run_chat(state, slot, "hello")
 
-        client.approve_tool.assert_called_once()
+        client.approve_tool.assert_called_once_with("req-1")
         client.reject_tool.assert_not_called()
+        assert not any("hook blocked" in m.get("content", "").lower() for m in _tool_messages(slot))
 
     @pytest.mark.asyncio
     async def test_auto_approve_deny_by_default_on_unexpected_hook_output(self, tmp_path):
@@ -518,7 +562,8 @@ class TestApprovalModes:
 
         # Deny-by-default: auto-approve must NOT silently approve on bad hook output.
         client.approve_tool.assert_not_called()
-        client.reject_tool.assert_called_once()
+        client.reject_tool.assert_called_once_with("req-1")
+        assert [m["content"] for m in _tool_messages(slot)] == ["🚫 fs_write (hook error)"]
 
     @pytest.mark.asyncio
     @pytest.mark.xdist_group(name="serial")
@@ -537,7 +582,13 @@ class TestApprovalModes:
             await _run_chat(state, slot, "hello")
         await _drain(rejecter)
 
-        client.reject_tool.assert_called_once()
+        client.reject_tool.assert_called_once_with("req-1")
+        client.approve_tool.assert_not_called()
+        msgs = _tool_messages(slot)
+        assert [json.loads(m["cls"])["resolved"] for m in msgs if m["role"] == "permission"] == [
+            "rejected"
+        ]
+        assert "🚫 fs_write (rejected)" in [m["content"] for m in msgs]
 
     @pytest.mark.asyncio
     async def test_interactive_approve_with_empty_hooks(self, tmp_path):
@@ -609,6 +660,35 @@ class TestApprovalModes:
             if m.get("role") == "permission" or "Auto-approve not applied" in m.get("content", "")
         ]
         assert shown == (["system", "permission"] if expect_note else []), slot.messages
+        client.approve_tool.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_gate_ask_note_is_shown_ahead_of_the_card(self, tmp_path):
+        """The gate's reason for asking (an allowedCommands entry kept off by shell
+        composition) reaches the person as a note right before the card."""
+        note = "This command matches allowedCommands, but commands with | always ask."
+        cb = _context_builder(ToolHookResult(action=TOOL_ALLOW, reason=note))
+        state, client = _make_state(tmp_path, context_builder=cb)
+        slot = _make_slot()
+        _set_stream(client, [_permission_event(), _complete_event()])
+
+        async def _approve() -> None:
+            await _answer_approval(slot, "req-1", "approved")
+
+        approver = asyncio.get_running_loop().create_task(_approve())
+        try:
+            with _patch_stats():
+                await finished(_run_chat(state, slot, "hello"), "the chat turn completing")
+        finally:
+            await _drain(approver)
+
+        shown = [
+            (m.get("role"), m.get("content", ""))
+            for m in slot.messages
+            if m.get("role") in ("system", "permission")
+        ]
+        assert [role for role, _ in shown] == ["system", "permission"], slot.messages
+        assert note in shown[0][1]
         client.approve_tool.assert_called_once()
 
 

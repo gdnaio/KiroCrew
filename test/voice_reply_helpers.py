@@ -46,14 +46,6 @@ def _capture_mkstemp(monkeypatch) -> list[str]:
     return allocated
 
 
-def _make_executable(path: str) -> None:
-    """Touch *path* and flag it executable so shutil.which / os.access pass."""
-    with open(path, "wb") as f:
-        f.write(b"#!/bin/sh\n")
-    # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions -- marks a fake binary under tmp_path executable so shutil.which finds it, moved verbatim
-    os.chmod(path, 0o755)
-
-
 # _synthesize_polly() short-circuits to None when the `aws` CLI is absent, so any
 # test that exercises the argv build or the subprocess lifecycle must state that
 # the CLI is present. It is NOT present on a stock Windows box (nor on a minimal
@@ -76,8 +68,7 @@ def _patch_aws_on_path(monkeypatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-# nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- the module-wide argv pin of test_voice_reply.py and the modules split out of it, moved verbatim; none of them calls monkeypatch.undo()
-def _no_argv_prefixers(monkeypatch):
+def _no_argv_prefixers(_floor_monkeypatch):
     """Strip the host-dependent argv prefixes for every test in this module.
 
     Two layers sit between the command these tests build and the
@@ -94,8 +85,8 @@ def _no_argv_prefixers(monkeypatch):
     the same host dependence. A test specifically about resource limits or cgroup
     scoping should patch the real function back.
     """
-    monkeypatch.setattr("kiro_crew.voice_reply.cgroup_scope_argv", lambda argv: list(argv))
-    monkeypatch.setattr(
+    _floor_monkeypatch.setattr("kiro_crew.voice_reply.cgroup_scope_argv", lambda argv: list(argv))
+    _floor_monkeypatch.setattr(
         "kiro_crew.voice_reply.create_subprocess_limited",
         lambda *argv, **kw: asyncio.create_subprocess_exec(*argv, **kw),
     )

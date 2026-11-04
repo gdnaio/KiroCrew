@@ -546,9 +546,9 @@ class TestAConcurrentEditIsNeverLost:
             fh = real_open(file, *a, **k)
             return _CountingReads(fh) if str(file) == str(p) else fh
 
-        monkeypatch.setattr(builtins, "open", counting_open)
-        loaded = CloudConfig.load(p)
-        monkeypatch.undo()
+        with monkeypatch.context() as mp:
+            mp.setattr(builtins, "open", counting_open)
+            loaded = CloudConfig.load(p)
 
         assert pulled, "the loader never read the file, so nothing here tested the bound"
         assert max(pulled) <= _MAX_FILE_BYTES + 1, (
@@ -582,7 +582,7 @@ class TestAConcurrentEditIsNeverLost:
     def test_the_precondition_caller_cannot_resolve_an_empty_tag(self, monkeypatch):
         """Merging from displaced bytes stays out of reach of a caller with a precondition.
 
-        `_on_disk_tag` answers the default for a file that cannot be parsed, so a caller
+        The on-disk tag read answers the default for a file that cannot be parsed, so a caller
         naming the default tag would be the one way a precondition could be satisfied by a
         tag nobody read. The only production caller of `expect_last_tag` resolves its tag
         through a path that exits rather than yielding an empty one, which is what closes
@@ -736,22 +736,22 @@ class TestAConcurrentEditIsNeverLost:
         requiring each to be the field-scoped one.
         """
         import ast as _ast
-        import pathlib as _pathlib
 
-        src_root = _pathlib.Path(__file__).resolve().parents[1] / "src/kiro_crew"
+        from source_corpus import parsed_candidates
+        from source_corpus import src_root as corpus_root
+
+        src_root = corpus_root()
         # `load` is a read and is always fine. Anything ELSE that is not `apply_update`
         # fails, including a write method added later under a name nobody here foresaw --
         # that is what makes this a closed set rather than a list of the two callers a
         # reviewer happened to name.
         allowed = {"apply_update", "load"}
         offenders: list[str] = []
-        for f in sorted(src_root.rglob("*.py")):
+        # A flagged call's receiver is spelled ``CloudConfig``, so only the files whose
+        # text holds it are parsed.
+        for f, _text, tree in parsed_candidates(require_any=("CloudConfig",)):
             if f.name == "config.py" and f.parent.name == "cloud":
                 continue  # the implementation itself
-            try:
-                tree = _ast.parse(f.read_text(encoding="utf-8"))
-            except SyntaxError:
-                continue
             for n in _ast.walk(tree):
                 if not (isinstance(n, _ast.Call) and isinstance(n.func, _ast.Attribute)):
                     continue

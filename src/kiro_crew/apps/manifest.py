@@ -40,6 +40,9 @@ from kiro_crew.apps.manifest_containment import (  # noqa: F401
 from kiro_crew.apps.manifest_contributes import (  # noqa: F401
     _COMMAND_AGENT_RE,
     _COMMAND_SLUG_RE,
+    _COMPOSER_ACTION_ICON_RE,
+    _COMPOSER_ACTION_KEYS,
+    _COMPOSER_ACTION_POPOVER,
     _FILE_MENU_KINDS,
     _HOST_RE,
     _MAX_ARGUMENT_HOSTS,
@@ -47,26 +50,63 @@ from kiro_crew.apps.manifest_contributes import (  # noqa: F401
     _MAX_FILE_MENU_ITEMS_PER_APP,
     _MAX_KEYWORD,
     _MAX_KEYWORDS,
+    _MAX_LINK_OPEN_HOSTS,
+    _MAX_LINK_PREVIEW_HOSTS,
+    _MAX_MESSAGE_ACTION_TITLE,
     _MAX_PANEL_TABS_PER_APP,
     _MAX_PROMPT_TEMPLATE,
+    _MAX_SELECTION_TITLE,
     _MAX_TITLE,
+    _MESSAGE_ACTION_KEYS,
+    _MESSAGE_ACTION_POPOVER_HEIGHT,
+    _MESSAGE_ACTION_POPOVER_WIDTH,
     _PANEL_TAB_ID_RE,
+    _POPOVER_KEYS,
+    _SELECTION_ICON_RE,
+    _SELECTION_POPOVER_HEIGHT,
+    _SELECTION_POPOVER_WIDTH,
     _SESSION_CONTROL_ID_RE,
     _SESSION_CONTROL_STATUS_PATH_RE,
+    _TEXT_PATTERN_FLAGS_RE,
+    _TEXT_PATTERN_KEYS,
     ARGUMENT_TOKEN,
     FILE_MENU_SURFACES,
+    MAX_COMPOSER_ACTION_STRING,
+    MAX_COMPOSER_ACTION_TITLE,
+    MAX_COMPOSER_ACTIONS_PER_APP,
+    MAX_LINK_OPEN_PER_APP,
+    MAX_LINK_PREVIEW_TEXT_PATTERN_LEN,
+    MAX_LINK_PREVIEW_TEXT_PATTERNS,
+    MAX_LINK_PREVIEWS_PER_APP,
+    MAX_MESSAGE_ACTION_CHARS,
+    MAX_MESSAGE_ACTIONS_PER_APP,
+    MAX_SELECTION_ACTIONS_PER_APP,
+    MAX_SELECTION_TEXT,
     MAX_SESSION_CONTROLS_PER_APP,
+    MESSAGE_ACTION_FORMATS,
+    MESSAGE_ACTION_ROLES,
+    SELECTION_EFFECTS,
+    SELECTION_SOURCES,
     CommandArgument,
     CommandContribution,
+    ComposerActionConfig,
     Contributes,
     FileMenuItemConfig,
     FileMenuWhen,
+    LinkOpenConfig,
+    LinkPreviewConfig,
+    MessageActionConfig,
     PanelTabConfig,
+    SelectionActionConfig,
     SessionControlContribution,
+    _int_field,
     _mirrored_len,
+    _name_list,
     _normalize_status_path,
+    _strict_int,
 )
 from kiro_crew.apps.manifest_names import (  # noqa: F401
+    APP_NAME_MAX_LENGTH,
     KEBAB_RE,
     RESERVED_APP_NAME_CODE,
     RESERVED_APP_NAMES,
@@ -79,7 +119,17 @@ from kiro_crew.apps.manifest_names import (  # noqa: F401
 )
 from kiro_crew.apps.manifest_sections import (  # noqa: F401
     _CHANNEL_PRIORITIES,
+    _L10N_QUOTED_CHARS,
+    _L10N_QUOTED_KEYS,
     _OVERLAY_SLUG_RE,
+    L10N_LOCALE_RE,
+    L10N_TEXT_CAPS,
+    LIFECYCLE_SCRIPT_TIMEOUT_DEFAULT,
+    LIFECYCLE_SCRIPT_TIMEOUT_MAX,
+    MAX_L10N_HIGHLIGHT_CHARS,
+    MAX_L10N_HIGHLIGHTS,
+    MAX_L10N_LOCALES,
+    MAX_L10N_WARNINGS,
     MAX_NOTIFICATION_CHANNELS,
     BackendConfig,
     CapabilityDependencies,
@@ -87,6 +137,8 @@ from kiro_crew.apps.manifest_sections import (  # noqa: F401
     CronEntry,
     Dependencies,
     HooksConfig,
+    L10nConfig,
+    L10nEntry,
     NotificationChannel,
     NotificationsConfig,
     Permissions,
@@ -98,11 +150,15 @@ from kiro_crew.apps.manifest_sections import (  # noqa: F401
     UIPage,
     UISidebar,
     _granted_list,
+    _l10n_quoted,
+    _sidebar_order,
+    clamp_lifecycle_timeout,
+    lifecycle_timeout_error,
+    lifecycle_timeout_seconds,
+    logger,
 )
 from kiro_crew.atomic_write import read_bytes_with_retry
 from kiro_crew.constants import WINDOWS_DEVICE_STEMS  # noqa: F401
-from kiro_crew.cron import is_valid_skip_date, is_valid_timezone
-from kiro_crew.cron_service.fields import validate_create_timeouts
 
 # This module is the facade of the app manifest: every name is reached through it as
 # ``kiro_crew.apps.manifest.<name>``. It keeps ``AppManifest`` itself, the cron grant rule
@@ -129,6 +185,7 @@ _CRON_FIELD_JSON_TYPES = {
     "skip_dates": "an array of YYYY-MM-DD strings",
     "timeout": "a whole number of seconds",
     "timeout_secs": "a whole number of seconds",
+    "strict_schedule": "a boolean",
 }
 
 #: Refusal for a manifest that schedules ``crons`` without the ``permissions.cron``
@@ -181,6 +238,7 @@ CORE_APP_ROUTE_SEGMENTS = frozenset(
         "dev",
         "disable",
         "enable",
+        "frames",
         "manifest",
         "migrate-cleanup",
         "open",
@@ -274,14 +332,14 @@ def app_endpoint_allowed(
     # BOTH documented app namespaces, but only when the CALLER's contract covers the
     # second one: which namespace an app owns is not its choice — one declaring
     # ``backend.entryPoint`` runs its own process and is reverse-proxied at
-    # ``/apps/<app>/api/`` (``routes.py`` ``handle_app_api_proxy``), while one declaring
+    # ``/apps/<app>/api/`` (``routes_proxy.py`` ``handle_app_api_proxy``), while one declaring
     # only ``backend.hooks.routes`` is registered in-gateway under ``/api/apps/<app>/``.
     # Admitting just the in-gateway form refused every process-backed app's contribution
     # at install, so those apps could not contribute a row at all.
     #
     # It is a per-caller flag rather than a blanket widening because this is the ONE
     # shared endpoint check (see ``test_app_endpoint_allowed_is_the_one_shared_check``)
-    # and its other caller, the publish-provider registry in ``routes.py``, states
+    # and its other caller, the publish-provider registry in ``routes_listing.py``, states
     # ``/api/apps/<app>/`` as its contract in its own refusal message. Widening the
     # helper for everyone would have broadened that surface silently.
     #
@@ -337,6 +395,7 @@ _KNOWN_FIELDS = frozenset(
         "publishProvider",
         "notifications",
         "contributes",
+        "l10n",
     }
 )
 
@@ -410,6 +469,9 @@ class AppManifest:
     # ``extra`` is by definition the un-checked bucket. Being a known field is what
     # makes ``validate()`` see it on every parse.
     contributes: Contributes = field(default_factory=Contributes)
+
+    # --- Listing copy per locale (content, never trust; see L10nConfig) ---
+    l10n: L10nConfig = field(default_factory=L10nConfig)
 
     # --- Discovery ---
     tags: list[str] = field(default_factory=list)
@@ -502,6 +564,35 @@ class AppManifest:
             refusal = path_refusal(tab.entry)
             if refusal:
                 report_path(refusal, f"contributes.panelTabs entry {refusal}: {tab.entry!r}")
+        # A link-preview entry is imported by the same ESM host, so same check.
+        for preview in self.contributes.linkPreviews:
+            refusal = path_refusal(preview.entry)
+            if refusal:
+                report_path(refusal, f"contributes.linkPreviews entry {refusal}: {preview.entry!r}")
+        # A message-action entry is imported by the same frame bootstrap.
+        for action in self.contributes.messageActions:
+            refusal = path_refusal(action.entry)
+            if refusal:
+                report_path(
+                    refusal, f"contributes.messageActions entry {refusal}: {action.entry!r}"
+                )
+        for link_open in self.contributes.linkOpen:
+            refusal = path_refusal(link_open.entry)
+            if refusal:
+                report_path(refusal, f"contributes.linkOpen entry {refusal}: {link_open.entry!r}")
+        # A composer-action entry is imported by the same frame bootstrap.
+        for composer in self.contributes.composerActions:
+            refusal = path_refusal(composer.entry)
+            if refusal:
+                report_path(
+                    refusal, f"contributes.composerActions entry {refusal}: {composer.entry!r}"
+                )
+        for selection in self.contributes.selectionActions:
+            refusal = path_refusal(selection.entry)
+            if refusal:
+                report_path(
+                    refusal, f"contributes.selectionActions entry {refusal}: {selection.entry!r}"
+                )
 
         # UI page validation
         for page in self.ui.pages:
@@ -563,9 +654,7 @@ class AppManifest:
                     refusal,
                     f"session control contribution entryPoint {refusal}: {ctl.entryPoint!r}",
                 )
-            if ctl.statusPath and not _SESSION_CONTROL_STATUS_PATH_RE.fullmatch(
-                ctl.statusPath
-            ):
+            if ctl.statusPath and not _SESSION_CONTROL_STATUS_PATH_RE.fullmatch(ctl.statusPath):
                 # Refused rather than ignored: a status route the dashboard
                 # declines to call would leave the chip permanently stateless
                 # with nothing saying why.
@@ -574,7 +663,12 @@ class AppManifest:
                     f"backend route (lowercase, no scheme, host or query): {ctl.statusPath!r}"
                 )
 
-        # Cron validation
+        # Cron validation. The cron modules are imported only for a manifest
+        # that declares crons: a manifest is also read by the stdio MCP servers
+        # at start-up, for its config keys, and the cron service is heavy.
+        if self.crons:
+            from kiro_crew.cron import is_valid_skip_date, is_valid_timezone
+            from kiro_crew.cron_service.fields import validate_create_timeouts
         for cron in self.crons:
             if not cron.name:
                 errors.append("cron entry missing required field: name")
@@ -637,6 +731,9 @@ class AppManifest:
 
         # Backend hooks validation
         errors.extend(self.backend.hooks.validate())
+
+        # onEnable / onDisable timeouts that are not a number at all
+        errors.extend(self.setup.validate())
 
         # Platform names the install and enable gates compare against
         errors.extend(self.platform.validate())
@@ -730,6 +827,16 @@ class AppManifest:
             or self.contributes.sessionControls
             or self.contributes.panelTabs
             or self.contributes.fileMenuItems
+            # A link-preview `entry` is an ESM module the dashboard imports and runs
+            # in its own origin, like a panel tab's: same reason to sign it.
+            or self.contributes.linkPreviews
+            # A message action's roles and format decide which text the app is handed.
+            or self.contributes.messageActions
+            # A link-open `entry` is the same kind of module, and `hosts` decides which
+            # clicked links the app is handed.
+            or self.contributes.linkOpen
+            or self.contributes.composerActions
+            or self.contributes.selectionActions
         ):
             # A contributed command's `prompt` is sent to an agent with tools as if
             # the reader typed it, and `autoSend` fires it without a further
@@ -928,6 +1035,9 @@ class AppManifest:
         contrib_d = self.contributes.to_dict()
         if contrib_d:
             d["contributes"] = contrib_d
+        l10n_d = self.l10n.to_dict()
+        if l10n_d:
+            d["l10n"] = l10n_d
         if self.tags:
             d["tags"] = self.tags
         if self.jobFamilies:
@@ -968,7 +1078,12 @@ class AppManifest:
             config_keys = list(config_keys_raw)
             config_keys_error = ""
 
+        # A present non-list value for a list field reads as absent: `get` returns a
+        # stored `null` instead of the default, and iterating it would raise (or split
+        # a string into characters). The same guard covers every top-level list below.
         crons_raw = data.get("crons", [])
+        if not isinstance(crons_raw, list):
+            crons_raw = []
         crons = [CronEntry.from_dict(c) for c in crons_raw if isinstance(c, dict)]
 
         ui_raw = data.get("ui", {})
@@ -1034,13 +1149,19 @@ class AppManifest:
             minKiroCrewVersion=str(data.get("minKiroCrewVersion", "")),  # noqa: N815
             signer=str(data.get("signer", "")),
             signature=str(data.get("signature", "")),
-            agents=[str(a) for a in data.get("agents", []) if a],
+            agents=[
+                str(a)
+                for a in (data["agents"] if isinstance(data.get("agents"), list) else [])
+                if a
+            ],
             skills=[
                 str(s.get("path", s.get("name", "")) if isinstance(s, dict) else s)
-                for s in data.get("skills", [])
+                for s in (data["skills"] if isinstance(data.get("skills"), list) else [])
                 if s
             ],
-            sops=[str(s) for s in data.get("sops", []) if s],
+            sops=[
+                str(s) for s in (data["sops"] if isinstance(data.get("sops"), list) else []) if s
+            ],
             mcpServers=dict(data.get("mcpServers", {})),  # noqa: N815
             config_keys=config_keys,
             config_keys_error=config_keys_error,
@@ -1054,8 +1175,15 @@ class AppManifest:
             publishProvider=publish_provider,
             notifications=notifications,
             contributes=contributes,
-            tags=[str(t) for t in data.get("tags", []) if t],
-            jobFamilies=[str(j) for j in data.get("jobFamilies", []) if j],  # noqa: N815
+            l10n=L10nConfig.from_value(data.get("l10n")),
+            tags=[
+                str(t) for t in (data["tags"] if isinstance(data.get("tags"), list) else []) if t
+            ],
+            jobFamilies=[  # noqa: N815
+                str(j)
+                for j in (data["jobFamilies"] if isinstance(data.get("jobFamilies"), list) else [])
+                if j
+            ],
             extra=extra,
         )
 
@@ -1162,9 +1290,7 @@ def has_stdio_mcp_server(manifest: AppManifest) -> bool:
     from the app's provisioned deps tree, which is why its presence is what
     makes ``bridges_mcp.py`` provision at registration.
     """
-    return any(
-        isinstance(cfg, dict) and not cfg.get("url") for cfg in manifest.mcpServers.values()
-    )
+    return any(isinstance(cfg, dict) and not cfg.get("url") for cfg in manifest.mcpServers.values())
 
 
 def file_entry_point_refusal(entry_point: str, app_root: Path) -> str:
@@ -1277,3 +1403,24 @@ def requirements_in_tree(app_root: Path, req_file: Path) -> tuple[Path, Path] | 
         # 500.
         return None
     return root_resolved, target
+
+
+#: Cron helpers served as attributes of this module on first access, so
+#: ``kiro_crew.apps.manifest.<name>`` is the object its home module holds. The
+#: cron service is heavy and the stdio MCP servers read manifests at start-up.
+_LAZY_CRON_NAMES: dict[str, str] = {
+    "is_valid_skip_date": "kiro_crew.cron",
+    "is_valid_timezone": "kiro_crew.cron",
+    "validate_create_timeouts": "kiro_crew.cron_service.fields",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module = _LAZY_CRON_NAMES.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+
+    value = getattr(importlib.import_module(module), name)
+    globals()[name] = value
+    return value

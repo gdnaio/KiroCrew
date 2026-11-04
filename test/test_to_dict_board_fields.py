@@ -42,10 +42,92 @@ def test_options_ts_stays_on_reply_after_system_notice():
     assert after["options_ts"] == before["options_ts"] == "t1"
 
 
+# ── stale options ending ──
+# A reply ending in [OPTIONS:] older than the cutoff does not count as waiting,
+# so a finished session leaves the Waiting lane and the Needs-you list on its own.
+
+
+def _iso_ago(seconds: float) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+
+
+def test_old_options_ending_no_longer_waits():
+    ts = _iso_ago(8 * 24 * 3600)
+    s = _slot({"role": "assistant", "content": "Done.\n[OPTIONS: Ship it | Hold]", "ts": ts})
+    d = s.to_dict()
+    assert d["has_options"] is False
+    # The reply is unchanged: its labels and stamp still travel.
+    assert d["options"] == ["Ship it", "Hold"]
+    assert d["options_ts"] == ts
+    # A finished turn with nothing owed reads like any other finished turn.
+    assert d["waiting_for_input"] is True
+
+
+def test_recent_options_ending_still_waits():
+    from kiro_crew.dashboard.slot_projection import OPTIONS_WAITING_MAX_AGE_SECS
+
+    ts = _iso_ago(OPTIONS_WAITING_MAX_AGE_SECS - 3600)
+    s = _slot({"role": "assistant", "content": "Pick.\n[OPTIONS: A | B]", "ts": ts})
+    d = s.to_dict()
+    assert d["has_options"] is True
+    assert d["waiting_for_input"] is False
+
+
+def test_options_ending_cutoff_edges():
+    from kiro_crew.dashboard.slot_projection import (
+        OPTIONS_WAITING_MAX_AGE_SECS,
+        options_ending_is_stale,
+    )
+
+    now = 1_800_000_000.0
+    from datetime import datetime, timezone
+
+    def stamp(at: float) -> str:
+        return datetime.fromtimestamp(at, timezone.utc).isoformat()
+
+    assert options_ending_is_stale(stamp(now - OPTIONS_WAITING_MAX_AGE_SECS - 1), now) is True
+    assert options_ending_is_stale(stamp(now - OPTIONS_WAITING_MAX_AGE_SECS), now) is False
+    # An unreadable stamp keeps the old behaviour: still waiting.
+    assert options_ending_is_stale("t1", now) is False
+    assert options_ending_is_stale("", now) is False
+
+
 def test_options_ts_empty_without_options():
     assert _slot().to_dict()["options_ts"] == ""
     s = _slot({"role": "assistant", "content": "Done.", "ts": "t1"})
     assert s.to_dict()["options_ts"] == ""
+
+
+def test_no_options_after_a_goal_loop_cycle_ran_past_the_ask():
+    """A silent cycle (``nothing_to_do``) writes only its ``nudge`` row.
+
+    The loop has run past the ask, so the slot must not read as waiting on it.
+    """
+    s = _slot(
+        {"role": "assistant", "content": "Armed.\n[OPTIONS: Stop | Keep going]", "ts": "t1"},
+        {"role": "nudge", "content": "Check the PR and report.", "ts": "t2"},
+        {"role": "tool_call", "content": "", "ts": "t3"},
+    )
+    d = s.to_dict()
+    assert d["has_options"] is False
+    assert d["options"] == []
+    assert d["options_ts"] == ""
+    assert d["prompt_preview"] == ""
+
+
+def test_options_kept_when_the_cycle_reply_carries_them():
+    """A cycle whose own reply ends in an ask still holds for the user."""
+    s = _slot(
+        {"role": "assistant", "content": "Old.\n[OPTIONS: A | B]", "ts": "t1"},
+        {"role": "nudge", "content": "Check the PR and report.", "ts": "t2"},
+        {"role": "assistant", "content": "Red CI.\n[OPTIONS: Fix it | Skip]", "ts": "t3"},
+    )
+    d = s.to_dict()
+    assert d["has_options"] is True
+    assert d["options"] == ["Fix it", "Skip"]
+    assert d["options_ts"] == "t3"
 
 
 def test_no_options_when_user_last():
@@ -124,6 +206,122 @@ def test_last_activity_ts_from_tool_call():
     )
     d = s.to_dict()
     assert d["last_activity_ts"] == "t4"
+
+
+# ── last_activity_ts normalization (store boundary) ──
+# last_activity_ts is the newest durable, non-notice row of any role, so every
+# consumer that sorts by it ranks a session by when it last moved, without its
+# own max(last_activity_ts, last_ts) derivation. last_agent_ts keeps the old
+# "newest assistant / tool row" reading for the artifact freshness nudge.
+
+
+def test_last_activity_ts_advances_to_last_ts_when_user_prompt_is_newer():
+    # A user message AFTER the last assistant turn leaves last_activity_ts stuck
+    # at the assistant row on the raw scan; the normalizer must take last_ts.
+    # Two consumers disagreed on the pre-fix behavior: byRecentActivity sorted
+    # by last_activity_ts ("t1"), while slotRecency() correctly returned "t2".
+    s = _slot(
+        {"role": "assistant", "content": "done", "ts": "t1"},
+        {"role": "user", "content": "follow-up", "ts": "t2"},
+    )
+    d = s.to_dict()
+    assert d["last_ts"] == "t2"
+    assert d["last_activity_ts"] == "t2"  # normalized to last_ts, not stale "t1"
+
+
+def test_last_activity_ts_unchanged_when_assistant_is_already_newest():
+    # When the latest row is an assistant/tool row, last_activity_ts is already
+    # the correct value; the normalizer must leave it alone.
+    s = _slot(
+        {"role": "user", "content": "do it", "ts": "t1"},
+        {"role": "assistant", "content": "done", "ts": "t2"},
+    )
+    d = s.to_dict()
+    assert d["last_activity_ts"] == "t2"
+    assert d["last_ts"] == "t2"
+
+
+def test_last_activity_ts_takes_last_ts_when_no_assistant_row():
+    # A session where only user rows exist has last_activity_ts == "" on the raw
+    # scan; the normalizer promotes the latest non-notice durable row so the
+    # slot sorts correctly.
+    s = _slot(
+        {"role": "user", "content": "hello", "ts": "t1"},
+    )
+    d = s.to_dict()
+    assert d["last_ts"] == "t1"
+    assert d["last_activity_ts"] == "t1"
+
+
+def test_last_activity_ts_does_not_advance_for_notice_rows():
+    # System-notice rows (e.g. session-reload cards) are excluded from the
+    # non-notice durable scan, so they do not count as user activity and the
+    # session is not incorrectly ranked above ones a person actually used.
+    s = _slot(
+        {"role": "assistant", "content": "done", "ts": "t1"},
+        {
+            "role": "assistant",
+            "content": "Session reloaded.",
+            "meta": {"kind": "session_reload"},
+            "ts": "t2",
+        },
+    )
+    d = s.to_dict()
+    assert d["last_ts"] == "t2"  # last_ts includes the notice row
+    assert d["last_activity_ts"] == "t1"  # notice row does not advance this
+
+
+def test_last_activity_ts_takes_newer_user_row_across_offsets():
+    # The newer user row is the SMALLER string: 09:00+08:00 is 01:00Z, and the
+    # prompt at 02:00+00:00 came an hour later. Rows mix offsets (a channel reply
+    # restored from another host, a DST change), so position decides, not text.
+    s = _slot(
+        {"role": "assistant", "content": "done", "ts": "2026-08-17T09:00:00+08:00"},
+        {"role": "user", "content": "follow-up", "ts": "2026-08-17T02:00:00+00:00"},
+    )
+    d = s.to_dict()
+    assert d["last_activity_ts"] == "2026-08-17T02:00:00+00:00"
+    assert d["last_agent_ts"] == "2026-08-17T09:00:00+08:00"
+
+
+def test_last_activity_ts_takes_newer_user_row_after_naive_agent_row():
+    # An older build wrote naive rows; a current one writes aware rows.
+    s = _slot(
+        {"role": "assistant", "content": "done", "ts": "2026-08-17T10:00:00"},
+        {"role": "user", "content": "follow-up", "ts": "2026-08-17T09:30:00+00:00"},
+    )
+    assert s.to_dict()["last_activity_ts"] == "2026-08-17T09:30:00+00:00"
+
+
+def test_last_agent_ts_stays_on_the_agent_row_after_a_user_prompt():
+    s = _slot(
+        {"role": "assistant", "content": "done", "ts": "t1"},
+        {"role": "user", "content": "follow-up", "ts": "t2"},
+    )
+    d = s.to_dict()
+    assert d["last_agent_ts"] == "t1"
+    assert d["last_activity_ts"] == "t2"
+
+
+def test_last_agent_ts_empty_without_an_agent_row():
+    d = _slot({"role": "user", "content": "hello", "ts": "t1"}).to_dict()
+    assert d["last_agent_ts"] == ""
+    assert _slot().to_dict()["last_activity_ts"] == ""
+
+
+def test_last_activity_ts_counts_a_send_queued_behind_a_running_turn():
+    # The dashboard bumps last_activity_ts on queue_push; the snapshot must agree,
+    # or the next slots frame drops the session back down the grid.
+    s = _slot(
+        {"role": "user", "content": "do it", "ts": "2026-08-17T01:00:00+00:00"},
+        {"role": "tool_call", "content": "grep ...", "ts": "2026-08-17T01:00:05+00:00"},
+    )
+    s.task = SimpleNamespace(done=lambda: False)
+    s.queue_append("and also this")
+    d = s.to_dict()
+    assert d["last_activity_ts"] == s._last_enqueue_ts
+    assert d["last_activity_ts"] != d["last_ts"]
+    assert d["last_agent_ts"] == "2026-08-17T01:00:05+00:00"
 
 
 # ── last_turn_ts ──

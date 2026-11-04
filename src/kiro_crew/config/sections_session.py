@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from kiro_crew.config.fields import _meta
 from kiro_crew.config.sections_defaults import (
@@ -17,6 +18,10 @@ from kiro_crew.config.sections_defaults import (
     DEFAULT_WATCHDOG_RSS_MAX_MB,
     SectionReader,
 )
+
+# Highest dock position a crew may hold. Far above any roster a person drags by
+# hand; it only bounds a hand-edited or hostile value.
+STAR_ORDER_MAX = 10_000
 
 
 def _archive_retention_days(session_data: dict) -> int:
@@ -95,6 +100,18 @@ class SessionConfig:
             "Context usage percentage at which auto-compaction triggers (5-90).",
         ),
     )
+    context_cap: bool = field(
+        default=True,
+        metadata=_meta(
+            "Conductor Context Cap",
+            "Trim a goal conductor's chat on the KAS backend at the start of a "
+            "dashboard turn: a chat over 400K tokens, or over 200K tokens after 5 "
+            "minutes idle, starts that turn on a new session seeded with its "
+            "session-ledger snapshot and the newest messages as text. Older messages "
+            "and tool output stay in the chat's transcript. Read at each turn start, "
+            "so a change needs no restart.",
+        ),
+    )
     compact_wait_secs: float = field(
         default=0.0,
         metadata=_meta(
@@ -166,13 +183,27 @@ class SessionConfig:
             "turn's copies.",
         ),
     )
+    kas_delete_delay_secs: int = field(
+        default=0,
+        metadata=_meta(
+            "KAS Session Record Delete Delay (seconds)",
+            "On the kas backend, seconds a task-runner session's record, and a reused "
+            "workflow worker's previous conversation, stay on disk after the session "
+            "ends before Kiro Crew deletes them. The session leaves the engine's "
+            "memory when it ends either way. 0 (the default) deletes the record when "
+            "the session ends. Incognito and temporary sessions are deleted when "
+            "they end whatever this says. A record that comes due while another "
+            "backend is selected waits until kas is selected again. Other backends "
+            "ignore it.",
+        ),
+    )
     watchdog_rss_max_mb: int = field(
         default=DEFAULT_WATCHDOG_RSS_MAX_MB,
         metadata=_meta(
             "Watchdog RSS Limit (MiB)",
             "Recycle a session when its process tree resident memory exceeds "
-            "this many MiB. 0 disables (the default); the internal background "
-            "runtime still recycles at 1536 MiB. Busy sessions (turn in "
+            "this many MiB (default 4096). 0 disables; the internal background "
+            "runtime recycles at 1536 MiB, or at this value when it is lower. Busy sessions (turn in "
             "flight) are never recycled.",
         ),
     )
@@ -236,12 +267,12 @@ class KiroCrewAgentConfig:
         default="",
         metadata=_meta(
             "Worker Model",
-            "Model for the sessions this crewmate dispatches through "
+            "Model for the sessions this mate dispatches through "
             "session_create when the call names none. Empty copies the "
-            "crewmate's model pin when set; with both fields empty, no session "
+            "mate's model pin when set; with both fields empty, no session "
             "model is pinned and the worker's own agent or the global default "
             "decides. Unlike 'model', 'auto' is a real pin here: workers run "
-            "on the backend's own default, which is how a crewmate on a costly "
+            "on the backend's own default, which is how a mate on a costly "
             "model keeps its workers cheap. An explicit model on the call wins.",
         ),
     )
@@ -249,21 +280,43 @@ class KiroCrewAgentConfig:
         default="",
         metadata=_meta(
             "Worker Reasoning Effort",
-            "Reasoning effort for the sessions this crewmate dispatches through "
+            "Reasoning effort for the sessions this mate dispatches through "
             "session_create when the call names none. Empty means: while the "
-            "workers run the crewmate's own model (worker_model empty and no model "
-            "on the call) they take the crewmate's own effort (the field above); "
+            "workers run the mate's own model (worker_model empty and no model "
+            "on the call) they take the mate's own effort (the field above); "
             "under any other model no level is pinned and the worker's agent "
-            "decides as usual (its own crew pin if it runs as a crewmate, else "
+            "decides as usual (its own crew pin if it runs as a mate, else "
             "agent.reasoning_effort, else the model default). Set, one of the five "
             "standard levels. An explicit effort on the call wins.",
+        ),
+    )
+    acp_backend: str = field(
+        default="",
+        metadata=_meta(
+            "Harness",
+            "Agent harness for this crewmate's own chat and the worker sessions it "
+            "opens, spelled as agent.acp_backend (kiro, kas, claude, ...). Empty "
+            "inherits agent.member_acp_backend. A harness this gateway cannot start "
+            "refuses the session with the reason instead of running another one. "
+            "The model and worker_model pins are judged against this harness.",
+        ),
+    )
+    dynamic_capabilities: bool = field(
+        default=False,
+        metadata=_meta(
+            "Dynamic capabilities",
+            "Preview, per crewmate: this crewmate can find "
+            "new skills or tools for its worker and ask for them on a card in its "
+            "chat. Off (the default): only you add them, in this crewmate's "
+            "advanced settings, and it tells you when its worker lacks one. "
+            "Read per request, so a change reaches the crewmate's next session.",
         ),
     )
     approval_mode: str = field(
         default="",
         metadata=_meta(
             "Approval Mode",
-            "Tool approval for this crewmate's own Crewmates-page thread: normal, "
+            "Tool approval for this mate's own Mates-page thread: normal, "
             "trust_reads or trust. Empty means the user never chose one, and the "
             "thread opens in trust.",
         ),
@@ -305,6 +358,16 @@ class KiroCrewAgentConfig:
             "crews, so the dozens of package-installed crews the agent sync "
             "writes here can be collapsed behind the few you actually drive. "
             "Never read by routing, spawning, or the orchestrator.",
+        ),
+    )
+    star_order: int = field(
+        default=0,
+        metadata=_meta(
+            "Star order",
+            "Position of this starred crew in the dashboard's left dock, set by "
+            "dragging its row there. 1 is the top; 0 means not placed yet, which "
+            "sorts after every placed crew. Cleared when the crew is unstarred. "
+            "Purely a display preference, like starred.",
         ),
     )
     # Per-agent watchdog window overrides. The global ``watchdog.tool_stall_*``
@@ -383,6 +446,16 @@ class KiroCrewAgentConfig:
             "endpoint.",
         ),
     )
+    imported: dict = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Imported",
+            "Provenance stamp of a mate imported from a .crewmate file: "
+            "{'format_version', 'sender_label', 'sha256', 'imported_at'}. Empty "
+            "for a mate made here. The sender label is self-declared; nothing "
+            "reads the stamp to reach the sender.",
+        ),
+    )
 
 
 @dataclass
@@ -412,6 +485,143 @@ def _migrate_workspaces(raw_workspaces: dict) -> dict[str, WorkspaceConfig]:
     if not result:
         result["default"] = WorkspaceConfig()
     return result
+
+
+@dataclass
+class SessionEnvironmentProfileConfig:
+    """One named remote workspace profile the Session Environments UI offers.
+
+    Configuration only: a profile names a template and a working directory, it
+    does not provision anything. Validated by
+    ``config.session_environments.validate_profile``.
+    """
+
+    id: str = field(
+        default="",
+        metadata=_meta(
+            "Profile ID",
+            "Stable identifier: an ASCII letter or digit first, then letters, "
+            "digits, '_' or '-'; at most 64 characters and unique within the list.",
+        ),
+    )
+    name: str = field(
+        default="",
+        metadata=_meta("Profile Name", "Display name shown in the picker (1-128 characters)."),
+    )
+    template: str = field(
+        default="",
+        metadata=_meta(
+            "Template", "Name of the workspace template this profile uses (1-255 characters)."
+        ),
+    )
+    workdir: str = field(
+        default="",
+        metadata=_meta(
+            "Working Directory",
+            "Absolute POSIX path sessions start in inside the workspace "
+            "(at most 1024 characters).",
+        ),
+    )
+    compute_survives_stop: bool = field(
+        default=True,
+        metadata=_meta(
+            "Files Survive A Stop",
+            "Whether the template's workspace storage survives a workspace stop. "
+            "Turn it off for a template whose stop destroys the compute and its "
+            "files (such as MicroVM): Kiro Crew then never stops that workspace "
+            "itself, and its session is not recoverable after a stop.",
+        ),
+    )
+
+
+@dataclass
+class SessionEnvironmentsConfig:
+    """Persisted Session Environments settings (configuration only).
+
+    Saving this section registers no provider, activates no remote runtime and
+    contacts nothing. It holds no credential. The UI is gated by the per-device
+    preview flag, so there is deliberately no ``enabled`` field here.
+    """
+
+    coder_url: str = field(
+        default="",
+        metadata=_meta(
+            "Coder URL",
+            "Base URL of the Coder deployment: empty, or an http(s) URL with a "
+            "hostname and no username, password, query or fragment.",
+        ),
+    )
+    profiles: list[SessionEnvironmentProfileConfig] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Profiles",
+            "Named workspace profiles (at most 20), each {id, name, template, workdir, "
+            "compute_survives_stop}.",
+        ),
+    )
+    sprites_profiles: list[dict[str, Any]] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Sprites Profiles",
+            "Named Fly.io Sprites profiles (at most 20), each {id, name, token_secret, "
+            "workdir}. token_secret names the Settings > Secrets entry that holds the "
+            "Sprites API token; the token itself is never stored here.",
+        ),
+    )
+    boxd_profiles: list[dict[str, Any]] = field(
+        default_factory=list,
+        metadata=_meta(
+            "boxd Profiles",
+            "Named boxd machine profiles (at most 20), each {id, name, snapshot, vcpu, "
+            "workdir}. The gateway machine's own boxd auth login authenticates; no "
+            "credential is stored.",
+        ),
+    )
+
+    default_profile: str = field(
+        default="",
+        metadata=_meta(
+            "Default Environment",
+            "Profile id new dashboard chats start on; empty runs them on this machine. "
+            "Applied once, when a chat is created, and changeable in its composer until "
+            "the first message. Scheduled jobs, channels and subagents are unaffected "
+            "(a subagent follows its parent).",
+        ),
+    )
+
+    stop_on_shutdown: bool = field(
+        default=True,
+        metadata=_meta(
+            "Stop On Shutdown",
+            "Stop every remote session environment when the gateway shuts down, except "
+            "one whose files do not survive a workspace stop. Off keeps them running "
+            "across a restart, which reconnects faster. Coder's own auto-stop still "
+            "applies either way.",
+        ),
+    )
+
+    @classmethod
+    def from_raw(cls, section: object) -> "SessionEnvironmentsConfig":
+        """Build from the raw section, keeping every valid part (never raises)."""
+        from kiro_crew.config.session_environments import (
+            load_boxd_profiles,
+            load_default_profile,
+            load_session_environments,
+            load_sprites_profiles,
+            load_stop_on_shutdown,
+        )
+
+        coder_url, profiles = load_session_environments(section)
+        # Keep cross-provider collisions visible to the launch resolver: choosing
+        # one provider by list order could send an existing session elsewhere.
+        return cls(
+            coder_url=coder_url,
+            profiles=[SessionEnvironmentProfileConfig(**p) for p in profiles],
+            sprites_profiles=load_sprites_profiles(section),
+            boxd_profiles=load_boxd_profiles(section),
+            default_profile=load_default_profile(section),
+            stop_on_shutdown=load_stop_on_shutdown(section),
+        )
 
 
 @dataclass

@@ -18,6 +18,7 @@ from aiohttp import web
 
 from kiro_crew import session_directive
 from kiro_crew.dashboard import directive_queue
+from kiro_crew.dashboard.body_numbers import body_int
 from kiro_crew.dashboard.handlers._shared import guard_owner_surface_routes, internal_memory_scope
 from kiro_crew.dashboard.handlers.sessions_parts.app_scope import (
     _STATE_APPROVALS_NOT_APP_VISIBLE,
@@ -78,6 +79,7 @@ async def _resolve_app_approval(
     # Imported here: chat_handlers imports this package at module scope.
     from kiro_crew.dashboard.chat_handlers import (
         _app_may_send_to_slot,
+        _pending_elicitation_ids,
         deny_session_approval_caller,
     )
 
@@ -87,10 +89,16 @@ async def _resolve_app_approval(
     live: list[tuple[Any, asyncio.Future[str]]] = []
     if "origin" not in request.query:
         # Snapshot before any await: the permission reads below yield the loop.
+        # An MCP elicitation shares the slot's registry so a Stop and the Board
+        # see it, but it is the SERVER's question to a person, not a tool
+        # approval this grant covers: its future is not a candidate here, and
+        # the id reads as "does not exist" like every other refusal.
         live = [
             (slot, future)
             for slot in list(state._slots.values())
-            if (future := slot._approval_futures.get(approval_id)) and not future.done()
+            if (future := slot._approval_futures.get(approval_id))
+            and not future.done()
+            and approval_id not in _pending_elicitation_ids(slot)
         ]
     controllable = [pair for pair in live if await _app_may_send_to_slot(request_app, pair[0])]
     if len(controllable) == 1:
@@ -163,9 +171,33 @@ async def api_approval_resolve(request: web.Request) -> web.Response:
                 },
                 status=404,
             )
-        ok = state.resolve_approval(
-            approval_id, action == "approve", rejected_once=action == "reject_once"
+        # Shared Crew: resolve once under the decision registry, naming the
+        # verified responder; a different collaborator's later click gets 409
+        # with the winning decision, a retry of the same click replays it.
+        from kiro_crew.shared_crew import decisions as shared_decisions
+
+        try:
+            raw_body = await request.json() if request.can_read_body is True else {}
+        except ValueError:
+            raw_body = {}
+        response_id, response_id_ok = shared_decisions.read_response_id(
+            raw_body if isinstance(raw_body, dict) else {}
         )
+        if not response_id_ok:
+            return web.json_response(
+                {"error": "invalid response_id", "code": "invalid_response_id"}, status=400
+            )
+        reply = shared_decisions.resolve_approval_by_id(
+            state,
+            request,
+            approval_id,
+            approved=action == "approve",
+            rejected_once=action == "reject_once",
+            response_id=response_id,
+        )
+        if reply is not None:
+            return shared_decisions.respond(reply)
+        ok = False
     if not ok:
         return web.json_response({"error": "not found or expired"}, status=404)
     return web.json_response({"ok": True})
@@ -254,7 +286,7 @@ async def api_session_directive(request: web.Request) -> web.Response:
     # Lazy on purpose: mcp_core is the MCP server module and imports every tool
     # handler; no dashboard module loads it at import time, and this route is
     # the only one that needs it.
-    from kiro_crew import mcp_core
+    from kiro_crew import mcp_core, session_environment
 
     tool = str(body.get("tool") or "").strip()
     raw_args = body.get("raw_args")
@@ -284,7 +316,14 @@ async def api_session_directive(request: web.Request) -> web.Response:
             },
             status=400,
         )
-    derived = mcp_core.derive_directive(tool, raw_args, session_key)
+    if tool in session_environment.LOCAL_ONLY_CORE_TOOLS:
+        # The replay's remote-workspace guard would read the choices store on this
+        # loop; look it up in a thread and hand the replay the answer.
+        remote = await asyncio.to_thread(session_environment.session_runs_remotely, session_key)
+        with session_environment.known_placement(session_key, remote):
+            derived = mcp_core.derive_directive(tool, raw_args, session_key)
+    else:
+        derived = mcp_core.derive_directive(tool, raw_args, session_key)
     if derived is None:
         logger.warning(
             "session-directive REFUSED (not_derivable) for session_key=%r tool=%r: "
@@ -529,8 +568,8 @@ def _service_wait_ping(
         # killed MCP process, a hard stop). Safe to hand the slot to this one.
     if not prev or prev.get("wait_id") != wait_id:
         try:
-            remaining = max(0, min(1800, int(body.get("remaining") or 0)))
-            total = max(0, min(1800, int(body.get("seconds") or 0)))
+            remaining = max(0, min(1800, body_int(body.get("remaining") or 0)))
+            total = max(0, min(1800, body_int(body.get("seconds") or 0)))
         except (TypeError, ValueError):
             remaining, total = 0, 0
         slot._wait_state = {

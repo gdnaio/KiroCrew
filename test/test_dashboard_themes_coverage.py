@@ -31,9 +31,11 @@ from unittest.mock import AsyncMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from windows_sim import read_sharing_violation, read_text_sharing_violation
 
 import kiro_crew.platform.governance_profiles as gov_mod
 from conftest import requires_symlinks
+from kiro_crew import atomic_write as aw
 from kiro_crew import platform_compat
 from kiro_crew.dashboard.conditional_get import bare_etag_value, weak_content_etag
 from kiro_crew.dashboard.handlers import themes as th
@@ -148,6 +150,18 @@ class TestListThemesSync:
         (row,) = th._list_themes_sync()
         assert row == {"slug": "sunset", "name": "sunset", "emoji": "🎨", "created_at": ""}
 
+    def test_files_saved_with_a_bom_are_listed(self, themes_dir: Path) -> None:
+        """A hand-edited theme file saved by an editor that writes a UTF-8 BOM."""
+        bom = b"\xef\xbb\xbf"
+        (themes_dir / "sunset.json").write_bytes(bom + json.dumps({"name": "Sunset"}).encode())
+        (themes_dir / "lcars").mkdir()
+        (themes_dir / "lcars" / "theme.json").write_bytes(
+            bom + json.dumps({"name": "LCARS"}).encode()
+        )
+        rows = {r["slug"]: r for r in th._list_themes_sync()}
+        assert rows["sunset"]["name"] == "Sunset"
+        assert rows["lcars"]["name"] == "LCARS"
+
     def test_unparseable_custom_record_is_skipped(self, themes_dir: Path) -> None:
         _write_text(themes_dir / "broken.json", "{not json")
         _write_json(themes_dir / "ok.json", {"name": "Ok"})
@@ -178,6 +192,49 @@ class TestListThemesSync:
         _write_text(themes_dir / "bad" / "theme.json", "{{{")
         assert th._list_themes_sync() == []
 
+    @staticmethod
+    def _slugs_despite_bad_encoding() -> list[str]:
+        """List the slugs; a decode error escaping the list is the bug under test."""
+        try:
+            rows = th._list_themes_sync()
+        except UnicodeDecodeError as exc:
+            pytest.fail(f"one non-UTF-8 theme file failed the whole list: {exc}")
+        return [r["slug"] for r in rows]
+
+    def test_non_utf8_custom_record_is_skipped(self, themes_dir: Path) -> None:
+        # A latin-1 file is not UTF-8: reading it raises UnicodeDecodeError,
+        # which must skip that one theme rather than fail the whole list.
+        (themes_dir / "latin1.json").write_bytes('{"name": "Café"}'.encode("latin-1"))
+        _write_json(themes_dir / "ok.json", {"name": "Ok"})
+        assert self._slugs_despite_bad_encoding() == ["ok"]
+
+    def test_non_utf8_installed_manifest_is_skipped(self, themes_dir: Path) -> None:
+        # Install validation rejects a non-UTF-8 manifest, but the list scans
+        # whatever sits in the themes directory, including hand-copied packs.
+        bad = themes_dir / "copied" / "theme.json"
+        bad.parent.mkdir()
+        bad.write_bytes('{"name": "Café"}'.encode("latin-1"))
+        _write_json(themes_dir / "lcars" / "theme.json", {"name": "LCARS"})
+        assert self._slugs_despite_bad_encoding() == ["lcars"]
+
+    @pytest.mark.parametrize("non_object", [[], 42])
+    def test_non_object_custom_record_is_skipped(
+        self, themes_dir: Path, non_object: object
+    ) -> None:
+        # Valid JSON that is not an object has no .get, so it must be skipped
+        # like a corrupt file rather than fail the whole list.
+        _write_json(themes_dir / "odd.json", non_object)
+        _write_json(themes_dir / "ok.json", {"name": "Ok"})
+        assert [r["slug"] for r in th._list_themes_sync()] == ["ok"]
+
+    @pytest.mark.parametrize("non_object", [[], 42])
+    def test_non_object_installed_manifest_is_skipped(
+        self, themes_dir: Path, non_object: object
+    ) -> None:
+        _write_json(themes_dir / "odd" / "theme.json", non_object)
+        _write_json(themes_dir / "lcars" / "theme.json", {"name": "LCARS"})
+        assert [r["slug"] for r in th._list_themes_sync()] == ["lcars"]
+
     def test_dot_prefixed_staging_and_backup_dirs_are_never_listed(
         self, themes_dir: Path
     ) -> None:
@@ -190,6 +247,61 @@ class TestListThemesSync:
         real = _make_pack(tmp_path / "outside")
         (themes_dir / "linked").symlink_to(real, target_is_directory=True)
         assert th._list_themes_sync() == []
+
+    # On Windows a read that meets a save's or reinstall's replace raises
+    # PermissionError (a sharing violation). That is a valid theme mid-write, so
+    # the list retries it instead of dropping the theme like a corrupt file.
+
+    @pytest.fixture
+    def windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(aw, "_REPLACE_BACKOFF_SECONDS", 0)
+
+    @pytest.mark.parametrize(
+        ("rel", "slug"), [("sunset.json", "sunset"), ("lcars/theme.json", "lcars")]
+    )
+    def test_theme_locked_mid_save_is_still_listed(
+        self, windows: None, themes_dir: Path, rel: str, slug: str
+    ) -> None:
+        _write_json(themes_dir / rel, {"name": "Locked"})
+        target = str(themes_dir / rel)
+        # Both read paths fault once, so the test does not depend on which one
+        # the list uses: only a retry gets the theme listed.
+        with read_text_sharing_violation(match=target, times=1):
+            with read_sharing_violation(match=target, times=1):
+                rows = th._list_themes_sync()
+        assert [r["slug"] for r in rows] == [slug]
+
+    @pytest.mark.parametrize(
+        ("rel", "slug"), [("sunset.json", "sunset"), ("lcars/theme.json", "lcars")]
+    )
+    def test_theme_still_locked_after_retries_is_skipped_with_a_warning(
+        self,
+        windows: None,
+        themes_dir: Path,
+        rel: str,
+        slug: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _write_json(themes_dir / rel, {"name": "Locked"})
+        _write_json(themes_dir / "ok.json", {"name": "Ok"})
+        with caplog.at_level("WARNING", logger=th.logger.name):
+            target = str(themes_dir / rel)
+            with read_text_sharing_violation(match=target, times=10_000):
+                with read_sharing_violation(match=target, times=10_000):
+                    rows = th._list_themes_sync()
+        assert [r["slug"] for r in rows] == ["ok"]
+        warned = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warned) == 1
+        assert repr(slug) in warned[0].getMessage()
+
+    def test_corrupt_theme_is_skipped_without_a_warning(
+        self, windows: None, themes_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _write_text(themes_dir / "broken.json", "{not json")
+        with caplog.at_level("WARNING", logger=th.logger.name):
+            assert th._list_themes_sync() == []
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
     def test_sorted_oldest_first_with_undated_last(self, themes_dir: Path) -> None:
         _write_json(themes_dir / "b.json", {"name": "B", "created_at": "2026-05-05"})
@@ -204,6 +316,17 @@ class TestListThemesSync:
 class TestApiThemes:
     @pytest.mark.asyncio
     async def test_returns_the_enumerated_list(self, themes_dir: Path) -> None:
+        _write_json(themes_dir / "sunset.json", {"name": "Sunset"})
+        resp = await th.api_themes(_request("GET", "/api/themes"))
+        assert resp.status == 200
+        assert [t["slug"] for t in _body(resp)["themes"]] == ["sunset"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("non_object", [[], 42])
+    async def test_a_non_object_theme_file_does_not_fail_the_list(
+        self, themes_dir: Path, non_object: object
+    ) -> None:
+        _write_json(themes_dir / "odd.json", non_object)
         _write_json(themes_dir / "sunset.json", {"name": "Sunset"})
         resp = await th.api_themes(_request("GET", "/api/themes"))
         assert resp.status == 200
@@ -1018,6 +1141,17 @@ def _detail(method: str, slug: str, *, body: object = ...) -> web.Request:
     )
 
 
+class TestApiThemeDetailReadsABomFile:
+    @pytest.mark.asyncio
+    async def test_get_of_a_theme_saved_with_a_bom_is_200(self, themes_dir: Path) -> None:
+        (themes_dir / "sunset.json").write_bytes(
+            b"\xef\xbb\xbf" + json.dumps({"name": "Sunset"}).encode()
+        )
+        resp = await th.api_theme_detail(_detail("GET", "sunset"))
+        assert resp.status == 200
+        assert _body(resp)["name"] == "Sunset"
+
+
 class TestApiThemeDetailSlugGuard:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("slug", ["", "Upper", "../etc", "a/b", "a.b", "sp ace"])
@@ -1090,6 +1224,26 @@ class TestApiThemeDetailDelete:
         assert not (themes_dir / "lcars").exists()
 
     @pytest.mark.asyncio
+    async def test_a_pack_left_half_removed_reports_an_error(
+        self, themes_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A file another process holds open survives the delete on Windows.
+        # Simulate it: the rmtree removes every file but ``theme.json``.
+        pack = themes_dir / "lcars"
+        _make_pack(pack)
+
+        def leave_one_file(path: Any, *args: Any, **kwargs: Any) -> None:
+            for child in Path(path).rglob("*"):
+                if child.is_file() and child.name != "theme.json":
+                    child.unlink()
+
+        monkeypatch.setattr(th.shutil, "rmtree", leave_one_file)
+        resp = await th.api_theme_detail(_detail("DELETE", "lcars"))
+        assert resp.status == 500
+        assert _body(resp)["code"] == "theme_delete_incomplete"
+        assert (pack / "theme.json").is_file()
+
+    @pytest.mark.asyncio
     async def test_unknown_slug_is_404(self, themes_dir: Path) -> None:
         resp = await th.api_theme_detail(_detail("DELETE", "ghost"))
         assert resp.status == 404
@@ -1151,6 +1305,30 @@ class TestApiThemeDetailPut:
         assert _body(resp)["theme"]["created_at"]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("non_object", [[], 42])
+    async def test_non_object_existing_record_gets_a_fresh_created_at(
+        self, themes_dir: Path, non_object: object
+    ) -> None:
+        # The existing record is read only for its created_at; one that is not a
+        # JSON object is treated like a corrupt one, not a 500.
+        _write_json(themes_dir / "sunset.json", non_object)
+        resp = await th.api_theme_detail(_detail("PUT", "sunset", body=_theme_body()))
+        assert resp.status == 200
+        assert _body(resp)["theme"]["created_at"]
+
+    @pytest.mark.asyncio
+    async def test_non_utf8_existing_record_gets_a_fresh_created_at(
+        self, themes_dir: Path
+    ) -> None:
+        (themes_dir / "sunset.json").write_bytes('{"name": "Café"}'.encode("latin-1"))
+        try:
+            resp = await th.api_theme_detail(_detail("PUT", "sunset", body=_theme_body()))
+        except UnicodeDecodeError as exc:
+            pytest.fail(f"a non-UTF-8 record failed the update: {exc}")
+        assert resp.status == 200
+        assert _body(resp)["theme"]["created_at"]
+
+    @pytest.mark.asyncio
     async def test_blank_emoji_falls_back_to_the_default(self, themes_dir: Path) -> None:
         _write_json(themes_dir / "sunset.json", {"name": "Sunset"})
         resp = await th.api_theme_detail(
@@ -1172,6 +1350,16 @@ class TestApiThemeDetailGet:
     async def test_corrupt_record_is_500(self, themes_dir: Path) -> None:
         _write_text(themes_dir / "sunset.json", "{{{")
         resp = await th.api_theme_detail(_detail("GET", "sunset"))
+        assert resp.status == 500
+        assert _body(resp)["error"] == "failed to read theme"
+
+    @pytest.mark.asyncio
+    async def test_non_utf8_record_is_500(self, themes_dir: Path) -> None:
+        (themes_dir / "sunset.json").write_bytes('{"name": "Café"}'.encode("latin-1"))
+        try:
+            resp = await th.api_theme_detail(_detail("GET", "sunset"))
+        except UnicodeDecodeError as exc:
+            pytest.fail(f"a non-UTF-8 record escaped the read error handling: {exc}")
         assert resp.status == 500
         assert _body(resp)["error"] == "failed to read theme"
 

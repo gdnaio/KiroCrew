@@ -20,9 +20,8 @@ if TYPE_CHECKING:
         DashboardState,
         _is_slack_ts,
         _sel,
+        body_not_object_error,
         logger,
-        redact_credentials,
-        redact_exfiltration_urls,
     )
 
 
@@ -47,6 +46,9 @@ async def api_slack_pins(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    not_object = body_not_object_error(body)
+    if not_object is not None:
+        return not_object
 
     action = body.get("action", "")
     if action not in ("add", "remove", "list"):
@@ -92,8 +94,9 @@ async def api_slack_pins(request: web.Request) -> web.Response:
             # it to the caller (same output contract as send_message).
             pins = await slack.list_pins(channel)
             for pin in pins:
-                safe_text, _ = redact_credentials(pin.get("text", ""))
-                safe_text, _ = redact_exfiltration_urls(safe_text)
+                from kiro_crew.security import redact
+
+                safe_text = redact(pin.get("text", ""))
                 pin["text"] = safe_text
             result["pins"] = pins
         _sel().log_tool_invocation(
@@ -107,8 +110,9 @@ async def api_slack_pins(request: web.Request) -> web.Response:
         )
         return web.json_response(result)
     except Exception as e:
-        safe_error, _ = redact_credentials(str(e))
-        safe_error, _ = redact_exfiltration_urls(safe_error)
+        from kiro_crew.security import redact
+
+        safe_error = redact(str(e))
         _sel().log_tool_invocation(
             session_key="api",
             source="api",
@@ -142,6 +146,9 @@ async def api_slack_reactions(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    not_object = body_not_object_error(body)
+    if not_object is not None:
+        return not_object
 
     action = body.get("action", "")
     if action not in ("add", "remove"):
@@ -195,8 +202,9 @@ async def api_slack_reactions(request: web.Request) -> web.Response:
         )
         return web.json_response({"ok": True})
     except Exception as e:
-        safe_error, _ = redact_credentials(str(e))
-        safe_error, _ = redact_exfiltration_urls(safe_error)
+        from kiro_crew.security import redact
+
+        safe_error = redact(str(e))
         _sel().log_tool_invocation(
             session_key="api",
             source="api",
@@ -232,7 +240,7 @@ def _missing_scope_message(needed: str) -> str:
 
 async def api_slack_profile(request: web.Request) -> web.Response:
     """POST /api/slack-profile — read a Slack user's profile."""
-    from kiro_crew.security import redact_credentials, redact_exfiltration_urls  # noqa: F811
+    from kiro_crew.security import redact
     from kiro_crew.validation import USER_ID_RE  # noqa: F811
 
     state: DashboardState = request.app["state"]
@@ -240,6 +248,9 @@ async def api_slack_profile(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    not_object = body_not_object_error(body)
+    if not_object is not None:
+        return not_object
 
     raw_user = body.get("user", "")
     if not isinstance(raw_user, str):
@@ -250,8 +261,7 @@ async def api_slack_profile(request: web.Request) -> web.Response:
     # Validate format first, then redact (#2)
     if not USER_ID_RE.match(user_id):
         return web.json_response({"error": "invalid user ID format"}, status=400)
-    user_id, _ = redact_exfiltration_urls(user_id)
-    user_id, _ = redact_credentials(user_id)
+    user_id = redact(user_id)
 
     # Authorization first (deny-by-default) — reject before any side effects
     from kiro_crew.slack.handler import is_allowed_user  # noqa: F811
@@ -315,8 +325,7 @@ async def api_slack_profile(request: web.Request) -> web.Response:
                     downstream_service="slack",
                     resources=f"user={user_id} reason=missing_scope needed={needed}",
                 )
-                needed, _ = redact_credentials(needed)
-                needed, _ = redact_exfiltration_urls(needed)
+                needed = redact(needed)
                 return web.json_response({"error": _missing_scope_message(needed)}, status=403)
         logger.exception("slack-profile: failed for %s", user_id)
         _sel().log_tool_invocation(
@@ -332,8 +341,7 @@ async def api_slack_profile(request: web.Request) -> web.Response:
     for key in list(profile):
         val = profile[key]
         if isinstance(val, str) and key not in ("id",):
-            val, _ = redact_exfiltration_urls(val)
-            val, _ = redact_credentials(val)
+            val = redact(val)
             profile[key] = val
 
     _sel().log_tool_invocation(
@@ -355,20 +363,39 @@ async def api_slack_manifest(request: web.Request) -> web.Response:
     Slack's new-app deep link. ``command`` is the slash command that manifest
     registers. The gateway answers only ``/{slack.command}`` and this endpoint
     writes no config, so a caller that passes ``?alias=`` gets the value its
-    ``kirocrew config set slack.command`` step needs. Settings → Slack passes no
-    alias, so its link registers the default ``/kirocrew``. Serves only the
-    public template — no secrets.
+    ``kirocrew config set slack.command`` step needs. With no alias, the
+    endpoint renders for this install: the alias the saved ``slack.command`` was
+    generated from, and that command, so a manifest copied to update an existing
+    app keeps its slash command. Serves only the public template — no secrets.
     """
     from kiro_crew import slack_manifest
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.slack.features import manifest_features
 
-    # Default to a non-identifying alias: $USER is a host account name and
-    # should not be volunteered to every authenticated client.
-    alias = request.query.get("alias", "").strip() or slack_manifest.DEFAULT_ALIAS
+    try:
+        cfg = KiroCrewConfig.load()
+    except Exception:
+        cfg = None
+    explicit = request.query.get("alias", "").strip()
+    # With no ?alias, render for THIS install: the alias its saved slash command
+    # was generated from, and that command itself, so the manifest an existing
+    # app is updated from keeps the name and the /command the gateway answers.
+    # The default alias stays non-identifying: $USER is a host account name and
+    # is never volunteered to an authenticated client.
+    saved_command = str(getattr(getattr(cfg, "slack", None), "command", "") or "")
+    alias = explicit or slack_manifest.alias_for_command(saved_command)
     if not slack_manifest.valid_alias(alias):
         return web.json_response({"error": "invalid alias"}, status=400)
+    command = None if explicit else saved_command or None
+    # The SAME switches `kirocrew manifest` renders for: the manifest a user
+    # copies here must ask Slack for what the gateway will use.
     try:
-        rendered = slack_manifest.render(alias)
-        create_url = slack_manifest.deep_link(alias)
+        features = manifest_features(cfg) if cfg is not None else frozenset()
+    except Exception:
+        features = frozenset()
+    try:
+        rendered = slack_manifest.render(alias, features=features, command=command)
+        create_url = slack_manifest.deep_link(alias, features)
     except FileNotFoundError:
         return web.json_response({"error": "manifest template missing"}, status=500)
     return web.json_response(
@@ -376,6 +403,7 @@ async def api_slack_manifest(request: web.Request) -> web.Response:
             "alias": alias,
             "manifest": rendered,
             "create_url": create_url,
-            "command": slack_manifest.slash_command(alias),
+            "command": command or slack_manifest.slash_command(alias),
+            "features": [f for f in slack_manifest.FEATURES if f in features],
         }
     )

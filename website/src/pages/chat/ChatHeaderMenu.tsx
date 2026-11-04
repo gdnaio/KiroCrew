@@ -19,10 +19,11 @@ import { i18nT } from '../../i18n/t'
 import { deriveLoadedMcpTools } from '../../lib/mcpLoadedTools'
 import { useAppSelector } from '../../store'
 import type { McpServer } from '../../types'
+import InitialPromptSubmenu from './InitialPromptSubmenu'
 import McpToolsPanel from './McpToolsPanel'
 
 /** The session header's dropdown: reveal, rename, auto-title, mode, the MCP
- *  servers submenu and the rest of SessionActionsMenu. Header chrome, so it
+ *  servers and initial-prompt submenus and the rest of SessionActionsMenu. Header chrome, so it
  *  lives beside the page, not in the message-content module. */
 export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, onAutoTitle, mode, sidebarOnScreen, omitPopout, triggerLabel, newSessionHere }: {
   activeSlot: string | null; agent?: string; onReveal?: () => void; onRename?: () => void; onAutoTitle?: () => void; mode?: string
@@ -92,13 +93,13 @@ export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, onAutoTi
           /* No aria-label here: the visible title IS the accessible name, and the
              menu's role is appended as sr-only text -- an aria-label would replace
              the title, which on the phone this trigger is the only copy of. */
-          <button data-testid="session-title-menu" className="flex min-w-0 items-center gap-1 px-1 py-1 rounded-md text-text-strong cursor-pointer bg-transparent border-none transition-colors hover:bg-bg-hover" aria-haspopup="menu">
+          <button data-testid="session-title-menu" data-chat-header-focus className="flex min-w-0 items-center gap-1 px-1 py-1 rounded-md text-text-strong cursor-pointer bg-transparent border-none transition-colors hover:bg-bg-hover" aria-haspopup="menu">
             <span className="session-header-title text-[15px] font-semibold truncate min-w-0">{triggerLabel}</span>
             <span className="sr-only">, {i18nT('pages.chatPage.session_options')}</span>
             <ChevronDown size={16} className="shrink-0 text-muted" />
           </button>
         ) : (
-          <button className="px-0.5 py-1 rounded-md text-muted hover:text-text cursor-pointer bg-transparent border-none transition-all" aria-label={i18nT('pages.chatPage.session_options')}>
+          <button data-chat-header-focus className="px-0.5 py-1 rounded-md text-muted hover:text-text cursor-pointer bg-transparent border-none transition-all" aria-label={i18nT('pages.chatPage.session_options')}>
             <ChevronDown size={14} />
           </button>
         )}
@@ -144,6 +145,9 @@ export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, onAutoTi
                 />
               </DropdownMenuSubContent>
             </DropdownMenuSub>,
+            // The session's first prompt, with Copy and "New session from this
+            // prompt" (#25977). Read lazily from the start of the transcript.
+            <InitialPromptSubmenu key="initial-prompt" slotKey={activeSlot} mode={mode} onStarted={() => setOpen(false)} />,
           ]}
           onReveal={onReveal}
           onAutoTitle={onAutoTitle}

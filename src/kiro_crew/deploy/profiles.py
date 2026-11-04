@@ -33,12 +33,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator
 
-from kiro_crew.atomic_write import replace_with_retry
+from kiro_crew.atomic_write import read_bytes_with_retry, replace_with_retry
 from kiro_crew.config.paths import config_dir
-from kiro_crew.constants import AWS_PROFILE_NAME_RE
+from kiro_crew.constants import AWS_PROFILE_FIRST_CHARS, AWS_PROFILE_NAME_RE
 from kiro_crew.deploy import engine
 from kiro_crew.platform_compat import file_lock, open_lock_file
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.validation import FieldSpec, ValidationError, validate_field
 
 logger = logging.getLogger(__name__)
@@ -87,6 +86,16 @@ _NOTE_MAX = 256
 # (stripped before matching, so the anchor is behavior-neutral there).
 _PROFILE_RE = AWS_PROFILE_NAME_RE
 PROFILE_SPEC = FieldSpec(name="profile", type=str, max_len=128, pattern=_PROFILE_RE)
+# What a STORED entry's name may look like: the union of every writer's own
+# charset. The deploy routes write PROFILE_SPEC names; the AWS control app's
+# register route admits ``@`` and ``=`` as well (``aws_consent._PROFILE_RE``,
+# the legacy continuation set the AWS CLI itself accepts). Both are inert in
+# the remediation command once ``shlex.join`` quotes them. Checking a stored
+# name against the narrower request spec would drop a name a shipped writer
+# registered, which is a data-loss shape, not a refusal. Composed from
+# AWS_PROFILE_FIRST_CHARS per the contract in constants.py.
+_STORED_PROFILE_RE = re.compile(rf"^[{AWS_PROFILE_FIRST_CHARS}][{AWS_PROFILE_FIRST_CHARS}@=-]{{0,127}}\Z")
+STORED_PROFILE_SPEC = FieldSpec(name="profile", type=str, max_len=128, pattern=_STORED_PROFILE_RE)
 # Multi-segment to admit GovCloud (us-gov-west-1) alongside standard regions;
 # max_len=32 keeps the backtracking surface negligible.
 _REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d+$")
@@ -117,6 +126,9 @@ def locked_registry() -> Generator[dict[str, Any], None, None]:
 
     The lock is held for the entire context — concurrent callers block until
     release. This prevents interleaved load/mutate/save from losing writes.
+
+    The save never replaces an unreadable ``profiles.json`` with an empty registry
+    plus one edit: :func:`_load_registry_for_update` moves such a file aside first.
     """
     _data_dir().mkdir(parents=True, exist_ok=True)
     lock_path = _registry_path().with_suffix(".lock")
@@ -127,32 +139,164 @@ def locked_registry() -> Generator[dict[str, Any], None, None]:
     # the Windows rationale.
     with open_lock_file(lock_path) as fd:
         with file_lock(fd, exclusive=True, required=True):
-            reg = load_registry()
+            reg = _load_registry_for_update()
             yield reg
             # Persist on clean exit (exceptions skip save, lock still releases)
-            tmp_fd = tempfile.NamedTemporaryFile(
-                mode="w", dir=str(_data_dir()), suffix=".json.tmp",
-                delete=False, encoding="utf-8",
-            )
-            try:
-                tmp_fd.write(json.dumps(reg, indent=2))
-                tmp_fd.flush()
-                os.fsync(tmp_fd.fileno())
-                tmp_fd.close()
-                replace_with_retry(tmp_fd.name, _registry_path())
-            except BaseException:
-                tmp_fd.close()
-                try:
-                    os.unlink(tmp_fd.name)
-                except OSError:
-                    pass
-                raise
+            _write_registry_file(reg)
+
+
+class RegistryUnreadableError(Exception):
+    """``profiles.json`` cannot be read or set aside, so a write would replace it."""
+
+
+def _load_registry_for_update() -> dict[str, Any]:
+    """The registry a locked write starts from.
+
+    :func:`load_registry` degrades for readers, so one bad file cannot 500 every
+    route. A writer cannot start from that answer as it stands: the empty registry
+    it returns would be saved over the profiles still in the file. Here a present
+    file that cannot be decoded or parsed as a registry is moved aside to
+    ``<name>.corrupt-<utc>`` with a warning first, so its bytes outlive the save;
+    the write then starts where a missing file does. When the read itself fails, or
+    the move does, the write raises :class:`RegistryUnreadableError` and the file
+    stays as it is. A UTF-8 byte-order mark is not content and reads normally.
+    """
+    path = _registry_path()
+    try:
+        raw = json.loads(read_bytes_with_retry(path).decode("utf-8-sig"))
+    except FileNotFoundError:
+        return load_registry()
+    except OSError as e:
+        # A read that fails says nothing about the bytes, which may be a good registry:
+        # moving it aside would hide every profile, so the write is refused instead.
+        raise RegistryUnreadableError(f"{path} could not be read ({e}); not saving over it") from e
+    except ValueError as e:
+        _set_aside(path, e)
+        return load_registry()
+    # ``_parse_registry`` drops what it cannot use, so a ``profiles`` mapping or string
+    # would parse to an empty registry without raising. A writer keeps such a file.
+    if not isinstance(raw, dict) or not isinstance(raw.get("profiles", []), list):
+        _set_aside(path, "not a profile registry: no profiles list")
+        return load_registry()
+    return _parse_registry(raw)
+
+
+def _set_aside(path: Path, reason: object) -> None:
+    """Move an unreadable registry to ``<name>.corrupt-<utc>`` so a save cannot destroy it."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    aside = path.with_name(f"{path.name}.corrupt-{stamp}")
+    try:
+        replace_with_retry(path, aside)
+    except OSError as e:
+        raise RegistryUnreadableError(
+            f"{path} could not be read ({reason}) or moved aside ({e}); not saving over it"
+        ) from e
+    logger.warning(
+        "deploy profile registry %s could not be read (%s); moved it to %s before saving",
+        path, reason, aside.name,
+    )
+
+
+def _write_registry_file(reg: dict[str, Any]) -> None:
+    """Replace the registry file with ``reg`` through a fsynced temp file in the
+    same directory. The caller holds the registry lock."""
+    tmp_fd = tempfile.NamedTemporaryFile(
+        mode="w", dir=str(_data_dir()), suffix=".json.tmp",
+        delete=False, encoding="utf-8",
+    )
+    try:
+        tmp_fd.write(json.dumps(reg, indent=2))
+        tmp_fd.flush()
+        os.fsync(tmp_fd.fileno())
+        tmp_fd.close()
+        replace_with_retry(tmp_fd.name, _registry_path())
+    except BaseException:
+        tmp_fd.close()
+        try:
+            os.unlink(tmp_fd.name)
+        except OSError:
+            pass
+        raise
 
 
 def make_entry(name: str, region: str, *, account: str = "", verified_at: str = "",
                note: str = "") -> dict[str, str]:
     return {"name": name, "region": region or DEFAULT_REGION,
             "account": account, "verified_at": verified_at, "note": note[:_NOTE_MAX]}
+
+
+def _well_formed_entry(raw: Any) -> bool:
+    """True when a stored registry entry's ``name`` and ``region`` pass the
+    field specs its writers enforce (``STORED_PROFILE_SPEC`` / ``REGION_SPEC``).
+
+    The registry file is agent-writable, and a stored entry's name and region
+    flow into ``aws`` argv and into the copyable remediation command exactly
+    like a request's ``profile`` does -- but ``_resolve_profile`` validates only
+    the request parameter, and a request that names no profile is served the
+    registry default unvalidated. Checking here on load is what makes "a deploy
+    only ever runs with a registered profile" also mean a well-formed one. An
+    empty region is admitted: ``make_entry`` fills in the default.
+
+    The stored value itself must pass, not a cleaned copy of it:
+    ``validate_field`` sanitizes a string (control characters, NUL, padding)
+    before matching the pattern and returns the cleaned form, while the entry
+    keeps the raw one. A raw ``"p\\x00"`` that validates as ``"p"`` would still
+    be the string handed to ``aws`` argv, where an embedded NUL raises out of
+    ``subprocess`` as a 500. So an entry is well formed only when validation
+    returns it unchanged.
+    """
+    if not isinstance(raw, dict):
+        return False
+    name = raw.get("name")
+    region = raw.get("region", "")
+    if not isinstance(name, str) or not name or not isinstance(region, str):
+        logger.warning("deploy profile registry: dropping malformed entry %r", str(name)[:40])
+        return False
+    try:
+        clean_name = validate_field(name, STORED_PROFILE_SPEC)
+        clean_region = validate_field(region, REGION_SPEC) if region else ""
+    except ValidationError:
+        clean_name, clean_region = "", None
+    if clean_name != name or clean_region != region:
+        logger.warning("deploy profile registry: dropping malformed entry %r", name[:40])
+        return False
+    return True
+
+
+def _parse_registry(raw: Any) -> dict[str, Any]:
+    """Build the v2 registry from a parsed ``profiles.json``-shaped document.
+
+    Entries that fail :func:`_well_formed_entry` are left out. The default is
+    then settled by WHY it is missing: a default that names no entry at all (a
+    stale pointer) falls back to the first profile, as it always has; a default
+    whose entry was present but dropped as malformed becomes ``""``. Falling
+    back there would silently point a deploy that names no profile at a
+    different account and region, with no error -- a 400 "not configured" is
+    the honest answer, and the warning log names the dropped entry.
+
+    This is a LOAD-time guarantee only: this function never substitutes a
+    profile. A later registry write runs under its own rules -- the AWS
+    control app's unregister route, for one, fills an empty default with the
+    first kept profile -- so the cleared default can be re-pointed by an
+    explicit profile edit afterwards.
+    """
+    entries = [p for p in raw.get("profiles", []) if isinstance(p, dict)]
+    profiles = [
+        make_entry(str(p.get("name", "")), str(p.get("region", "")),
+                   account=str(p.get("account", "")),
+                   verified_at=str(p.get("verified_at", "")),
+                   note=str(p.get("note", "")))
+        for p in entries if _well_formed_entry(p)
+    ][:_MAX_PROFILES]
+    default = str(raw.get("default", ""))
+    if default and not any(p["name"] == default for p in profiles):
+        # str(): the stored name may be a bare number (``123456789012``), which
+        # the loader has always normalized through ``str`` and which fails
+        # _well_formed_entry as a non-string; comparing the raw value would miss
+        # it and fall back to another profile, i.e. another account.
+        default_was_dropped = any(str(p.get("name", "")) == default for p in entries)
+        default = "" if default_was_dropped else (profiles[0]["name"] if profiles else "")
+    return {"version": 2, "profiles": profiles, "default": default}
 
 
 def load_registry() -> dict[str, Any]:
@@ -172,46 +316,36 @@ def load_registry() -> dict[str, Any]:
     implements (try the legacy registry, then the v1 config, then an empty
     registry) rather than inventing a second recovery, and it fixes every reader
     at once instead of asking each call site to guard a shape it did not parse.
+    A file that is not UTF-8 takes the same path: its ``UnicodeDecodeError`` is a
+    ``ValueError``, not a ``json.JSONDecodeError``, so it is named separately.
+    Each read drops one leading UTF-8 byte-order mark (``utf-8-sig``), the form
+    Windows PowerShell 5.1 ``Set-Content -Encoding UTF8`` saves.
+
+    Writers do not start from this answer for a present file: :func:`locked_registry`
+    reads through :func:`_load_registry_for_update`, which moves a file this function
+    would degrade aside before the save.
     """
     try:
-        raw = json.loads(_registry_path().read_text(encoding="utf-8"))
-        profiles = [
-            make_entry(str(p.get("name", "")), str(p.get("region", "")),
-                       account=str(p.get("account", "")),
-                       verified_at=str(p.get("verified_at", "")),
-                       note=str(p.get("note", "")))
-            for p in raw.get("profiles", []) if isinstance(p, dict) and p.get("name")
-        ][:_MAX_PROFILES]
-        default = str(raw.get("default", ""))
-        if default and not any(p["name"] == default for p in profiles):
-            default = profiles[0]["name"] if profiles else ""
-        return {"version": 2, "profiles": profiles, "default": default}
-    except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError, TypeError):
+        return _parse_registry(json.loads(_registry_path().read_text(encoding="utf-8-sig")))
+    except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError,
+            AttributeError, TypeError):
         pass
     # Legacy app-dir registry migration (apps/deploy-web/data/profiles.json)
     try:
-        raw = json.loads(_legacy_registry_path().read_text(encoding="utf-8"))
-        profiles = [
-            make_entry(str(p.get("name", "")), str(p.get("region", "")),
-                       account=str(p.get("account", "")),
-                       verified_at=str(p.get("verified_at", "")),
-                       note=str(p.get("note", "")))
-            for p in raw.get("profiles", []) if isinstance(p, dict) and p.get("name")
-        ][:_MAX_PROFILES]
-        default = str(raw.get("default", ""))
-        if default and not any(p["name"] == default for p in profiles):
-            default = profiles[0]["name"] if profiles else ""
-        return {"version": 2, "profiles": profiles, "default": default}
-    except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError, TypeError):
+        return _parse_registry(json.loads(_legacy_registry_path().read_text(encoding="utf-8-sig")))
+    except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError,
+            AttributeError, TypeError):
         pass
     # v1 single-profile migration path (apps/deploy-web/data/config.json)
     try:
-        legacy = json.loads(_legacy_config_path().read_text(encoding="utf-8"))
-        name = str(legacy.get("profile", ""))
-        if name:
+        legacy = json.loads(_legacy_config_path().read_text(encoding="utf-8-sig"))
+        if _well_formed_entry({"name": legacy.get("profile", ""),
+                               "region": legacy.get("region", "")}):
+            name = str(legacy["profile"])
             return {"version": 2, "default": name,
                     "profiles": [make_entry(name, str(legacy.get("region", "")))]}
-    except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError, TypeError):
+    except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError,
+            AttributeError, TypeError):
         pass
     return {"version": 2, "profiles": [], "default": ""}
 
@@ -222,23 +356,7 @@ def save_registry(reg: dict[str, Any]) -> dict[str, Any]:
     # open_lock_file: writable but non-truncating; see locked_registry above.
     with open_lock_file(lock_path) as fd:
         with file_lock(fd, exclusive=True, required=True):
-            tmp_fd = tempfile.NamedTemporaryFile(
-                mode="w", dir=str(_data_dir()), suffix=".json.tmp",
-                delete=False, encoding="utf-8",
-            )
-            try:
-                tmp_fd.write(json.dumps(reg, indent=2))
-                tmp_fd.flush()
-                os.fsync(tmp_fd.fileno())
-                tmp_fd.close()
-                replace_with_retry(tmp_fd.name, _registry_path())
-            except BaseException:
-                tmp_fd.close()
-                try:
-                    os.unlink(tmp_fd.name)
-                except OSError:
-                    pass
-                raise
+            _write_registry_file(reg)
     return reg
 
 
@@ -313,8 +431,8 @@ def _configure_set(key: str, value: str, profile: str) -> str | None:
     rc, _out, err = engine.run_aws(["configure", "set", key, value], profile)
     if rc != 0:
         raw = (err or f"aws configure set {key} failed").strip()[:200]
-        raw, _ = redact_credentials(raw)
-        raw, _ = redact_exfiltration_urls(raw)
+        from kiro_crew.security import redact
+        raw = redact(raw)
         return raw
     return None
 
@@ -331,9 +449,9 @@ def create_aws_profile(name: str, region: str, *, account: str = "",
     credentials come from however the user otherwise configures it).
     Returns an error string, or None on success.
     """
-    # Reject Windows BEFORE any AWS call — engine.run_aws uses
-    # subprocess preexec_fn (unsupported on nt); reaching it mid-way could
-    # leave a partially-written profile (region set, credentials not).
+    # Reject Windows BEFORE any AWS call — deploy features are POSIX-only, and
+    # refusing any later than this could leave a partially-written profile
+    # (region set, credentials not).
     if os.name == "nt":
         return "deploy features are not supported on Windows"
 
@@ -361,12 +479,6 @@ def create_aws_profile(name: str, region: str, *, account: str = "",
         # aws via subprocess (argv list, no shell pipe) so there is only ONE
         # level of quoting -- outer single quotes for shlex, double quotes
         # inside. Nested bash -c quoting is fragile and breaks silently.
-        if os.name == "nt":
-            return (
-                "credential_process is not supported on Windows. "
-                "Please configure AWS credentials manually via `aws configure` "
-                "or environment variables."
-            )
         python_bin = sys.executable or "python3"
         # Deliberately a bare "aws" (NOT the deploy engine's absolute resolver):
         # this command is persisted into ~/.aws/config and later run by

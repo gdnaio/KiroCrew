@@ -39,6 +39,7 @@ from kiro_crew.dashboard.handlers import security
 from kiro_crew.dashboard.handlers.security import (
     build_trusted_apps_snapshot,
 )
+from kiro_crew.testing.wait import async_wait_until
 
 # A real builtin: its name is declared by a SHIPPED app.json, so it is exempt at
 # the gate and must never be granted or torn down by this surface.
@@ -462,15 +463,16 @@ def _beacon_body(beacon: Path) -> str:
     )
 
 
-def _await_beacon(beacon: Path, timeout: float = 5.0) -> str:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if beacon.exists():
-            text = beacon.read_text(encoding="utf-8")
-            if text:
-                return text
-        time.sleep(0.05)
-    raise AssertionError(f"backend never wrote {beacon}")
+async def _await_beacon(beacon: Path, timeout: float = 5.0) -> str:
+    def _text() -> str:
+        return beacon.read_text(encoding="utf-8") if beacon.exists() else ""
+
+    return await async_wait_until(
+        _text,
+        timeout=timeout,
+        off_loop=True,
+        describe=lambda: f"backend never wrote {beacon}",
+    )
 
 
 @pytest.mark.asyncio
@@ -516,7 +518,7 @@ async def test_revoke_stops_the_backend_process_and_the_beacon(
         # Precondition: the third-party code is alive and demonstrably running.
         assert proc.proc.poll() is None
         assert _LOOP_APP in appbackend._processes
-        before = _await_beacon(beacon)
+        before = await _await_beacon(beacon)
 
         async with _client() as client:
             resp = await client.delete(f"/api/security/trusted-apps/{_LOOP_APP}")
@@ -1265,7 +1267,7 @@ async def test_a_failing_on_disable_warns_but_never_refuses_the_withdrawal(
     _install(tmp_path, _APP, enabled=True)
     # `enabled: True` matters: teardown only runs the app's OWN shutdown code
     # when there is reason to believe it is running. The not-running case is
-    # covered by test_a_disabled_apps_own_code_is_not_launched_by_a_revoke.
+    # covered by test_a_disabled_apps_own_code_is_not_launched_by_an_ordinary_disable.
     record = {
         "resources": "app",
         "enabled": True,

@@ -17,7 +17,7 @@ from enum import Enum
 from typing import Any, Protocol
 
 from kiro_crew.monitoring.limits import MAX_RUNTIME_CEILING_SECS
-from kiro_crew.monitoring.registry import PULL_REQUEST_MONITOR_KINDS
+from kiro_crew.monitoring.registry import PULL_REQUEST_MONITOR_KINDS, is_pull_request_monitor_kind
 
 logger = logging.getLogger(__name__)
 
@@ -778,6 +778,25 @@ class MonitorProbe(Protocol):
     ) -> Mapping[str, MonitorProbeResult]: ...
 
 
+class MonitorProbeProvider(MonitorProbe, Protocol):
+    """The probe contract the controller calls, one provider per monitored kind.
+
+    :class:`MonitorProbe` plus ``use_owner_credentials``: the controller passes
+    False when the monitor's owner did not authorize probing with their
+    credentials. The persistence-only path (``shadow.run_shadow_probe``) takes the
+    narrower :class:`MonitorProbe` because it never applies that gate. Every
+    built-in provider and every contributed kind's provider satisfies both.
+    """
+
+    def probe(
+        self,
+        subjects: Sequence[str],
+        *,
+        previous_observations: Mapping[str, Mapping[str, object]] | None = None,
+        use_owner_credentials: bool = True,
+    ) -> Mapping[str, MonitorProbeResult]: ...
+
+
 def transient_probe_failure() -> MonitorProbeResult:
     """The result a probe that could not answer usably is treated as returning."""
     return MonitorProbeResult(
@@ -1063,6 +1082,13 @@ class MonitorState:
     #: because no outcome is recorded in the meantime a restart in the window finds
     #: a plain live loop rather than one tagged as finished and refused revival.
     terminal_pending: str = ""
+    #: Non-empty once that owed turn LANDED but its settlement has not: the delivery
+    #: moves the outcome out of ``terminal_pending`` into this field, so a restart
+    #: in the window settles without repeating the channel turn. A separate field,
+    #: not a new value of ``terminal_pending``, so a gateway that predates it files
+    #: the key under ``extra_fields`` and writes it back untouched, reads nothing
+    #: owed, and keeps the monitor running at the same state version.
+    terminal_delivered: str = ""
     next_probe_at: float = 0.0
     outcome: MonitorOutcome | None = None
     stopped_reason: str = ""
@@ -1162,6 +1188,8 @@ class MonitorState:
         # look rather than a false all-clear.
         if not isinstance(self.terminal_pending, str):
             self.terminal_pending = "blocked" if self.terminal_pending else ""
+        if not isinstance(self.terminal_delivered, str):
+            self.terminal_delivered = "blocked" if self.terminal_delivered else ""
         if not isinstance(self.budgets, MonitorBudgets):
             raise ValueError("budgets must be MonitorBudgets")
         if not isinstance(self.creation_surface, MonitorCreationSurface):
@@ -1462,7 +1490,7 @@ def _public_pull_request_observation(
     pull_request_state = projected.get("state")
     if (
         projected.get("kind") != expected_kind
-        or expected_kind not in PULL_REQUEST_MONITOR_KINDS
+        or not is_pull_request_monitor_kind(expected_kind)
         or not isinstance(projected.get("target"), str)
         or not projected.get("target")
         or not isinstance(projected.get("head_revision"), str)

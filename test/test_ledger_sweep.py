@@ -446,25 +446,68 @@ def test_the_sweep_is_its_own_command_and_doctor_stays_read_only(monkeypatch, tm
     so the sweep is a top-level command: its flags belong to it alone, and a
     modifier handed to ``doctor`` is an argparse error rather than a health pass
     that exits 0 and reads like a purge that found nothing."""
+    import logging
     import sys
 
     from kiro_crew.cli import main
+    from kiro_crew.cli_log_files import _AppendOnlyLogFileHandler, _OwnerOnlyRotatingFileHandler
+
+    # Snapshot both loggers' handlers BEFORE calling main().  main() calls
+    # _setup_cli_logging, which installs a _AppendOnlyLogFileHandler on the
+    # ``kiro_crew`` logger pointing at a path under ``tmp_path``.  When
+    # pytest later deletes tmp_path the handler is still installed on the
+    # process-global logger, so any subsequent kiro_crew log record causes a
+    # FileNotFoundError whose traceback formatting (via handleError) races
+    # half-finalised PosixPath objects and fires an unraisable exception that
+    # is blamed on the next innocent test.  The finally below removes every
+    # handler the main() calls add, and the assertion below acts as a
+    # regression guard.
+    kiro_logger = logging.getLogger("kiro_crew")
+    pre_kiro_handlers = frozenset(kiro_logger.handlers)
 
     monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
     ran: list[dict[str, object]] = []
     monkeypatch.setattr(sweep, "run_command", lambda **kwargs: ran.append(kwargs))
 
-    monkeypatch.setattr(sys, "argv", ["kirocrew", "ledger-sweep", "--older-than-days", "7"])
-    main()
-    assert ran == [{"purge": False, "older_than_days": 7.0, "purge_unreadable": False}]
-
-    monkeypatch.setattr(sys, "argv", ["kirocrew", "doctor", "--purge"])
-    with pytest.raises(SystemExit) as exit_info:
+    try:
+        monkeypatch.setattr(sys, "argv", ["kirocrew", "ledger-sweep", "--older-than-days", "7"])
         main()
-    assert exit_info.value.code == 2
-    err = capsys.readouterr().err
-    assert "unrecognized arguments: --purge" in err
-    assert len(ran) == 1, "doctor never reaches the sweep"
+        assert ran == [{"purge": False, "older_than_days": 7.0, "purge_unreadable": False}]
+
+        monkeypatch.setattr(sys, "argv", ["kirocrew", "doctor", "--purge"])
+        with pytest.raises(SystemExit) as exit_info:
+            main()
+        assert exit_info.value.code == 2
+        err = capsys.readouterr().err
+        assert "unrecognized arguments: --purge" in err
+        assert len(ran) == 1, "doctor never reaches the sweep"
+    finally:
+        # Close and remove every file handler main() added to the named
+        # loggers.  We deliberately skip the root logger: pytest's
+        # catching_logs fixture adds and removes its own handlers per test
+        # phase, and snapshotting it would re-attach a phase handler that
+        # the framework already removed.
+        for lgr in (kiro_logger,):
+            for h in list(lgr.handlers):
+                if h in pre_kiro_handlers:
+                    continue
+                if isinstance(h, (_AppendOnlyLogFileHandler, _OwnerOnlyRotatingFileHandler)):
+                    lgr.removeHandler(h)
+                    h.close()
+        # Regression guard: no stray file handler should survive after the
+        # test. A failure here means _setup_cli_logging changed its attach
+        # target; update the cleanup loop above accordingly.
+        stray = [
+            h
+            for h in kiro_logger.handlers
+            if h not in pre_kiro_handlers
+            and isinstance(h, (_AppendOnlyLogFileHandler, _OwnerOnlyRotatingFileHandler))
+        ]
+        assert not stray, (
+            f"_setup_cli_logging left {len(stray)} stray file handler(s) on the kiro_crew "
+            f"logger after the test: {stray}. The test cleanup in this function must be "
+            f"updated to remove them so they do not outlive tmp_path."
+        )
 
 
 # ── doctor's count line ──────────────────────────────────────────────────
@@ -1373,3 +1416,88 @@ def test_the_cli_reports_an_unreadable_root_as_a_failure(monkeypatch, capsys):
         sweep.run_command(purge=False, older_than_days=None, purge_unreadable=False)
     assert exit_info.value.code == 1
     assert "could not read the ledger stores" in capsys.readouterr().out
+
+
+# ── the exit code says whether the purge did what it listed ─────────────────
+
+
+def test_a_purge_whose_delete_fails_finishes_the_rest_and_exits_non_zero(monkeypatch, capsys):
+    """A failed delete must not read as a clean run to a script that checks the
+    exit code. The sweep still finishes every other delete, names the store that
+    did not go on stderr, and exits 1."""
+    stuck = _work_ledger("chat-30-stuck")
+    gone = _session_ledger("chat-31-gone", phase="done", age_days=90)
+    real_purge_conductor = wl.purge_conductor
+
+    def _refuse_one(slot_key, **kwargs):
+        if slot_key == "chat-30-stuck":
+            raise PermissionError(13, "Permission denied")
+        return real_purge_conductor(slot_key, **kwargs)
+
+    monkeypatch.setattr(wl, "purge_conductor", _refuse_one)
+
+    with pytest.raises(SystemExit) as exit_info:
+        sweep.run_command(purge=True, older_than_days=None, purge_unreadable=False)
+
+    assert exit_info.value.code == 1
+    captured = capsys.readouterr()
+    assert "purged 1, failed 1" in captured.out
+    assert f"could not delete work {stuck.name}" in captured.err
+    assert "key=chat-30-stuck" in captured.err
+    assert not gone.exists(), "the other delete still runs"
+    assert stuck.is_dir()
+
+
+def test_a_purge_with_no_failure_returns_normally(capsys):
+    """The success path keeps exit 0: only a delete that did not go changes it."""
+    work = _work_ledger("chat-32-clean")
+
+    sweep.run_command(purge=True, older_than_days=None, purge_unreadable=False)
+
+    captured = capsys.readouterr()
+    assert "purged 1" in captured.out and "failed" not in captured.out
+    assert captured.err == ""
+    assert not work.exists()
+
+
+def test_purge_unreadable_without_purge_is_refused_not_ignored(monkeypatch, capsys):
+    """``--purge-unreadable`` modifies ``--purge``. Alone it must not run a dry
+    run that exits 0 and reads like a purge that found nothing: it is refused
+    with exit 2 before any store is read."""
+    scanned: list[float] = []
+
+    def _fake_scan(*, older_than_days):
+        scanned.append(older_than_days)
+        return sweep.SweepReport((), 0, older_than_days)
+
+    monkeypatch.setattr(sweep, "scan", _fake_scan)
+
+    with pytest.raises(SystemExit) as exit_info:
+        sweep.run_command(purge=False, older_than_days=None, purge_unreadable=True)
+
+    assert exit_info.value.code == 2
+    assert "--purge-unreadable only works with --purge" in capsys.readouterr().err
+    assert scanned == []
+
+
+def test_a_work_ledger_an_overlapping_sweep_removed_is_not_a_failure(monkeypatch, capsys):
+    """Two purges over one report: the second finds the store gone and
+    ``purge_conductor`` answers False. The store is gone, so it counts as
+    removed and the command exits 0."""
+    work = _work_ledger("chat-33-raced")
+    report = sweep.scan(older_than_days=30)
+    real_purge_conductor = wl.purge_conductor
+
+    def _already_gone(slot_key, **kwargs):
+        real_purge_conductor(slot_key, **kwargs)
+        return False
+
+    monkeypatch.setattr(wl, "purge_conductor", _already_gone)
+    monkeypatch.setattr(sweep, "scan", lambda *, older_than_days: report)
+
+    sweep.run_command(purge=True, older_than_days=None, purge_unreadable=False)
+
+    captured = capsys.readouterr()
+    assert "purged 1" in captured.out and "failed" not in captured.out
+    assert captured.err == ""
+    assert not work.exists()

@@ -20,6 +20,7 @@ _TO_DICT_KEYS = (
     "title",
     "agent",
     "agent_kind",
+    "crew_mode_agent",
     "effective_agent",
     "model",
     # The owner's per-turn model-routing choice (the picker's "Auto (Jev)" entry).
@@ -44,6 +45,7 @@ _TO_DICT_KEYS = (
     "artifact",
     "messages",
     "running",
+    "admission_queued",
     "wake_starting",
     # Turn identity beside `running`: the slot's monotonic turn counter and the
     # gateway process generation it is comparable within. The dashboard uses the
@@ -51,12 +53,14 @@ _TO_DICT_KEYS = (
     "turn",
     "turn_gen",
     "compacting",
+    "preparing",
     "stop_declined",
     "queue_depth",
     "stopping",
     "pending_approval",
     "pending_approval_info",
     "last_activity_ts",
+    "last_agent_ts",
     "waiting_for_input",
     "needs_input",
     "interrupted",
@@ -99,6 +103,7 @@ _TO_DICT_KEYS = (
     "origin",
     "created_by",
     "lineage_minted",
+    "attribution",
 )
 
 

@@ -17,6 +17,7 @@ Design (see docs/request-for-change/rfc-local-notification-bus.md):
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -65,6 +66,32 @@ SYSTEM_CHANNELS: dict[str, str] = {
     # A dashboard terminal shell that exited with a non-zero code; its tab
     # closed with it, so the note is where the code is left to read.
     "system.terminal": _DEFAULT_PRIORITY,
+    # A crewmate's message in its DM thread (dashboard/member_message_notes.py).
+    # Its own channel so the user can mute crewmate chatter without muting
+    # system.agent; the note keeps kind "agent", as system.monitor's do.
+    # Passive: the note lands in the bell without a banner, sound or OS toast
+    # until the user raises the channel in Settings -> Notifications.
+    "system.member": "passive",
+    # An installed app has a newer version published. Its own channel for the
+    # same reason system.monitor has one: this is the one system note a user
+    # may reasonably never want, and without a channel of its own it would
+    # fall back to system.agent, where muting it also mutes the notes agents
+    # write for a human decision. Default priority -- nothing is blocked, the
+    # app keeps working on the version it has.
+    "system.apps": _DEFAULT_PRIORITY,
+    # A chat turn that DIED with an error the user must act on -- a provider
+    # 5xx / throttle, a content-filter refusal, or a terminal transport death
+    # ("start a new chat" / "please retry"). Until this channel existed the
+    # only trace of a dead turn was the inline error card in the transcript,
+    # so an operator working in another session would learn work has stopped
+    # only by opening it. Its own channel, not system.agent, so the
+    # user can mute dead-turn alerts without muting the notes agents write for
+    # a human decision. Default priority: the note lands in the bell with the
+    # channel's configured sound/banner but blocks no turn -- the prompt that
+    # does (an approval) has its own critical channel. Deduped per session via
+    # group_key and attributed to the publishing session so that session's
+    # own mute applies (the note is suppressed when the user has muted it).
+    "system.turn": _DEFAULT_PRIORITY,
 }
 
 # The channel the gateway's monitor-loop stop/finish notices use. Their legacy
@@ -121,6 +148,23 @@ _RESERVED_NOTE_KEYS = frozenset(
         "acked",
     }
 )
+
+
+def _finite_json(value: Any) -> Any:
+    """*value* with every NaN or infinite float, at any depth, read as ``None``.
+
+    The push route parses with plain ``json.loads``, which accepts ``NaN`` and
+    ``Infinity``; stored as is, one such meta value is written back out
+    literally, and the feed is then not JSON a browser can parse, for every
+    client, until the note ages out. ``None`` keeps the key and the note.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _finite_json(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_finite_json(v) for v in value]
+    return value
 
 
 class NotificationValidationError(ValueError):
@@ -496,6 +540,6 @@ class NotificationBus:
             for key, value in payload.meta.items():
                 if key in note or key.startswith("_") or key in _RESERVED_NOTE_KEYS:
                     continue
-                note[key] = value
+                note[key] = _finite_json(value)
         self._sink(note)
         return note

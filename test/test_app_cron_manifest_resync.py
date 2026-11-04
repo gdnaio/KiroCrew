@@ -43,6 +43,9 @@ from kiro_crew.apps.bridges import (
 from kiro_crew.apps.manifest import AppManifest
 from kiro_crew.cron import CronService
 
+pytestmark = pytest.mark.usefixtures("command_crons_run_here")
+
+
 APP = "resync-app"
 SHORT = "digest"
 NAME = f"{APP}/{SHORT}"
@@ -583,7 +586,7 @@ class TestDigest:
         job = _run_scenario(home, scenario)
 
         assert job.timeout_secs == 900
-        assert len(job.app_manifest_digest.split(",")) == 15
+        assert len(job.app_manifest_digest.split(",")) == 16
 
     def test_a_stamp_missing_one_key_counts_that_key_alone(self, home):
         """A key added to the manifest after the stamp was written is the only one re-applied."""
@@ -633,6 +636,7 @@ class TestDigest:
             ("folder", "Ops"),
             ("timeout", 60),
             ("timeout_secs", 65),
+            ("strict_schedule", True),
         ],
     )
     def test_every_manifest_owned_field_takes_part(self, field, value):

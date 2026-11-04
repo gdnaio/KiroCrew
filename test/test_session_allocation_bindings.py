@@ -126,7 +126,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "project_aws_profile": ("function", False, "cb2074e9df23", "companions"),
     "record_failure": ("function", True, "1eda252b53bd", "facade"),
     "record_success": ("function", False, "958babeb61c8", "facade"),
-    "release": ("function", False, "b35cc323b390", "facade"),
+    "release": ("function", False, "b3a2d80a5701", "facade"),
     "release_subagent_runtime": ("function", True, "0f7ee42764e5", "companions"),
     "reserve_inbound_callback": ("function", False, "b58e9cc18136", "facade"),
     "restore_queue": ("function", False, "e233ef2976f2", "facade"),
@@ -468,7 +468,7 @@ _TEST_TREE = Path(__file__).resolve().parents[1] / "test"
 
 #: The patches the test trees make through the facade at the split, and where they are.
 _KNOWN_PATCHES = {
-    "ENDING_FENCE_WAIT_SECS": "test_session.py",
+    "ENDING_FENCE_WAIT_SECS": "test_session_get_or_create.py",
     "record_session_started": "test_compaction_stop_declined.py",
     "resolve_project_profile": "test_aws_project_profiles.py",
     "wake_other_drains": "test_compaction_stop_declined.py",

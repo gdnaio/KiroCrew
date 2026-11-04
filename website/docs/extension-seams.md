@@ -9,10 +9,10 @@ The backend has the sibling mechanism, Composed Platform Providers: see
 [`docs/system-specs/modules/platform-context.md`](../../docs/system-specs/modules/platform-context.md).
 The two are independent. Nothing here reads `CONTRACT_VERSION`.
 
-## The fifteen registry seams
+## The sixteen registry seams
 
 Each entry is one registrar the edition may call, paired with the reader the core
-already calls. `src/extensions.ts` names exactly these fifteen in its header.
+already calls. `src/extensions.ts` names exactly these sixteen in its header.
 `src/test/extensionSeams.test.tsx` exercises each one except the source-provider
 seam, which has its own suite in `src/test/sourceProviderSeam.test.ts`.
 
@@ -22,7 +22,8 @@ POSTs the file context to the app's endpoint — see the App Kit publishing guid
 
 | Seam | Module | Registrar to reader |
 |------|--------|---------------------|
-| Builtin page routes | `apps/builtinRegistry.ts` | `registerBuiltinComponents()` to `getBuiltinApp(route)` (returns `{ component, appId }`) |
+| Builtin page routes | `apps/builtinRegistry.ts` | `registerBuiltinComponents()` to `getBuiltinApp(route)` (returns `{ component, appId, opensPathParam? }`) |
+| "Open in <app>" for a file | `apps/pathOpener.ts` | an entry's `opensPathParam` to `pathOpenerTarget(apps)` |
 | Nav icons | `apps/builtinIcons.tsx` | `registerBuiltinIcons()` to `getBuiltinIcon()` |
 | Theme branding | `themeBranding.tsx` | `registerThemeBranding()` to `getThemeBranding()` |
 | Theme picker options | `hooks/useTheme.tsx` | `registerTheme()` to `getRegisteredThemes()` |
@@ -36,17 +37,20 @@ POSTs the file context to the app's endpoint — see the App Kit publishing guid
 | Source providers (Changes panel + sidebar chips) | `utils/pullRequestLinks.ts` | `registerSourceProvider()` to `sourceProviderDescriptor()` |
 | Phone-connection method renderers | `components/mobileConnectRenderers.tsx` | `registerMobileConnectRenderer()` to `getMobileConnectRenderers()` / `canRenderMobileConnectKind()` |
 | Remote-instance provisioner forms | `components/remoteProvisionerRenderers.tsx` | `registerRemoteProvisionerRenderer()` to `getRemoteProvisionerRenderer()` / `canRenderRemoteProvisionerKind()` |
+| Remote-crew row actions (keyed by the row's `provisioner_id`; refuses `aws_ec2`, a chained row, an empty contribution and a duplicate) | `components/remoteCrewRowActions.tsx` | `registerCrewRowActions()` to `getCrewRowActions(inst)` |
 | Bare-token autolink rules | `utils/autolinkRules.ts` | `registerAutolinkRules()` to `getAutolinkRules()` |
 
-Plus one **exported-transport** seam for edition-owned API methods and one
-**data-module** seam for syntax-highlighting languages. Neither is a registry; see
-"API methods" and "Highlighting languages" below.
+Plus two **exported-setter** seams for a value the core consumes itself (the
+product name and the feedback tracker), one **exported-transport** seam for
+edition-owned API methods and one **data-module** seam for syntax-highlighting
+languages. None is a registry; see "Product name", "Feedback tracker", "API
+methods" and "Highlighting languages" below.
 
 Other `register*()` functions in `src/` (built-in surfaces, command-palette
 providers, tool pills, terminal sockets) are core-internal wiring, not edition
-seams. Only the fifteen above are called from the composition root.
+seams. Only the sixteen above are called from the composition root.
 
-Fourteen of the fifteen are **additive** — the edition contributes a surface. The
+Fifteen of the sixteen are **additive** — the edition contributes a surface. The
 remaining one is **subtractive**: `suppressOverviewBuiltin()` removes a built-in
 Overview surface for a distribution whose environment makes it permanently
 inapplicable, which no additive seam can express. It is named `suppress*` rather
@@ -684,6 +688,52 @@ Scope: catalog strings only, and which catalog keys keep the literal name is
 rule. The shell logo and welcome mark are the theme-branding seam's job; the chat
 bot display name stays `dashboard.bot_name`.
 
+## Feedback tracker: exported setter, not a registry
+
+Three surfaces send a user to the project's issue tracker, and the stock build
+points every one of them at the public GitHub repository: the top bar's **Request
+a Feature** (the hidden prompt it seeds, which tells the agent to search, label
+and file with `gh`; the copy/paste route that prompt offers; and the
+non-inference form link the `usage_limit` row shows when the plan is spent,
+#13342), the prerelease **report it** link in Settings › About, and the
+false-positive report a redaction card offers. On an edition where that
+repository is unreachable each of them dead-ends, and the agent, handed `gh`
+instructions it cannot follow, improvises a fallback nobody designed.
+
+`setFeedbackTracker({ prompt, issueUrl? })` (exported from
+`src/feedbackTracker.ts`) retargets them in one call from the composition root.
+The readers go through `feedbackTracker()`, which answers `{ prompt, issueUrl,
+formUrl }`; the public values stay as constants in `src/prompts/featureRequest.ts`,
+so the stock build is byte-identical. The seam seals on its first read: a later
+call throws in dev and is ignored in production, because a set that landed after
+one surface had rendered would retarget some surfaces and not others.
+
+Two rules a caller must know:
+
+- **The prompt is the fix, and it is replaced wholesale, never templated.** The
+  public prompt already carries its own tracker URL and its own filing steps
+  (`gh issue list` for duplicates, `gh label list` for the live taxonomy, `gh
+  issue create`, the 200-character pre-filled-URL rule), all GitHub's; an
+  edition's tracker has its own, so the edition writes the whole prompt, URL
+  included, in the agent's language. `featureRequestLabels.test.ts` pins the
+  PUBLIC prompt's label rules only.
+- **`issueUrl` is optional** and only moves the three links that do not go
+  through a prompt: the About link, the redaction report, and the spent-plan exit
+  (`formUrl`, which becomes `issueUrl` since an edition tracker has no public-repo
+  template form). Without it those links keep the public tracker.
+
+Validation runs through `reportSeamCollision`: `prompt` must be non-empty and
+`issueUrl`, when given, an absolute `http(s)` URL (a relative path or a
+`javascript:` URL is refused). A refused call leaves the stock tracker in place,
+so the surfaces keep working. `src/test/feedbackTrackerSeam.test.ts` exercises
+the seam on a fresh module per test, since the seal is a module singleton.
+
+Out of scope: the **Report a Problem** flow's issue link is built by the
+gateway (`diagnostics.github_issue_url`), so the backend `feedback` Composed
+Platform Provider retargets it
+([platform-context](../../docs/system-specs/modules/platform-context.md)), not
+this seam. An edition sets both.
+
 ## API methods: exported transport, not a registry
 
 There is no registrar for edition API methods. The core never *consumes* them:
@@ -723,13 +773,17 @@ without an ordering hazard against `extensions.ts`.
 The core's own methods sit on the same helpers. They are defined by domain in
 `api/client/*.ts`, one module per product area (chat, memory, security, …), each
 a `create*Endpoints` factory that `client.ts` hands the transport it owns
-(`ClientTransport`, `api/client/transport.ts`): the five helpers, the three
-parsers, the shared `X-Session-Key` header, the session-expiry hooks a
+(`ClientTransport`, `api/client/transport.ts`): the five helpers, the parsers,
+the shared `X-Session-Key` header, the session-expiry hooks a
 method that reads its own response calls, and `withJournaledDeadline` (a
-deadline that also records a timed-out read in the error journal). The third parser
-(`jInstancesDisabled`) is core-only and deliberately absent from `ApiTransport`
-above: it opts one specific benign denial on one core route out of the error
-journal, which is not an edition's decision to make. None of them imports a
+deadline that also records a timed-out read in the error journal). The
+route-specific parsers (`jInstancesDisabled`, `jCrewBoard`, `jSlotEnvironment`,
+`jSharedCrewPreview` and `jMembers`)
+are core-only and deliberately absent from `ApiTransport` above: each opts one
+specific benign denial on one core route out of the error journal (a disabled
+instances control plane's 403, a conductor with no ledger's 404 `no_ledger`, and
+the slot-environment, Shared Crew preview and members roster reads' 403 `owner_only`
+for a caller that is not the dashboard owner), which is not an edition's decision to make. None of them imports a
 runtime value
 from `client.ts` (the telemetry module takes the Kiro usage types defined there
 as types only), so the transport and its recovery keep one definition.

@@ -208,7 +208,9 @@ class WeixinRenderer(Renderer):
         """
         body = self.redact_for_target(body)
         ctx_token = self._ctx.get(self._account_id, self._to)
-        chunks = render_chunks(body, self.capabilities.max_message_chars)
+        # OFF the loop: the split grades credential seams and rescans the text
+        # per candidate boundary, which can hold the gateway's one loop for seconds.
+        chunks = await asyncio.to_thread(render_chunks, body, self.capabilities.max_message_chars)
         for i, part in enumerate(chunks):
             if i:
                 await asyncio.sleep(_CHUNK_DELAY_S)
@@ -244,10 +246,10 @@ class WeixinRenderer(Renderer):
         self._typing_task = None
         if task is not None:
             task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+            # Gathered, not awaited: the typing task's own cancellation comes back
+            # as a result, while one aimed at this turn (closing the channel cancels
+            # the poll task the turn runs on) still propagates.
+            await asyncio.gather(task, return_exceptions=True)
         await self._typing_signal(TYPING_STOP)
 
     async def _typing_signal(self, status: int) -> None:

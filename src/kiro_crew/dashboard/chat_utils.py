@@ -31,7 +31,7 @@ from kiro_crew.dashboard.state import (
 )
 from kiro_crew.external_text import redact_external_text
 from kiro_crew.quick_prompts import QUICK_PROMPTS
-from kiro_crew.security import (
+from kiro_crew.security import (  # noqa: F401 - pinned by test_chat_utils.py
     redact_credentials,
     redact_exfiltration_urls,
 )
@@ -49,7 +49,7 @@ logger = logging.getLogger("kiro_crew.dashboard.chat_utils")
 #: English fallback below, read verbatim by non-dashboard consumers (channel
 #: mirrors, SSE, an older frontend); the dashboard ignores it and renders
 #: localized copy keyed on this token instead
-#: (``website/src/pages/chat/transientNotice.ts``). A structured token rather
+#: (``website/src/pages/chat/gatewayNotice.ts``). A structured token rather
 #: than prose-matching so the wording can change on either side without the
 #: other silently falling back to raw English -- the drift class
 #: ``test_recovery_marker_parity.py`` exists for. Both sides are still
@@ -107,8 +107,9 @@ def history_corpus_unreadable(code: str = "history_corpus_unreadable") -> Any:
 def _redact_deep(obj):
     """Recursively redact all string values in a nested structure."""
     if isinstance(obj, str):
-        obj, _ = redact_exfiltration_urls(obj)
-        obj, _ = redact_credentials(obj)
+        from kiro_crew.security import redact
+
+        obj = redact(obj)
         return obj
     if isinstance(obj, dict):
         return {k: _redact_deep(v) for k, v in obj.items()}
@@ -141,8 +142,9 @@ def _redact_tool_field(text: str | None, *, limit: int = _MAX_TOOL_FIELD) -> str
                 encoded[:limit].decode("utf-8", errors="ignore")
                 + f"\n… [truncated at {limit:,} bytes]"
             )
-    text, _ = redact_exfiltration_urls(text)
-    text, _ = redact_credentials(text)
+    from kiro_crew.security import redact
+
+    text = redact(text)
     return text
 
 
@@ -171,8 +173,9 @@ def _build_stream_chunk(msg: dict) -> str:
     content = redact_display_content(msg.get("content", ""))
     cls_val = msg.get("cls", "")
     if isinstance(cls_val, str):
-        cls_val, _ = redact_exfiltration_urls(cls_val)
-        cls_val, _ = redact_credentials(cls_val)
+        from kiro_crew.security import redact
+
+        cls_val = redact(cls_val)
     else:
         cls_val = _redact_deep(cls_val)
     return json.dumps(
@@ -250,8 +253,36 @@ _KIRO_ONLY_BLOCKED_SLASH_COMMANDS = frozenset({"/todos"})
 # once — advertising a command that only yields a warning teaches a gesture
 # that does not work.
 _BLOCKED_SLASH_COMMANDS = (
-    frozenset({"/quit", "/exit", "/q", "/chat", "/paste", "/reply", "/editor", "/tangent"})
+    # These kiro-cli TUI commands have no dashboard transport. /issue is
+    # documented by the interactive CLI, but the ACP TuiCommand schema in the
+    # bundled harness rejects it before it can produce a result.
+    frozenset(
+        {"/quit", "/exit", "/q", "/chat", "/paste", "/reply", "/editor", "/issue", "/tangent"}
+    )
     | _KIRO_ONLY_BLOCKED_SLASH_COMMANDS
+)
+
+# Commands the dashboard serves without the harness: the composer opens /side
+# itself, and the slash gate answers /agent, /clear, /context, /goal, /help, /mcp,
+# /model, /prompts, /tools, /usage and /workflow before any session work. On a
+# harness in ``ACP_BACKENDS_LOCAL_HARNESS_COMMANDS`` every other harness command
+# only gets a notice, so GET /api/slash-commands lists these (plus /compact, which
+# has a gate of its own) and nothing else there.
+_DASHBOARD_SERVED_SLASH_COMMANDS = frozenset(
+    {
+        "/agent",
+        "/clear",
+        "/context",
+        "/goal",
+        "/help",
+        "/mcp",
+        "/model",
+        "/prompts",
+        "/side",
+        "/tools",
+        "/usage",
+        "/workflow",
+    }
 )
 
 # Slash-command descriptions surfaced by the dashboard API
@@ -380,12 +411,15 @@ def _tool_identity_fields(event: "LLMEvent") -> dict[str, str]:
 
 def _broadcast_auto_tool(state: DashboardState, slot: _ChatSlot, event: "LLMEvent") -> str:
     """Broadcast an auto-approved tool call via WS with redacted title. Returns redacted title."""
-    title, _ = redact_exfiltration_urls(event.title)
-    title, _ = redact_credentials(title)
-    kind, _ = redact_exfiltration_urls(event.tool_kind)
-    kind, _ = redact_credentials(kind)
-    tcid, _ = redact_exfiltration_urls(event.tool_call_id or "")
-    tcid, _ = redact_credentials(tcid)
+    from kiro_crew.security import redact
+
+    title = redact(event.title)
+    from kiro_crew.security import redact
+
+    kind = redact(event.tool_kind)
+    from kiro_crew.security import redact
+
+    tcid = redact(event.tool_call_id or "")
     state.broadcast_ws(
         "tool_call",
         {
@@ -422,8 +456,9 @@ def _append_compaction_notice(state: DashboardState, slot: _ChatSlot, msg_text: 
     so a future caller passing unredacted LLM-derived text (e.g. a compaction
     summary) can never leak a credential/exfil URL. Both passes are idempotent.
     """
-    msg_text, _ = redact_credentials(msg_text)
-    msg_text, _ = redact_exfiltration_urls(msg_text)
+    from kiro_crew.security import redact
+
+    msg_text = redact(msg_text)
     meta = {"kind": "compaction"}
     append_and_surface(state, slot, "assistant", msg_text, "msg msg-a", meta=meta)
 
@@ -450,8 +485,9 @@ def _broadcast_compaction_result(
     if status_type == "completed":
         slot._compaction_fail_streak = 0
         slot._compaction_fail_cooldown_until = 0.0
-        summary, _ = redact_credentials(event.title)
-        summary, _ = redact_exfiltration_urls(summary)
+        from kiro_crew.security import redact
+
+        summary = redact(event.title)
         msg_text = (
             f"✅ Conversation compacted: {summary}" if summary else "✅ Conversation compacted."
         )
@@ -472,8 +508,9 @@ def _broadcast_compaction_result(
             # once/twice. Nothing new to say — don't spam identical notices.
             return None
 
-        error, _ = redact_credentials(event.title or "unknown error")
-        error, _ = redact_exfiltration_urls(error)
+        from kiro_crew.security import redact
+
+        error = redact(event.title or "unknown error")
         if streak <= _COMPACTION_NOTICE_SHOW_FIRST_N:
             msg_text = f"❌ Compaction failed: {error}"
         else:
@@ -588,6 +625,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         SYNTHESIS_UNKNOWN,
         _attached_verdict,
         _queued_depth_off_loop,
+        _slot_holds_delivery,
+        background_wake_absent,
+        background_wake_pending,
         chat_done_payload,
         chunk_generation,
         subagents_attached,
@@ -597,6 +637,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
     from kiro_crew.dashboard.chat_utils_display import (  # noqa: F401
         _DISPLAY_CLEAN_GENERATION,
+        _DISPLAY_PREVIEW_BY_OBJECT_MAX,
+        _DISPLAY_PREVIEW_BY_OBJECT_MAX_CHARS,
         _DISPLAY_PREVIEW_CACHE_MAX_BYTES,
         _DISPLAY_PREVIEW_CACHE_MAX_ENTRIES,
         _DISPLAY_REDACTION_CACHE_MAX_BYTES,
@@ -604,6 +646,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _DISPLAY_REDACTION_SALT,
         _DISPLAY_REDACTION_STRINGS_PER_ROW,
         _NO_BASE,
+        BLOCKED_LINKS_ORDERED_KEY,
         REDACTION_RECORD_FIELDS,
         SLOT_DETAIL_MAX_LIMIT,
         UNKNOWN_ROW_FIELDS_KEY,
@@ -616,6 +659,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _display_clean_old,
         _display_clean_seen,
         _display_clean_young,
+        _display_preview_by_object,
+        _display_preview_by_object_chars,
+        _display_preview_by_object_context,
         _display_preview_cache,
         _display_preview_cache_bytes,
         _display_preview_cache_info,
@@ -636,8 +682,11 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _redact_meta_for_role,
         _redact_value,
         _redacted_preview,
+        _redacted_preview_by_digest,
         _remember_preview,
+        _remember_preview_by_object,
         _remember_redacted,
+        _same_preview_context,
         _variant_for_emit,
         adopt_variant_text,
         drop_records_without_placeholders,
@@ -662,13 +711,16 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         APP_MESSAGE_PREFIX,
         AUTH_REQUIRED_KIND,
         AUTOMATION_NOTICE_KIND,
+        AUTOMATION_STEER_META,
         CONTEXT_OVERFLOW_KIND,
         CRON_NOTIFICATION_KIND,
         EMPTY_TURN_NOTICE_KIND,
         FALSE_TOOL_BLOCKER_REPLAY_KIND,
+        IMAGE_REPAIR_KIND,
         KIRO_CLI_MISSING_KIND,
         MCP_APP_MESSAGE_KIND,
         MODEL_UNENTITLED_KIND,
+        SEED_DECLINED_NOTICE_KIND,
         SESSION_START_FAILED_KIND,
         SPEC_HOOKS_NOTICE_KIND,
         STEER_INTENT_META,
@@ -693,8 +745,10 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         is_system_injection_item,
         payload_for_replay,
         releases_past_subagent_hold,
+        teardown_hold_active,
     )
     from kiro_crew.dashboard.chat_utils_slack_options import (  # noqa: F401
+        _forget_slack_options_message,
         _persisted_thread_owner,
         expire_slack_options,
         forget_slack_options,
@@ -773,6 +827,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.dashboard.chat_utils_turn_text import (  # noqa: F401
         _APPROVAL_GATED_RE,
         _CODE_DELIM_RE,
+        _DEFERRED_FOLLOWUP_RE,
+        _DEFERRED_FOLLOWUP_TAIL_SENTENCES,
+        _FOLLOWUP_USER_GATED_RE,
         _LEAKED_INVOKE_BODY_RE,
         _LEAKED_INVOKE_OPEN_RE,
         _NEGATED_PROMISE_RE,
@@ -780,9 +837,14 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _PROMISE_HAS_FOLLOWING_CONTENT_RE,
         _PROMISE_NOW_RE,
         _SENTENCE_BOUNDARY_RE,
+        _TOOL_NAME_SEPARATOR_RE,
         _UNFINISHED_PROGRESS_RE,
+        DEFERRED_FOLLOWUP_NOTICE,
+        WAKE_ARMING_TOOLS,
+        _bare_tool_name,
         _strip_quoted_code,
         _terminal_sentence,
+        has_deferred_followup_promise,
         has_leaked_tool_call,
         has_unfinished_progress_claim,
         is_promise_only_terminal,
@@ -790,6 +852,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         should_notice_compaction_dropped_leak,
         should_notice_leaked_tool_call,
         should_notice_mixed_turn_leak,
+        turn_armed_a_wake,
     )
 
 if TYPE_CHECKING:  # names it serves from outside the family, from their homes
@@ -799,6 +862,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     )
     from kiro_crew.dashboard.slot_queue_repository import (  # noqa: F401
         ATTACHMENT_META_KEYS,
+        source_channels_of,
     )
     from kiro_crew.dashboard.state import (  # noqa: F401
         BUSY_RECOVERY_PREFIX,
@@ -876,6 +940,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         encode_options_token,
         expire_options,
         mark_options_terminal,
+        options_answer_settled,
         options_edit_lock,
     )
     from kiro_crew.validation import (  # noqa: F401

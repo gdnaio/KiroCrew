@@ -17,9 +17,12 @@ Instance fields written: ``_jobs``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from typing import TYPE_CHECKING, Any, Callable
 
+from kiro_crew import milestones
 from kiro_crew.cron_service.fields import validate_managed_by
 from kiro_crew.cron_service.identity import bind_cron_memory
 from kiro_crew.cron_service.model import CronJob
@@ -67,6 +70,7 @@ def add_job(
     timeout: int = 0,
     timeout_secs: int = 0,
     auto_pause_after_failures: int | None = None,
+    alert_after_failures: int | None = None,
 ) -> CronJob:
     """Add a new job. Provide one of ``every_secs``, ``at_ts``, or ``cron_expr``.
 
@@ -129,10 +133,16 @@ def add_job(
         timeout=timeout,
         timeout_secs=timeout_secs,
         auto_pause_after_failures=auto_pause_after_failures,
+        alert_after_failures=alert_after_failures,
     )
     self._persist_add_locked(job)
     self._arm_timer()
     logger.info("Added cron job '%s' (%s)", name, job.id)
+    # The "first scheduled task" milestone, after the job is stored. A job an app
+    # registers for itself (``created_by="app:<name>"``) is not the user
+    # scheduling anything. Never raises.
+    if not str(created_by or "").startswith("app:"):
+        milestones.record("scheduled-task")
     return job
 
 
@@ -366,6 +376,7 @@ async def add_job_async(
     timeout: int = 0,
     timeout_secs: int = 0,
     auto_pause_after_failures: int | None = None,
+    alert_after_failures: int | None = None,
     source_preset: str = "",
     source_template_prompt: str = "",
 ) -> CronJob:
@@ -418,6 +429,7 @@ async def add_job_async(
         timeout=timeout,
         timeout_secs=timeout_secs,
         auto_pause_after_failures=auto_pause_after_failures,
+        alert_after_failures=alert_after_failures,
     )
     # Dashboard-only template provenance. Set on the freshly-built job
     # BEFORE the off-loop persist -- the object has no other reference yet,
@@ -432,6 +444,8 @@ async def add_job_async(
     await asyncio.to_thread(self._persist_add_locked, job)
     self._arm_timer()
     logger.info("Added cron job '%s' (%s)", name, job.id)
+    if not str(created_by or "").startswith("app:"):
+        milestones.record("scheduled-task")
     return job
 
 
@@ -441,7 +455,8 @@ def update_job(self: CronService, job_id: str, **kwargs: Any) -> CronJob | None:
     Accepted kwargs: name, message, every_secs, cron_expr, agent_id, channel,
     approval_mode, silent, skip_dates, timezone, thread_ts, model,
     timeout_secs (per-wake execution budget, 1..86400),
-    auto_pause_after_failures (0..10000; 0 = never auto-pause).
+    auto_pause_after_failures (0..10000; 0 = never auto-pause),
+    alert_after_failures (1..10000; failures in a row before the alert is sent).
 
     Raises :class:`CronStoreBusy` if the store lock is contended past the
     timeout; see :meth:`update_job_async` for the event-loop-safe variant.
@@ -512,37 +527,70 @@ async def enable_job_async(
     return ok
 
 
-def ack_job(self: CronService, job_id: str, summary: str) -> bool:
+def ack_job(self: CronService, job_id: str, summary: str, ack_id: str = "") -> bool:
     """Acknowledge a cron notification — stores summary for future context.
 
+    *ack_id* names this entry so :meth:`unack_job` can take back exactly it.
     Raises :class:`CronStoreBusy` on lock contention; see
     :meth:`ack_job_async` for the event-loop-safe variant.
     """
-    return self._ack_job_locked(job_id, summary)
+    return self._ack_job_locked(job_id, summary, ack_id)
 
 
-async def ack_job_async(self: CronService, job_id: str, summary: str) -> bool:
+async def ack_job_async(self: CronService, job_id: str, summary: str, ack_id: str = "") -> bool:
     """Event-loop-safe :meth:`ack_job`: the lock+save runs off the loop.
 
     Raises :class:`CronStoreBusy` (retryable) on sustained contention.
     """
-    ok = await asyncio.to_thread(self._ack_job_locked, job_id, summary)
+    ok = await asyncio.to_thread(self._ack_job_locked, job_id, summary, ack_id)
     # ack itself changes no schedule. If the worker's _sync() reloaded an
     # external change, its _load() re-armed the timer thread-safely via the
     # bound loop (see _arm_timer) — no drain needed here.
     return ok
 
 
-def _ack_job_locked(self: CronService, job_id: str, summary: str) -> bool:
+def _acked_items_digest(items: list[str]) -> str:
+    """A fingerprint of *items*, saved beside the ids written against them."""
+    # ASCII-escaped, so a lone surrogate (an emoji cut in half by a client's
+    # 200-character slice) hashes instead of failing to encode.
+    encoded = json.dumps(items, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("ascii")).hexdigest()[:16]
+
+
+def _aligned_ack_ids(job: CronJob) -> list[str]:
+    """``job.acked_item_ids`` as one id per ``acked_items`` entry ("" = none).
+
+    The ids count only while the items are the ones they were written
+    against (same length and the saved digest). A writer that changed the
+    items and kept the ids, as an older build does, leaves them naming no
+    entry at all, so an unack by id finds nothing rather than the wrong entry.
+    """
+    ids = job.acked_item_ids
+    items = job.acked_items
+    if (
+        not isinstance(ids, list)
+        or len(ids) != len(items)
+        or job.acked_item_ids_digest != _acked_items_digest(items)
+    ):
+        return [""] * len(items)
+    return [i if isinstance(i, str) else "" for i in ids]
+
+
+def _ack_job_locked(self: CronService, job_id: str, summary: str, ack_id: str = "") -> bool:
     """Lock/reload/mutate/save core of :meth:`ack_job`."""
     with self._file_lock():
         self._sync_for_write()
         for job in self._jobs:
             if job.id == job_id:
-                before = list(job.acked_items)
-                job.acked_items.append(summary[:500])
-                # Keep only last 20 acks
-                job.acked_items = job.acked_items[-20:]
+                before = job.acked_items
+                before_ids = job.acked_item_ids
+                before_digest = job.acked_item_ids_digest
+                # Built before any of it is assigned, so a failure here leaves
+                # the job as it was. Keep only last 20 acks.
+                items = [*job.acked_items, summary[:500]][-20:]
+                ids = [*_aligned_ack_ids(job), ack_id][-20:]
+                digest = _acked_items_digest(items)
+                job.acked_items, job.acked_item_ids, job.acked_item_ids_digest = items, ids, digest
                 # Restore the list a failed save never persisted: the mutated
                 # object is the one ``list_jobs`` already handed out, so a
                 # rejected ack must not linger in the live cache.
@@ -550,44 +598,65 @@ def _ack_job_locked(self: CronService, job_id: str, summary: str) -> bool:
                     self._save()
                 except BaseException:
                     job.acked_items = before
+                    job.acked_item_ids = before_ids
+                    job.acked_item_ids_digest = before_digest
                     raise
                 return True
     return False
 
 
-def unack_job(self: CronService, job_id: str) -> bool:
-    """Remove the most recent acked item from a cron job.
+def unack_job(self: CronService, job_id: str, ack_id: str | None = None) -> bool:
+    """Remove an acked item from a cron job: the one *ack_id* names, else the newest.
 
-    Raises :class:`CronStoreBusy` on lock contention; see
-    :meth:`unack_job_async` for the event-loop-safe variant.
+    With *ack_id*, only the entry its :meth:`ack_job` added is removed; a job
+    that does not hold it (aged out of the last 20, or already removed) is
+    left alone (``False``), so neither a repeat nor an equal summary
+    acknowledged later can lose a different entry. Raises
+    :class:`CronStoreBusy` on lock contention; see :meth:`unack_job_async`
+    for the event-loop-safe variant.
     """
-    return self._unack_job_locked(job_id)
+    return self._unack_job_locked(job_id, ack_id)
 
 
-async def unack_job_async(self: CronService, job_id: str) -> bool:
+async def unack_job_async(self: CronService, job_id: str, ack_id: str | None = None) -> bool:
     """Event-loop-safe :meth:`unack_job`: the lock+save runs off the loop.
 
     Raises :class:`CronStoreBusy` (retryable) on sustained contention.
     """
-    ok = await asyncio.to_thread(self._unack_job_locked, job_id)
+    ok = await asyncio.to_thread(self._unack_job_locked, job_id, ack_id)
     # See ack_job_async: any external-change re-arm self-heals in the worker.
     return ok
 
 
-def _unack_job_locked(self: CronService, job_id: str) -> bool:
+def _unack_job_locked(self: CronService, job_id: str, ack_id: str | None = None) -> bool:
     """Lock/reload/mutate/save core of :meth:`unack_job`."""
     with self._file_lock():
         self._sync_for_write()
         for job in self._jobs:
             if job.id == job_id and job.acked_items:
-                before = list(job.acked_items)
-                job.acked_items.pop()
+                ids = _aligned_ack_ids(job)
+                if ack_id is None:
+                    index = len(job.acked_items) - 1
+                else:
+                    if not ack_id or ack_id not in ids:
+                        return False
+                    index = ids.index(ack_id)
+                before = job.acked_items
+                before_ids = job.acked_item_ids
+                before_digest = job.acked_item_ids_digest
+                # Built before any of it is assigned (see :meth:`_ack_job_locked`).
+                items = job.acked_items[:index] + job.acked_items[index + 1 :]
+                del ids[index]
+                digest = _acked_items_digest(items)
+                job.acked_items, job.acked_item_ids, job.acked_item_ids_digest = items, ids, digest
                 # Restore the list a failed save never persisted (see
                 # :meth:`_ack_job_locked`).
                 try:
                     self._save()
                 except BaseException:
                     job.acked_items = before
+                    job.acked_item_ids = before_ids
+                    job.acked_item_ids_digest = before_digest
                     raise
                 return True
     return False

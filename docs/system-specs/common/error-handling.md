@@ -41,6 +41,10 @@ AcpError (base, acp/transport_errors.py) — carries `transient`, the retry verd
 │                            AcpProcessDied with ambiguous_delivery set
 ├── AcpAuthRequired        — kiro-cli not authenticated; non-retryable
 ├── AcpSandboxInitFailed   — an OS sandbox refused to initialize; non-retryable
+├── AcpDelegateLaunchFailed — the kiro-cli-chat delegate failed to launch (a stale
+│                            or version-skewed install); non-retryable, and not an
+│                            AcpProcessDied, so the chat shows the reinstall
+│                            message instead of a respawn loop
 ├── AcpToolGateUnroutable  — tool calls would bypass the PreToolUse gate;
 │                            non-retryable, wraps acp_tool_gate.ToolGateUnroutable
 ├── PiGateExtensionTampered — a shipped gate extension (Pi or DeepSeek) failed its digest check
@@ -90,9 +94,11 @@ instead of the row simply disappearing.
 | ACP → CLI | Catch `AcpError`, print user-friendly message, `sys.exit(1)` |
 | JSON-RPC read | Non-JSON lines silently skipped (kiro-cli debug output) |
 | Config load | Invalid JSON → log warning, return defaults |
+| Integer field in a dashboard JSON body | Read through `dashboard/body_numbers.body_int`, which raises `ValueError` for `1e999`/`-1e999` (infinite floats after `json.loads`) where `int()` raises `OverflowError`. The handler's own `except (TypeError, ValueError)` then gives the infinite value the same 400 or fallback any other malformed value gets there, never a 500. A site does not add `OverflowError` to its own except clause instead |
 | Skill index (`list_skills`) | One global SKILL.md that is not UTF-8 or cannot be opened → one warning naming the file, that row dropped, every other row listed. Never a failed listing: the index feeds every chat turn and `GET /api/skills`. Rationale: [memory-skills-hooks](../modules/memory-skills-hooks.md) |
 | Process spawn | Backend-specific executable resolver, including trusted-path checks where required; clear error if missing |
 | Notes git subprocess (`md_notebook/git_ops.py`) | A non-zero exit reports git's last 3 stderr lines PLUS the first transport-caused line when one sits outside that tail. git ends every fetch/push failure with the same access-rights boilerplate and prints an SSH diagnosis first, so a tail alone reports a permission problem the operator does not have (a host reachable only via `~/.ssh/config` never resolved at all). The extra line widens what the message reports; it does not decide whether the command failed. |
+| Auto-Improvement git step (`auto_improvement/backend/clone_setup.py`) | A failed clone, branch list, checkout or fetch reports git's last 2 stderr lines after dropping blank lines and git's access-rights advisory (`Please make sure you have the correct access rights` / `and the repository exists.`), redacted and then bounded. The advisory follows every transport or auth fatal, so keeping it reports a repository problem in place of the `Permission denied (publickey).` line above it. |
 | asyncio loop callback | A Windows Proactor reset repeated by its `connection_lost` close callback is warning-only; task-level connection resets and other exceptions remain ERRORs with crash breadcrumbs |
 
 ## Code Review Sage consolidation refusal
@@ -201,7 +207,12 @@ never drift. Notable terminal (non-retryable) classes:
   (`CREDENTIAL_RELOAD_RETRY_NOTICE`), and when the fresh process fails too (the
   helper itself is broken: an expired SSO login, a revoked role) the give-up
   line carries the provider's own message (`credential_give_up_text`) instead
-  of "start a new chat", which would fail the same way.
+  of "start a new chat", which would fail the same way. That message is
+  redacted inside `credential_give_up_text` through `redact_via_context`, the
+  egress path that finds link and credential spans on the original text and
+  rewrites it once (so neither pass hides a value from the other), because the
+  dashboard row and the channel post that show it do not redact on their own,
+  and the frame's trailing `data` repr is dropped from it.
 - **Preserved-thinking binding mismatch**: `AcpConversationBindingMismatch`
   (non-transient) means the stored native conversation carries thinking bound to
   another conversation prefix. A dashboard outer turn with no reply, thought or
@@ -287,7 +298,7 @@ accepted seconds later, so the existing backoff ladder absorbs it.
 formatter, ahead of `llm_helpers._is_transient_acp_error`'s
 `accessdenied`/`unrecognizedclient` exclusion short-circuit (a
 `_TRANSIENT_MARKERS` entry alone is unreachable, because the exclusion sits
-above the markers), and inside `is_auth_failure_output` so `acp/runtime.py`'s
+above the markers), and inside `is_auth_failure_output` so `acp/runtime_liveness.py`'s
 stderr latch does not convert it to the explicitly non-retryable
 `AcpAuthRequired` and skip the ladder entirely. It is scoped to the "is invalid"
 WORDING, never to the status: a bare 401/403, an `... is expired` token, a
@@ -302,6 +313,19 @@ deleted, rotated, or mistyped), so a never-valid credential is also classified
 transient. The retry budget bounds that misclassification — three retries, ~15 s
 — and the formatted message closes with the terminal "refresh your AWS
 credentials" guidance rather than asserting the propagation diagnosis as fact.
+
+The engine's **model-list refusal** is checked before the connection and 5xx
+families. KAS answers `session/prompt` with `-32000` "Kiro could not load the
+available models. Please try again." and `data.errorType`
+`ModelRegistryUnavailableError` when every fetch of the model list failed for a
+reason other than a rejected or denied credential. The frame keeps no HTTP status
+and none of the service's answer, and its cause may persist (a sign-in that sends
+no profile ARN got HTTP 400 `ValidationException` on every call, #26109), so it is
+never worded as an HTTP 5xx: `acp/model_registry_errors.py` matches the token in
+`data` and words it as a model list that could not load, with the sign-in as the
+fix when it repeats. Only the wording changes: the frame's "Please try again"
+still gives it the retryable verdict and the `http_5xx` classifier kind, which
+match the engine's own `SERVER_ERROR`, bounded by the ladder.
 
 Retry hints are the other wording-only signal, and they are **provider-scoped**:
 `_RE_5XX_HINT` carries one alternative per backend spelling ("please try again"
@@ -328,8 +352,10 @@ verdict is transient and `classify_provider_error` names the frame
 `PROVIDER_ERROR_CONNECTION`: connection wording (`_RE_CONNECTION`) or a
 connector dispatch failure, with no throttle, usage limit, auth or
 session-expiry rejection, or model-availability answer outranking it. The
-formatter folds a dispatch failure into the generic 5xx prose, which is why the
-verdict travels as a tag instead of being read back from the message. On an
+formatter checks the same connector patterns before the 5xx family, so a
+dispatch failure shows the "Could not reach the model backend" card rather than
+the generic 5xx prose; the verdict still travels as a tag so the retry layer
+never reads it back from the message. On an
 interactive dashboard turn
 (`chat_runner`'s pre-stream transient branch) a connection failure keeps
 re-prompting the same live session past `TRANSIENT_RETRIES` until
@@ -337,7 +363,16 @@ re-prompting the same live session past `TRANSIENT_RETRIES` until
 retry, on the same backoff curve capped at `CONNECTION_RETRY_MAX_DELAY` (30 s),
 and shows one standing "Connection unstable — retrying…" notice for the extra
 attempts rather than one per attempt. Stop, a landed turn and an exhausted
-window end it exactly as they end the fixed ladder. Provider answers keep the
+window end it exactly as they end the fixed ladder. The dashboard settles that
+standing notice once the window closes (`resolveGatewayNotice` in
+`website/src/pages/chat/gatewayNotice.ts`): it reads "Connection restored"
+when an answer follows it, and the muted past-tense "Connection interrupted"
+when the give-up row or any other error comes first, so it never stays
+"retrying…" above the red "please try again." row. A new user turn decides
+neither: a message typed during the backoff does not end the replay, so the
+notice stays pending. Another re-queued recovery row (`kind: transient_retry`,
+such as a dead process's "Connection lost — retrying…") is read as recovery
+still running, so the scan continues past it. Provider answers keep the
 fixed count: a provider that answers with errors is not helped by a longer wait.
 
 ### Provider failures a harness writes as text

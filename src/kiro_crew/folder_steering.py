@@ -22,7 +22,7 @@ from collections.abc import Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kiro_crew import context_omissions, pinned_fs
+from kiro_crew import context_omissions, pinned_fs, sandbox_plan
 from kiro_crew.config.loader import KiroCrewConfig, config_dir, workspace_dir_from_entry
 from kiro_crew.config.resolution import DEGRADED_WHOLE_CONFIG, DEGRADED_WORKSPACES
 from kiro_crew.frontmatter import STEERING_LOADER, split_frontmatter
@@ -334,11 +334,10 @@ def crosses_memory_silo(root_resolved: Path, silos: tuple[Path, ...] | None = No
     root_cf = str(root_resolved).casefold()
     for silo in silos:
         silo_cf = str(silo).casefold()
-        if (
-            root_cf == silo_cf
-            or root_cf.startswith(silo_cf + os.sep)
-            or silo_cf.startswith(root_cf + os.sep)
-        ):
+        # ``path_within`` rather than ``x + os.sep``: a drive root (``H:\``, or
+        # ``/``) already ends in a separator, so the doubled one would clear a
+        # root that contains a silo, or that lies inside a drive-root silo.
+        if sandbox_plan.path_within(root_cf, silo_cf) or sandbox_plan.path_within(silo_cf, root_cf):
             return True
     return False
 
@@ -735,8 +734,11 @@ def collect_folder_steering(
                 logger.debug("folder steering document unreadable: %s", key)
                 continue
             try:
+                # utf-8-sig drops one leading byte-order mark, which would
+                # otherwise hide the column-0 frontmatter fence and turn a
+                # manual document into an always-loaded one.
                 body = data.decode(
-                    "utf-8", errors="ignore" if len(data) >= _MAX_SOURCE_BYTES else "strict"
+                    "utf-8-sig", errors="ignore" if len(data) >= _MAX_SOURCE_BYTES else "strict"
                 )
             except UnicodeDecodeError:
                 logger.debug("folder steering document is not UTF-8: %s", key)

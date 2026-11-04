@@ -608,6 +608,32 @@ class TestCloudLogin:
         assert cli_cloud._DISPATCH["tunnel"] is cli_cloud._DISPATCH["connect"]
 
 
+class TestEnsurePlugin:
+    def test_a_refused_plugin_is_named_not_offered_an_install(self, monkeypatch, capsys):
+        """Reinstalling a found-but-refused plugin rewrites the same file."""
+        from kiro_crew.cloud import ssm
+
+        refusal = ssm.PluginRefusal(
+            path="/usr/local/sessionmanagerplugin/bin/session-manager-plugin",
+            reason="executable is owned by another user (uid 1501)",
+            remedy_command="sudo chown -R root:wheel /usr/local/sessionmanagerplugin",
+            code="other_owner",
+        )
+        monkeypatch.setattr(ssm, "session_manager_plugin_installed", lambda: False)
+        monkeypatch.setattr(ssm, "session_manager_plugin_refusal", lambda: refusal)
+
+        def _no_prompt(*_a, **_k):
+            raise AssertionError("must not offer to install a refused plugin")
+
+        monkeypatch.setattr(cli_cloud.ui, "confirm", _no_prompt)
+        monkeypatch.setattr(ssm, "install_session_manager_plugin", _no_prompt)
+
+        assert cli_cloud._ensure_session_manager_plugin() is False
+        out = capsys.readouterr()
+        text = out.out + out.err
+        assert refusal.path in text and refusal.reason in text
+
+
 class TestDoctor:
     def test_doctor_probes_resolved_aws_binary(self, monkeypatch, capsys):
         """The doctor probes the binary resolved spawns execute, never the
@@ -671,7 +697,7 @@ class TestDoctor:
     @pytest.mark.parametrize(
         ("code", "next_step"),
         [
-            ("other_owner", "Fix the file's ownership or permissions"),
+            ("other_owner", "Install a copy with AWS's own installer, then rerun."),
             ("world_writable", "Fix the file's ownership or permissions"),
             ("root_gateway", "Start the gateway from a regular account instead of root"),
             ("strict_policy", "Install it where only root can change the file"),
@@ -705,11 +731,53 @@ class TestDoctor:
         out = capsys.readouterr().out
         assert "aws CLI found at /opt/homebrew/bin/aws but refused: the check's words" in out
         assert next_step in out
+        if code == "other_owner":
+            # Making another account's file trusted is the risk the check guards.
+            assert "Fix the file's ownership or permissions" not in out
+            assert "/usr/local/bin belongs to the other account" in out
         assert "aws CLI not found" not in out
         assert "https://aws.amazon.com/cli/" not in out
         # The profile was never checked, so its advice would point the wrong way.
         assert "Profile did not resolve" not in out
         assert "The aws CLI above was refused, so the profile was not checked." in out
+
+    @pytest.mark.parametrize(
+        ("code", "next_step"),
+        [
+            ("other_owner", "Install a copy with AWS's own installer, then rerun."),
+            ("root_gateway", "Start the gateway from a regular account instead of root"),
+            ("", "Fix the file's ownership or permissions"),
+        ],
+    )
+    def test_doctor_gives_a_refused_plugin_with_no_command_its_code_s_step(
+        self, monkeypatch, capsys, code, next_step
+    ):
+        """The plugin line takes the same step per code as the aws CLI line."""
+        monkeypatch.setattr(cli_cloud, "resolve_aws_bin", lambda: "/opt/aws-cli/aws")
+        monkeypatch.setattr(shutil, "which", lambda *_a, **_k: "/opt/aws-cli/aws")
+        monkeypatch.setattr(cli_cloud, "_resolve", lambda _args: ("dev", "us-west-2"))
+        monkeypatch.setattr(cli_cloud.ssm, "session_manager_plugin_installed", lambda: False)
+        monkeypatch.setattr(
+            cli_cloud.ssm,
+            "session_manager_plugin_refusal",
+            lambda: cli_cloud.ssm.PluginRefusal(
+                path="/opt/homebrew/bin/session-manager-plugin",
+                reason="the check's words",
+                remedy_command="",
+                code=code,
+            ),
+        )
+        monkeypatch.setattr(
+            cli_cloud.iam,
+            "reachability_check",
+            lambda profile, region: {"reachable": False, "note": ""},
+        )
+
+        assert cli_cloud.handle_cloud(_args(cloud_action="doctor")) == 0
+        out = capsys.readouterr().out
+        assert next_step in out
+        if code == "other_owner":
+            assert "Fix the file's ownership or permissions" not in out
 
 
 _ACCT = "123456789012"

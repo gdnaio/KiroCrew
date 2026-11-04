@@ -7,7 +7,7 @@
  */
 import { describe, expect, it } from 'vitest'
 
-import { ACP_BACKEND_KAS, ACP_BACKEND_KIRO, configuredAcpBackend, DEFAULT_ACP_BACKEND, isKiroBackend, mcpWholeServerDeny, reportsCredits, isKiroHarness } from './acpBackend'
+import { ACP_BACKEND_KAS, ACP_BACKEND_KIRO, acpBackendName, acpBackendShortName, configuredAcpBackend, DEFAULT_ACP_BACKEND, isKiroBackend, kasChatOwnsMcpSignIn, mcpServerDeny, mcpWholeServerDeny, reportsCredits, isKiroHarness } from './acpBackend'
 import type { AcpBackendProbe } from './client/config'
 
 describe('isKiroBackend', () => {
@@ -21,6 +21,26 @@ describe('isKiroBackend', () => {
     expect(isKiroBackend({ agent: { acp_backend: '' } })).toBe(false)
     expect(isKiroBackend({ agent: {} })).toBe(false)
     expect(isKiroBackend({})).toBe(false)
+  })
+})
+
+describe('kasChatOwnsMcpSignIn', () => {
+  it('is true on KAS, named or by default', () => {
+    expect(kasChatOwnsMcpSignIn({ agent: { acp_backend: ACP_BACKEND_KAS } })).toBe(true)
+    expect(kasChatOwnsMcpSignIn({ agent: { acp_backend: '' } })).toBe(true)
+    expect(kasChatOwnsMcpSignIn({})).toBe(true)
+  })
+
+  it('stays true with sign-in persistence on: that vault never takes a Settings sign-in', () => {
+    // A key the slice type does not list, as the real config body carries it.
+    const cfg = { agent: { acp_backend: ACP_BACKEND_KAS, kas_persist_mcp_sign_in: true } }
+    expect(kasChatOwnsMcpSignIn(cfg)).toBe(true)
+  })
+
+  it('is false on another harness, or before the config loads', () => {
+    expect(kasChatOwnsMcpSignIn({ agent: { acp_backend: ACP_BACKEND_KIRO } })).toBe(false)
+    expect(kasChatOwnsMcpSignIn({ agent: { acp_backend: 'claude' } })).toBe(false)
+    expect(kasChatOwnsMcpSignIn(undefined)).toBe(false)
   })
 })
 
@@ -71,14 +91,14 @@ describe('mcpWholeServerDeny', () => {
 
   it('states the rule, naming the harness, where the server classed the reach as whole-server', () => {
     const out = mcpWholeServerDeny(row({ per_tool_deny: 'whole-server', costs_whole_server: true, ineffective: [] }))
-    expect(out.rule).toMatch(/^Turning off one MCP tool on Goose stops every tool on the same server/)
+    expect(out.rule).toMatch(/^Turning off one MCP tool on goose stops every tool on the same server/)
     expect(out.exception).toBe('')
   })
 
   it('adds the exception on a per-call reach', () => {
     const out = mcpWholeServerDeny(row({ per_tool_deny: 'per-call', costs_whole_server: true, ineffective: [] }, 'codex', 'Codex'))
-    expect(out.rule).toContain('on Codex')
-    expect(out.exception).toMatch(/^One exception: .*kirocrew-core.* on Codex\.$/)
+    expect(out.rule).toContain('on OpenAI Codex')
+    expect(out.exception).toMatch(/^One exception: .*kirocrew-core.* on OpenAI Codex\.$/)
   })
 
   it('says nothing on a reach that stops only the named tool', () => {
@@ -88,6 +108,42 @@ describe('mcpWholeServerDeny', () => {
   it('reads the server flag, not the reach name: no flag (an older gateway) is no rule', () => {
     expect(mcpWholeServerDeny(row({ per_tool_deny: 'whole-server', ineffective: [] })).rule).toBe('')
     expect(mcpWholeServerDeny(row(undefined)).rule).toBe('')
+  })
+})
+
+describe('mcpServerDeny', () => {
+  // The tool list's wording for ONE server, from the gateway's spared list.
+  const row = (mcp: AcpBackendProbe['mcp']): AcpBackendProbe =>
+    ({ id: 'codex', policy_id: 'Codex', mcp } as AcpBackendProbe)
+  const perCall = (spared?: string[]) => row({
+    per_tool_deny: 'per-call', costs_whole_server: true, ineffective: [],
+    ...(spared ? { spared_servers: spared } : {}),
+  })
+
+  it('gives a spared server only the tool-by-tool fact', () => {
+    const out = mcpServerDeny(perCall(['kirocrew-core']), 'kirocrew-core')
+    expect(out.rule).toBe('')
+    expect(out.exception).toMatch(/on OpenAI Codex turning off one tool here stops only that tool\.$/)
+  })
+
+  it('gives every other server only the rule', () => {
+    const out = mcpServerDeny(perCall(['kirocrew-core']), 'github')
+    expect(out.rule).toContain('on OpenAI Codex')
+    expect(out.exception).toBe('')
+  })
+
+  it('reads the names from the gateway, not from a list of its own', () => {
+    expect(mcpServerDeny(perCall(['someone-else']), 'kirocrew-core').rule).toContain('on OpenAI Codex')
+  })
+
+  it('keeps the pair on a gateway that sends no list', () => {
+    expect(mcpServerDeny(perCall(), 'kirocrew-core')).toEqual(mcpWholeServerDeny(perCall()))
+  })
+
+  it('says nothing where the reach costs only the tool', () => {
+    const out = mcpServerDeny(row({ per_tool_deny: 'settings-file', costs_whole_server: false, spared_servers: [], ineffective: [] }), 'github')
+    expect(out).toEqual({ rule: '', exception: '' })
+    expect(mcpServerDeny(undefined, 'github')).toEqual({ rule: '', exception: '' })
   })
 })
 
@@ -107,5 +163,15 @@ describe('isKiroHarness', () => {
     for (const id of ['claude', 'codex', 'opencode', 'goose', 'pi', 'deepseek']) {
       expect(isKiroHarness({ agent: { acp_backend: id } })).toBe(false)
     }
+  })
+})
+
+describe('acpBackendName / acpBackendShortName', () => {
+  it('calls the KAS harness "Kiro Agent" everywhere, badges included, without renaming its id', () => {
+    // A display rename only: the id the config stores and the gateway reads stays `kas`.
+    expect(ACP_BACKEND_KAS).toBe('kas')
+    expect(acpBackendName({ id: ACP_BACKEND_KAS })).toBe('Kiro Agent')
+    expect(acpBackendShortName(ACP_BACKEND_KAS)).toBe('Kiro Agent')
+    expect(acpBackendName({ id: ACP_BACKEND_KIRO })).toBe('Kiro CLI')
   })
 })

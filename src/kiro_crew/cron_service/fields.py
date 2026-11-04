@@ -21,17 +21,22 @@ from typing import Any
 from kiro_crew import cron_script
 from kiro_crew.cron_service.execution import _SUBPROC_CLEANUP_ALLOWANCE_SECS
 from kiro_crew.cron_service.model import (
+    _ALERT_AFTER_DEFAULT,
     _AUTO_PAUSE_THRESHOLD,
     CronJob,
     CronSchedule,
+    validate_alert_after_failures,
     validate_auto_pause_after_failures,
 )
 from kiro_crew.cron_service.schedule import (
+    LOCAL_TIMEZONE,
+    is_local_timezone,
     is_valid_skip_date,
     is_valid_timezone,
     validate_cron_expr,
 )
 from kiro_crew.cron_service.store import _is_representable_number
+from kiro_crew.cron_service.zone_default_migration import release_legacy_zone
 from kiro_crew.validation import CHANNEL_MAX_LEN, MAX_CRON_MESSAGE, MAX_SHORT_STRING
 
 _MIN_INTERVAL_SECS = 60
@@ -171,6 +176,11 @@ def validate_create_timeouts(
             )
 
 
+def _stored_timezone(timezone: str) -> str:
+    """The spelling a validated *timezone* is stored in: ``local`` in one case, else as given."""
+    return LOCAL_TIMEZONE if timezone and is_local_timezone(timezone) else timezone
+
+
 def build_job(
     name: str,
     message: str,
@@ -204,6 +214,7 @@ def build_job(
     timeout_secs: int = 0,
     app_manifest_digest: str = "",
     auto_pause_after_failures: int | None = None,
+    alert_after_failures: int | None = None,
 ) -> CronJob:
     """Validate inputs and construct the :class:`CronJob` (no I/O, no lock).
 
@@ -218,7 +229,9 @@ def build_job(
 
     ``auto_pause_after_failures`` is how many consecutive failed runs pause the
     job; ``None`` means the ``_AUTO_PAUSE_THRESHOLD`` default and ``0`` means the
-    job never auto-pauses.
+    job never auto-pauses. ``alert_after_failures`` is how many consecutive
+    failed runs it takes before the failure message is delivered; ``None`` means
+    the ``_ALERT_AFTER_DEFAULT`` of 1.
 
     The optional presentation/routing fields (``agent_id``, ``model``,
     ``silent``, ``timezone``, ``strict_schedule``, ``hide_in_chat``) are set
@@ -276,8 +289,14 @@ def build_job(
         if auto_pause_after_failures is None
         else validate_auto_pause_after_failures(auto_pause_after_failures)
     )
+    _alert_after = (
+        _ALERT_AFTER_DEFAULT
+        if alert_after_failures is None
+        else validate_alert_after_failures(alert_after_failures)
+    )
     if timezone and not is_valid_timezone(timezone):
         raise ValueError(f"Invalid timezone: {timezone!r}")
+    timezone = _stored_timezone(timezone)
     skip_dates = skip_dates or []
     for _d in skip_dates:
         if not is_valid_skip_date(_d):
@@ -327,6 +346,7 @@ def build_job(
         timeout_secs=int(timeout_secs) if timeout_secs else seams._JOB_TIMEOUT_SECS,
         app_manifest_digest=app_manifest_digest or "",
         auto_pause_after_failures=_auto_pause,
+        alert_after_failures=_alert_after,
     )
 
 
@@ -419,6 +439,9 @@ def apply_job_update(
     _auto_pause: int | None = None
     if "auto_pause_after_failures" in kwargs and kwargs["auto_pause_after_failures"] is not None:
         _auto_pause = validate_auto_pause_after_failures(kwargs["auto_pause_after_failures"])
+    _alert_after: int | None = None
+    if "alert_after_failures" in kwargs and kwargs["alert_after_failures"] is not None:
+        _alert_after = validate_alert_after_failures(kwargs["alert_after_failures"])
     # Script/command subprocess timeout. MCP cron_update passes this
     # field, so a branch has to consume it here — otherwise the
     # update is accepted and silently dropped.
@@ -535,7 +558,9 @@ def apply_job_update(
     if "skip_dates" in kwargs:
         job.skip_dates = kwargs["skip_dates"] or []
     if "timezone" in kwargs:
-        job.timezone = kwargs["timezone"] or ""
+        job.timezone = _stored_timezone(kwargs["timezone"] or "")
+        # Chosen with today's meaning of an empty zone, so no upgrade holds it on UTC.
+        release_legacy_zone(job)
     if "strict_schedule" in kwargs:
         job.strict_schedule = bool(kwargs["strict_schedule"])
     if "persistent_session" in kwargs:
@@ -601,6 +626,8 @@ def apply_job_update(
         # A new limit governs the NEXT failure; it does not lift a pause the
         # job is already in -- resuming stays the user's explicit action.
         job.auto_pause_after_failures = _auto_pause
+    if _alert_after is not None:
+        job.alert_after_failures = _alert_after
 
     # Schedule changes (already validated above)
     if "cron_expr" in kwargs and kwargs["cron_expr"]:

@@ -327,13 +327,23 @@ class TestDelegationCarriesTheCrewsStore:
         memory_store_dir_for("legacy").mkdir(parents=True)
 
         class Raises:
-            def ensure_store(self, _name):
+            def __init__(self):
+                self.names = []
+
+            def ensure_store(self, name):
+                self.names.append(name)
                 raise RuntimeError("boom")
 
         await prepare_store_vectors(object(), "legacy")  # no ensure_store at all
-        await prepare_store_vectors(MagicMock(), "legacy")  # not awaitable
-        await prepare_store_vectors(Raises(), "legacy")  # raises
-        await prepare_store_vectors(MagicMock(), "")  # no store named
+        not_awaitable = MagicMock()
+        await prepare_store_vectors(not_awaitable, "legacy")
+        not_awaitable.ensure_store.assert_called_once_with("legacy")
+        raises = Raises()
+        await prepare_store_vectors(raises, "legacy")
+        assert raises.names == ["legacy"]
+        unnamed = MagicMock()
+        await prepare_store_vectors(unnamed, "")
+        assert unnamed.ensure_store.call_count == 0
 
     @pytest.mark.asyncio
     async def test_a_named_store_is_actually_stood_up(self, crew_config, monkeypatch):
@@ -372,11 +382,15 @@ class TestTheMembersRosterCarriesIdentity:
         sentinel. That is a redaction of the VALUE, not a withdrawal of the
         field, so the roster still carries a crew's identity.
         """
+        import importlib
         import inspect
 
         from kiro_crew.dashboard.handlers import members as members_handler
 
         src = inspect.getsource(members_handler)
+        src += "".join(
+            inspect.getsource(importlib.import_module(o)) for o in members_handler._OWNERS
+        )
         assert '"description": _roster_mask(agent_cfg.description)' in src
         assert '"triggers": _roster_mask(agent_cfg.triggers)' in src
 
@@ -536,7 +550,7 @@ class TestTheSpawnEndpointActuallyDelegates:
             "mcp_tools/control_parts/directive.py",
             "mcp_tools/control_parts/monitor.py",
         ):
-            text = (root / rel).read_text()
+            text = (root / rel).read_text(encoding="utf-8")
             assert 'spawn_run(agent="<name>"' not in text, rel
             assert "spawn_run(agent=<crew>" not in text, rel
         # Packaged prompts, skills and docs are guidance too: one that routes with

@@ -134,6 +134,131 @@ def test_create_inherits_an_ancestor_folders_project_dir(tmp_path):
     assert child.project == str(folder_project.resolve())
 
 
+def test_a_create_without_a_folder_keeps_the_callers_project(tmp_path):
+    """A dispatcher passes no ``folder``, so its worker works where it works.
+
+    The caller sits in a project folder; the child is filed nowhere and still runs
+    in the caller's project, in memory and in the birth metadata.
+    """
+    state = _make_state(tmp_path)
+    caller_project = tmp_path / "caller-project"
+    caller_project.mkdir()
+    _folder(state, "fold00000005", "Ops", project_dir=str(caller_project))
+    caller = _slot(state, "chat-1")
+    caller.folder_id = "fold00000005"
+    caller.project = str(caller_project.resolve())
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+
+    child = state.get_slot(created["target"])
+    assert child is not None
+    assert not child.folder_id
+    assert child.project == str(caller_project.resolve())
+    written = state.conversation_log.get_metadata(slot_history_key(child))
+    assert written.get("project") == str(caller_project.resolve())
+
+
+def test_an_explicit_folder_project_wins_over_the_callers(tmp_path):
+    state = _make_state(tmp_path)
+    caller_project = tmp_path / "caller-project"
+    caller_project.mkdir()
+    folder_project = tmp_path / "folder-project"
+    folder_project.mkdir()
+    _folder(state, "fold00000006", "Other", project_dir=str(folder_project))
+    caller = _slot(state, "chat-1")
+    caller.project = str(caller_project.resolve())
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000006")
+    )
+
+    child = state.get_slot(created["target"])
+    assert child is not None
+    assert child.project == str(folder_project.resolve())
+
+
+def test_a_caller_project_switch_mid_create_is_refused(tmp_path, monkeypatch):
+    """The inherited project is re-checked at the late gate, like a folder project.
+
+    A switch inside an await of the create would otherwise start the child in the
+    caller's former project.
+    """
+    from kiro_crew.dashboard.session_control_parts import session_create as create_mod
+
+    state = _make_state(tmp_path)
+    first = tmp_path / "first-project"
+    first.mkdir()
+    second = tmp_path / "second-project"
+    second.mkdir()
+    caller = _slot(state, "chat-1")
+    caller.project = str(first.resolve())
+    real = create_mod._inherited_project_dir
+
+    def _switch_after_read(raw, workspace):
+        resolved = real(raw, workspace)
+        caller.project = str(second.resolve())
+        return resolved
+
+    monkeypatch.setattr(create_mod, "_inherited_project_dir", _switch_after_read)
+
+    with pytest.raises(sc.SessionControlError) as refused:
+        asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+
+    assert refused.value.code == "caller_project_changed"
+    assert list(state._slots) == [caller.key], "the refused create must allocate nothing"
+
+
+def test_the_validated_project_is_the_one_the_late_gate_compares(tmp_path, monkeypatch):
+    """A-to-B-to-A during the create must not start the child in B.
+
+    The helper validates the snapshot it is handed and never re-reads the slot, so
+    the late gate's equality check compares against the very value the child gets.
+    """
+    from kiro_crew.dashboard.session_control_parts import session_create as create_mod
+
+    state = _make_state(tmp_path)
+    first = tmp_path / "first-project"
+    first.mkdir()
+    second = tmp_path / "second-project"
+    second.mkdir()
+    caller = _slot(state, "chat-1")
+    caller.project = str(first.resolve())
+    real = create_mod._inherited_project_dir
+
+    def _flip_and_back(raw, workspace):
+        caller.project = str(second.resolve())
+        resolved = real(raw, workspace)
+        caller.project = str(first.resolve())
+        return resolved
+
+    monkeypatch.setattr(create_mod, "_inherited_project_dir", _flip_and_back)
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+
+    child = state.get_slot(created["target"])
+    assert child is not None
+    assert child.project == str(first.resolve())
+
+
+@pytest.mark.parametrize("stored", ["", "relative/path", "/nonexistent/kc-project-gone"])
+def test_a_caller_without_a_usable_project_gives_the_default(tmp_path, monkeypatch, stored):
+    """An empty, relative or vanished caller project is not reused."""
+    from kiro_crew.dashboard.session_control_parts import session_create as create_mod
+
+    default = tmp_path / "workspace-default"
+    default.mkdir()
+    monkeypatch.setattr(create_mod, "default_project_dir", lambda _ws: str(default))
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller.project = stored
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+
+    child = state.get_slot(created["target"])
+    assert child is not None
+    assert child.project == str(default)
+
+
 def test_create_refuses_an_unknown_folder(tmp_path):
     """An unresolvable folder refuses the WHOLE create, allocating nothing.
 
@@ -484,6 +609,7 @@ def test_the_empty_window_merge_mirrors_the_full_saves_slot_owned_fields(tmp_pat
         "last_consolidated",
         "closed",
         "closed_at",
+        "closed_id",
         "app",
         "forked_from",
         "linked_session_key",
@@ -705,3 +831,203 @@ def test_the_empty_window_merge_cannot_resurrect_a_deleted_session(tmp_path):
     asyncio.run(save_slot_off_loop(state, child, force=True))
 
     assert not path.exists(), "the merge must not resurrect a deleted session file"
+
+
+def test_a_crew_mode_root_creates_its_worker_outside_the_persons_folders(tmp_path, request):
+    """The server drops a Crew Mode caller's folder, whoever sent it (``crew_mode``)."""
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller.agent_kind = "template"
+    # The caller's own agent is the configured Crew Mode conductor, so the case does
+    # not depend on a conductor spec being installed in the test home.
+    from types import SimpleNamespace
+
+    from kiro_crew import crew_mode
+
+    caller.agent = "kirocrew"
+    # The chat turned Crew Mode on: its root slot carries the stamp.
+    caller.crew_mode_agent = caller.agent
+    crew_mode.remember(SimpleNamespace(agent=SimpleNamespace(crew_mode_agent="kirocrew")))
+    request.addfinalizer(
+        lambda: crew_mode.remember(SimpleNamespace(agent=SimpleNamespace(crew_mode_agent="")))
+    )
+    folder_project = tmp_path / "goal-project"
+    folder_project.mkdir()
+    _folder(state, "fold00000001", "Goal", project_dir=str(folder_project))
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000001")
+    )
+
+    child = state.get_slot(created["target"])
+    assert child is not None
+    assert not child.folder_id
+    assert created.get("folder_ignored") == "crew_mode"
+    assert created.get("crew_mode") is True
+    # Not filed, but the folder still gives the worker its project directory, so it
+    # does its work in the folder's repository rather than the workspace default.
+    assert child.project == str(folder_project.resolve())
+
+    # A worker of that root is held to the same rule for the sessions IT opens.
+    grandchild = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(child), folder_id="fold00000001")
+    )
+    assert not state.get_slot(grandchild["target"]).folder_id
+    assert grandchild.get("folder_ignored") == "crew_mode"
+
+
+@pytest.mark.parametrize("conductor", [True, False], ids=["crew-mode", "plain"])
+@pytest.mark.parametrize("folder_id", ["", "fold00000002"], ids=["inherited", "named"])
+def test_fork_filing_respects_the_callers_crew_mode_tree(
+    tmp_path, monkeypatch, conductor, folder_id
+):
+    """Crew workers are unfiled at birth; plain forks keep normal folder inheritance."""
+    from kiro_crew import crew_mode
+    from kiro_crew.dashboard import chat_fork
+    from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
+
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller.agent_kind = "template"
+    caller.agent = "kirocrew"
+    if conductor:
+        caller.crew_mode_agent = caller.agent
+    monkeypatch.setattr(crew_mode, "_live_cfg", lambda: None)
+    monkeypatch.setattr(crew_mode, "_configured", "kirocrew" if conductor else "other-conductor")
+    _folder(state, "fold00000001", "Parent", hidden=True)
+    named_folder = _folder(state, "fold00000002", "Requested", hidden=True)
+    caller.folder_id = "fold00000001"
+    caller.append("user", "Split this investigation", "msg msg-u")
+    caller.append("assistant", "Investigation context", "msg msg-a")
+    caller.drain()
+    _save_slot_to_history(state, caller, closed=False)
+    caller._resumed_count = len(caller.messages)
+    caller._disk_window_len = len(caller.messages)
+    caller._dirty = False
+    birth_folders = []
+    real_save = chat_fork.save_slot_off_loop
+
+    async def _save(st, slot, *args, **kwargs):
+        if slot is not caller:
+            birth_folders.append(slot.folder_id)
+        return await real_save(st, slot, *args, **kwargs)
+
+    monkeypatch.setattr(chat_fork, "save_slot_off_loop", _save)
+    forked = asyncio.run(
+        sc.fork_session(state, caller_session_key=_key(caller), folder_id=folder_id)
+    )
+
+    child = state.get_slot(forked["target"])
+    expected_folder = "" if conductor else folder_id or caller.folder_id
+    assert child is not None
+    assert child.folder_id == expected_folder
+    assert birth_folders == [expected_folder], "the first save must already have the final filing"
+    written = state.conversation_log.get_metadata(slot_history_key(child))
+    assert (written.get("folder_id") or "") == expected_folder
+    assert forked["folder_id"] == (expected_folder or None)
+    assert caller.folder_id == "fold00000001"
+    if conductor:
+        assert forked.get("crew_mode") is True
+        assert forked.get("folder_ignored") == ("crew_mode" if folder_id else None)
+        assert named_folder["hidden"] is True
+    else:
+        assert "crew_mode" not in forked
+        assert "folder_ignored" not in forked
+
+
+def test_a_plain_caller_still_files_its_child(tmp_path):
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    _folder(state, "fold00000001", "Goal")
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000001")
+    )
+    assert state.get_slot(created["target"]).folder_id == "fold00000001"
+    assert "folder_ignored" not in created
+    assert "crew_mode" not in created
+
+
+def _unstamped_conductor_root(state, monkeypatch):
+    """A root chat on the configured conductor that never turned Crew Mode on."""
+    from kiro_crew import crew_mode
+
+    caller = _slot(state, "chat-1")
+    caller.agent_kind = "template"
+    caller.agent = "kirocrew"
+    caller.crew_mode_agent = ""
+    monkeypatch.setattr(crew_mode, "_live_cfg", lambda: None)
+    monkeypatch.setattr(crew_mode, "_configured", "kirocrew")
+    assert crew_mode.slot_is_crew_mode_root(caller)
+    return caller
+
+
+def test_an_unstamped_conductor_root_still_files_its_child(tmp_path, monkeypatch):
+    """Folder effects follow the root's stamp, not the conductor template alone."""
+    from kiro_crew import crew_mode
+
+    state = _make_state(tmp_path)
+    caller = _unstamped_conductor_root(state, monkeypatch)
+    _folder(state, "fold00000001", "Goal")
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000001")
+    )
+
+    child = state.get_slot(created["target"])
+    assert child.folder_id == "fold00000001"
+    assert "folder_ignored" not in created
+    assert "crew_mode" not in created
+    # The row stamps still mark the tree: only the folder rule reads the stamp.
+    assert crew_mode.slot_in_crew_tree(state._slots, child.key)
+    assert not crew_mode.slot_in_turned_on_tree(state._slots, child.key)
+
+    grandchild = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(child), folder_id="fold00000001")
+    )
+    assert state.get_slot(grandchild["target"]).folder_id == "fold00000001"
+    assert "folder_ignored" not in grandchild
+
+
+def test_an_unstamped_conductor_roots_fork_inherits_its_folder(tmp_path, monkeypatch):
+    from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
+
+    state = _make_state(tmp_path)
+    caller = _unstamped_conductor_root(state, monkeypatch)
+    _folder(state, "fold00000001", "Parent")
+    caller.folder_id = "fold00000001"
+    caller.append("user", "Split this investigation", "msg msg-u")
+    caller.append("assistant", "Investigation context", "msg msg-a")
+    caller.drain()
+    _save_slot_to_history(state, caller, closed=False)
+    caller._resumed_count = len(caller.messages)
+    caller._disk_window_len = len(caller.messages)
+    caller._dirty = False
+
+    forked = asyncio.run(sc.fork_session(state, caller_session_key=_key(caller)))
+
+    assert state.get_slot(forked["target"]).folder_id == "fold00000001"
+    assert forked["folder_id"] == "fold00000001"
+    assert "crew_mode" not in forked
+    assert "folder_ignored" not in forked
+
+
+def test_turned_on_tree_reads_the_root_rows_stamp():
+    from kiro_crew import crew_mode
+
+    stamped = {"key": "r1", "crew_mode_root": True, "crew_mode_agent": "kirocrew"}
+    unstamped = {"key": "r2", "crew_mode_root": True, "crew_mode_agent": ""}
+    rows = {
+        "r1": stamped,
+        "r2": unstamped,
+        "w1": {"key": "w1", "crew_root": "r1"},
+        "w2": {"key": "w2", "crew_root": "r2"},
+        "w3": {"key": "w3", "crew_root": "closed-root"},
+        "p": {"key": "p"},
+    }
+    assert crew_mode.row_in_turned_on_tree(rows["r1"], rows)
+    assert crew_mode.row_in_turned_on_tree(rows["w1"], rows)
+    assert not crew_mode.row_in_turned_on_tree(rows["r2"], rows)
+    assert not crew_mode.row_in_turned_on_tree(rows["w2"], rows)
+    assert not crew_mode.row_in_turned_on_tree(rows["w3"], rows)
+    assert not crew_mode.row_in_turned_on_tree(rows["p"], rows)
+    assert not crew_mode.row_in_turned_on_tree(None, rows)

@@ -20,34 +20,32 @@ now is not part of it: that is the crewmate's work ledger.
   (``set_key_results``); once confirmed it records readings directly
   (``key_result_progress``). The user edits or removes them on the Goals tab.
   A reading is free text: a number ("27", "80%") or a short qualitative note.
-* ``schedules`` -- the three check-in switches (Daily Goal Reminder, Weekly
-  report, Monthly review), the one shared time of day, the weekday and the day of
-  the month; the gateway schedules they drive are owned by
-  :mod:`kiro_crew.dashboard.goal_reminder`.
+* ``schedules`` -- the four check-in switches (Daily Goal Reminder, Weekly
+  report, Monthly review, Heartbeat), the one shared time of day, the weekday,
+  the day of the month and the heartbeat's interval in minutes; the gateway
+  schedules they drive are owned by :mod:`kiro_crew.dashboard.goal_reminder`.
 * ``reports`` -- pointers to the newest weekly reports and monthly reviews, each
   saved as an artifact under ``Crewmates/<name>/Reports``.
 
 Where it lives
 --------------
-``trust/member-goals/<slug>.json``, beside the permanent rules, NOT in the
-agent-writable ``members/<slug>/`` directory that holds ``briefing.md``. A
+``member-records/member-goals/<slug>.json``, beside the permanent rules, NOT in
+the agent-writable ``members/<slug>/`` directory that holds ``briefing.md``. A
 goal needs the user's button to change, and a file the crewmate's own file
 tools can write would let it change a goal without one. The protection is
-exactly ``member-rules/``'s: ``trust/`` is in the sensitive-path floor, so the
-agent's file-write and edit tools are refused there (the tool gate). It is not
-an OS seal: ``trust/`` is a read-write leaf of the crew sandbox, so a shell
-command in a sandboxed turn can still write it, the same as the rules file. It
-is still a different file from ``member-rules/``: rules are the user's safety
-boundary, and nothing about a goal, not even an applied card, ever writes them.
+exactly ``member-rules/``'s (:mod:`kiro_crew.member_records`): the OS sandbox
+masks ``member-records/`` in every mode, and the sensitive-path floor refuses
+the agent's file tools there. It is still a different file from
+``member-rules/``: rules are the user's safety boundary, and nothing about a
+goal, not even an applied card, ever writes them.
 
-Because a sandboxed shell can write ``trust/``, it can also put a symlink there,
-and the gateway that writes this record is not sandboxed. So the record is never
-reached through a link: ``trust``, ``member-goals`` and the record itself are
-each opened relative to the one before without following a symlink, and the
-write goes into that pinned directory (:func:`_open_goals_dir`). A link at any of
-them is refused (:class:`GoalsUnreadable`), so a crewmate cannot point the
-directory at ``profiles/`` or another sealed leaf and have the gateway write
-there. Where the platform has no ``O_NOFOLLOW`` and ``dir_fd`` (Windows), each
+The gateway that writes this record is not sandboxed, so the record is never
+reached through a link: ``member-records``, ``member-goals`` and the record
+itself are each opened relative to the one before without following a symlink,
+and the write goes into that pinned directory (:func:`_open_goals_dir`). A link
+at any of them is refused (:class:`GoalsUnreadable`), so a link at one of those
+names cannot point the gateway's write at ``profiles/`` or another sealed leaf.
+Where the platform has no ``O_NOFOLLOW`` and ``dir_fd`` (Windows), each
 component is checked with ``lstat`` before the path is used.
 
 Keyed like every lossy-slug member file: the payload records the exact member
@@ -71,13 +69,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import platform_compat
+from kiro_crew import dashboard_frame, member_records, platform_compat
 from kiro_crew.atomic_write import atomic_write, fsync_dir, read_bytes_with_retry
 from kiro_crew.config.paths import data_home
 
 logger = logging.getLogger(__name__)
 
-#: Directory under ``trust/`` holding one ``<slug>.json`` per member.
+#: Directory under ``member-records/`` holding one ``<slug>.json`` per member.
 GOALS_DIR_NAME = "member-goals"
 
 #: Bounds. The record is injected into every session of the crewmate, so each
@@ -95,6 +93,15 @@ KR_READING_MAX_CHARS = 120
 #: One saved weekly or monthly report: its title and its Markdown body.
 REPORT_TITLE_MAX_CHARS = 200
 REPORT_MAX_CHARS = 40_000
+#: A report saved as a whole HTML page, in bytes of UTF-8: the crewmate
+#: Dashboard page's own ceiling, since the viewer opens a report in that page's
+#: sandbox (``dashboard_frame.MAX_PAGE_BYTES``).
+REPORT_HTML_MAX_BYTES = dashboard_frame.MAX_PAGE_BYTES
+
+#: The crewmate's notes (``save_notes``): what its briefing injects, which is
+#: ``members.MEMBER_BRIEFING_MAX_CHARS`` (spelled here because this module
+#: imports no ``members``; a test pins the two equal).
+NOTES_MAX_CHARS = 4000
 #: The record file itself, as read back: a hand-edited file past this is
 #: unreadable rather than loaded whole.
 _RECORD_MAX_BYTES = 64 * 1024
@@ -110,11 +117,29 @@ BY_CREWMATE = "crewmate"
 _AUTHORS = (BY_USER, BY_CREWMATE)
 
 DEFAULT_REMINDER_TIME = "09:00"
-#: The three check-ins, each its own switch and its own schedule.
+#: The four check-ins, each its own switch and its own schedule. The heartbeat
+#: wakes the crewmate every :data:`HEARTBEAT_INTERVALS` minutes to move its work
+#: forward on its own (RFC "Crewmate heartbeat").
 CADENCE_DAILY = "daily"
 CADENCE_WEEKLY = "weekly"
 CADENCE_MONTHLY = "monthly"
-CADENCES = (CADENCE_DAILY, CADENCE_WEEKLY, CADENCE_MONTHLY)
+CADENCE_HEARTBEAT = "heartbeat"
+CADENCES = (CADENCE_DAILY, CADENCE_WEEKLY, CADENCE_MONTHLY, CADENCE_HEARTBEAT)
+#: The heartbeat's intervals, in minutes, and the one a record without one reads as.
+#: Each wake is a full model turn over the crewmate's whole context, and a
+#: provider's prompt cache lives minutes, not half-hours, so no interval here reuses
+#: the last wake's cache: credits scale with the number of wakes alone. Hence a
+#: 30-minute floor and an hourly default (RFC "Crewmate heartbeat", Cost and cache).
+HEARTBEAT_INTERVALS = (30, 60, 120, 240)
+DEFAULT_HEARTBEAT_INTERVAL = 60
+#: The user's answer to the Heartbeat checkbox on a ``crewmate.goal`` card, kept
+#: as the record's ``heartbeat_offer``: a decline is remembered, so no later goal
+#: card offers the Heartbeat again, and either answer tells the goal-setup turn
+#: that the card already settled it. A goal card offers the Heartbeat while it is
+#: off and this is not ``declined`` (``change_card_catalog_plans._goal_heartbeat_offer``).
+HEARTBEAT_OFFER_ACCEPTED = "accepted"
+HEARTBEAT_OFFER_DECLINED = "declined"
+HEARTBEAT_OFFER_ANSWERS = (HEARTBEAT_OFFER_ACCEPTED, HEARTBEAT_OFFER_DECLINED)
 #: Report kinds: what a weekly and a monthly check-in each produce.
 REPORT_KINDS = (CADENCE_WEEKLY, CADENCE_MONTHLY)
 #: Cron day of week (0 = Sunday); Monday by default.
@@ -164,15 +189,14 @@ def _lock_for(slug: str) -> threading.Lock:
 def member_goals_path(slug: str) -> Path:
     """Absolute path to one member's goal record.
 
-    Lexical, under the resolved data home: ``trust`` and ``member-goals`` are
-    NOT resolved, because a sandboxed shell can replace either with a symlink.
-    :func:`_open_goals_dir` refuses such a link; this path is what the
-    no-``dir_fd`` fallback and the tests use.
+    Lexical, under the resolved data home: ``member-records`` and
+    ``member-goals`` are NOT resolved. :func:`_open_goals_dir` refuses a link at
+    either; this path is what the no-``dir_fd`` fallback and the tests use.
     """
     from kiro_crew.members import MemberSlugError, validate_slug
 
     validate_slug(slug)
-    root = data_home().resolve() / "trust" / GOALS_DIR_NAME
+    root = member_records.records_dir(GOALS_DIR_NAME)
     target = root / f"{slug}.json"
     if target.parent != root:
         raise MemberSlugError(f"member slug {slug!r} escapes {root}")
@@ -226,34 +250,35 @@ def _open_dir_at(parent_fd: int, name: str, *, create: bool) -> int | None:
 
 
 def _open_goals_dir(*, create: bool) -> int | None:
-    """A pinned fd of ``trust/member-goals``, or None when it does not exist.
+    """A pinned fd of ``member-records/member-goals``, or None when it does not exist.
 
     Each component below the data home is opened relative to the one before
-    without following a link, so a symlink planted at ``trust`` or
+    without following a link, so a symlink at ``member-records`` or
     ``member-goals`` is refused instead of redirecting the gateway's write.
     """
+    member_records.ensure_migrated()
     home = os.open(str(data_home().resolve()), os.O_RDONLY | _O_DIRECTORY)
     try:
-        trust = _open_dir_at(home, "trust", create=create)
+        records = _open_dir_at(home, member_records.MEMBER_RECORDS_LEAF, create=create)
     finally:
         os.close(home)
-    if trust is None:
+    if records is None:
         return None
     try:
-        goals = _open_dir_at(trust, GOALS_DIR_NAME, create=create)
+        goals = _open_dir_at(records, GOALS_DIR_NAME, create=create)
         if goals is not None and create:
-            for fd in (trust, goals):
+            for fd in (records, goals):
                 try:
                     getattr(os, "fchmod")(fd, 0o700)
                 except OSError:
                     logger.debug("could not tighten mode on the goals dir", exc_info=True)
         return goals
     finally:
-        os.close(trust)
+        os.close(records)
 
 
 def _check_unlinked(path: Path) -> None:
-    """The no-``dir_fd`` fallback: refuse when ``trust``, the dir or *path* is a link.
+    """The no-``dir_fd`` fallback: refuse when the records leaf, the dir or *path* is a link.
 
     A Windows directory junction counts as a link: ``is_symlink`` is False for
     one, so a planted junction would otherwise redirect the write.
@@ -272,6 +297,8 @@ def default_schedules() -> dict[str, Any]:
         "weekday": DEFAULT_WEEKDAY,
         CADENCE_MONTHLY: False,
         "month_day": DEFAULT_MONTH_DAY,
+        CADENCE_HEARTBEAT: False,
+        "interval": DEFAULT_HEARTBEAT_INTERVAL,
     }
 
 
@@ -284,6 +311,7 @@ def empty_record() -> dict[str, Any]:
         "reports": [],
         "removed_key_result": None,
         "removed_goal": None,
+        "heartbeat_offer": None,
     }
 
 
@@ -458,6 +486,8 @@ def _normalize(data: dict[str, Any]) -> dict[str, Any]:
         day = sched.get("month_day")
         if isinstance(day, int) and 1 <= day <= MAX_MONTH_DAY:
             out["month_day"] = day
+        if is_heartbeat_interval(sched.get("interval")):
+            out["interval"] = sched["interval"]
     reports = data.get("reports")
     if isinstance(reports, list):
         rec["reports"] = [
@@ -500,6 +530,8 @@ def _normalize(data: dict[str, Any]) -> dict[str, Any]:
                     k for k in (links if isinstance(links, list) else []) if isinstance(k, str)
                 ],
             }
+    if data.get("heartbeat_offer") in HEARTBEAT_OFFER_ANSWERS:
+        rec["heartbeat_offer"] = data["heartbeat_offer"]
     return rec
 
 
@@ -528,7 +560,11 @@ def _read_pinned(path: Path) -> bytes | None:
 
 
 def _read_raw(slug: str) -> dict[str, Any] | None:
-    path = member_goals_path(slug)
+    try:
+        path = member_goals_path(slug)
+    except member_records.RecordsNotMoved as exc:
+        # Not moved yet is not "no goal": a write here would bury the real record.
+        raise GoalsUnreadable(f"goal record for {slug!r} has not been moved yet") from exc
     try:
         if _PINNED:
             raw = _read_pinned(path)
@@ -612,7 +648,34 @@ def _write_pinned(path: Path, data: bytes) -> None:
         os.close(d)
 
 
+#: Called as ``listener(slug, member, record)`` after each write of a goal record.
+_change_listeners: list[Any] = []
+
+
+def add_change_listener(listener: Any) -> None:
+    """Call *listener* after every write of a goal record, with the record written.
+
+    The gateway registers one (``dashboard.crewmate_feed``) to record the goal into
+    the crewmate's crew log for its Dashboard page. A listener runs on the writing
+    thread and must hand real work elsewhere; one that raises is logged and skipped.
+    """
+    _change_listeners.append(listener)
+
+
+def _notify_change(slug: str, member: str, rec: dict[str, Any]) -> None:
+    for listener in list(_change_listeners):
+        try:
+            listener(slug, member, rec)
+        except Exception:
+            logger.debug("goal change listener failed for %s", slug, exc_info=True)
+
+
 def _write(slug: str, member: str, rec: dict[str, Any]) -> None:
+    _write_record(slug, member, rec)
+    _notify_change(slug, member, rec)
+
+
+def _write_record(slug: str, member: str, rec: dict[str, Any]) -> None:
     path = member_goals_path(slug)
     data = _payload(slug, member, rec)
     try:
@@ -722,6 +785,7 @@ def set_goal(
     goal_id: str | None = None,
     expected: str | None = None,
     restore_from: str | None = None,
+    heartbeat_offer: str | None = None,
 ) -> dict[str, Any]:
     """Add a goal, or change or clear the goal *goal_id*.
 
@@ -740,13 +804,21 @@ def set_goal(
     pre-change text of that goal, read server-side from the card's private
     snapshot: the plan's body carries it scrubbed, and the raw text is what
     goes back.
+
+    *heartbeat_offer* is the user's answer to the goal card's Heartbeat
+    checkbox (:data:`HEARTBEAT_OFFER_ANSWERS`), stored in the same write as the
+    goal so the goal-setup turn that write starts already sees it.
     """
     clean = _clean_text(text, max_chars=GOAL_TEXT_MAX_CHARS, multiline=True, what="the goal")
     if goal_id is not None and not is_goal_id(goal_id):
         raise GoalError("invalid_goal_id", "a goal id is g and 8 hex digits")
+    if heartbeat_offer is not None and heartbeat_offer not in HEARTBEAT_OFFER_ANSWERS:
+        raise GoalError("invalid_heartbeat_offer", "heartbeat_offer is accepted or declined")
 
     def fn(rec: dict[str, Any]) -> dict[str, Any]:
         now = _now()
+        if heartbeat_offer is not None:
+            rec["heartbeat_offer"] = heartbeat_offer
         if goal_id is None:
             if expected is not None and (expected != "" or rec["goals"]):
                 raise GoalError("changed_meanwhile", "the goals were changed since this was shown")
@@ -1205,8 +1277,53 @@ def is_check_in_time(value: str) -> bool:
     return bool(_TIME_RE.match(value))
 
 
+def interval_label(minutes: Any) -> str:
+    """The one way a heartbeat interval is written: ``"30 min"``, ``"1 hr"``, ``"2 hr"``.
+
+    The card, the tool text and the wake prompt use it, and the Goals tab's
+    ``fmtInterval`` gives the same English words (``Intl`` short units), so a
+    user reads one wording everywhere. A value off the list reads as the default.
+    """
+    value = minutes if is_heartbeat_interval(minutes) else DEFAULT_HEARTBEAT_INTERVAL
+    return f"{value} min" if value < 60 else f"{value // 60} hr"
+
+
+def wakes_per_day(minutes: Any) -> int:
+    """The most wakes a heartbeat at *minutes* makes in a day: 48, 24, 12 or 6.
+
+    The bound the user consents to on the card, matching the Goals tab's
+    ``wakesPerDay``. A value off the list reads as the default.
+    """
+    value = minutes if is_heartbeat_interval(minutes) else DEFAULT_HEARTBEAT_INTERVAL
+    return (24 * 60) // value
+
+
+def interval_choices() -> str:
+    """Every interval in :func:`interval_label` words, for tool and card text.
+
+    Built from :data:`HEARTBEAT_INTERVALS`, so the text a model reads can never
+    offer an interval the validator refuses: ``"30 min, 1 hr (the default), 2 hr or 4 hr"``.
+    """
+    words = [
+        interval_label(m) + (" (the default)" if m == DEFAULT_HEARTBEAT_INTERVAL else "")
+        for m in HEARTBEAT_INTERVALS
+    ]
+    return ", ".join(words[:-1]) + " or " + words[-1]
+
+
+def interval_minutes_text() -> str:
+    """:data:`HEARTBEAT_INTERVALS` as the numbers a tool call sends: ``"30, 60, 120 or 240"``."""
+    nums = [str(m) for m in HEARTBEAT_INTERVALS]
+    return ", ".join(nums[:-1]) + " or " + nums[-1]
+
+
+def is_heartbeat_interval(value: Any) -> bool:
+    """Whether *value* is one of :data:`HEARTBEAT_INTERVALS` (an int, never a bool)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value in HEARTBEAT_INTERVALS
+
+
 def _validate_schedules(changes: Any) -> None:
-    allowed = {*CADENCES, "time", "timezone", "weekday", "month_day"}
+    allowed = {*CADENCES, "time", "timezone", "weekday", "month_day", "interval"}
     if not isinstance(changes, dict) or not changes or set(changes) - allowed:
         raise GoalError("invalid_schedule", "give switches or timing to change")
     for cadence in CADENCES:
@@ -1226,6 +1343,11 @@ def _validate_schedules(changes: Any) -> None:
     day = changes.get("month_day", 1)
     if not isinstance(day, int) or isinstance(day, bool) or not 1 <= day <= MAX_MONTH_DAY:
         raise GoalError("invalid_month_day", f"month_day must be 1 to {MAX_MONTH_DAY}")
+    if "interval" in changes and not is_heartbeat_interval(changes["interval"]):
+        raise GoalError(
+            "invalid_interval",
+            "interval must be one of " + ", ".join(str(m) for m in HEARTBEAT_INTERVALS),
+        )
 
 
 def set_schedules(
@@ -1234,14 +1356,20 @@ def set_schedules(
     changes: dict[str, Any],
     *,
     expected: dict[str, Any] | None = None,
+    held_is_done: bool = False,
 ) -> dict[str, Any]:
     """Change the check-in switches and their timing. Returns the record.
 
-    *changes* holds any of ``daily``/``weekly``/``monthly`` (bool), ``time``
-    (``HH:MM``), ``timezone`` (IANA name), ``weekday`` (0-6, 0 = Sunday) and
-    ``month_day`` (1-28). Turning any switch on needs a goal (``no_goal``).
+    *changes* holds any of ``daily``/``weekly``/``monthly``/``heartbeat``
+    (bool), ``time`` (``HH:MM``), ``timezone`` (IANA name), ``weekday`` (0-6,
+    0 = Sunday), ``month_day`` (1-28) and ``interval`` (the heartbeat's minutes,
+    one of :data:`HEARTBEAT_INTERVALS`). Turning any switch on needs a goal
+    (``no_goal``). Only the owner's route and an applied card call this, so the
+    crewmate never turns a switch on by itself.
     When supplied, *expected* covers every written field and is compared under
-    the write lock; omitted fields stay untouched. No expectation keeps the
+    the write lock; omitted fields stay untouched. With *held_is_done* (a goal
+    card's Undo only) a write whose *changes* already hold succeeds without
+    writing even when *expected* does not match. No expectation keeps the
     ordinary owner's partial-update behavior.
     """
     _validate_schedules(changes)
@@ -1255,6 +1383,11 @@ def set_schedules(
 
     def fn(rec: dict[str, Any]) -> dict[str, Any]:
         if expected is not None and any(rec["schedules"].get(k) != v for k, v in expected.items()):
+            if held_is_done and all(rec["schedules"].get(k) == v for k, v in changes.items()):
+                # An Undo turning off a Heartbeat the user turned off since:
+                # nothing to write and nothing to refuse. Never on Apply, where a
+                # no-op success would read as the card having turned it on.
+                return copy.deepcopy(rec)
             raise GoalError("changed_meanwhile", "the check-ins were changed since this was shown")
         if not has_goal(rec) and any(changes.get(c) is True for c in CADENCES):
             raise GoalError("no_goal", "set a goal before turning a check-in on")

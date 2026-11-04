@@ -20,8 +20,8 @@ read, and how out-of-band action stays out of the in-band recovery path's way.
 ## The failure that made this concrete
 
 `_dispatch_events` yields a permission event (`action == "permission"` →
-`_build_permission_event`). The consumer, `dashboard/chat_runner.py`, handles it
-in place at the `EVENT_PERMISSION_REQUEST` branch and awaits the user's decision:
+`_build_permission_event`). The consumer, `dashboard/chat_turn/permission_prompt.py`, handles it
+in place in `_on_permission_prompt` and awaits the user's decision:
 
 ```python
 outcome = await asyncio.wait_for(fut, timeout=_approval_window)
@@ -256,7 +256,7 @@ In-band recovery already exists end to end. `_end_stalled_tool`
 never the process, because co-tenant sessions share the runtime — and yields one
 terminal `EVENT_COMPLETE` carrying `STOP_REASON_TOOL_STALL` plus the tool title,
 redacted command, and evidence. The consumer's `STOP_REASON_TOOL_STALL` branch
-in `chat_runner.py` then, for `_prompt_depth == 0 and
+in `_turn_stop_recovery` (`chat_turn/stop_recovery.py`) then, for `_prompt_depth == 0 and
 slot._tool_stall_retries < 3`, increments the
 budget and `queue_insert`s a continue-nudge (`SYNTHETIC_RECOVERY_KIND` /
 `RecoveryPayload.CONTINUATION`) naming the stalled tool. It no longer replays the

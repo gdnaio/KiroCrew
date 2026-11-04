@@ -24,6 +24,7 @@ modules use are in ``steer_requeue_helpers.py``.
 
 from __future__ import annotations
 
+import re
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -400,6 +401,7 @@ class TestSteerRegisteredBeforeAwait:
         state = _make_state(tmp_path)
         state.broadcast_ws = MagicMock()
         slot = _running_slot(state)
+        slot._steer_possibly_delivered.add("later")
         client_mock = MagicMock()
         client_mock.supports_steer = True
         client_mock.steer = AsyncMock(side_effect=RuntimeError("boom"))
@@ -414,6 +416,7 @@ class TestSteerRegisteredBeforeAwait:
 
         # unwound — queue fallback owns delivery, no double-delivery via requeue
         assert slot._pending_steers == []
+        assert "later" not in slot._steer_possibly_delivered
         assert [i["content"] for i in slot._queue] == ["later"]
 
     @pytest.mark.asyncio
@@ -514,9 +517,13 @@ class TestProductionWiring:
         src = self._runner_source()
         assert "elif event.kind == EVENT_STEER_CONSUMED:" in src
         branch_at = src.index("elif event.kind == EVENT_STEER_CONSUMED:")
-        settle_at = src.index("_settle_consumed_steers(slot, event.text", branch_at)
-        # the settle call must be the branch body (within a few lines)
-        assert settle_at - branch_at < 200
+        assert src.index("await _on_steer_consumed(turn, event)", branch_at) - branch_at < 200
+        phase_at = src.index("async def _on_steer_consumed(")
+        # The phase's entry reads (``x = turn.x``) are plumbing, not body: measure past them.
+        body = re.sub(r"(?m)^[ \t]*(\w+) = turn\.\1\n", "", src[phase_at:])
+        settle_at = body.index("_settle_consumed_steers(slot, event.text")
+        # the settle call must be the branch body (within a few lines of its phase's head)
+        assert settle_at < 400
 
     def test_steer_handler_registers_before_await(self):
         from pathlib import Path

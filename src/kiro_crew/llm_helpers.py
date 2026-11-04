@@ -64,6 +64,7 @@ __all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("
 if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
     from kiro_crew.llm_helpers_parts.backend_errors import (  # noqa: F401
         _CONNECTION_MARKERS,
+        _FRAME_DATA_TAIL_RE,
         _JITTER_RNG,
         _PROMPT_BUSY_DELAY,
         _PROMPT_BUSY_RETRIES,
@@ -101,6 +102,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.llm_helpers_parts.background_turns import (  # noqa: F401
         _background_crew_log_owner,
         _cleanup_memory_consolidation_session,
+        _lite_spec_unconfirmed,
         _raise_if_unfinished,
         _record_background_crew_log,
         _start_fresh_conversation,
@@ -113,8 +115,11 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         FALLBACK_STORY_ATTR,
         ROUTE_BASELINE_ATTR,
         TURN_FALLBACK_ATTR,
+        ActiveModelLine,
         FallbackState,
+        _annotate_engine_fallback,
         _bound_to_other_loop,
+        _consume_engine_promotion,
         _fallback_wire_spelling,
         _latch_identity,
         _slot_switch_session_locks,
@@ -122,6 +127,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         annotate_model_fallback,
         append_fallback_story,
         configured_fallback_chain,
+        engine_attributed_model,
         fallback_rewound_transient_budget,
         fallback_story_of,
         first_advertised_fallback,
@@ -148,7 +154,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _steer_host_deny,
     )
     from kiro_crew.llm_helpers_parts.tool_input_denials import (  # noqa: F401
+        _DIFF_TRUNCATION_MARK,
         _MAX_SCANNABLE_TOOL_INPUT_CHARS,
+        _diff_candidates,
         _edit_target_denial,
         _extract_tool_input_strings,
         _first_tool_input_denial,
@@ -194,6 +202,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.agent_sdk import (  # noqa: F401
         CONTEXT_EVENT_COMPACTION,
     )
+    from kiro_crew.agent_sdk.backends import ACP_BACKENDS_MODEL_AT_LAUNCH  # noqa: F401
     from kiro_crew.agent_sdk.drivers.acp import (  # noqa: F401
         provider_error_client,
         resolve_pin_spelling_on,
@@ -204,6 +213,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         EVENT_STEER_CONSUMED,
         EVENT_TEXT_CHUNK,
         EVENT_TOOL_CALL,
+        EVENT_TOOL_RESULT,
         AcpError,
         AcpPromptBusy,
         LLMEvent,
@@ -216,6 +226,10 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         STOP_REASON_STALE_RECOVER,
         STOP_REASON_TIMEOUT,
         AcpTimeoutError,
+        engine_served_model,
+        same_model,
+        tracker_of,
+        walk_outcome,
     )
     from kiro_crew.config.loader import (  # noqa: F401
         KiroCrewConfig,
@@ -241,6 +255,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         get_global_hook_store,
         hook_gate_kwargs,
         title_is_trusted_mcp_identity,
+        unattended_turn,
         untruncated_shell_title,
     )
     from kiro_crew.image_refs import (  # noqa: F401
@@ -249,9 +264,13 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.messaging.link import (  # noqa: F401
         canonical_key,
     )
+    from kiro_crew.metrics.usage_attrs import (  # noqa: F401
+        TRIGGER_SYSTEM,
+    )
     from kiro_crew.permission_floor import (  # noqa: F401
         OUTCOME_REJECTED_TRANSPORT_FLOOR,
     )
+    from kiro_crew.platform.context import redact_via_context  # noqa: F401
     from kiro_crew.platform.tool_paths import WRITE_PLANE_KINDS as _WRITE_PLANE_KINDS  # noqa: F401
     from kiro_crew.platform.tool_paths import (  # noqa: F401
         command_shaped_strings,

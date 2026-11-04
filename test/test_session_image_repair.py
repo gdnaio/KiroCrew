@@ -853,11 +853,11 @@ class TestReplacementTranscriptIsLockedDown:
             order.append("fdopen")
             return real_fdopen(fd, *a, **kw)
 
-        monkeypatch.setattr(sir.platform_compat, "restrict_to_owner", traced_restrict)
-        monkeypatch.setattr(os, "fdopen", traced_fdopen)
+        with monkeypatch.context() as mp:
+            mp.setattr(sir.platform_compat, "restrict_to_owner", traced_restrict)
+            mp.setattr(os, "fdopen", traced_fdopen)
 
-        sir.apply_repair(p, lines, backup=False, expect=report.source_stat)
-        monkeypatch.undo()
+            sir.apply_repair(p, lines, backup=False, expect=report.source_stat)
 
         # The temp is restricted, and restricted before it is opened for writing.
         assert "restrict:tmp" in order
@@ -967,11 +967,11 @@ class TestBackupIsNeverOverwritten:
                 order.append("read")
             return real_read_bytes(self)
 
-        monkeypatch.setattr(os, "open", traced_open)
-        monkeypatch.setattr(Path, "read_bytes", traced_read)
+        with monkeypatch.context() as mp:
+            mp.setattr(os, "open", traced_open)
+            mp.setattr(Path, "read_bytes", traced_read)
 
-        sir.apply_repair(p, lines, backup=True, expect=report.source_stat)
-        monkeypatch.undo()
+            sir.apply_repair(p, lines, backup=True, expect=report.source_stat)
 
         assert order == ["open(exclusive=True)", "read"]
 
@@ -1002,35 +1002,86 @@ class TestBackupIsNeverOverwritten:
         def boom(_path):
             raise OSError("icacls failed")
 
-        monkeypatch.setattr(sir.platform_compat, "restrict_to_owner", boom)
+        with monkeypatch.context() as mp:
+            mp.setattr(sir.platform_compat, "restrict_to_owner", boom)
 
-        opened: list[int] = []
-        real_open = os.open
+            opened: list[int] = []
+            real_open = os.open
 
-        def tracking_open(target, *args, **kwargs):
-            fd = real_open(target, *args, **kwargs)
-            if str(target) == str(sidecar):
-                opened.append(fd)
-            return fd
+            def tracking_open(target, *args, **kwargs):
+                fd = real_open(target, *args, **kwargs)
+                if str(target) == str(sidecar):
+                    opened.append(fd)
+                return fd
 
-        monkeypatch.setattr(os, "open", tracking_open)
+            mp.setattr(os, "open", tracking_open)
 
-        with pytest.raises(OSError, match="icacls failed"):
-            sir.apply_repair(p, lines, backup=True, expect=report.source_stat)
+            with pytest.raises(OSError, match="icacls failed"):
+                sir.apply_repair(p, lines, backup=True, expect=report.source_stat)
 
-        assert not sidecar.exists()  # nothing stranded to block the retry
-        assert not list(tmp_path.glob("*.tmp"))
-        assert len(opened) == 1
-        with pytest.raises(OSError) as info:
-            os.fstat(opened[0])
-        assert info.value.errno == errno.EBADF, "the sidecar's descriptor was leaked"
+            assert not sidecar.exists()  # nothing stranded to block the retry
+            assert not list(tmp_path.glob("*.tmp"))
+            assert len(opened) == 1
+            with pytest.raises(OSError) as info:
+                os.fstat(opened[0])
+            assert info.value.errno == errno.EBADF, "the sidecar's descriptor was leaked"
 
         # And the retry it would have blocked now works.
-        monkeypatch.undo()
         report2, lines2 = sir.scan_file(p)
         assert lines2 is not None
         sir.apply_repair(p, lines2, backup=True, expect=report2.source_stat)
         assert sidecar.exists()
+
+    def test_a_failed_replacement_write_removes_this_calls_backup(self, tmp_path, monkeypatch):
+        """A retryable write failure must not leave a sidecar that blocks retry."""
+        p = tmp_path / "s.jsonl"
+        _write_transcript(p, [_prompt_record((3000, 1200))])
+        report, lines = sir.scan_file(p)
+        assert lines is not None
+        before = p.read_bytes()
+        sidecar = p.with_suffix(".jsonl.pre-image-repair.bak")
+
+        fsync_calls = 0
+        real_fsync = os.fsync
+
+        def fail_the_temp_fsync(fd):
+            nonlocal fsync_calls
+            fsync_calls += 1
+            if fsync_calls == 2:
+                raise OSError("disk full during replacement write")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", fail_the_temp_fsync)
+
+        with pytest.raises(OSError, match="disk full during replacement write"):
+            sir.apply_repair(p, lines, backup=True, expect=report.source_stat)
+
+        assert fsync_calls == 2  # backup completed before the replacement failed
+        assert p.read_bytes() == before  # replacement did not land
+        assert not sidecar.exists()  # no failed-attempt sidecar blocks retry
+        assert not list(tmp_path.glob("*.tmp"))
+
+    def test_a_failed_temp_allocation_removes_this_calls_backup(self, tmp_path, monkeypatch):
+        """No inode for the temp (ENOSPC) must not strand the backup either."""
+        p = tmp_path / "s.jsonl"
+        _write_transcript(p, [_prompt_record((3000, 1200))])
+        report, lines = sir.scan_file(p)
+        assert lines is not None
+        before = p.read_bytes()
+        sidecar = p.with_suffix(".jsonl.pre-image-repair.bak")
+
+        def no_inode_left(*_a, **_k):
+            assert sidecar.exists()  # the backup was written before the temp
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(sir.tempfile, "mkstemp", no_inode_left)
+
+        with pytest.raises(OSError, match="No space left on device"):
+            sir.apply_repair(p, lines, backup=True, expect=report.source_stat)
+
+        assert p.read_bytes() == before
+        assert not sidecar.exists()  # a retry is not turned into BackupExistsError
+        assert not list(tmp_path.glob("*.tmp"))
 
     def test_a_dangling_symlink_sidecar_is_also_refused(self, tmp_path):
         """exists() is False for a dangling link, so is_symlink is checked too."""

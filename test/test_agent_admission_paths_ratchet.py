@@ -66,7 +66,7 @@ ADMISSION_SITES: dict[Site, frozenset[str]] = {
     ("acp/client_start.py", "_spawn"): frozenset({FORK, FRESH}),
     ("acp/harness/kas.py", "KasHarness.session_extras._build"): frozenset({FORK, FRESH}),
     ("acp/harness/kiro.py", "KiroHarness.resolve_spawn"): frozenset({FORK}),
-    ("acp/runtime.py", "AcpRuntime._activate_mode_bracketed"): frozenset({FRESH}),
+    ("acp/runtime_mode_activation.py", "_activate_mode_bracketed"): frozenset({FRESH}),
     ("acp/runtime_spawn_launch.py", "_resolve_spawn_plan"): frozenset({FRESH}),
     ("acp/session_mcp.py", "_agent_spec_and_snapshot_for"): frozenset({FRESH}),
 }
@@ -78,7 +78,7 @@ KNOWN_GAPS: dict[Site, tuple[frozenset[str], str]] = {
         "covered: AcpRuntime._resolve_spawn_plan runs the freshness gate after this "
         "method returns, as the last check before the process is created",
     ),
-    ("acp/runtime.py", "AcpRuntime._activate_mode_bracketed"): (
+    ("acp/runtime_mode_activation.py", "_activate_mode_bracketed"): (
         frozenset({FORK}),
         "UNCOVERED: a shared runtime spawned as one agent and switched to another "
         "here passes no fork-governance check for the agent it switched to; a "
@@ -100,6 +100,10 @@ KNOWN_GAPS: dict[Site, tuple[frozenset[str], str]] = {
 # (module, function) -> the admission sites that govern the spawn it builds, or a
 # string stating why no admission gate applies.
 AGENT_ARGV_SITES: dict[Site, tuple[Site, ...] | str] = {
+    ("acp/harness/strands.py", "StrandsLaunch.resolve_spawn"): (
+        "UNGATED: the Strands CLI's own --agent names Kiro Crew's sealed gate module, a "
+        "Python project file, not a Kiro agent spec, so no spec admission applies"
+    ),
     ("acp/client_start.py", "_spawn"): (("acp/client_start.py", "_spawn"),),
     ("acp/harness/kiro.py", "KiroHarness.resolve_spawn"): (
         ("acp/harness/kiro.py", "KiroHarness.resolve_spawn"),
@@ -120,6 +124,15 @@ AGENT_ARGV_SITES: dict[Site, tuple[Site, ...] | str] = {
     ),
     ("testing/workflow_memory_scenario.py", "respond"): (
         "not a kiro-cli spawn: a test scenario reading its own argv"
+    ),
+    ("acp/kas_env_launch.py", "_shim_entry"): (
+        "not a kiro-cli spawn: the KAS MCP launcher's own --agent names the snapshot to read"
+    ),
+    ("acp/kas_env_launch.py", "batch_snapshot_names"): (
+        "not a kiro-cli spawn: reads the KAS MCP launcher's --agent back from a projected entry"
+    ),
+    ("kas_env_shim.py", "_resolve_snapshot"): (
+        "not a kiro-cli spawn: the KAS MCP launcher declaring its own --agent option"
     ),
 }
 

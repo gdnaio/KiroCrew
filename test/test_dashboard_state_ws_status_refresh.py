@@ -130,8 +130,7 @@ class TestPeriodicCheckStatusRefresh:
             async def __anext__(self):
                 # Hold the connection open until the periodic loop has fired
                 # once, then end the handler (which cancels the loop task).
-                # flake-ok: pre-existing unbounded wait that holds the fake socket open, moved verbatim; the await_until around api_ws bounds the test
-                await refreshed.wait()
+                await await_until(refreshed, what="the periodic loop to fire once")
                 raise StopAsyncIteration
 
         fake_ws = FakeWebSocket()
@@ -156,6 +155,7 @@ class TestPeriodicCheckStatusRefresh:
         loop must push explicitly instead of waiting for message activity."""
         from kiro_crew.dashboard import ws as dashboard_ws
         from kiro_crew.dashboard.handlers import source_providers
+        from kiro_crew.platform import governance_profiles
 
         state = MagicMock()
         state.owner_id = "U_OWNER"
@@ -217,8 +217,7 @@ class TestPeriodicCheckStatusRefresh:
                 return self
 
             async def __anext__(self):
-                # flake-ok: pre-existing unbounded wait that holds the fake socket open, moved verbatim; the await_until around api_ws bounds the test
-                await pushed.wait()
+                await await_until(pushed, what="the allowlist-change push")
                 raise StopAsyncIteration
 
         monkeypatch.setattr(source_providers, "_gitlab_hosts_snapshot", frozenset())
@@ -228,10 +227,16 @@ class TestPeriodicCheckStatusRefresh:
         monkeypatch.setattr(dashboard_ws.web, "WebSocketResponse", lambda **kwargs: FakeWebSocket())
         monkeypatch.setattr(source_providers, "ensure_gitlab_hosts_loaded", fake_ensure)
         monkeypatch.setattr(source_providers, "CHECK_STATUS_TTL_SECS", 0.01)
+        # The governance watch also pushes slots when real profile files change,
+        # which other tests on the same xdist worker do; pin it so the only push
+        # left is the host-allowlist one this test is about.
+        monkeypatch.setattr(governance_profiles, "poll_profiles_fresh", lambda: None)
+        monkeypatch.setattr(governance_profiles, "governance_answer_generation", lambda: 0)
 
         await await_until(asyncio.ensure_future(dashboard_ws.api_ws(Request())))  # type: ignore[arg-type]
 
-        state.push_slots_update.assert_called()
+        assert calls["n"] >= 2
+        state.push_slots_update.assert_called_with()
 
     @pytest.mark.asyncio
     async def test_slots_broadcast_carries_gitlab_hosts_generation(
@@ -394,11 +399,12 @@ class TestPeriodicCheckStatusRefresh:
                 return self
 
             async def __anext__(self):
-                # flake-ok: pre-existing 50 ms window for a wrongly started refresh loop to fire, moved verbatim; tracked for a de-flake pass
-                # nosemgrep: kirocrew.test-sleep-as-barrier -- pre-existing 50 ms window before the negative assertion, moved verbatim; tracked for a de-flake pass
-                await asyncio.sleep(0.05)
+                handler_entered.set()
+                await await_until(hold, what="the socket handler to end")
                 raise StopAsyncIteration
 
+        handler_entered = asyncio.Event()
+        hold = asyncio.Event()
         fake_ws = FakeWebSocket()
         monkeypatch.setattr(ws_event_scope, "is_app_enabled", lambda _name: True)
         monkeypatch.setattr(ws_event_scope, "get_app_manifest", lambda _name: None)
@@ -409,10 +415,19 @@ class TestPeriodicCheckStatusRefresh:
         monkeypatch.setattr(source_providers, "schedule_check_refresh", refresh)
         monkeypatch.setattr(source_providers, "schedule_visibility_refresh", MagicMock())
 
-        await await_until(asyncio.ensure_future(dashboard_ws.api_ws(Request())))  # type: ignore[arg-type]
+        task = asyncio.ensure_future(dashboard_ws.api_ws(Request()))  # type: ignore[arg-type]
+        try:
+            await await_until(handler_entered, what="the handler to reach its connection loop")
+            # The negative window: a wrongly started refresh loop would fire within these 50 ms.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(hold.wait(), timeout=0.05)
+        finally:
+            hold.set()
+        await await_until(task, what="api_ws to end")
 
         refresh.assert_not_called()
         state.source_link_urls.assert_not_called()
+        assert fake_ws.sent[0]["type"] == "slots"
 
     @pytest.mark.asyncio
     async def test_non_owner_dashboard_user_does_not_start_refresh_loop(self, monkeypatch) -> None:
@@ -469,11 +484,12 @@ class TestPeriodicCheckStatusRefresh:
                 return self
 
             async def __anext__(self):
-                # flake-ok: pre-existing 50 ms window for a wrongly started refresh loop to fire, moved verbatim; tracked for a de-flake pass
-                # nosemgrep: kirocrew.test-sleep-as-barrier -- pre-existing 50 ms window before the negative assertion, moved verbatim; tracked for a de-flake pass
-                await asyncio.sleep(0.05)
+                handler_entered.set()
+                await await_until(hold, what="the socket handler to end")
                 raise StopAsyncIteration
 
+        handler_entered = asyncio.Event()
+        hold = asyncio.Event()
         fake_ws = FakeWebSocket()
         monkeypatch.setattr(dashboard_ws, "_check_ws_origin", lambda request: None)
         monkeypatch.setattr(dashboard_ws.web, "WebSocketResponse", lambda **kwargs: fake_ws)
@@ -481,7 +497,15 @@ class TestPeriodicCheckStatusRefresh:
         monkeypatch.setattr(source_providers, "schedule_check_refresh", check_refresh)
         monkeypatch.setattr(source_providers, "schedule_visibility_refresh", vis_refresh)
 
-        await await_until(asyncio.ensure_future(dashboard_ws.api_ws(Request())))  # type: ignore[arg-type]
+        task = asyncio.ensure_future(dashboard_ws.api_ws(Request()))  # type: ignore[arg-type]
+        try:
+            await await_until(handler_entered, what="the handler to reach its connection loop")
+            # The negative window: a wrongly started refresh loop would fire within these 50 ms.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(hold.wait(), timeout=0.05)
+        finally:
+            hold.set()
+        await await_until(task, what="api_ws to end")
         # Non-owner: the driver never starts, so neither refresh is ever called
         # and source_link_urls is never polled by a refresh round.
         assert not check_refresh.called
@@ -555,8 +579,7 @@ class TestPeriodicCheckStatusRefresh:
                 return self
 
             async def __anext__(self):
-                # flake-ok: pre-existing unbounded wait that holds the fake socket open, moved verbatim; the await_until around api_ws bounds the test
-                await done.wait()
+                await await_until(done, what="the refresh rounds to finish")
                 raise StopAsyncIteration
 
         fake_ws = FakeWebSocket()
@@ -637,8 +660,7 @@ class TestPeriodicCheckStatusRefresh:
                 return self
 
             async def __anext__(self):
-                # flake-ok: pre-existing unbounded wait that holds the fake socket open, moved verbatim; the await_until around api_ws bounds the test
-                await recovered.wait()
+                await await_until(recovered, what="the loop to recover after the exception")
                 raise StopAsyncIteration
 
         fake_ws = FakeWebSocket()
@@ -714,6 +736,10 @@ class TestTurnBoundarySourceStatus:
         state.refresh_slot_source_status("chat-a")
 
         refresh.assert_not_called()
+        state._owner_ws_clients.add(MagicMock(closed=False))
+        state.refresh_slot_source_status("chat-a")
+        assert refresh.call_count == 1
+        assert refresh.call_args.args[0] == ["https://github.com/acme/repo/pull/7"]
 
     def test_turn_boundary_non_owner_drives_no_refresh(
         self, state: DashboardState, monkeypatch
@@ -766,13 +792,12 @@ class TestTurnBoundarySourceStatus:
         slot = state.get_or_create_slot("chat-a")
         slot.append("assistant", "opened https://github.com/acme/repo/pull/7", broadcast=False)
         state._owner_ws_clients.add(MagicMock(closed=False))
-        monkeypatch.setattr(
-            source_providers,
-            "request_check_refresh_now",
-            MagicMock(side_effect=RuntimeError("no event loop")),
-        )
+        refresh = MagicMock(side_effect=RuntimeError("no event loop"))
+        monkeypatch.setattr(source_providers, "request_check_refresh_now", refresh)
 
-        state.refresh_slot_source_status("chat-a")  # must not raise
+        state.refresh_slot_source_status("chat-a")
+
+        assert refresh.call_args.args[0] == ["https://github.com/acme/repo/pull/7"]
 
     def test_status_delta_goes_only_to_owner_sockets(
         self, state: DashboardState, monkeypatch

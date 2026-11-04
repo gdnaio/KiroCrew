@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from contextlib import contextmanager
@@ -216,9 +217,22 @@ def _project_skills_enabled() -> bool:
     Independent of any grant: with this false, project skills are impossible
     even for a directory that carries one. Fails closed -- an unreadable config
     disables the feature rather than enabling it.
+
+    Every skill-catalog read asks this, several times per turn, and a full
+    ``KiroCrewConfig.load`` rebuilds every section with the GIL held. The answer
+    is reused while the config files are unchanged (``config.load_memo``); a
+    failed read is never remembered, so it fails closed again on the next ask.
     """
+    from kiro_crew.config import load_memo
+
     try:
-        return bool(KiroCrewConfig.load().skills.project_skills_enabled)
+        return bool(
+            load_memo.memoized(
+                "skills.project_skills_enabled",
+                KiroCrewConfig.load,
+                lambda cfg: cfg.skills.project_skills_enabled,
+            )
+        )
     except Exception as exc:  # noqa: BLE001 - unreadable policy must fail closed
         logger.error(
             "skills.project_skills_enabled unreadable (%s); " "refusing every project-skills grant",
@@ -695,12 +709,12 @@ def _as_epoch(value: Any) -> int:
         return 0
     if isinstance(value, int):
         return value
-    if isinstance(value, float):
-        return int(value)
     try:
-        return int(float(str(value)))
+        number = value if isinstance(value, float) else float(str(value))
     except (TypeError, ValueError):
         return 0
+    # json.load accepts NaN and Infinity, and int() raises on both.
+    return int(number) if math.isfinite(number) else 0
 
 
 def list_trusted_projects() -> list[dict[str, Any]]:

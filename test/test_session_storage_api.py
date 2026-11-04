@@ -23,6 +23,7 @@ from body_stream_helpers import BodyStreamPayload
 
 from kiro_crew import session_storage as session_storage_module
 from kiro_crew.dashboard.handlers import session_storage as handler
+from kiro_crew.testing.wait import async_wait_until
 
 _DAY = 86400.0
 
@@ -153,6 +154,47 @@ class TestCleanup:
         body = json.loads(resp.body)
 
         assert body == {"dry_run": True, "sessions": 1, "bytes": size, "remaining": 0}
+        assert (kiro_home / "sessions" / "cli" / "aaaa1111.jsonl").is_file()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sent", ["false", "0", "Off", "no"])
+    async def test_a_spelled_false_dry_run_is_a_real_cleanup(
+        self, stores: tuple[Path, Path], sent: str
+    ) -> None:
+        """``bool("false")`` is True; a spelled false must not be a dry run."""
+        _, kiro_home = stores
+        _retired(kiro_home, "aaaa1111")
+        req = _request(
+            "POST",
+            "/api/system/session-storage/cleanup",
+            {"older_than_days": 30, "dry_run": sent},
+        )
+
+        with patch.object(handler, "_sel", return_value=_sel_stub()):
+            resp = await handler.api_session_storage_cleanup(req)
+        body = json.loads(resp.body)
+
+        assert resp.status == 200
+        assert body.get("dry_run") is not True
+        assert not (kiro_home / "sessions" / "cli" / "aaaa1111.jsonl").is_file()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sent", ["true", "yes please", 1])
+    async def test_a_truthy_dry_run_still_moves_nothing(
+        self, stores: tuple[Path, Path], sent: object
+    ) -> None:
+        _, kiro_home = stores
+        _retired(kiro_home, "aaaa1111")
+        req = _request(
+            "POST",
+            "/api/system/session-storage/cleanup",
+            {"older_than_days": 30, "dry_run": sent},
+        )
+
+        with patch.object(handler, "_sel", return_value=_sel_stub()):
+            resp = await handler.api_session_storage_cleanup(req)
+
+        assert json.loads(resp.body)["dry_run"] is True
         assert (kiro_home / "sessions" / "cli" / "aaaa1111.jsonl").is_file()
 
     @pytest.mark.asyncio
@@ -555,10 +597,7 @@ class TestEmpty:
                 # its executor down and a failed test became a hung run.
                 try:
                     # Let the worker thread report once.
-                    for _ in range(200):
-                        if job.freed_bytes:
-                            break
-                        await asyncio.sleep(0.01)
+                    await async_wait_until(lambda: job.freed_bytes)
 
                     mid = json.loads(
                         (

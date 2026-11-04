@@ -1183,11 +1183,12 @@ describe('RemoteCrewPanel', () => {
     renderWithProviders(<RemoteCrewPanel />)
     await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
     // The failure is shown as a short human cause (never the raw exception
-    // text) and offers NO agent hand-off: a hand-off would unmount the form
-    // the user is about to submit.
+    // text) and offers the agent hand-off: the form keeps what the user typed,
+    // so the navigation loses nothing.
     const notice = await screen.findByText(/request to read this computer's Kiro sign-in failed/i)
     expect(notice.textContent).not.toMatch(/whoami timed out/)
-    expect(screen.queryByRole('button', { name: /Ask the agent/i })).toBeNull()
+    const alert = notice.closest('[role="alert"]') as HTMLElement
+    expect(within(alert).getByRole('button', { name: /Ask the agent/i })).toBeInTheDocument()
     // Nothing is known about this computer's sign-in, so NO radio renders
     // checked and Launch waits for the user to pick: a checked Builder ID
     // beside a gate that says "choose" would read as a choice already made,
@@ -1946,8 +1947,37 @@ describe('RemoteCrewPanel per-crew enable toggle', () => {
 })
 
 describe('RemoteCrewPanel enabled after the gateway started', () => {
-  it('says enabled-but-not-active and tells a failed Connect to restart', async () => {
+  it('says enabled-but-not-active and mutes Connect until the restart', async () => {
     vi.mocked(api.listInstances).mockResolvedValue({ active: false, warm_set_cap: 5, instances: [MANUAL_INSTANCE] })
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+    renderWithProviders(<RemoteCrewPanel />)
+
+    expect(await screen.findByText('dev-box-1')).toBeInTheDocument()
+    const banner = screen.getByText(/not active yet/).closest('[role="status"]') as HTMLElement
+    // #22104: say where to run the command and what works after; no "tunnel manager".
+    expect(banner.textContent).toBe(
+      'Remote crew management is on, but not active yet. Run kirocrew restart in a terminal on the computer this dashboard runs on, not on a remote crew. Then you can connect to your remote crews.',
+    )
+    expect(screen.queryByText(/Disabled in config/)).not.toBeInTheDocument()
+
+    // #23692: the button must agree with the banner. While not active yet, Connect
+    // is disabled (so a click cannot fail) and says why, instead of looking ready.
+    const connect = screen.getByRole('button', { name: /^Connect$/i })
+    expect(connect).toBeDisabled()
+    expect(connect).toHaveAttribute('title', expect.stringMatching(/restart/i))
+    expect(api.connectInstance).not.toHaveBeenCalled()
+
+    // The banner stays the one place the restart command appears.
+    expect(screen.getAllByText(/not active yet/)).toHaveLength(1)
+    expect(screen.getAllByText('kirocrew restart')).toHaveLength(1)
+  })
+
+  it('maps a 503 instances_manager_unavailable Connect failure to the restart hint', async () => {
+    // Distinct from the muted-while-not-active case above: the list reports
+    // active:true (so Connect is enabled and clickable), but the gateway's
+    // instance manager is gone, so the connect route rejects 503. The row must
+    // show the keyed restart hint, not the raw "instances manager not running".
+    vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [MANUAL_INSTANCE] })
     vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
     vi.mocked(api.connectInstance).mockRejectedValue(
       new ApiError(
@@ -1959,15 +1989,11 @@ describe('RemoteCrewPanel enabled after the gateway started', () => {
     renderWithProviders(<RemoteCrewPanel />)
 
     expect(await screen.findByText('dev-box-1')).toBeInTheDocument()
-    expect(screen.getByText(/Enabled, but not active yet/)).toBeInTheDocument()
-    expect(screen.queryByText(/Disabled in config/)).not.toBeInTheDocument()
-
-    await userEvent.setup().click(screen.getByRole('button', { name: /^Connect$/i }))
+    const connect = screen.getByRole('button', { name: /^Connect$/i })
+    expect(connect).toBeEnabled()
+    await userEvent.setup().click(connect)
 
     const alert = await screen.findByText('Connect to m1 failed: the gateway needs a restart first. See the note below.')
     expect(alert.textContent).not.toContain('instances manager not running')
-    // The banner stays where it was and is the one place the restart command appears.
-    expect(screen.getAllByText(/Enabled, but not active yet/)).toHaveLength(1)
-    expect(screen.getAllByText('kirocrew restart')).toHaveLength(1)
   })
 })

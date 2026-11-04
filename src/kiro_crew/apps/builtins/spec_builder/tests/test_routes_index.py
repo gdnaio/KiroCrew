@@ -14,7 +14,6 @@ import inspect
 import json
 import re
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -34,6 +33,7 @@ from kiro_crew.apps.builtins.spec_builder.tests.routes_helpers import (  # noqa:
     _never_touch_the_real_state,
     _redirect_state,
 )
+from kiro_crew.testing.wait import default_timeout
 
 # ── stale-index writes (concurrent delete resurrects a spec) ─────────────────
 
@@ -215,15 +215,45 @@ async def test_concurrent_index_transactions_do_not_lose_a_write(tmp_path, monke
     routes._save_index({})
 
     real_load = routes._load_index
+    real_lock = routes._INDEX_LOCK
+    second_moved = threading.Event()
+    bookkeeping = threading.Lock()
+    arrivals = 0
+    reads = 0
+
+    class _ArrivalLock:
+        """The real index lock, reporting the second transaction's arrival at it."""
+
+        def __enter__(self):
+            nonlocal arrivals
+            with bookkeeping:
+                arrivals += 1
+                if arrivals == 2:
+                    second_moved.set()
+            return real_lock.__enter__()
+
+        def __exit__(self, *exc):
+            return real_lock.__exit__(*exc)
 
     def _slow_load():
-        # Widen the read→write window so an unserialized implementation loses a
-        # write deterministically rather than by luck.
-        # flake-ok: widens the stub's read-to-write window so a lost write shows; no assertion waits on it
-        # nosemgrep: kirocrew.test-sleep-as-barrier -- widens the stub's read-to-write window on purpose; no assertion waits on it
-        time.sleep(0.05)
-        return real_load()
+        nonlocal reads
+        index = real_load()
+        with bookkeeping:
+            reads += 1
+            first = reads == 1
+        if first:
+            # Hold the first transaction between its read and its write until a second one
+            # is positively on its way: waiting at the lock or, with the lock gone, reading
+            # the same index. An unserialized implementation then loses a write on every
+            # run rather than by luck.
+            assert second_moved.wait(
+                timeout=default_timeout()
+            ), "no second transaction reached the index lock"
+        else:
+            second_moved.set()
+        return index
 
+    monkeypatch.setattr(routes, "_INDEX_LOCK", _ArrivalLock())
     monkeypatch.setattr(routes, "_load_index", _slow_load)
 
     def _insert(key):
@@ -449,7 +479,7 @@ def test_index_keys_that_cannot_be_served_are_dropped_at_load(tmp_path, monkeypa
     _redirect_state(monkeypatch, tmp_path)
     # A real AWS-key shape satisfies the name grammar, which is why the grammar alone
     # was not enough -- _redact is what recognises it.
-    credential = "AKIAIOSFODNN7EXAMPLE"
+    credential = "glpat-IOSFODNN7EXAMPLE"
     assert routes._valid_name(credential), "precondition: the grammar accepts this"
     assert routes._redact(credential) != credential, "precondition: _redact rewrites it"
 
@@ -469,7 +499,7 @@ def test_usable_name_requires_grammar_and_redaction_stability():
     """The predicate: a key must pass the same grammar create enforces AND survive
     _redact unchanged."""
     assert routes._usable_name("my-spec_2") is True
-    assert routes._usable_name("AKIAIOSFODNN7EXAMPLE") is False
+    assert routes._usable_name("glpat-IOSFODNN7EXAMPLE") is False
     assert routes._usable_name("../escape") is False
     assert routes._usable_name("with space") is False
     assert routes._usable_name("") is False

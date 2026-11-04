@@ -84,12 +84,14 @@ class TestRememberCancelledIdBound:
         a non-empty deque. (This skew cannot occur once every add routes
         through the helper; the guard is a defensive backstop, so the only
         contract here is 'does not crash'.)"""
-        ids = {f"stray-{i}" for i in range(50)}  # set already over any small cap
+        strays = {f"stray-{i}" for i in range(50)}  # set already over any small cap
+        ids = set(strays)
         order: "collections.deque[str]" = collections.deque()  # empty deque
-        # Must not raise even though len(ids) >> cap and order is empty.
         _remember_cancelled_id(ids, order, "new", cap=4)
-        # The deque never desyncs below the set in real code, so no membership
-        # guarantee is asserted for this artificial skew -- only crash-safety.
+        # Eviction can only drop what the deque names, so it stops once the deque
+        # is empty: the strays it cannot see stay, and nothing indexes past the end.
+        assert len(order) == 0
+        assert strays <= ids
 
     def test_idle_and_busy_paths_share_the_bound(self):
         """Both add sites route through the same helper, so mixing them keeps
@@ -117,9 +119,7 @@ class TestProtectedIdsSurviveEviction:
         # Now a flood of unrelated cancels arrives, each protecting only the
         # still-live "victim" (models _live_request_ids while it stays queued).
         for i in range(1000):
-            _remember_cancelled_id(
-                ids, order, f"noise-{i}", cap=cap, protected={"victim"}
-            )
+            _remember_cancelled_id(ids, order, f"noise-{i}", cap=cap, protected={"victim"})
         # The victim's cancellation flag is still present -- the queued call
         # will be dropped at dispatch instead of executing.
         assert "victim" in ids
@@ -140,9 +140,7 @@ class TestProtectedIdsSurviveEviction:
         ids, order = _fresh()
         cap = 8
         for i in range(1000):
-            _remember_cancelled_id(
-                ids, order, f"noise-{i}", cap=cap, protected={"keepme"}
-            )
+            _remember_cancelled_id(ids, order, f"noise-{i}", cap=cap, protected={"keepme"})
         # No "keepme" was ever added, so nothing is protected -> strict bound.
         assert len(ids) == cap
 

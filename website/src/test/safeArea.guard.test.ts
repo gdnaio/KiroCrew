@@ -68,9 +68,18 @@ const ALLOWLIST: ReadonlyArray<{ file: string; classes: string; reason: string }
     file: 'src/pages/members/MembersPage.tsx',
     classes: 'fixed left-0 top-0 z-[60] pointer-events-none origin-top-left will-change-transform',
     reason:
-      'The crewmate face in flight between the identity pill and the Profile card (CrewFaceFlight). '
+      'The mate face in flight between the identity pill and the Profile card (CrewFaceFlight). '
       + 'left-0 top-0 is only the transform origin: every frame translates it onto a viewport box '
       + 'measured from a face that already sits inside the p-safe shell, so it never hugs an edge.',
+  },
+  {
+    file: 'src/pages/members/MateEntrance.tsx',
+    classes: 'fixed left-0 top-0 origin-top-left will-change-transform',
+    reason:
+      'The first Mate\'s face in flight from centre stage to the header pill (MateEntrance). '
+      + 'Same shape as CrewFaceFlight: left-0 top-0 is only the transform origin, and the inline '
+      + 'left/top place it on a box measured from the thread area and the pill slot, both inside '
+      + 'the p-safe shell, so it never hugs an edge.',
   },
 ]
 
@@ -87,6 +96,14 @@ const INLINE_ALLOWLIST: ReadonlyArray<{ file: string; contains: string; reason: 
       'Decorative theme branding strip: pointerEvents:none, transparent background, height-clamped '
       + 'by data-theme-maxh. It paints ACROSS the top strip, so insetting it would leave an unpainted '
       + 'gap beside the notch, and being click-through it buries no control.',
+  },
+  {
+    file: 'src/pages/chat/BrowserLiveCardCanvas.tsx',
+    contains: "position: 'fixed', left: 0, top: 0, width: 1, height: 1",
+    reason:
+      'The takeover typing proxy: a 1x1, opacity-0, pointer-events:none textarea the phone keyboard '
+      + 'types into. It draws nothing and takes no tap, and each tap moves its top to the tap point, '
+      + 'so no safe-area inset applies to it.',
   },
 ]
 

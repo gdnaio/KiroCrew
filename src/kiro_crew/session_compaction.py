@@ -20,7 +20,6 @@ such as guarded reset and queue retirement.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import time
 from collections.abc import Callable
@@ -35,6 +34,7 @@ from kiro_crew.metrics.sessions import (
     END_REASON_RECYCLED,
     record_session_ended,
     record_session_started,
+    started_trigger_of,
 )
 from kiro_crew.session_lifecycle import allocation_identity, clear_stop_declined
 
@@ -247,10 +247,13 @@ def _compaction_unmanaged_backend(provider: LLMProvider) -> str | None:
 def _harness_managed_backend(provider: LLMProvider) -> str | None:
     """Backend id this provider names as compacting on its own initiative.
 
-    The threshold leaves such a harness alone even when Crew could hand it a
-    manual ``/compact``: its own summarization bounds the context, and a
-    Crew compaction at ``session.autocompact_pct`` would only move that
-    point earlier. Same ``str`` contract as its siblings.
+    The global threshold leaves such a harness alone even when Crew could hand
+    it a manual ``/compact``: its own summarization bounds the context. An
+    explicit threshold (a per-session override or the agent's declared
+    ``autocompact_pct``) asks for that point to move earlier, so there Crew
+    compacts a harness that serves ``/compact``
+    (:meth:`CompactionCoordinator.crew_compacts_harness_managed`). Same
+    ``str`` contract as its siblings.
     """
     backend = getattr(provider, "harness_managed_compaction_backend", None)
     return backend if isinstance(backend, str) and backend else None
@@ -544,6 +547,38 @@ class CompactionCoordinator:
             return None
         return self._deps.agent_autocompact_pct(session)
 
+    def autocompact_pct_is_explicit(self, key: str) -> bool:
+        """Whether *key*'s threshold was chosen for it rather than inherited.
+
+        True for a per-session override (the slider) and for a default the
+        session's agent declares; False when the session follows the global
+        ``session.autocompact_pct``.
+        """
+        key = self._owner._fold_key(key)
+        return key in self.state.pct_overrides or self.agent_autocompact_pct(key) is not None
+
+    def crew_compacts_harness_managed(self, key: str, provider: LLMProvider) -> bool:
+        """Whether Crew compacts a harness-managed backend itself at *key*'s threshold.
+
+        A harness-managed backend (KAS) summarizes on its own, and at the global
+        threshold Crew leaves it to do so. An explicit threshold is a request for
+        an earlier compaction than the harness would choose, so when the backend
+        also serves ``/compact`` and its engine advertised the verb that carries
+        it (``harness_compact_verb_advertised``), Crew sends it at that threshold
+        through the ordinary in-place path. A backend that cannot be handed
+        ``/compact`` has no such path and stays declined. So does an engine that
+        did not advertise the verb: the session handle would fail every such
+        ``/compact`` at once, and each failure would repeat an "Auto-compact
+        failed" notice after every cooldown. Only a literal ``True`` counts, so a
+        mocked provider's attribute never reads as advertised.
+        """
+        return (
+            _harness_managed_backend(provider) is not None
+            and _compact_unsupported_backend(provider) is None
+            and self.autocompact_pct_is_explicit(key)
+            and getattr(provider, "harness_compact_verb_advertised", False) is True
+        )
+
     def _compaction_gate_decision(self, key: str, provider: LLMProvider, pct: float) -> str | None:
         """Return the first compaction gate decline, in lifecycle order.
 
@@ -605,7 +640,17 @@ class CompactionCoordinator:
             return "cc_managed"
         if pct < self.effective_autocompact_pct(key):
             return "below_threshold"
-        unsupported = _compact_unsupported_backend(provider) or _harness_managed_backend(provider)
+        harness_managed = _harness_managed_backend(provider)
+        if harness_managed is not None and self.crew_compacts_harness_managed(key, provider):
+            # An explicit threshold on a harness-managed backend that serves
+            # ``/compact``: Crew compacts it here, so this is not a decline and
+            # the reading goes on to ``unconfirmed`` / ``in_progress`` /
+            # ``cooldown`` like any member backend's. While that compaction runs
+            # the session is in ``compacting``, so a reading taken meanwhile,
+            # including one after a summarization the harness ran itself, is
+            # answered ``in_progress`` and cannot start a second compaction.
+            harness_managed = None
+        unsupported = _compact_unsupported_backend(provider) or harness_managed
         if unsupported is not None and _compaction_unmanaged_backend(provider) is None:
             # Declining, not recycling, and ONLY for a harness that positively
             # claims the other side of the bargain. A member of
@@ -710,9 +755,9 @@ class CompactionCoordinator:
             return False
         if self._gate_rung(key, provider, provider.context_usage_pct(), log=False) is not None:
             return False
-        return (
-            _compact_unsupported_backend(provider) is None
-            and _harness_managed_backend(provider) is None
+        return _compact_unsupported_backend(provider) is None and (
+            _harness_managed_backend(provider) is None
+            or self.crew_compacts_harness_managed(key, provider)
         )
 
     def _trigger_compaction(
@@ -956,14 +1001,14 @@ class CompactionCoordinator:
                 # claims a missing capability the harness has.
                 self.state.uncompactable_recycles.discard(key)
 
-    def _live_cotenants(self, runs: Any, key: str) -> list[str]:
-        """Ids of *key*'s runs that are live on a process they share with it."""
-        return [
-            info.id
-            for info in runs.running
-            if info.parent_session_key == key
-            and runs.has_live_shared_session(info.conversation_key or f"subagent:{info.id}")
-        ]
+    @staticmethod
+    def _live_cotenants(lifecycle: Any, key: str) -> list[str]:
+        """Ids of *key*'s runs that are live on a process they share with it.
+
+        The same selection a hard Stop's reset stops (``_select_shared_children``),
+        so the two cannot disagree about which runs share the process.
+        """
+        return [info.id for info in lifecycle._select_shared_children(key)]
 
     async def _await_cotenants(
         self, key: str, pct: float, *, stopped: Callable[[], bool] | None = None
@@ -975,8 +1020,8 @@ class CompactionCoordinator:
         them with no report.
         The restart polls (the manager's per-key completion event is shared, so another
         waiter may release it) for at most ``cotenant_wait_secs``. Past that it stops
-        those runs with the ordinary cancel, bounded, so each reports "stopped" into
-        the conversation, which carries on after the restart.
+        those runs through the shared stop step, which returns once their reaps have
+        started; each "stopped" report lands in the conversation after the restart.
 
         *stopped* is polled on every tick: a user Stop that lands during the wait has
         already reset the parent, and this task's restart is then stale -- cancelling
@@ -986,7 +1031,7 @@ class CompactionCoordinator:
         lifecycle = self._owner._lifecycle_boundary()
         # The ``SubagentManager`` registered as the parent-end teardown handler.
         runs = lifecycle._child_teardown
-        if runs is None or not self._live_cotenants(runs, key):
+        if runs is None or not self._live_cotenants(lifecycle, key):
             return True
         self._deps.logger.warning("Session %s restart held: sub-agents share its process", key)
         callback = self.state.on_compacted
@@ -999,20 +1044,16 @@ class CompactionCoordinator:
                 self._deps.logger.exception("Compact callback failed for %s", key)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._deps.cotenant_wait_secs
-        while ids := self._live_cotenants(runs, key):
+        while self._live_cotenants(lifecycle, key):
             if stopped is not None and stopped():
                 return False
             remaining = deadline - loop.time()
             if remaining <= 0:
-                self._deps.logger.warning("Session %s: stopping sub-agents %s", key, ids)
-                for info in runs.running:
-                    if info.id in ids and not info._stop_origin:
-                        info._stop_origin = "stopped at a context restart"
-                task = asyncio.ensure_future(asyncio.gather(*(runs.cancel(i) for i in ids)))
-                self._owner._background_tasks.add(task)
-                task.add_done_callback(self._owner._background_tasks.discard)
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(asyncio.shield(task), timeout=20.0)
+                await lifecycle._stop_shared_children(
+                    key,
+                    lifecycle._select_shared_children(key),
+                    origin="stopped at a context restart",
+                )
                 return True
             await asyncio.sleep(min(remaining, self._deps.cotenant_poll_secs))
         return not (stopped is not None and stopped())
@@ -1058,7 +1099,10 @@ class CompactionCoordinator:
                     owner._recycling.pop(key, None)
                 self._keep_resume_sid(key, session, dropped_sid)
                 if owner._sessions.get(key) is session:
-                    await record_session_started(key)  # it lives on
+                    # It lives on, so it keeps the opener its first start recorded.
+                    await record_session_started(
+                        key, session.provider, trigger=started_trigger_of(key)
+                    )
         try:
             successor = owner._sessions.get(key)
             live = [e for e in session.queue if e[0] not in session.cancelled]
@@ -1224,6 +1268,50 @@ class CompactionCoordinator:
                 # lose the session's memory to a restart the notice then blames
                 # on compaction.
                 return await self._settle_cancelled(key, pct)
+            if self._owner._sessions.get(key) is None:
+                # The session was closed while ``/compact`` ran, and the close
+                # took its process down with it: the error here is the harness
+                # dying under the teardown, not compaction failing. The teardown
+                # that unregistered it owns its shutdown, so there is no failure
+                # to report or count, and nothing left to recycle. A recycle
+                # would shut the same process down a second time. A key that now
+                # holds a DIFFERENT session is not this case: that replacement did
+                # not reap the held one, so ``_restart_held`` still must.
+                self._deps.logger.debug(
+                    "Session %s left during in-place /compact after %.0fs — nothing to recycle",
+                    key,
+                    time.monotonic() - started,
+                )
+                return "absent"
+            if (
+                _harness_managed_backend(session.provider) is not None
+                and self._owner._sessions.get(key) is session
+            ):
+                # Only while the held session is still the registered one: a key
+                # that now holds a replacement leaves this process to
+                # ``_restart_held`` below, which reaps it.
+                # Crew sends a harness-managed backend ``/compact`` only for an
+                # explicit threshold. Read the capability, not that threshold: a
+                # slider reset while this ran must not turn the failure into a
+                # recycle. The harness still summarizes on its own, so a refused
+                # or failed compaction leaves the context
+                # bounded and is not worth the conversation: no recycle, the
+                # failure cooldown, and a failed verdict. KAS refuses the verb
+                # while its own summarization runs, and that refusal lands here.
+                # An engine that does not advertise the verb is declined at the
+                # gate (``crew_compacts_harness_managed``) and does not get here.
+                self._deps.logger.warning(
+                    "Session %s in-place /compact failed after %.0fs on a backend that "
+                    "compacts on its own — cooldown, no recycle",
+                    key,
+                    time.monotonic() - started,
+                    exc_info=True,
+                )
+                self.state.cooldown_until[key] = (
+                    time.monotonic() + self._deps.compact_failure_cooldown_secs
+                )
+                await self._owner._fire_compact_callback(key, pct, success=False)
+                return "failed"
             self._deps.logger.warning(
                 "Session %s in-place /compact failed after %.0fs — recycling "
                 "(semaphore held; async status wait %s)",

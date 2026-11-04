@@ -10,7 +10,6 @@ import contextlib
 import json
 import logging
 import threading
-import time
 import unittest.mock
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -26,6 +25,7 @@ from mcp_merge_helpers import DEFAULT_MANAGED_MCPS as _DEFAULT_MANAGED_MCPS
 from mcp_merge_helpers import bundled_defaults as _bundled_defaults
 
 from kiro_crew import agent_state
+from kiro_crew.testing.wait import default_timeout, wait_until
 
 
 @contextmanager
@@ -41,7 +41,7 @@ def _fork_env(tmp_path: Path):
     kiro_dir.mkdir(exist_ok=True)
     prompt = cfg_dir / "prompt.md"
     mc_config = tmp_path / "empty_mc_config.json"
-    mc_config.write_text(json.dumps({"agent": {"kiro_hooks_autoimport": False}}))
+    mc_config.write_text(json.dumps({"agent": {"kiro_hooks_autoimport": False}}), encoding="utf-8")
     _user_home = tmp_path / "kirocrew_home"
     patches = [
         patch.multiple(
@@ -443,11 +443,9 @@ class TestRefreshForkedTemplates:
             calls.append(len(calls))
             if len(calls) == 1:
                 started_first.set()
-                # flake-ok: pre-existing 5 s ceiling on the first pass's release, moved verbatim; tracked for a de-flake pass
-                assert release_first.wait(5)
+                assert release_first.wait(default_timeout()), "first pass was never released"
             else:
-                # flake-ok: pre-existing 5 s ceiling on the queued pass's release, moved verbatim; tracked for a de-flake pass
-                assert release_second.wait(5)
+                assert release_second.wait(default_timeout()), "queued pass was never released"
 
         monkeypatch.setattr(agent_mod, "_refresh_forked_templates_locked", _blocking_pass)
         monkeypatch.setattr(agent_mod, "_fork_refresh_settled", threading.Event())
@@ -455,34 +453,29 @@ class TestRefreshForkedTemplates:
 
         first = threading.Thread(target=agent_mod._refresh_forked_templates)
         first.start()
-        # flake-ok: pre-existing 5 s ceiling on the first pass starting, moved verbatim; tracked for a de-flake pass
-        assert started_first.wait(5)
+        assert started_first.wait(default_timeout()), "first refresh pass never started"
         second = threading.Thread(target=agent_mod._refresh_forked_templates)
         second.start()
         # The queued pass registers before contending for the pass lock.
-        for _ in range(500):
-            if agent_mod._fork_refresh_pending == 2:
-                break
-            # flake-ok: pre-existing 10 ms poll on the pending-pass counter, moved verbatim; tracked for a de-flake pass
-            time.sleep(0.01)
-        assert agent_mod._fork_refresh_pending == 2
+        wait_until(
+            lambda: agent_mod._fork_refresh_pending == 2,
+            describe=lambda: f"pending passes: {agent_mod._fork_refresh_pending}",
+        )
 
         # First pass finishes while the second is still pending: gate stays shut.
         release_first.set()
-        for _ in range(500):
-            if agent_mod._fork_refresh_pending == 1:
-                break
-            # flake-ok: pre-existing 10 ms poll on the pending-pass counter, moved verbatim; tracked for a de-flake pass
-            time.sleep(0.01)
-        assert agent_mod._fork_refresh_pending == 1
+        wait_until(
+            lambda: agent_mod._fork_refresh_pending == 1,
+            describe=lambda: f"pending passes: {agent_mod._fork_refresh_pending}",
+        )
         assert not agent_mod._fork_refresh_settled.is_set()
 
         # Last pass finishes: gate re-opens.
         release_second.set()
-        # flake-ok: pre-existing 5 s join ceiling on the first refresh thread, moved verbatim; tracked for a de-flake pass
-        first.join(5)
-        # flake-ok: pre-existing 5 s join ceiling on the queued refresh thread, moved verbatim; tracked for a de-flake pass
-        second.join(5)
+        first.join(default_timeout())
+        second.join(default_timeout())
+        hung = [t.name for t in (first, second) if t.is_alive()]
+        assert not hung, f"refresh thread(s) still running past the lost-run ceiling: {hung}"
         assert agent_mod._fork_refresh_settled.is_set()
 
     def test_refresh_records_per_fork_failure_and_continues(self, tmp_path: Path, monkeypatch):
@@ -799,8 +792,9 @@ class TestRefreshForkedTemplates:
             agent_mod.rebuild_agent_config(refresh_forks="defer")
             # The background pass re-sets the event when it finishes; the
             # refresh itself must have run (fork re-plumbed).
-            # flake-ok: pre-existing 10 s ceiling on the deferred pass settling, moved verbatim; tracked for a de-flake pass
-            assert agent_mod._fork_refresh_settled.wait(timeout=10)
+            assert agent_mod._fork_refresh_settled.wait(
+                timeout=default_timeout()
+            ), "deferred refresh never settled"
             result = json.loads(path.read_text(encoding="utf-8"))
         assert result["hooks"] == {"preToolUse": "audit"}
 
@@ -867,17 +861,34 @@ class TestRefreshForkedTemplates:
         assert seen == ["fork-refresh:cust-crew"]
         assert "autoApprove" not in result["mcpServers"]["rogue"]
 
-    def test_unavailable_custom_prompt_is_preserved(self, tmp_path: Path):
-        """a custom file-backed prompt that is temporarily
-        unavailable (unmounted drive) must NOT be misread as dangling and
-        replaced — only pointers naming the managed prompt file are healed."""
+    @pytest.mark.parametrize(
+        "custom_prompt",
+        [
+            # A user prompt at a path that does not exist right now (unmounted
+            # drive) must NOT be misread as dangling and replaced.
+            pytest.param(
+                "file:///Volumes/nas/my-own-instructions.md",
+                id="test_unavailable_custom_prompt_is_preserved",
+            ),
+            # The managed file is called prompt.md, the natural custom name too.
+            # Identity must come from managed LOCATIONS, so a custom reference
+            # merely sharing the basename survives the refresh.
+            pytest.param(
+                "file:///Users/someone/Documents/prompt.md",
+                id="test_custom_prompt_named_prompt_md_is_preserved",
+            ),
+        ],
+    )
+    def test_a_custom_prompt_is_preserved(self, tmp_path: Path, custom_prompt: str):
+        """Only pointers naming the managed prompt file are healed; a custom one is
+        kept verbatim. (The sibling -- a stale MANAGED pointer being healed -- is
+        locked by test_kirocrew_origin_fork_is_refreshed above.)"""
         import kiro_crew.agent as agent_mod
 
         with _fork_env(tmp_path) as (kiro_dir, prompt):
             custom = self._write_fork(kiro_dir, "my-crew")
             spec = json.loads(custom.read_text(encoding="utf-8"))
-            # A user prompt at a path that does not exist right now.
-            spec["prompt"] = "file:///Volumes/nas/my-own-instructions.md"
+            spec["prompt"] = custom_prompt
             custom.write_text(json.dumps(spec), encoding="utf-8")
             agent_state.set_fork_info("my-crew", forked_from="kirocrew", private_to="my-crew")
             self._seed_binding(("my-crew", "my-crew"))
@@ -885,32 +896,7 @@ class TestRefreshForkedTemplates:
 
             result = json.loads(custom.read_text(encoding="utf-8"))
 
-        # Preserved verbatim — not healed to the managed URI. (The sibling —
-        # a stale MANAGED pointer being healed — is locked by
-        # test_kirocrew_origin_fork_is_refreshed above.)
-        assert result["prompt"] == "file:///Volumes/nas/my-own-instructions.md"
-
-    def test_custom_prompt_named_prompt_md_is_preserved(self, tmp_path: Path):
-        """the managed file is called prompt.md — the natural
-        custom name too. Identity must come from managed LOCATIONS, so a
-        custom reference merely sharing the basename survives the refresh."""
-        import kiro_crew.agent as agent_mod
-
-        with _fork_env(tmp_path) as (kiro_dir, prompt):
-            custom = self._write_fork(kiro_dir, "my-crew")
-            spec = json.loads(custom.read_text(encoding="utf-8"))
-            spec["prompt"] = "file:///Users/someone/Documents/prompt.md"
-            custom.write_text(json.dumps(spec), encoding="utf-8")
-            agent_state.set_fork_info("my-crew", forked_from="kirocrew", private_to="my-crew")
-            self._seed_binding(("my-crew", "my-crew"))
-            agent_mod._refresh_forked_templates(gated_off=frozenset())
-
-            result = json.loads(custom.read_text(encoding="utf-8"))
-
-        # Same basename, non-managed location: preserved verbatim. (The
-        # managed-shaped stale pointer being healed is locked by
-        # test_kirocrew_origin_fork_is_refreshed via the fixture default.)
-        assert result["prompt"] == "file:///Users/someone/Documents/prompt.md"
+        assert result["prompt"] == custom_prompt
 
     def test_source_checkout_prompt_preserved_but_site_packages_healed(self, tmp_path: Path):
         """a bare "/kiro_crew/" spelling also matches a source

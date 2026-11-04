@@ -69,18 +69,22 @@ function setup(blocks: PasteBlock[], value: string) {
   const result = render(<Wrapper blocks={blocks} value={value} />)
 
   const moveOver = (chipIndex = 0) => {
-    hoverRef.current!.handleMouseMove({
-      clientX: 15 + chipIndex * 220,
-      clientY: 105,
-    } as MouseEvent)
+    act(() => {
+      hoverRef.current!.handleMouseMove({
+        clientX: 15 + chipIndex * 220,
+        clientY: 105,
+      } as MouseEvent)
+    })
   }
 
   const moveOutside = () => {
-    hoverRef.current!.handleMouseMove({ clientX: -100, clientY: -100 } as MouseEvent)
+    act(() => {
+      hoverRef.current!.handleMouseMove({ clientX: -100, clientY: -100 } as MouseEvent)
+    })
   }
 
   const leave = () => {
-    hoverRef.current!.handleMouseLeave()
+    act(() => { hoverRef.current!.handleMouseLeave() })
   }
 
   const rerender = (newBlocks: PasteBlock[], newValue: string) => {
@@ -122,7 +126,7 @@ describe('PasteHoverLayer hover preview', () => {
     expect(screen.queryByTestId('composer-paste-preview-1')).not.toBeInTheDocument()
     act(() => { vi.advanceTimersByTime(350) })
     expect(screen.getByTestId('composer-paste-preview-1')).toBeInTheDocument()
-    expect(screen.getByText(/composer line 1/)).toBeInTheDocument()
+    expect(screen.getByText('composer line 1')).toBeInTheDocument()
   })
 
   it('caps the preview at PREVIEW_MAX_LINES and shows "+N more" footer', () => {
@@ -137,6 +141,14 @@ describe('PasteHoverLayer hover preview', () => {
     expect(panel.textContent).toContain('composer line 12')
     expect(panel.textContent).not.toContain('composer line 13')
     expect(panel.textContent).toContain('8 more lines')
+  })
+
+  it('names the double-click expand and Backspace remove gestures', () => {
+    const { moveOver } = setup([shortBlock], valueWith(shortBlock))
+    resetIdx()
+    moveOver()
+    act(() => { vi.advanceTimersByTime(350) })
+    expect(screen.getByTestId('composer-paste-preview-2-hint').textContent).toBe('Double-click to insert the full text · Backspace removes the paste')
   })
 
   it('shows full content without footer for short pastes', () => {
@@ -201,7 +213,7 @@ describe('PasteHoverLayer hover preview', () => {
     act(() => { vi.advanceTimersByTime(350) })
     expect(screen.getByTestId('composer-paste-preview-1')).toBeInTheDocument()
 
-    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    act(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })) })
     vi.useRealTimers()
     await waitFor(() => expect(screen.queryByTestId('composer-paste-preview-1')).not.toBeInTheDocument())
   })

@@ -229,7 +229,6 @@ def test_engine_deploy_returns_oac_id():
         # find_site_by_tag returns None (first deploy)
         if "resourcegroupstaggingapi" in str(args):
             return (0, '{"ResourceTagMappingList": []}', "")
-        # create-bucket
         if "create-bucket" in args:
             return (0, "", "")
         # Various put commands
@@ -237,22 +236,17 @@ def test_engine_deploy_returns_oac_id():
                     "put-bucket-encryption", "put-bucket-tagging"]
         if any(x in str(args) for x in put_cmds):
             return (0, "", "")
-        # create-origin-access-control
         if "create-origin-access-control" in args:
             return (0, json.dumps({"OriginAccessControl": {"Id": "OAC123"}}), "")
-        # create-distribution-with-tags
         if "create-distribution-with-tags" in args:
             return (0, json.dumps({"Distribution": {
                 "Id": "DIST123", "ARN": "arn:aws:cloudfront::123:distribution/DIST123",
                 "DomainName": "d123.cloudfront.net"
             }}), "")
-        # put-bucket-policy
         if "put-bucket-policy" in args:
             return (0, "", "")
-        # s3 sync
         if "s3" in args and "sync" in args:
             return (0, "", "")
-        # create-invalidation
         if "create-invalidation" in args:
             return (0, "", "")
         # get-distribution (for status)
@@ -273,7 +267,7 @@ def test_engine_deploy_returns_oac_id():
 def test_handlers_manifest_includes_oac_id():
     """F7: The deploy manifest JSON written by handlers includes oac_id."""
     # Just verify the manifest_data construction in source code
-    source = Path(__file__).parent.parent / "src" / "kiro_crew" / "deploy" / "handlers.py"
+    source = Path(__file__).parent.parent / "src" / "kiro_crew" / "deploy" / "handlers_sites.py"
     content = source.read_text(encoding="utf-8")
     assert '"oac_id": result.get("oac_id", "")' in content
 

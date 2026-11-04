@@ -11,12 +11,10 @@ import json
 import threading
 
 import pytest
-from test_dashboard_save_tool import SLUG, _client, _instance, _package_body, _save
+from test_dashboard_save_tool import SLUG, _client, _flip, _instance, _package_body, _save
 
 from kiro_crew.artifact_store.dashboard_package import DASHBOARD_KIND
 from kiro_crew.dashboard.handlers import agent_panel as routes
-
-pytestmark = pytest.mark.asyncio
 
 
 def test_the_write_check_refuses_a_package_replaced_between_its_two_reads(monkeypatch, tmp_path):
@@ -33,10 +31,10 @@ def test_the_write_check_refuses_a_package_replaced_between_its_two_reads(monkey
     monkeypatch.setattr(artifacts, "get_default_store", lambda: real)
     pkg = {**_package_body(), "kind": DASHBOARD_KIND, "bound_to": f"crewmate:{SLUG}"}
     art = real.create(name="page", content=json.dumps(pkg), kind=DASHBOARD_KIND)
-    pkg["view"]["blocks"].reverse()
+    _flip(pkg)
     read = real.get(art.slug, assign_token=True)
     real.update(art.slug, content=json.dumps(pkg), actor="user", snapshot_token=read.content_token)
-    pkg["view"]["blocks"].reverse()
+    _flip(pkg)
     read = real.get(art.slug, assign_token=True)
     real.update(art.slug, content=json.dumps(pkg), actor="agent", snapshot_token=read.content_token)
     # The control: the person's version is not the current one, so a second read happens.
@@ -56,6 +54,7 @@ def test_the_write_check_refuses_a_package_replaced_between_its_two_reads(monkey
     assert refused.state == reader.STATE_ERROR
 
 
+@pytest.mark.asyncio
 async def test_two_first_saves_at_once_bind_one_package(monkeypatch, tmp_path):
     """Two first saves for one crewmate, both past the lookup before either writes.
 
@@ -94,6 +93,7 @@ async def test_two_first_saves_at_once_bind_one_package(monkeypatch, tmp_path):
     assert dashboard_agentic.bound_package(SLUG) == packages[0].slug
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("adopted", [True, False], ids=["older-record", "never-adopted"])
 async def test_a_save_without_an_apply_leaves_an_older_crewmate_on_its_template(
     monkeypatch, tmp_path, adopted

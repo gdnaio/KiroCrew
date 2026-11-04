@@ -94,6 +94,29 @@ describe('SkillsTab', () => {
     expect(screen.getByText(/Loaded by 2 agents/)).toBeInTheDocument()
   })
 
+  it('names the disabled refresh for the read in flight, then restores it', async () => {
+    // A disabled "Refresh skills" reads as unavailable; while the refetch runs its
+    // name says it is busy instead.
+    const rows = [{ key: 'foo', name: 'foo', description: 'a foo skill', source: 'kirocrew', loaded_by_agents: [] }]
+    mockApi.skills.mockResolvedValue(rows)
+    renderWithQuery()
+    const idle = await screen.findByRole('button', { name: 'Refresh skills' })
+    await waitFor(() => expect(idle).toBeEnabled())
+
+    let release: (v: typeof rows) => void = () => {}
+    mockApi.skills.mockReturnValue(new Promise(resolve => { release = resolve }))
+    fireEvent.click(idle)
+
+    const busy = await screen.findByRole('button', { name: 'Refreshing skills…' })
+    expect(busy).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'Refresh skills' })).toBeNull()
+
+    await act(async () => { release(rows) })
+
+    const back = await screen.findByRole('button', { name: 'Refresh skills' })
+    await waitFor(() => expect(back).toBeEnabled())
+  })
+
   it('shows singular form when exactly one agent loads the skill', async () => {
     mockApi.skills.mockResolvedValue([
       { key: 'solo', name: 'solo', description: 'lone', source: 'kirocrew', loaded_by_agents: ['only-one'] },
@@ -123,16 +146,13 @@ describe('SkillsTab', () => {
     expect(otherRow.className).not.toMatch(/\bborder(-|\b)/)
   })
 
-  it('skill list uses the overlay (autohide, no-layout-shift) scrollbar', async () => {
+  it('skill list is its own scroll box', async () => {
     mockApi.skills.mockResolvedValue([
       { key: 'a', name: 'a', description: 'first', source: 'kirocrew', loaded_by_agents: [] },
     ])
     renderWithQuery()
 
     const list = await screen.findByRole('listbox', { name: 'Skills' })
-    // ``scrollbar-overlay`` keeps the scrollbar hidden until hover and
-    // overlays it so the row width never shifts.
-    expect(list.className).toContain('scrollbar-overlay')
     expect(list.className).toContain('overflow-y-auto')
   })
 
@@ -220,6 +240,28 @@ describe('SkillsTab', () => {
     fireEvent.click(del)
     expect(confirmSpy).toHaveBeenCalled()
     await waitFor(() => expect(mockApi.deleteSkill).toHaveBeenCalledWith('doomed'))
+    confirmSpy.mockRestore()
+  })
+
+  it('a refused delete puts back only its own row, not one another delete removed meanwhile', async () => {
+    // The first read serves the list; later reads never answer, so the cache
+    // shows what the rollback left rather than a refetch.
+    mockApi.skills.mockResolvedValueOnce([
+      { key: 'doomed', name: 'doomed', description: 'will go', source: 'kirocrew', loaded_by_agents: [] },
+      { key: 'gone', name: 'gone', description: 'deleted elsewhere', source: 'kirocrew', loaded_by_agents: [] },
+    ]).mockImplementation(() => new Promise(() => {}))
+    let refuse!: (e: Error) => void
+    mockApi.deleteSkill.mockImplementation(() => new Promise((_, reject) => { refuse = reject }))
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+
+    const { qc } = renderWithQuery()
+    fireEvent.click(await screen.findByText('Delete'))
+    await waitFor(() => expect(mockApi.deleteSkill).toHaveBeenCalledWith('doomed'))
+    // A second delete lands while the first is in flight.
+    act(() => { qc.setQueryData<{ key: string }[]>(['skills'], old => old?.filter(s => s.key !== 'gone')) })
+    await act(async () => { refuse(new Error('permission denied')) })
+    await screen.findByTestId('skill-delete-failure')
+    expect(qc.getQueryData<{ key: string }[]>(['skills'])?.map(s => s.key)).toEqual(['doomed'])
     confirmSpy.mockRestore()
   })
 
@@ -1389,7 +1431,7 @@ describe('SkillsTab update/delete failure surfacing', () => {
     resolveDelete({ ok: true })
     // The editor must remain mounted with the draft intact.
     await waitFor(() => expect(screen.queryByTestId('skill-delete-failure')).not.toBeInTheDocument())
-    expect(screen.getByText('Save')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByText('Save')).toBeInTheDocument())
     expect(screen.getByText('Cancel')).toBeInTheDocument()
     confirmSpy.mockRestore()
   })

@@ -44,7 +44,7 @@ vi.mock('../pages/chat/ChatSettings', () => cfgMock)
 import { store } from '../store'
 import { ApiError } from '../api/apiError'
 import { sseSlots, sseSlotPatch, markSlotUnread, updateSlotPin } from '../store/dashboardSlice'
-import { useSessionActions } from '../hooks/useSessionActions'
+import { useSessionActions, pinMutationKeysInFlight } from '../hooks/useSessionActions'
 import { recordError, __resetErrorJournalForTests } from '../utils/errorReport'
 
 /** A refusal as apiFailure (api/client.ts) builds it: `.message` is the friendly text, `.body` the raw body. */
@@ -128,9 +128,25 @@ describe('useSessionActions', () => {
 
     await waitFor(() => expect(result.current.forkError).toBeTruthy())
     // Without a referent "Open it" points at nothing: the notice sits at the panel root,
-    // not under the row that was pressed.
-    expect(result.current.forkError?.message).toContain(SLOT)
+    // not under the row that was pressed. The seeded session is untitled (its title is
+    // its key), so it is named "Untitled session", never by its raw key (#23084).
+    expect(result.current.forkError?.message).toContain('Untitled session')
+    expect(result.current.forkError?.message).not.toContain(SLOT)
     expect(result.current.forkError?.message).not.toContain('{{title}}')
+  })
+
+  it('names a titled refused session by its title', async () => {
+    // Its own key: a close in an earlier test can leave a close hold on SLOT that
+    // filters SLOT's row out of a later slot list.
+    const TITLED = 'chat-actions-titled'
+    store.dispatch(sseSlots([{ key: TITLED, title: 'Fix the build', messages: 0, running: false, folder_id: '' }]))
+    mocks.forkChatSlot.mockRejectedValue(overCapacity())
+    const result = renderActions()
+
+    act(() => result.current.duplicate(TITLED))
+
+    await waitFor(() => expect(result.current.forkError).toBeTruthy())
+    expect(result.current.forkError?.message).toContain('Fix the build')
   })
 
   it('opens with the verb of the Duplicate control the reader pressed', async () => {
@@ -321,7 +337,8 @@ describe('useSessionActions', () => {
     // before this tab's HTTP answer.
     act(() => { store.dispatch(sseSlotPatch({ slots: [{ key: SLOT, pinned: false }] })) })
     await act(async () => { answer({ ok: true, pinned: true }) })
-    await new Promise(resolve => setTimeout(resolve, 20))
+    // The pin batch closes only after the answer is reconciled, and a list re-read would be issued before it closes.
+    await waitFor(() => expect(pinMutationKeysInFlight()).toEqual([]))
     expect(slotOf()?.pinned).toBe(false)
     expect(mocks.chatSlots).not.toHaveBeenCalled()
   })

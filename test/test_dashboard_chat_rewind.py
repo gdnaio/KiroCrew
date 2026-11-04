@@ -72,7 +72,6 @@ class TestRewindSlot:
             "dashboard:src", skip_if_busy=True
         )
         state.sessions.remove.assert_not_awaited()
-        # Cleanup runs
         if slot.task:
             slot.task.cancel()
 
@@ -313,6 +312,7 @@ class TestRewindSlot:
             expected_history_key,
             expected_disk_older_count,
             expected_slot_name,
+            takeover_basis=None,
         ):
             # Emulate the real save's post-write bookkeeping on the live slot.
             assert expected_slot_name == "src", "the write must carry the slot's map key"
@@ -377,6 +377,7 @@ class TestRewindSlot:
             expected_history_key,
             expected_disk_older_count,
             expected_slot_name,
+            takeover_basis=None,
         ):
             seen["boundary"] = expected_disk_older_count
             seen["slot_name"] = expected_slot_name
@@ -898,6 +899,66 @@ class TestRewindSlot:
         assert record["error"] == "history_save_exception"
         # Without the slot the record cannot be attributed to a conversation.
         assert f"slot={slot.key}" in record["resources"]
+        if slot.task:
+            slot.task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_rewind_dispatch_verify_refusal_audits_as_a_refused_save(
+        self, tmp_path, monkeypatch
+    ):
+        """A key that changed hands before dispatch audits as ``history_save_refused``.
+
+        The dispatch verify runs after the native discard, so the context is
+        already gone: the record it leaves must say the save was REFUSED, not
+        that it raised. The replacement is minted during the sid flush, the
+        last await before the verify, so the handler reads a map whose key is
+        held by another slot and must settle the refusal without ever
+        dispatching a worker -- there is no task to await on that arm.
+        """
+        events: list[dict] = []
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_rewind.sel",
+            lambda: SimpleNamespace(log_api_access=lambda **kw: events.append(kw)),
+        )
+        state = _make_state(tmp_path)
+        slot = _populate_slot(state)
+        state.sessions._session_map.get = MagicMock(return_value="")
+        dispatched: list[object] = []
+
+        def _records_dispatch(*_args, **_kwargs):
+            dispatched.append(_args)
+            return True
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_rewind._save_slot_to_history", _records_dispatch
+        )
+
+        async def _replace_the_slot_during_the_flush():
+            state._slots.pop(slot.key, None)
+            replacement = state.get_or_create_slot(slot.key)
+            assert replacement is not slot
+
+        state.sessions.aflush = AsyncMock(side_effect=_replace_the_slot_during_the_flush)
+
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/chat/slots/src/rewind",
+                json={"at_message_index": 0, "content": "edited first question"},
+            )
+            assert resp.status == 503
+            assert (await resp.json())["code"] == "rewind_save_failed"
+
+        assert dispatched == [], "a refused dispatch must not reach the worker at all"
+        destroyed = [
+            event for event in events if "native_cleared=1" in str(event.get("resources", ""))
+        ]
+        assert len(destroyed) == 1
+        assert destroyed[0]["error"] == "history_save_refused"
+        assert destroyed[0]["outcome"] == "error"
+        assert f"slot={slot.key}" in destroyed[0]["resources"]
+        # The replacement keeps the key: the refused rewind commits nothing to it.
+        assert state._slots.get(slot.key) is not slot
         if slot.task:
             slot.task.cancel()
 
@@ -1476,15 +1537,30 @@ class TestRewindSlot:
             pending.set_result(None)
 
     @pytest.mark.asyncio
-    async def test_rewind_empty_content_400(self, tmp_path):
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param({"at_message_index": 0, "content": ""}, id="rewind_empty_content_400"),
+            pytest.param(
+                {"at_message_index": 99, "content": "x"}, id="rewind_index_out_of_range_400"
+            ),
+            # Booleans are int subclasses in Python -- reject them explicitly.
+            pytest.param(
+                {"at_message_index": True, "content": "x"}, id="rewind_bool_index_rejected"
+            ),
+            # Index pointing at an assistant message must be rejected.
+            pytest.param(
+                {"at_message_index": 1, "content": "x"}, id="rewind_assistant_index_rejected"
+            ),
+            pytest.param({"ts": "no-such-ts", "content": "x"}, id="rewind_unknown_ts_400"),
+        ],
+    )
+    async def test_rewind_bad_request_400(self, tmp_path, body):
         state = _make_state(tmp_path)
         _populate_slot(state)
         app = _make_app(state)
         async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/api/chat/slots/src/rewind",
-                json={"at_message_index": 0, "content": ""},
-            )
+            resp = await client.post("/api/chat/slots/src/rewind", json=body)
             assert resp.status == 400
 
     @pytest.mark.asyncio
@@ -1514,18 +1590,6 @@ class TestRewindSlot:
                 assert resp.status == 400, f"expected 400 for content={bad_content!r}"
 
     @pytest.mark.asyncio
-    async def test_rewind_index_out_of_range_400(self, tmp_path):
-        state = _make_state(tmp_path)
-        _populate_slot(state)
-        app = _make_app(state)
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/api/chat/slots/src/rewind",
-                json={"at_message_index": 99, "content": "x"},
-            )
-            assert resp.status == 400
-
-    @pytest.mark.asyncio
     async def test_rewind_negative_index_400(self, tmp_path):
         state = _make_state(tmp_path)
         _populate_slot(state)
@@ -1534,44 +1598,6 @@ class TestRewindSlot:
             resp = await client.post(
                 "/api/chat/slots/src/rewind",
                 json={"at_message_index": -1, "content": "x"},
-            )
-            assert resp.status == 400
-
-    @pytest.mark.asyncio
-    async def test_rewind_bool_index_rejected(self, tmp_path):
-        """Booleans are int subclasses in Python — reject them explicitly."""
-        state = _make_state(tmp_path)
-        _populate_slot(state)
-        app = _make_app(state)
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/api/chat/slots/src/rewind",
-                json={"at_message_index": True, "content": "x"},
-            )
-            assert resp.status == 400
-
-    @pytest.mark.asyncio
-    async def test_rewind_assistant_index_rejected(self, tmp_path):
-        """Index pointing at an assistant message must be rejected."""
-        state = _make_state(tmp_path)
-        _populate_slot(state)
-        app = _make_app(state)
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/api/chat/slots/src/rewind",
-                json={"at_message_index": 1, "content": "x"},
-            )
-            assert resp.status == 400
-
-    @pytest.mark.asyncio
-    async def test_rewind_unknown_ts_400(self, tmp_path):
-        state = _make_state(tmp_path)
-        _populate_slot(state)
-        app = _make_app(state)
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/api/chat/slots/src/rewind",
-                json={"ts": "no-such-ts", "content": "x"},
             )
             assert resp.status == 400
 

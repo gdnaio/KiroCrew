@@ -37,6 +37,7 @@ from kiro_crew.apps.registry import (
     _blob_cache_dir,
     _copy_declared_art,
     _effective_registries,
+    _fetch_owner_tier_store_assets,
     _prewarm_owner_tier_store_assets,
     _read_manifest_cache,
     _store_art_cache_path,
@@ -213,6 +214,73 @@ class TestCopyCancellation:
 
         hop.check()
         assert removal_saw_worker_returned == [True], removal_saw_worker_returned
+
+
+class TestScratchDirCancellation:
+    """The scratch dir is made off the loop, so a cancel can land while that thread
+    is still making it (a slow runner, where the batch budget fires during the hop).
+    The dir the thread then makes must still be removed, however many cancels land."""
+
+    @pytest.mark.asyncio
+    async def test_cancels_during_the_scratch_mkdtemp_still_remove_the_dir(self, monkeypatch):
+        """Two cancels land while the mkdtemp thread is held, and the thread makes the
+        dir only after both were delivered. Each step is queued on the loop behind
+        the one before it, so the order is fixed rather than raced against a budget."""
+        import asyncio
+        import os
+        import tempfile
+
+        from kiro_crew.apps.registry_pipeline import store_art
+
+        _pin_registry(monkeypatch, _TRUST_OWNER)
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        finished = asyncio.Event()
+        release = threading.Event()
+        made: list[str] = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def _held_mkdtemp(*args, **kwargs):
+            if kwargs.get("prefix") != "kirocrew-store-art-":
+                return real_mkdtemp(*args, **kwargs)
+            try:
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(timeout=_BARRIER_CEILING_SECS), "never released"
+                path = real_mkdtemp(*args, **kwargs)
+                made.append(path)
+                return path
+            finally:
+                loop.call_soon_threadsafe(finished.set)
+
+        _fake_fetch(monkeypatch, ART, dict(MANIFEST, screenshots=["ui/shot-1.png"]))
+        monkeypatch.setattr(store_art.tempfile, "mkdtemp", _held_mkdtemp)
+
+        def _second_cancel_then_release() -> None:
+            # Runs after the first cancel was delivered; the release is queued
+            # behind the second one, so the thread returns only after both.
+            task.cancel()
+            loop.call_soon(release.set)
+
+        task = asyncio.ensure_future(_fetch_owner_tier_store_assets(_entry(), "test"))
+        try:
+            try:
+                await _await_barrier(entered, "the mkdtemp thread", lambda: f"done={task.done()}")
+            finally:
+                task.cancel()
+                loop.call_soon(_second_cancel_then_release)
+            with pytest.raises(asyncio.CancelledError):
+                await _settled(task, "the cancelled fetch")
+            # Without the settle the thread outlives the task; wait for it to return.
+            await _await_barrier(finished, "the mkdtemp thread's return")
+
+            assert made, "the mkdtemp thread never made the scratch dir"
+            leaked = [p for p in made if os.path.exists(p)]
+            assert not leaked, f"a cancel during mkdtemp leaked the scratch dir: {leaked}"
+        finally:
+            release.set()
+            for path in made:
+                with contextlib.suppress(OSError):
+                    os.rmdir(path)
 
 
 # ---------------------------------------------------------------------------
@@ -406,12 +474,15 @@ class TestCallSites:
         assert result["ok"] is True
         assert result["refreshed"] == ["official", "second"]
         assert fetched == ["official", "second"]
-        # One manifest expiry per registry row happened BEFORE either prewarm ran.
-        assert len(expired) == 2, expired
+        # Each registry row's manifest file, installed-copy cache and failed-fetch
+        # marker were expired BEFORE either prewarm ran.
+        assert len(expired) == 6, expired
+        assert sum(p.endswith(".miss.json") for p in expired) == 2, expired
+        assert sum(p.endswith(".installed.json") for p in expired) == 2, expired
         assert [name for name, _f, _e, _rows in seen_at_prewarm] == ["official", "second"]
         for name, fetched_at, expired_at, rows in seen_at_prewarm:
             assert fetched_at == frozenset({"official", "second"}), (name, fetched_at)
-            assert expired_at == 2, (name, expired_at)
+            assert expired_at == 6, (name, expired_at)
             assert rows is rows_by_name[name], "each prewarm gets its own fresh rows"
 
 
@@ -1039,6 +1110,79 @@ class TestOuterCancellationSettlesTheBatch:
             release.set()
             if held:
                 await asyncio.wait(held, timeout=_BARRIER_CEILING_SECS)
+
+
+class TestCancelledBatchLeavesNoUnretrievedException:
+    """A cancelled batch is an outcome the prewarm handles, so it must not reach the
+    loop's exception handler. ``asyncio.gather`` records a requested cancellation with
+    ``set_exception(CancelledError())``; left unread, GC logs ``_GatheringFuture
+    exception was never retrieved`` and ``crash_guard`` writes a false ``ASYNCIO
+    UNHANDLED`` record to ``crash.log``. Both ways a batch is cancelled --
+    the budget and an outer cancel -- are covered."""
+
+    @staticmethod
+    async def _handler_reports(run) -> list[str]:
+        import asyncio
+        import gc
+
+        loop = asyncio.get_running_loop()
+        seen: list[str] = []
+        previous = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, ctx: seen.append(ctx.get("message", "")))
+        try:
+            await run()
+            # The batch is unreachable once the prewarm returned; collect it so an
+            # unread exception is reported now, inside this handler.
+            gc.collect()
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous)
+        return seen
+
+    @staticmethod
+    def _hang_on_fetch(monkeypatch, started):
+        import asyncio
+
+        async def _hang_fetch(git_url, branch, dest, log_lines, *, clone_env, sandbox_mode, **kw):
+            Path(dest).mkdir(parents=True, exist_ok=True)
+            started.set()
+            await asyncio.Event().wait()  # a git step that never finishes on its own
+
+        monkeypatch.setattr(reg_mod, "_git_fetch_branch", _hang_fetch)
+
+    @pytest.mark.asyncio
+    async def test_a_budget_cancelled_batch_reports_nothing(self, monkeypatch):
+        import asyncio
+
+        reg = _pin_registry(monkeypatch, _TRUST_OWNER)
+        self._hang_on_fetch(monkeypatch, asyncio.Event())
+        monkeypatch.setattr(reg_mod, "_PREWARM_BATCH_BUDGET", 0.2)
+
+        async def _run() -> None:
+            fetched = await await_until(
+                asyncio.ensure_future(_prewarm_owner_tier_store_assets(reg, [_entry()]))
+            )
+            assert fetched == 0
+
+        assert await self._handler_reports(_run) == []
+
+    @pytest.mark.asyncio
+    async def test_an_outer_cancelled_batch_reports_nothing(self, monkeypatch):
+        import asyncio
+
+        reg = _pin_registry(monkeypatch, _TRUST_OWNER)
+        started = asyncio.Event()
+        self._hang_on_fetch(monkeypatch, started)
+        monkeypatch.setattr(reg_mod, "_PREWARM_BATCH_BUDGET", 3600.0)
+
+        async def _run() -> None:
+            task = asyncio.ensure_future(_prewarm_owner_tier_store_assets(reg, [_entry()]))
+            await await_until(started)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await await_until(task)
+
+        assert await self._handler_reports(_run) == []
 
 
 # ---------------------------------------------------------------------------

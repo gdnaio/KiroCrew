@@ -2,7 +2,7 @@
 ``llm_helpers._extract_json_of_type`` scanner.
 
 Locks the call-site behaviors ``_extract_json_array`` / ``_has_json_array``
-provide to ``_discover_surfaces_via_agent``: fenced replies, stray bracketed
+provide to ``discover_surfaces_via_agent``: fenced replies, stray bracketed
 prose (the input class outermost-span scanners mishandle), object-record
 preference, the shared ambiguity refusal, and the top-level-only contract the
 tool-side forcing re-emit relies on. Pure-function tests — no agent, no I/O.
@@ -94,14 +94,13 @@ class TestHasJsonArray:
 
     def test_scalar_prose_array_is_not_an_answer(self) -> None:
         # "see line [12]" parses as a JSON array but is prose, not an answer —
-        # counting it suppressed the forcing re-emit (pre-push review finding).
+        # counting it would suppress the forcing re-emit.
         assert _has_json_array("see line [12] for details") is False
 
     def test_wrapper_plus_prose_array_still_reads_unanswered(self) -> None:
-        # The convergent pre-push review finding (GPT + Opus): an object-wrapped
-        # reply next to stray bracketed prose must NOT read as answered, or the
-        # wrapped findings are silently dropped instead of recovered by the
-        # forcing re-emit.
+        # An object-wrapped reply next to stray bracketed prose must NOT read as
+        # answered, or the wrapped findings are silently dropped instead of
+        # recovered by the forcing re-emit.
         text = '{"findings": [{"file": "a.py"}]} See line [12].'
         assert _extract_json_array(text) == []
         assert _has_json_array(text) is False
@@ -125,7 +124,7 @@ class TestHasJsonArray:
 class TestAdversarialNesting:
     # Untrusted model output can embed pathological nesting; the shared
     # scanner must keep both call-site contracts (ValueError / never-raises)
-    # instead of letting RecursionError escape (pre-push review finding).
+    # instead of letting RecursionError escape.
 
     def test_unterminated_nesting_bomb_never_raises(self) -> None:
         assert _extract_json_array("x " + "[" * 100_000) == []

@@ -44,6 +44,7 @@ from kiro_crew.monitoring.models import (
     MonitorOutcome,
     ProviderErrorKind,
 )
+from kiro_crew.testing.wait import await_until
 
 
 class _RaisingProvider:
@@ -354,7 +355,7 @@ async def test_actionable_probe_claims_once_before_concurrent_dispatch(tmp_path)
     # task -- leaves nobody to set it. Unbounded, that parks the whole run on an
     # Event instead of failing this test: pytest-timeout's thread method kills the
     # xdist worker and every test it had not reached goes silently uncollected.
-    await asyncio.wait_for(entered.wait(), timeout=5)
+    await await_until(entered, what="the dispatch handoff")
     assert loop.monitor is not None and loop.monitor.wake_in_flight
 
     await controller.tick(loop, now=121.0)
@@ -421,13 +422,13 @@ async def test_terminal_transition_queued_during_claim_persistence_prevents_disp
     original_write = service._write_monitor_snapshot_locked
     first_write = True
 
-    async def _block_claim_write(_payload=None):
+    async def _block_claim_write(_payload=None, *, admission=None):
         nonlocal first_write
         if first_write:
             first_write = False
             write_entered.set()
             await release_write.wait()
-        await original_write(_payload)
+        await original_write(_payload, admission=admission)
 
     monkeypatch.setattr(service, "_write_monitor_snapshot_locked", _block_claim_write)
     tick = asyncio.create_task(controller.tick(loop, now=120.0))
@@ -435,7 +436,7 @@ async def test_terminal_transition_queued_during_claim_persistence_prevents_disp
     # monkeypatched snapshot write, so a tick that stops before persisting the claim,
     # or a rename of `_write_monitor_snapshot_locked` that leaves this setattr
     # intercepting nothing, would hang the run rather than fail the test.
-    await asyncio.wait_for(write_entered.wait(), timeout=5)
+    await await_until(write_entered, what="the claim's snapshot write")
     terminal = asyncio.create_task(getattr(service, terminal_transition)(loop.id, now=121.0))
     await asyncio.sleep(0)
     release_write.set()
@@ -710,7 +711,8 @@ async def test_user_stop_persistence_failure_restores_active_monitor(tmp_path, m
     persisted_before = service._path.read_bytes()
     timer_before = service._timers[loop.id]
 
-    async def fail_snapshot(_payload=None):
+    async def fail_snapshot(_payload=None, *, admission=None):
+        _ = admission
         raise OSError("disk full")
 
     monkeypatch.setattr(service, "_write_monitor_snapshot_locked", fail_snapshot)
@@ -750,7 +752,8 @@ async def test_probe_persistence_failure_leaves_live_claim_and_timer_unchanged(
     persisted_before = service._path.read_bytes()
     timer_before = service._timers[loop.id]
 
-    async def fail_snapshot(_payload=None):
+    async def fail_snapshot(_payload=None, *, admission=None):
+        _ = admission
         raise OSError("disk full")
 
     monkeypatch.setattr(service, "_write_monitor_snapshot_locked", fail_snapshot)
@@ -903,8 +906,8 @@ async def test_cancelled_probe_publishes_the_durable_staged_state(tmp_path, monk
     assert loop.monitor is not None
     original_write = service._write_monitor_snapshot_locked
 
-    async def persist_then_cancel(payload=None):
-        await original_write(payload)
+    async def persist_then_cancel(payload=None, *, admission=None):
+        await original_write(payload, admission=admission)
         raise asyncio.CancelledError
 
     monkeypatch.setattr(service, "_write_monitor_snapshot_locked", persist_then_cancel)
@@ -947,7 +950,8 @@ async def test_update_persistence_failure_leaves_live_monitor_and_timer_unchange
     persisted_before = service._path.read_bytes()
     timer_before = service._timers[loop.id]
 
-    async def fail_snapshot(_payload=None):
+    async def fail_snapshot(_payload=None, *, admission=None):
+        _ = admission
         raise OSError("disk full")
 
     monkeypatch.setattr(service, "_write_monitor_snapshot_locked", fail_snapshot)
@@ -1020,7 +1024,8 @@ async def test_dispatch_persistence_failure_leaves_live_claim_and_timer_unchange
     persisted_before = service._path.read_bytes()
     timer_before = service._timers[loop.id]
 
-    async def fail_snapshot(_payload=None):
+    async def fail_snapshot(_payload=None, *, admission=None):
+        _ = admission
         raise OSError("disk full")
 
     monkeypatch.setattr(service, "_write_monitor_snapshot_locked", fail_snapshot)
@@ -1064,7 +1069,8 @@ async def test_budget_stop_persistence_failure_leaves_active_monitor_armed(tmp_p
     persisted_before = service._path.read_bytes()
     timer_before = service._timers[loop.id]
 
-    async def fail_snapshot(_payload=None):
+    async def fail_snapshot(_payload=None, *, admission=None):
+        _ = admission
         raise OSError("disk full")
 
     monkeypatch.setattr(service, "_write_monitor_snapshot_locked", fail_snapshot)
@@ -1448,7 +1454,7 @@ async def test_structured_timer_invokes_controller_without_legacy_cycle(tmp_path
         now=time.time() - 16,
     )
 
-    await asyncio.wait_for(ticked.wait(), timeout=2)
+    await await_until(ticked, what="the first tick")
 
     assert loop.cycle_count == 0
     assert loop.monitor is not None and loop.monitor.probe_count == 1

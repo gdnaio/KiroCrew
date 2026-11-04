@@ -23,8 +23,15 @@ describe('MarkdownRenderer reserves the transcript data-message-* hooks', () => 
       '<span data-message-editing>x</span>',
       '<div data-message-actions>y</div>',
       '<b data-Message-Edit>z</b>',
+      '<i data-message-body>w</i>',
     ].join(' ')
     const { container } = render(<MarkdownRenderer content={md} />)
+    // The renderer's own root is the one `data-message-body` (what a message
+    // action reads); content cannot mint a second one.
+    const root = container.firstElementChild!
+    expect(root.hasAttribute('data-message-body')).toBe(true)
+    expect(container.querySelectorAll('[data-message-body]')).toHaveLength(1)
+    root.removeAttribute('data-message-body')
     // The elements themselves are allowlisted and still render.
     expect(container.textContent).toContain('x')
     expect(container.textContent).toContain('y')
@@ -37,6 +44,25 @@ describe('MarkdownRenderer reserves the transcript data-message-* hooks', () => 
     const leaked = Array.from(container.querySelectorAll('*')).flatMap(el =>
       Array.from(el.attributes).map(a => a.name).filter(n => n.toLowerCase().replace(/-/g, '').startsWith('datamessage')))
     expect(leaked).toEqual([])
+  })
+
+  it('drops a content-minted link-preview scope, so only a chat message root carries one', () => {
+    // The scope is where an app's link preview listens (LinkPreviewLayer). On a
+    // surface that is not a chat message (a remote artifact, a doc), authored
+    // HTML must not be able to open it.
+    const md = [
+      '<div data-link-preview-scope><a href="https://tickets.example.com/t/1">a</a></div>',
+      '<p data-Link-Preview-Scope>b</p>',
+      '<span datalinkpreviewscope>c</span>',
+    ].join(' ')
+    const { container } = render(<MarkdownRenderer content={md} />)
+    expect(container.textContent).toContain('a')
+    const leaked = Array.from(container.querySelectorAll('*')).flatMap(el =>
+      Array.from(el.attributes).map(a => a.name).filter(n => n.toLowerCase().replace(/-/g, '').startsWith('datalinkpreviewscope')))
+    expect(leaked).toEqual([])
+    // The renderer's own root still carries it when the host asks for chat previews.
+    const chat = render(<MarkdownRenderer content="hi" textPreviews />)
+    expect(chat.container.querySelectorAll('[data-link-preview-scope]')).toHaveLength(1)
   })
 
   it('still admits an ordinary data-* attribute', () => {

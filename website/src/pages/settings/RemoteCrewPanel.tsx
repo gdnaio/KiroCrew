@@ -23,6 +23,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import DefaultDestinationCrewPicker from '../../components/DefaultDestinationCrewPicker'
 import {
   Server,
   Rocket,
@@ -74,13 +75,14 @@ import { reportInstanceFailure } from '../../utils/instanceFailureReport'
 import { isInstancesDisabledError } from '../../utils/instancesDisabled'
 import { readPersistedString, usePersistedString } from '../../hooks/usePersistedString'
 import { usePersistedBool } from '../../hooks/usePersistedBool'
+import { readCompanySignIn, rememberCompanySignIn, sameCompanyPortal } from '../../utils/companySignIn'
 import { AUTO_CONNECT_KEY } from '../../hooks/useAutoConnectInstances'
 import { copyToClipboard } from '../../utils/clipboard'
 import { useAppDispatch, useAppSelector } from '../../store'
-import { removeWarm, setCrewEditForm } from '../../store/instancesSlice'
+import { removeWarm, setCrewEditForm, setCrewLaunchDraft, dropLaunchedCrewDraft, type CrewLaunchDraft } from '../../store/instancesSlice'
 import { setCrewEnabled } from '../../lib/crewEnabled'
 import { i18nT } from '../../i18n/t'
-import { AddInstanceForm } from './InstancesPanel'
+import { AddInstanceForm, RestartToActivateText } from './InstancesPanel'
 import { CrewVersionsReadError } from './CrewVersionStatus'
 import { awsCliRefusalCopy, awsCliRefusalReport, credentialHelperMissingSentence, pluginRefusalCopy, pluginRefusalReport } from './remoteCrewPluginRefusal'
 import {
@@ -94,7 +96,7 @@ import {
 import {
   SizeCard, ProvisionerCard, SettingUpRow, PrereqRow, LaunchProgressCard,
 } from './RemoteCrewPanelLaunch'
-import { CREW_SWITCH_HINT_ID, CrewRow } from './RemoteCrewPanelCrewRow'
+import { CREW_SWITCH_HINT_ID, CREW_NEEDS_RESTART_BANNER_ID, CrewRow } from './RemoteCrewPanelCrewRow'
 export { TurnUrlField } from './RemoteCrewPanelCrewRow'
 
 export function RemoteCrewPanel() {
@@ -146,14 +148,37 @@ export function RemoteCrewPanel() {
   // machine's own sign-in (an Identity Center user gets their organization's
   // portal, not the Builder ID one) and overridable; the server re-validates.
   // `identity_region` is the IAM Identity Center region — NOT the EC2 region.
-  const [identityMode, setIdentityMode] = useState<'builder_id' | 'identity_center'>('builder_id')
-  const [identityStartUrl, setIdentityStartUrl] = useState('')
-  const [identityRegion, setIdentityRegion] = useState('')
-  const [subnetId, setSubnetId] = useState('')
-  const identityTouched = useRef(false)
+  // Seeded from the reader's own unlaunched choice when the store holds one
+  // (crewForms.launch): that choice is theirs, so it counts as touched and the
+  // inherited identity does not overwrite it.
+  const heldLaunchDraft = useAppSelector(s => s.instances.crewForms?.launch ?? null)
+  const [launchDraft] = useState(heldLaunchDraft)
+  const identityDraft = launchDraft?.identity ?? null
+  const [identityMode, setIdentityMode] = useState<'builder_id' | 'identity_center'>(identityDraft?.mode ?? 'builder_id')
+  // With no held draft, the fields start from the last company sign-in submitted
+  // on this browser (here or in the Kiro sign-in form), so a reload or gateway
+  // restart does not empty them. This fills the fields only; it does not pick the
+  // Identity Center option or count as the reader's choice.
+  const [identityStartUrl, setIdentityStartUrl] = useState(() => identityDraft?.start_url ?? readCompanySignIn().startUrl)
+  const [identityRegion, setIdentityRegion] = useState(() => identityDraft?.region ?? readCompanySignIn().region)
+  const [subnetId, setSubnetId] = useState(launchDraft?.subnet_id ?? '')
+  const identityTouched = useRef(identityDraft !== null)
   // Render-visible twin of the ref: an explicit choice must re-render the
   // Launch gate even when it re-selects the already-checked default.
-  const [identityChosen, setIdentityChosen] = useState(false)
+  const [identityChosen, setIdentityChosen] = useState(identityDraft !== null)
+  // Only a sign-in choice the reader made is kept: the inherited preselection
+  // is read again on the next visit anyway.
+  const currentLaunchDraft = useMemo<CrewLaunchDraft | null>(
+    () => (subnetId || identityChosen
+      ? { subnet_id: subnetId, identity: identityChosen ? { mode: identityMode, start_url: identityStartUrl, region: identityRegion } : null }
+      : null),
+    [subnetId, identityChosen, identityMode, identityStartUrl, identityRegion],
+  )
+  // Held on every edit, like the add form, so every exit keeps it.
+  useEffect(() => { dispatch(setCrewLaunchDraft(currentLaunchDraft)) }, [dispatch, currentLaunchDraft])
+  // The draft the last built-in launch was sent with, so its success drops that
+  // draft and not one typed while the request was in flight.
+  const sentLaunchDraft = useRef<CrewLaunchDraft | null>(null)
   const identityQuery = useQuery({
     queryKey: ['cloud-identity'],
     queryFn: api.cloudIdentity,
@@ -167,6 +192,10 @@ export function RemoteCrewPanel() {
     if (suggested?.start_url) {
       setIdentityMode('identity_center')
       setIdentityStartUrl(suggested.start_url)
+      // A remembered region belongs to the remembered portal. When this
+      // computer names a different portal, that region would be a guess, so
+      // the field goes back to empty and Launch waits for the right one.
+      if (!sameCompanyPortal(suggested.start_url, readCompanySignIn().startUrl)) setIdentityRegion('')
     }
   }, [identityQuery.data])
   // Mirrors normalize_start_url on the backend, which is the authority: the
@@ -214,6 +243,8 @@ export function RemoteCrewPanel() {
     : {}
   /** A failed copy, pinned to the checklist row whose button was pressed. */
   const [copyErr, setCopyErr] = useState<{ target: 'command' | 'policy'; message: string } | null>(null)
+  // The gateway's note that a second launcher policy is needed; status, not an error.
+  const [policyNotice, setPolicyNotice] = useState('')
   const [activeLaunchId, setActiveLaunchId] = useState<string | null>(null)
   const [confirmDeleteTag, setConfirmDeleteTag] = useState<string | null>(null)
   const [confirmRemoveId, setConfirmRemoveId] = useState<string | null>(null)
@@ -737,8 +768,15 @@ export function RemoteCrewPanel() {
     mutationFn: (body: { provider_id?: string; profile: string; region: string; size_key: string; subnet_id?: string }) =>
       api.cloudLaunch(body),
     onMutate: () => setActionErr(null),
-    onSuccess: job => { setActiveLaunchId(job.id); reloadLaunches() },
+    onSuccess: job => {
+      setActiveLaunchId(job.id)
+      reloadLaunches()
+      // The built-in form's draft has been used. Only the built-in Launch sets
+      // the ref, so a registered provisioner's launch leaves the draft alone.
+      if (sentLaunchDraft.current) dispatch(dropLaunchedCrewDraft(sentLaunchDraft.current))
+    },
     onError: e => setActionErr(errMsg(e, i18nT('pages.settings.instancesPanel.unknown_error'))),
+    onSettled: () => { sentLaunchDraft.current = null },
   })
   const enableMutation = useMutation({
     mutationFn: () => api.patchConfig('instances.enabled', true),
@@ -795,14 +833,25 @@ export function RemoteCrewPanel() {
   }, [])
   const copyPolicy = useCallback(async () => {
     setCopyErr(null)
+    setPolicyNotice('')
     try {
-      const { policy } = await api.cloudIamPolicy()
+      const {
+        policy,
+        host_policies_notice: hostPoliciesNotice,
+        host_policies_error: hostPoliciesError,
+      } = await api.cloudIamPolicy()
       if (!(await copyToClipboard(policy))) {
         setCopyErr({ target: 'policy', message: i18nT('pages.settings.remoteCrewPanel.copy_policy_failed') })
         return
       }
       setCopied('policy')
       setTimeout(() => setCopied(null), 1500)
+      // An edition that attaches host policies needs a second launcher policy the
+      // main one has no room for. The gateway's line saying how to get it is
+      // status text beside the button; a second policy it could not build is an
+      // error.
+      if (hostPoliciesError) setCopyErr({ target: 'policy', message: hostPoliciesError })
+      setPolicyNotice(hostPoliciesNotice ?? '')
     } catch (e) {
       setCopyErr({ target: 'policy', message: errMsg(e, i18nT('pages.settings.instancesPanel.unknown_error')) })
     }
@@ -916,8 +965,9 @@ export function RemoteCrewPanel() {
   const Notices = (
     <>
       {/* askAgent ON on both notices: every unsaved input this panel holds
-          outlives the navigation — the add-crew and edit-crew forms live in the
-          store (setCrewAddForm / setCrewEditForm), the launch form's size and
+          outlives the navigation — the add-crew and edit-crew forms and the
+          launch form's unlaunched subnet and sign-in choice live in the store
+          (setCrewAddForm / setCrewEditForm / setCrewLaunchDraft), its size and
           account in localStorage — so the hand-off destroys nothing, and every
           message here (a refused connect, a failed diagnose, a rejected launch)
           is a gateway-side failure the agent can look into. */}
@@ -1005,9 +1055,9 @@ export function RemoteCrewPanel() {
               {i18nT('pages.settings.remoteCrewPanel.crew_switch_hint')}
             </p>
             {needsRestart && (
-              <div role="status" className="flex items-start gap-2 px-3 py-2 mb-3 text-[13px] rounded-md bg-warn/10 text-warn-text border border-warn/30">
+              <div id={CREW_NEEDS_RESTART_BANNER_ID} role="status" className="flex items-start gap-2 px-3 py-2 mb-3 text-[13px] rounded-md bg-warn/10 text-warn-text border border-warn/30">
                 <AlertTriangle size={14} className="lucide-inline mt-0.5 shrink-0" />
-                <span>{i18nT('pages.settings.instancesPanel.enabled_but_not_active_yet_restart_the_gateway')}<code className="text-text">{i18nT('pages.settings.instancesPanel.kirocrew_restart')}</code>) {i18nT('pages.settings.instancesPanel.to_start_the_ssh_tunnel_manager_and_activate_ins')}</span>
+                <RestartToActivateText />
               </div>
             )}
             {listLoading ? (
@@ -1039,6 +1089,7 @@ export function RemoteCrewPanel() {
                   <SettingUpRow key={job.id} job={job} cancelling={cancelMutation.isPending && cancelMutation.variables === job.id} onCancel={id => cancelMutation.mutate(id)} />
                 ))}
                 <CrewVersionsReadError anyConnected={instances.some(i => !i.disabled && i.status.state === 'connected')} />
+                <DefaultDestinationCrewPicker instances={instances} value={instancesQuery.data?.default_destination ?? ''} />
                 {instances.map(inst => (
                   <CrewRow
                     key={inst.id}
@@ -1055,6 +1106,7 @@ export function RemoteCrewPanel() {
                     fetchingSignin={signinMutation.isPending && signinMutation.variables === signinJobIdFor(inst)}
                     signinNotice={signinNotice && signinNotice.jobId === signinJobIdFor(inst) ? signinNotice : null}
                     busy={busy}
+                    connectBlocked={needsRestart}
                     deleting={inst.ssm_target ? deletingTags.has(cloudTagByInstanceId.get(inst.ssm_target) ?? '') : false}
                     confirmDelete={confirmDeleteTag !== null && confirmDeleteTag === (inst.ssm_target ? cloudTagByInstanceId.get(inst.ssm_target) : null)}
                     confirmRemove={confirmRemoveId === inst.id}
@@ -1160,8 +1212,8 @@ export function RemoteCrewPanel() {
               renders (the list is presentation, not permission), but the
               failure is said rather than swallowed: a newer dashboard on an
               older gateway is exactly the version skew the agent can explain.
-              askAgent ON: the launch form persists its account and size, so
-              the navigation destroys nothing. */}
+              askAgent ON: the launch form keeps every entry the reader has not
+              launched with, so the navigation destroys nothing. */}
           {provisionersQuery.isError && (
             <ErrorNotice
               message={errMsg(provisionersQuery.error, i18nT('pages.settings.remoteCrewPanel.provisioners_unavailable'))}
@@ -1247,8 +1299,8 @@ export function RemoteCrewPanel() {
             {/* Rendered independently of `preflight`: a failed RE-check keeps the
                 previous result in cache, and the rows below would otherwise paint
                 that stale verdict as if the check had just passed. askAgent ON:
-                the launch form on this tab keeps its size and account in
-                localStorage (see the diagnosis notice above), so the navigation
+                the launch form on this tab keeps every entry the reader has not
+                launched with (see the diagnosis notice above), so the navigation
                 destroys nothing, and a preflight that cannot even run is exactly
                 the credential/CLI problem the agent can look into. */}
             {preflightQuery.isError && (
@@ -1291,7 +1343,7 @@ export function RemoteCrewPanel() {
                   rechecking={preflightQuery.isFetching}
                 />
                 <PrereqRow ok={preflight.ec2_reachable} title={i18nT('pages.settings.remoteCrewPanel.prereq_ec2')} detail={preflight.ec2_reachable ? i18nT('pages.settings.remoteCrewPanel.service_ok') : i18nT('pages.settings.remoteCrewPanel.service_missing')} />
-                <PrereqRow ok={preflight.cloudformation_reachable} title={i18nT('pages.settings.remoteCrewPanel.prereq_cloudformation')} detail={preflight.cloudformation_reachable ? i18nT('pages.settings.remoteCrewPanel.service_ok') : i18nT('pages.settings.remoteCrewPanel.service_missing')} extraAction={preflight.cloudformation_reachable ? undefined : <Btn onClick={copyPolicy}>{copied === 'policy' ? <Check className="lucide-inline" /> : <Copy className="lucide-inline" />} {copied === 'policy' ? i18nT('pages.settings.remoteCrewPanel.copied') : i18nT('pages.settings.remoteCrewPanel.copy_policy_json')}</Btn>} error={copyErr?.target === 'policy' ? copyErr.message : undefined} />
+                <PrereqRow ok={preflight.cloudformation_reachable} title={i18nT('pages.settings.remoteCrewPanel.prereq_cloudformation')} detail={preflight.cloudformation_reachable ? i18nT('pages.settings.remoteCrewPanel.service_ok') : i18nT('pages.settings.remoteCrewPanel.service_missing')} extraAction={preflight.cloudformation_reachable ? undefined : <><Btn onClick={copyPolicy}>{copied === 'policy' ? <Check className="lucide-inline" /> : <Copy className="lucide-inline" />} {copied === 'policy' ? i18nT('pages.settings.remoteCrewPanel.copied') : i18nT('pages.settings.remoteCrewPanel.copy_policy_json')}</Btn>{policyNotice ? <span role="status" className="text-[12px] text-muted">{policyNotice}</span> : null}</>} error={copyErr?.target === 'policy' ? copyErr.message : undefined} />
                 <PrereqRow ok={preflight.ssm_reachable} title={i18nT('pages.settings.remoteCrewPanel.prereq_ssm')} detail={preflight.ssm_reachable ? i18nT('pages.settings.remoteCrewPanel.service_ok') : i18nT('pages.settings.remoteCrewPanel.service_missing')} />
                 <PrereqRow
                   ok={preflight.session_manager_plugin}
@@ -1379,35 +1431,40 @@ export function RemoteCrewPanel() {
               <div className="text-[13px] text-muted mb-2">{i18nT('pages.settings.remoteCrewPanel.identity')}</div>
               {identityQuery.isError ? (
                 <>
-                  {/* No hand-off: this notice sits beside the unsaved Identity Center
-                      start-URL and region draft, and the hand-off navigates to chat,
-                      which would unmount the form and discard that draft. The failure is
-                      non-blocking — the only consequence is that the launching computer's
-                      identity could not be read to preselect the radios; the user can
-                      still pick and type the target below. */}
+                  {/* askAgent ON: the launch form keeps every entry the reader has
+                      not launched with (crewForms.launch), so the hand-off
+                      loses nothing, and a sign-in the gateway could not read is one
+                      the agent can look into. The failure is non-blocking: the user
+                      can still pick and type the target below. Once they have
+                      picked, the notice says the selected option is theirs rather
+                      than asking them to choose. */}
                   <ErrorNotice
                     variant="inline"
                     className="mb-2"
-                    message={i18nT('pages.settings.remoteCrewPanel.identity_lookup_failed')}
+                    message={i18nT(identityChosen
+                      ? 'pages.settings.remoteCrewPanel.identity_unknown_chosen'
+                      : 'pages.settings.remoteCrewPanel.identity_lookup_failed')}
+                    askAgent
                   />
                 </>
               ) : identityUnknownCause !== null ? (
                 <>
-                  {/* No hand-off: like the notice above, this sits beside the unsaved
-                      Identity Center start-URL and region draft, and a hand-off navigates
-                      to chat, unmounting the form and discarding that draft. The server
-                      suggests nothing, so no radio is checked until the user picks, and
-                      Launch waits for that pick. The notice names the cause the server
-                      reported: whoami did not answer, or an Identity Center sign-in was
-                      read without its portal address. */}
+                  {/* askAgent ON, as above. The server suggests nothing, so no radio
+                      is checked until the user picks, and Launch waits for that pick.
+                      The notice names the cause the server reported: whoami did not
+                      answer, or an Identity Center sign-in was read without its
+                      portal address; after a pick it says the choice is theirs. */}
                   <ErrorNotice
                     variant="inline"
                     className="mb-2"
                     message={i18nT(
-                      identityUnknownCause === 'no_portal'
-                        ? 'pages.settings.remoteCrewPanel.identity_unknown_no_portal'
-                        : 'pages.settings.remoteCrewPanel.identity_unknown_no_answer',
+                      identityChosen
+                        ? 'pages.settings.remoteCrewPanel.identity_unknown_chosen'
+                        : identityUnknownCause === 'no_portal'
+                          ? 'pages.settings.remoteCrewPanel.identity_unknown_no_portal'
+                          : 'pages.settings.remoteCrewPanel.identity_unknown_no_answer',
                     )}
+                    askAgent
                   />
                 </>
               ) : null}
@@ -1498,7 +1555,7 @@ export function RemoteCrewPanel() {
                   behind a different engine; omitting the id would let the server
                   default to the built-in and provision on the wrong lane. Only
                   an UNKNOWN list (loading or failed) sends the pre-seam body. */}
-              <Btn primary onClick={() => launchMutation.mutate({ ...(selectedProvisioner ? { provider_id: selectedProvisioner.id } : {}), profile, region, size_key: sizeKey, ...(subnetId.trim() ? { subnet_id: subnetId.trim() } : {}), ...loginTargetBody })} disabled={!blockingOk || !identityOk || launchMutation.isPending}>
+              <Btn primary onClick={() => { sentLaunchDraft.current = currentLaunchDraft; if (identityMode === 'identity_center') rememberCompanySignIn(identityStartUrl, identityRegion); launchMutation.mutate({ ...(selectedProvisioner ? { provider_id: selectedProvisioner.id } : {}), profile, region, size_key: sizeKey, ...(subnetId.trim() ? { subnet_id: subnetId.trim() } : {}), ...loginTargetBody }) }} disabled={!blockingOk || !identityOk || launchMutation.isPending}>
                 <Rocket className="lucide-inline" /> {launchMutation.isPending ? i18nT('pages.settings.remoteCrewPanel.launching') : i18nT('pages.settings.remoteCrewPanel.launch')}
               </Btn>
               <span className="text-[12px] text-muted">
@@ -1550,7 +1607,8 @@ export function RemoteCrewPanel() {
               below is absent and this notice is the only thing that says why.
               When a card IS showing, it shows the last state received, not a
               live one, and would otherwise just stop moving. askAgent ON: the
-              launch form persists its size and account, so the navigation loses
+              launch form keeps every entry the reader has not launched with,
+              so the navigation loses
               nothing. */}
           {effectiveLaunchId && launchStatusQuery.isError && (
             <ErrorNotice

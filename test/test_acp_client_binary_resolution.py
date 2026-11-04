@@ -20,6 +20,7 @@ from kiro_crew.acp.client import (
     _resolve_vendored_claude_acp,
     _vendored_acp_roots,
 )
+from kiro_crew.testing.ids import UNALLOCATABLE_PID
 
 
 class TestVendoredClaudeAcp:
@@ -290,6 +291,34 @@ class TestResolveClaudeCodeExecutable:
         )
         assert client_mod._resolve_claude_code_executable() == "/srv/u/.toolbox/bin/claude"
 
+    @_POSIX_EXEC_PATHS_ONLY
+    def test_windows_toolbox_claude_off_the_inherited_path_is_found(self, monkeypatch, tmp_path):
+        """A Toolbox install on Windows lands in ``%LOCALAPPDATA%\\Toolbox\\bin``.
+
+        The gateway's own PATH may not hold that dir, and the Agent Harness
+        probe must still find the ``claude`` there.
+        """
+        from kiro_crew import env as env_mod
+        from kiro_crew.acp import client as client_mod
+
+        bin_dir = tmp_path / "Local" / "Toolbox" / "bin"
+        bin_dir.mkdir(parents=True)
+        claude = bin_dir / "claude"
+        claude.write_text("#!/bin/sh\n")
+        claude.chmod(0o755)
+        monkeypatch.delenv("CLAUDE_CODE_EXECUTABLE", raising=False)
+        monkeypatch.setattr(client_mod, "_mise_which", lambda tool: None)
+        monkeypatch.setattr(env_mod.platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+        # The fixed well-known dirs (``/usr/local/bin`` and the like) sit ahead of
+        # the Toolbox dir, so a ``claude`` the host already has there would win.
+        # Empty them so only the fixture tree can answer.
+        monkeypatch.setattr(env_mod, "_EXTRA_PATH_DIRS", ())
+        monkeypatch.setattr(env_mod, "_node_all_bin_dirs", lambda *a, **k: [])
+        assert client_mod._resolve_claude_code_executable() == str(claude)
+
     def test_none_when_absent(self, monkeypatch):
         from kiro_crew.acp import client as client_mod
 
@@ -353,6 +382,41 @@ class TestMiseWhich:
         mock_sub.TimeoutExpired = subprocess.TimeoutExpired
         monkeypatch.setattr(client_mod, "subprocess_mod", mock_sub)
         assert _mise_which("claude-agent-acp") is None
+
+    @pytest.mark.parametrize("host_encoding", ["cp1252", "ascii"])
+    def test_non_ascii_path_survives_a_non_utf8_host_codepage(
+        self, tmp_path, monkeypatch, host_encoding
+    ):
+        """mise prints the path as UTF-8; a profile dir like ``José`` must resolve.
+
+        The stand-in decodes the way ``subprocess`` does: with ``encoding=`` when
+        given, else the host code page. cp1252 mangles the path (no such file, so
+        the lookup falls through to None); ascii raises ``UnicodeDecodeError``,
+        which escapes the ``TimeoutExpired``/``OSError`` handler.
+        """
+        import subprocess
+
+        from kiro_crew.acp import client as client_mod
+        from kiro_crew.acp.client import _mise_which
+
+        script = tmp_path / "José" / "node"
+        script.parent.mkdir()
+        script.write_text("#!/bin/sh\n", encoding="utf-8")
+        payload = (str(script) + "\n").encode("utf-8")
+
+        def _decoding_run(argv, **kwargs):
+            codec = kwargs.get("encoding") or host_encoding
+            return subprocess.CompletedProcess(argv, 0, payload.decode(codec), "")
+
+        monkeypatch.setattr(
+            client_mod.shutil,
+            "which",
+            lambda name: str(tmp_path / "mise") if name == "mise" else None,
+        )
+        mock_sub = MagicMock(run=_decoding_run)
+        mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+        monkeypatch.setattr(client_mod, "subprocess_mod", mock_sub)
+        assert _mise_which("node") == str(script)
 
 
 class TestResolveKiroBinEnvOverride:
@@ -434,8 +498,7 @@ class TestResolveKiroBinEnvOverride:
         fake.write_bytes(b"#!/bin/sh\n# original\n")
         fake.chmod(0o755)
         mock_exec = AsyncMock()
-        # nosemgrep: kirocrew.mock-pid-allocatable -- pre-existing literal pid on a mocked process; tracked for a de-flake pass
-        mock_exec.return_value.pid = 12345
+        mock_exec.return_value.pid = UNALLOCATABLE_PID
         with (
             patch.dict("os.environ", {"KIROCREW_KIRO_BIN": str(fake)}),
             patch("kiro_crew.session._track_pid"),
@@ -466,7 +529,15 @@ class TestResolveKiroBinEnvOverride:
 
             client = AcpClient(work_dir=tmp_path / "workspace")
             await client._spawn()
-            mock_exec.assert_awaited()
+            assert mock_exec.await_count == 1
+            launched = [
+                a
+                for a in mock_exec.await_args.args
+                if isinstance(a, str) and os.path.realpath(a) == os.path.realpath(fake)
+            ]
+            assert launched, mock_exec.await_args.args
+            # The path launched holds the updated bytes, not a pre-update copy.
+            assert Path(launched[0]).read_bytes() == b"#!/bin/sh\n# self-updated\n"
 
             await _stop_stderr_drain(client)
 
@@ -683,10 +754,9 @@ class TestMiseNodeInstallsDir:
     """
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- no test in this module calls monkeypatch.undo()
-    def _clean_env(self, monkeypatch):
-        monkeypatch.delenv("MISE_DATA_DIR", raising=False)
-        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    def _clean_env(self, _floor_monkeypatch):
+        _floor_monkeypatch.delenv("MISE_DATA_DIR", raising=False)
+        _floor_monkeypatch.delenv("XDG_DATA_HOME", raising=False)
 
     def test_default_layout_is_unchanged(self, tmp_path, monkeypatch):
         from kiro_crew.acp import client as client_mod

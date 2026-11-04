@@ -8,11 +8,12 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+from kiro_crew.testing.wait import wait_until
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
@@ -172,11 +173,12 @@ class TestCIProgress(unittest.TestCase):
             encoding="utf-8",
         )
         try:
-            deadline = time.monotonic() + 15
-            while not (self.root / "ready").exists():
-                self.assertIsNone(proc.poll())
-                self.assertLess(time.monotonic(), deadline, "child never reached its fixture gate")
-                time.sleep(0.01)
+            wait_until(
+                lambda: (self.root / "ready").exists() or proc.poll() is not None,
+                timeout=15,
+                describe=lambda: "child never reached its fixture gate",
+            )
+            self.assertIsNone(proc.poll(), "child exited before reaching its fixture gate")
             rows = next(iter(self.records().values()))
             self.assertTrue(any(r["event"] == "test_start" for r in rows))
             self.assertTrue(any(r.get("phase") == "setup" for r in rows))
@@ -327,7 +329,13 @@ class TestCIProgress(unittest.TestCase):
 
         workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
         job = workflow["jobs"]["backend-test"]
-        self.assertEqual(job["timeout-minutes"], 60)
+        # 60 on CodeBuild, 70 on a non-fleet runner that shards four-wide and
+        # needs the longer per-shard budget.
+        self.assertEqual(
+            job["timeout-minutes"],
+            "${{ startsWith(needs.changes.outputs.linux_runner_large, "
+            "'codebuild-') && 60 || 70 }}",
+        )
         self.assertEqual(job["env"]["SHARD_COUNT"], 8)
         step = next(s for s in job["steps"] if s.get("name", "").startswith("Run tests"))
         command = step["run"]
@@ -339,6 +347,8 @@ class TestCIProgress(unittest.TestCase):
         self.assertIn("--max-worker-restart=0", command)
         self.assertEqual(command.count('"${PROGRESS[@]}"'), 4)
         self.assertEqual(command.count("--timeout=120"), 4)
+        self.assertEqual(command.count('-n "$WORKERS"'), 4)
+        self.assertNotIn("-n auto", command)
         self.assertEqual(command.count("-p scripts.ci_file_shards"), 2)
         self.assertIn("--cov=kiro_crew --cov=sage_lib", command)
         self.assertIn("--cov=src/kiro_crew/apps/builtins/aws_control/crew/packaging", command)

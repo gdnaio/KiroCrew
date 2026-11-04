@@ -50,6 +50,7 @@ from urllib.parse import quote, urlparse, urlunparse  # noqa: F401
 
 from aiohttp import web
 
+from kiro_crew.config.fields import _coerce_bool
 from kiro_crew.dashboard.source_providers.contract import (
     ConfirmationRequired,
     SourceCapacityError,
@@ -216,6 +217,7 @@ _OWNED_NAMES: dict[str, tuple[str, ...]] = {
         "_merge_state_settled",
         "_or_empty",
         "_project_state",
+        "_record_merge_state",
         "_rollup_ci",
         "_safe_https_url",
         "_SECONDARY_PAGE_SIZE",
@@ -325,6 +327,8 @@ _OWNED_NAMES: dict[str, tuple[str, ...]] = {
     # Holds no name callers reach through this module; listed so the handler
     # loads it, which installs the Bitbucket Server provider into the seam.
     "bitbucket_server": (),
+    # Likewise: importing it installs the Gerrit provider into the seam.
+    "gerrit": (),
     "chip_status": (
         "_check_cache",
         "_CHECK_CACHE_MAX",
@@ -356,7 +360,6 @@ _OWNED_NAMES: dict[str, tuple[str, ...]] = {
         "_note_check_flap",
         "_queue_check_update",
         "record_full_payload_status",
-        "_record_merge_state",
         "_refresh_repo_visibility",
         "register_status_delta_sink",
         "schedule_visibility_refresh",
@@ -569,11 +572,31 @@ def _provider_error_response(
     _audit_source_api(request, operation, "failed", reason)
     # ``loginCommand`` is set only from the gateway's own allowlisted host, never
     # parsed from provider text, so the client can show it as the remedy as-is.
+    # ``secretName`` is the vault name the message tells the reader to store,
+    # admitted only in a Bitbucket Server token-name shape and only while the
+    # scrubbed message still names it. The value came through a provider, so it
+    # ships only when it is also a name Bitbucket Server code derives from the
+    # operator's allowlist: a shape alone cannot tell a name from an opaque token.
+    # The two remedies come from different providers (a sign-in for a CLI-backed
+    # one, a stored token for a REST-backed one), so a body carries one of them.
     if exc.login_command:
         return web.json_response(
             {"error": str(exc), "code": code, "loginCommand": exc.login_command}, status=503
         )
+    if exc.secret_name and exc.secret_name in _submodule("bitbucket_server").token_secret_names():
+        return web.json_response(
+            {"error": str(exc), "code": code, "secretName": exc.secret_name}, status=503
+        )
     return web.json_response({"error": str(exc), "code": code}, status=503)
+
+
+def _body_refresh(body: dict) -> bool:
+    """Read ``refresh``: a spelled "false"/"0"/"no"/"off" means False.
+
+    Any other value keeps the truthiness it has always been read with.
+    """
+    raw = body.get("refresh")
+    return _coerce_bool(raw, bool(raw))
 
 
 async def api_pull_request_source(request: web.Request) -> web.Response:
@@ -592,7 +615,7 @@ async def api_pull_request_source(request: web.Request) -> web.Response:
         body = {}
     try:
         data = await _submodule("cache").fetch_pull_request(
-            str(body.get("url") or ""), refresh=bool(body.get("refresh"))
+            str(body.get("url") or ""), refresh=_body_refresh(body)
         )
     except asyncio.CancelledError:
         _audit_source_api(request, "source.pull_request.read", "failed", "request_cancelled")
@@ -627,7 +650,7 @@ async def api_issue_source(request: web.Request) -> web.Response:
         body = {}
     try:
         data = await _submodule("cache").fetch_issue(
-            str(body.get("url") or ""), refresh=bool(body.get("refresh"))
+            str(body.get("url") or ""), refresh=_body_refresh(body)
         )
     except asyncio.CancelledError:
         _audit_source_api(request, "source.issue.read", "failed", "request_cancelled")
@@ -669,7 +692,7 @@ async def api_app_contributors(request: web.Request) -> web.Response:
         body = {}
     try:
         contributors = await _submodule("cache").fetch_app_contributors(
-            str(body.get("url") or ""), refresh=bool(body.get("refresh"))
+            str(body.get("url") or ""), refresh=_body_refresh(body)
         )
     except asyncio.CancelledError:
         _audit_source_api(request, "source.contributors.read", "failed", "request_cancelled")

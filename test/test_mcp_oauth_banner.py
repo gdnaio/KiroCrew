@@ -26,7 +26,7 @@ from oauth_url_corpus import LEGIT_OAUTH_URLS
 
 from kiro_crew import mcp_discovery
 from kiro_crew.connections import get_all_registry_providers, get_visible_providers
-from kiro_crew.dashboard import chat_runner
+from kiro_crew.dashboard import chat_runner, mcp_oauth_provenance
 from kiro_crew.dashboard.chat_runner import (
     _connections_managed_mcp_names,
     _drain_session_init_oauth_requests,
@@ -72,16 +72,30 @@ class TestIsSafeOAuthUrl:
 
 
 class TestRedactMetaForRole:
+    """The shape gates, on rows whose URL the child did send.
+
+    A URL no child sent is withheld before these gates run
+    (``test_mcp_oauth_provenance.py``); each row here is recorded first so the
+    scheme and credential gates are what is measured.
+    """
+
+    @staticmethod
+    def _emitted(meta: dict) -> dict:
+        mcp_oauth_provenance.record_emitted("live-child", meta["oauth_url"])
+        return {**meta, "child": "live-child"}
+
     def test_mcp_oauth_preserves_https_url(self):
         url = "https://mcp.linear.app/authorize?client_id=abc"
-        out = _redact_meta_for_role("mcp_oauth", {"server_name": "linear", "oauth_url": url})
+        out = _redact_meta_for_role(
+            "mcp_oauth", self._emitted({"server_name": "linear", "oauth_url": url})
+        )
         assert out["oauth_url"] == url
         assert out["server_name"] == "linear"
 
     def test_mcp_oauth_drops_unsafe_url(self):
         out = _redact_meta_for_role(
             "mcp_oauth",
-            {"server_name": "evil", "oauth_url": "javascript:alert(1)"},
+            self._emitted({"server_name": "evil", "oauth_url": "javascript:alert(1)"}),
         )
         # Unsafe scheme is replaced with empty string, not preserved as-is.
         assert out["oauth_url"] == ""
@@ -92,10 +106,12 @@ class TestRedactMetaForRole:
         Mirrors the live-emission gate in _emit_mcp_oauth_request."""
         out = _redact_meta_for_role(
             "mcp_oauth",
-            {
-                "server_name": "linear",
-                "oauth_url": "https://evil.com/auth?key=AKIAIOSFODNN7EXAMPLE",
-            },
+            self._emitted(
+                {
+                    "server_name": "linear",
+                    "oauth_url": "https://evil.com/auth?key=AKIAIOSFODNN7EXAMPLE",
+                }
+            ),
         )
         assert out["oauth_url"] == ""
 
@@ -104,11 +120,13 @@ class TestRedactMetaForRole:
         url = "https://mcp.example.com/authorize"
         out = _redact_meta_for_role(
             "mcp_oauth",
-            {
-                "server_name": "ex",
-                "oauth_url": url,
-                "error": "AKIAIOSFODNN7EXAMPLE leaked",
-            },
+            self._emitted(
+                {
+                    "server_name": "ex",
+                    "oauth_url": url,
+                    "error": "AKIAIOSFODNN7EXAMPLE leaked",
+                }
+            ),
         )
         assert out["oauth_url"] == url
         # _redact_value is invoked for non-preserved fields, so AKIA pattern is scrubbed.
@@ -126,11 +144,14 @@ class TestRedactMetaForRole:
         # a special-case preserved field.
         assert "oauth_url" in out  # key still present, value may differ
 
-    def test_non_string_oauth_url_redacted_as_value(self):
-        # If a tampered history line stored a non-string for oauth_url, fall
-        # through to _redact_value so the carve-out can't be exploited.
-        out = _redact_meta_for_role("mcp_oauth", {"oauth_url": 123})
-        assert out["oauth_url"] == 123  # _redact_value passes through non-str/non-container
+    @pytest.mark.parametrize("value", [123, ["https://mcp.linear.app/authorize"]])
+    def test_non_string_oauth_url_is_withheld(self, value):
+        # A tampered history line that stored a non-string for oauth_url is no
+        # URL any child sent, so it never reaches a client (a list would be
+        # stringified into a link by some renderers).
+        out = _redact_meta_for_role("mcp_oauth", {"oauth_url": value, "child": "live-child"})
+        assert "oauth_url" not in out
+        assert out["expired"] is True
 
 
 # ── _emit_mcp_oauth_request ──
@@ -534,13 +555,21 @@ class TestMarkMcpOAuthCompleted:
         prior_call_count = state.broadcast_ws.call_count
         _mark_mcp_oauth_completed(state, slot, "linear", success=True)
         assert state.broadcast_ws.call_count == prior_call_count
+        # The closed banner keeps its recorded failure rather than flipping to completed.
+        m = slot.messages[0]
+        assert m["meta"]["failed"] is True
+        assert m["meta"]["error"] == "boom"
+        assert "completed" not in m["meta"]
 
     def test_no_matching_banner_is_noop(self):
         slot = _ChatSlot("s1")
         state = MagicMock()
-        # No mcp_oauth message has been appended for "phantom".
+        # Only another server's banner exists; marking "phantom" must not touch it.
+        _emit_mcp_oauth_request(MagicMock(), slot, "linear", "https://mcp.linear.app/authorize")
         _mark_mcp_oauth_completed(state, slot, "phantom", success=True)
         state.broadcast_ws.assert_not_called()
+        assert len(slot.messages) == 1
+        assert "completed" not in slot.messages[0]["meta"]
 
     def test_completion_resolves_the_row_by_mid_on_a_ts_collision(self):
         """The completion path shares the supersede path's row-identity problem.
@@ -566,9 +595,9 @@ class TestMarkMcpOAuthCompleted:
         state = MagicMock()
         _mark_mcp_oauth_completed(state, slot, "linear", success=True)
 
-        assert second["meta"].get("completed") is True, (
-            "the completion landed on the wrong row -- ts is not a row identity"
-        )
+        assert (
+            second["meta"].get("completed") is True
+        ), "the completion landed on the wrong row -- ts is not a row identity"
         assert first["meta"].get("completed") is None
         _, payload = state.broadcast_ws.call_args[0]
         assert payload["mid"] == second["meta"]["mid"]
@@ -868,9 +897,9 @@ class TestSupersededOAuthBanners:
         state = MagicMock()
         _supersede_open_mcp_oauth_banners(state, slot, "miro", False)
 
-        assert all(m["meta"].get("superseded") is True for m in slot.messages), (
-            "a ts collision left a banner open, still offering a dead loopback link"
-        )
+        assert all(
+            m["meta"].get("superseded") is True for m in slot.messages
+        ), "a ts collision left a banner open, still offering a dead loopback link"
         assert all("oauth_url" not in m["meta"] for m in slot.messages)
         # Each row patched exactly once -- not the first one twice.
         assert state.broadcast_ws.call_count == 2
@@ -1540,8 +1569,10 @@ def _own(tmp_path, monkeypatch, servers) -> None:
 
 def _pending(*names):
     return _FakeProviderClient(
-        [{"serverName": n, "oauthUrl": f"https://{n}.example.com/authorize?client_id=x"}
-         for n in names]
+        [
+            {"serverName": n, "oauthUrl": f"https://{n}.example.com/authorize?client_id=x"}
+            for n in names
+        ]
     )
 
 
@@ -1679,9 +1710,7 @@ class TestAnnotationFailsOpen:
         """Both halves of the predicate must fail open, not just the store read."""
         _own(tmp_path, monkeypatch, {CARDED_SLUG: {"url": "https://mcp.notion.com/mcp"}})
         slot = _ChatSlot("s1")
-        with patch(
-            f"kiro_crew.dashboard.chat_runner.{broken}", side_effect=RuntimeError("boom")
-        ):
+        with patch(f"kiro_crew.dashboard.chat_runner.{broken}", side_effect=RuntimeError("boom")):
             await _drain_session_init_oauth_requests(MagicMock(), slot, _pending(CARDED_SLUG))
         assert _owned_flags(slot) == [False]
 
@@ -1713,9 +1742,7 @@ class TestDrainDoesNoBlockingWorkOnTheLoop:
         assert _owned_flags(slot) == [True]
 
     @pytest.mark.asyncio
-    async def test_lookup_is_skipped_entirely_when_nothing_is_pending(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_lookup_is_skipped_entirely_when_nothing_is_pending(self, tmp_path, monkeypatch):
         """Session init is the hot path and the common case is zero requests."""
         _own(tmp_path, monkeypatch, {CARDED_SLUG: {"url": "https://mcp.notion.com/mcp"}})
         calls: list[int] = []
@@ -1763,9 +1790,7 @@ class TestMidTurnRequestsAreNeverAnnotated:
 
     def test_annotation_is_opt_in_per_call(self):
         slot = _ChatSlot("s1")
-        _emit_mcp_oauth_request(
-            MagicMock(), slot, "acme", LEGIT_OAUTH_URLS[0][1], card_owned=True
-        )
+        _emit_mcp_oauth_request(MagicMock(), slot, "acme", LEGIT_OAUTH_URLS[0][1], card_owned=True)
         assert slot.messages[0]["meta"]["card_owned"] is True
 
 

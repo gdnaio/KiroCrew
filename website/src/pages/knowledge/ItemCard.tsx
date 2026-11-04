@@ -2,9 +2,10 @@ import { useState } from 'react'
 import { Tag, Copy, ChevronDown, ChevronRight, FileText } from 'lucide-react'
 import { Btn, Badge } from '../../components/ui'
 import Clickable from '../../components/Clickable'
-import { typeBadgeVariant, formatDate, useCopy } from './helpers'
+import { typeBadgeVariant, formatDate, useCopy, itemTypeLabel } from './helpers'
 import type { KnowledgeItem } from './types'
 import { i18nT } from '../../i18n/t'
+import { pathBasename } from '../../utils/pathBasename'
 
 export function ItemCard({ item, onClick, selected, onSelect }: {
   item: KnowledgeItem
@@ -23,7 +24,7 @@ export function ItemCard({ item, onClick, selected, onSelect }: {
             <div className="text-sm font-medium text-text-strong truncate">{item.title || i18nT('pages.knowledge.itemCard.untitled')}</div>
             {item.summary && <div className="text-[13px] text-muted mt-1 line-clamp-2">{item.summary}</div>}
           </div>
-          <Badge variant={typeBadgeVariant(item.item_type)}>{item.item_type.replace(/_/g, ' ')}</Badge>
+          <Badge variant={typeBadgeVariant(item.item_type)}>{itemTypeLabel(item.item_type)}</Badge>
         </div>
         <div className="flex items-center gap-3 mt-2 text-[11px] text-muted">
           <span>{formatDate(item.updated_at)}</span>
@@ -45,7 +46,7 @@ export function FileSubGroup({ filePath, items, onItemClick, selectedItems, onSe
   onSelect: (id: string, checked: boolean) => void
 }) {
   const [open, setOpen] = useState(true)
-  const fileName = filePath === '__ungrouped__' ? i18nT('pages.knowledge.itemCard.other') : filePath.split('/').pop() || filePath
+  const fileName = filePath === '__ungrouped__' ? i18nT('pages.knowledge.itemCard.other') : pathBasename(filePath) || filePath
 
   return (
     <div className="ml-2 border-l-2 border-border pl-2">

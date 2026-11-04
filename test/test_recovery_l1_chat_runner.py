@@ -5,7 +5,7 @@ chat_runner reads ``client.last_infra_error`` at end of turn and re-queues ONE
 continuation on the shared schedule. The verdict reaches that consumer through
 the provider wrapper chain (AcpProvider -> AcpSessionProvider -> handle), which
 is exercised on real objects here. The runner branch is pinned at source level
-because its host function is the 12k-line turn loop.
+because its host function is the turn phase ``_turn_ending_chain`` (``turn_ending``).
 
 The two transient-5xx recovery waits share the L1 arm's shape — guard, then a
 multi-second sleep, then a re-queue — so their post-backoff re-reads are pinned
@@ -257,10 +257,12 @@ class TestRunnerBranch:
         from pathlib import Path
 
         # A turn-state copy (``turn.x = x``, written after a store so a later phase reads
-        # the current value) is plumbing between the runner and its phases, not branch
-        # content: the character windows below measure the code without it.
-        return re.sub(
-            r"(?m)^[ \t]*turn\.(\w+) = \1\n",
+        # the current value) or reload (``x = turn.x``, a phase's entry read) is plumbing
+        # between the runner and its phases, not branch content: the character windows
+        # below measure the code without it. A name a phase reads off the turn
+        # (``turn.x``) is the runner's ``x``, so the windows read it in that spelling.
+        stripped = re.sub(
+            r"(?m)^[ \t]*(?:turn\.(\w+) = \1|(\w+) = turn\.\2)\n",
             "",
             "\n".join(
                 turn_file.read_text(encoding="utf-8")
@@ -271,6 +273,7 @@ class TestRunnerBranch:
                 if turn_file.name != "__init__.py"
             ),
         )
+        return re.sub(r"(?<![\w.])turn\.(?=\w)", "", stripped)
 
     def test_reads_the_handles_verdict_not_a_regex(self, src):
         assert 'isinstance(getattr(client, "last_infra_error", None), InfraError)' in src
@@ -362,7 +365,7 @@ class TestRunnerBranch:
         assert "_turn_landed" not in dwin
         assert "_stop_reason == STOP_REASON_END_TURN" in dwin
         assert "not _terminal_synthetic" in dwin
-        assert "not _had_empty_response_verdict" in dwin
+        assert re.search(r"not (?:turn\.)?_had_empty_response_verdict", dwin)
         # B1 (buluoray / iamwhatever): an exit that KEEPS the session also settles.
         # Once output streamed (_turn_emitted) the live session already holds the
         # history, regardless of how the turn then ENDS (a non-transient AcpError /
@@ -375,12 +378,16 @@ class TestRunnerBranch:
         # continuation runs on it, so it settles — the landed test cannot see it
         # because _recovering_compaction is itself a guard on the landed block.
         assert "_recovering_compaction and _compaction_completed" in dwin
-        settle = src.index("if _first_turn_history_assembled and _first_turn_history_delivered:")
+        settle = re.search(
+            r"if (?:turn\.)?_first_turn_history_assembled and _first_turn_history_delivered:", src
+        ).start()
         window = src[settle : settle + 400]
         assert "consume_first_turn_history_owed(session_key)" in window
         # The rejected imprecise boundaries must be gone entirely.
         assert "if _turn_landed:" not in window
-        assert "if _first_turn_history_assembled and _turn_emitted:" not in src
+        assert not re.search(
+            r"if (?:turn\.)?_first_turn_history_assembled and (?:turn\.)?_turn_emitted:", src
+        )
         assert "(_turn_emitted or _saw_terminal_event)" not in src
         # The assembled flag is raised in BOTH the builder and the builder-less
         # fallback context-build arms (a standalone dashboard without a builder
@@ -398,7 +405,7 @@ class TestRunnerBranch:
         # A confirmed native clear retires the debt beside the sibling replay lease
         # — otherwise a fresh /clear leaves it armed and the next prompt rebuilds
         # the history the user dropped.
-        clear = src.index("elif event.kind == EVENT_CLEAR_STATUS:")
+        clear = src.index("async def _on_clear_status(")
         assert "consume_first_turn_history_owed(session_key)" in src[clear : clear + 1200]
         # Post-token same-session recovery settles the debt, but ONLY when the
         # turn assembled history (``_first_turn_history_assembled``): a slash first
@@ -1070,12 +1077,12 @@ class TestTheRunnerCallSitesChargeTheFailedCycle:
     """The call sites, not the helper, are what these pin.
 
     The helper's own gate is unit-tested in test_autonudge_cycle_failures.py, but
-    nothing exercised the two ``_run_chat`` call sites: deleting either
-    ``_note_cycle_failure`` call, or dropping the ``err_meta=_err_meta`` argument
-    the generic arm passes, left the whole suite green. These drive ``_run_chat``
-    end to end into the generic terminal arm so a dispatched death DOES charge
-    while a pre-dispatch ``memory_unavailable`` does NOT -- the latter is what the
-    ``err_meta`` argument is for, so dropping it reddens the no-charge case.
+    nothing exercised its two call sites, ``_on_acp_error_card`` and ``_on_error`` in
+    ``chat_turn/turn_failures.py``: deleting either ``_note_cycle_failure`` call, or dropping
+    the ``err_meta=_err_meta`` argument the generic arm passes, left the whole suite green.
+    These drive ``_run_chat`` end to end into the generic terminal arm so a dispatched death
+    DOES charge while a pre-dispatch ``memory_unavailable`` does NOT -- the latter is what
+    the ``err_meta`` argument is for, so dropping it reddens the no-charge case.
     """
 
     @pytest.mark.asyncio
@@ -1193,7 +1200,7 @@ class TestTheRunnerCallSitesChargeTheFailedCycle:
     async def test_an_l1_infra_requeue_does_not_charge(self, tmp_path) -> None:
         """The L1 ladder's infra re-queue: a turn whose last tool result was a
         CLASS_CAPACITY infra refusal (``client.last_infra_error``) is re-queued
-        as a continuation (``chat_runner.py`` ~15355) and never reaches a
+        as a continuation (``_turn_ending_chain`` in ``turn_ending``) and never reaches a
         terminal arm, so it must not charge -- the cycle has not failed, it is
         being retried. The runner re-queues once and the turn ends clean, so
         neither call site runs.
@@ -1250,11 +1257,11 @@ class TestTheRunnerCallSitesChargeTheFailedCycle:
     @pytest.mark.asyncio
     async def test_an_acp_transient_5xx_same_session_retry_does_not_charge(self, tmp_path) -> None:
         """A transient backend 5xx raised as an ``AcpError`` is retried ONCE on
-        the SAME live session (no reset) at ``chat_runner.py`` ~16563 --
+        the SAME live session (no reset) in ``_run_chat``'s ``except AcpError`` chain --
         ``not _turn_emitted and acp_error_is_transient(exc) and
-        _transient_5xx_retries < TRANSIENT_RETRIES``. That arm re-queues the
-        message and ends the turn without reaching a terminal arm, so the cycle
-        has not failed and must NOT charge.
+        _transient_5xx_retries < TRANSIENT_RETRIES``. That arm, ``_on_acp_transient_retry``
+        in ``chat_turn/acp_recovery.py``, re-queues the message and ends the turn without
+        reaching a terminal arm, so the cycle has not failed and must NOT charge.
 
         This is a DIFFERENT branch from the L1 ``last_infra_error`` re-queue the
         test above covers: a charge added inside this ACP transient arm passed

@@ -11,17 +11,18 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 import yaml
+from git_maintenance_helpers import git_maintenance_off_entries
 from installer_test_helpers import run_bounded
 from skill_script_helpers import load_skill_script
 
 from kiro_crew import platform_compat
+from kiro_crew.testing.wait import wait_until
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "packaging" / "signing" / "cli-manifest.py"
@@ -142,9 +143,10 @@ def _run_helper(
     ``openssl`` it shells out to -- can then only ever write there.
     """
     return subprocess.run(
-        [sys.executable, str(HELPER), *args],
+        [sys.executable, "-X", "utf8", str(HELPER), *args],
         check=check,
         text=True,
+        encoding="utf-8",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,
@@ -257,6 +259,7 @@ def test_helper_builds_a_canonical_independently_verifiable_manifest(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
         cwd=tmp_path,
     )
     assert verified.returncode == 0, verified.stderr
@@ -675,12 +678,10 @@ wait
     # Liveness through the repo's own probe (AGENTS.md "Cross-platform"): a raw
     # ``os.kill(pid, 0)`` is a POSIX idiom that TERMINATES the target on Windows,
     # and the sweep's caller filter recognises only the sanctioned helper.
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        if not platform_compat.pid_exists(pid):
-            return
-        time.sleep(0.05)
-    pytest.fail(f"grandchild {pid} survived the bounded run")
+    wait_until(
+        lambda: not platform_compat.pid_exists(pid),
+        describe=lambda: f"grandchild {pid} survived the bounded run",
+    )
 
 
 @pytest.mark.parametrize("pinned", [False, True])
@@ -819,7 +820,7 @@ def test_no_documented_cli_pin_is_below_the_declared_cutoff() -> None:
             f"{guide.name} states {floor_text}"
         )
 
-    # `playwright-cli.sh --version` is a different installer on its own version
+    # a different installer script's `--version` is on its own version
     # line, so the lookbehind keeps `-cli.sh` suffixes out of the scan.
     invocation = re.compile(r"(?<![\w.-])cli\.sh\b")
     pin = re.compile(r"--version[= ]([0-9]+(?:\.[0-9]+)+)")
@@ -1211,6 +1212,10 @@ def test_publish_workflow_signing_step_runs_verbatim_against_the_helper(
             "GIT_COMMITTER_EMAIL": "t@example.invalid",
         }
     )
+    # Dropping GIT_* also drops the suite's maintenance entries, so they go back
+    # on: a detached maintenance run would otherwise keep writing under .git
+    # after the commit returns.
+    hermetic.update(git_maintenance_off_entries(hermetic))
     for argv in (
         ["git", "init", "-q"],
         ["git", "add", "-A"],

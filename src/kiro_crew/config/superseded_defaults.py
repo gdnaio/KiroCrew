@@ -23,8 +23,8 @@ them apart -- correcting one necessarily overrides the other.
 So the default stayed REPORT-ONLY, and it still is: an entry rewrites nothing
 unless it says ``auto_adopt``.
 
-Why THREE entries adopt themselves anyway
------------------------------------------
+Why FOUR entries adopt themselves anyway
+----------------------------------------
 Reporting is the right answer only while the two readings of the stored value are
 genuinely indistinguishable AND holding the old value is survivable. On the two
 agent timeout budgets neither holds: an install carrying
@@ -33,7 +33,9 @@ operator sees timeouts instead of results, having never chosen 1800 at all, and
 telling them to run a command they have no reason to know about is not a fix. The
 spawn memory floor is the third: a materialized ``agent.spawn_min_memory_gb: 4.0``
 holds every subagent in the queue on a 16 GB laptop, where 4 GB plus a start
-rarely stays free.
+rarely stays free. The KAS MCP sign-in vault is the fourth: a materialized
+``agent.kas_persist_mcp_sign_in: false`` asks for every remote MCP sign-in again
+in every new session, and false was the default its owner never chose.
 
 The set is deliberately SMALL, and what keeps it small is not a judgment about how
 wide the value's range is. That test was tried and is wrong: ``instances.warm_set_cap``
@@ -352,11 +354,11 @@ SUPERSEDED_DEFAULTS: tuple[SupersededDefault, ...] = (
         changed_in="#7248",
         new_default_display="0 (automatic: as many as are registered)",
     ),
-    # A stored False keeps every peer-session tool disabled, including a
-    # conductor whose agent spec deliberately mounts the dashboard server. False
-    # is also the supported global withdrawal, so this stays report-only: Doctor
-    # can name the stale-default possibility without overriding an operator's
-    # explicit security choice.
+    # A stored False withdraws session control from every ordinary agent. Crew
+    # members and the owner-tab Conductor keep a creator-fenced dispatch bypass
+    # unless agent.member_dispatch is also False. False is a supported operator
+    # withdrawal, so this stays report-only: Doctor can name the stale-default
+    # possibility without overriding an operator's explicit security choice.
     SupersededDefault(
         dotted_key="agent.session_control",
         old_default=False,
@@ -445,10 +447,10 @@ SUPERSEDED_DEFAULTS: tuple[SupersededDefault, ...] = (
         new_default=0.25,
         changed_in="#12203",
     ),
-    # Session recycling is off by default. An install materialized while the
-    # default was 1536 MiB of process-tree RSS still recycles any idle session
+    # Session recycling defaults to 4096 MiB of process-tree RSS. An install
+    # materialized while the default was 1536 MiB still recycles any idle session
     # whose tree passes 1536 MiB, which an agent with several MCP servers reaches
-    # after one heavy turn.
+    # after one heavy turn. A stored 0 is the documented off switch, not drift.
     #
     # REPORT-ONLY: 1536 is an ordinary deliberate ceiling, and holding it is
     # survivable -- a recycled session keeps its history and restarts its process
@@ -456,7 +458,7 @@ SUPERSEDED_DEFAULTS: tuple[SupersededDefault, ...] = (
     SupersededDefault(
         dotted_key="session.watchdog_rss_max_mb",
         old_default=1536,
-        new_default=0,
+        new_default=4096,
         changed_in="#16393",
     ),
     # The language default is auto-detect. On the local recogniser a stored 'en-US'
@@ -553,6 +555,21 @@ SUPERSEDED_DEFAULTS: tuple[SupersededDefault, ...] = (
         old_default=2,
         new_default="auto",
         changed_in="#17055",
+    ),
+    # A stored false asks for a fresh OAuth sign-in to every remote MCP server in
+    # every new KAS session, and KAS is the backend an install that never chose one
+    # runs, so its owner sees a sign-in that never sticks. auto_adopt: until this
+    # change false WAS the default and the setting read "When false (the default)",
+    # so the one direction an owner had a reason to write was true; a stored false
+    # is the materialized default, with no suite pinning it as a configuration.
+    # One-shot: a false set back after the adoption is the owner's opt-out and is
+    # kept.
+    SupersededDefault(
+        dotted_key="agent.kas_persist_mcp_sign_in",
+        old_default=False,
+        new_default=True,
+        changed_in="#28630",
+        auto_adopt=True,
     ),
 )
 
@@ -839,7 +856,7 @@ def _update_map(
         raise AckPathRefused(f"refusing to write through a link at {ACK_FILE_NAME}")
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.parent / (path.name + ".lock")
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    fd = platform_compat.open_create_or_existing(str(lock_path), os.O_RDWR, 0o600)
     try:
         with platform_compat.file_lock(fd, exclusive=True, wait=wait_for_lock):
             document, readable = _read_ack_document_status()
@@ -1161,8 +1178,10 @@ class CoercedValue:
     #: setting is the one thing the command promises never to do.
     resolves_to: Callable[[object], str]
     #: Section default for the key, so an adoption whose resolution IS the default
-    #: can delete the key (an absent key resolves to it) rather than write it.
-    default: str
+    #: can delete the key (an absent key resolves to it) rather than write it. A
+    #: callable when the absent-key answer can move at runtime (an edition's
+    #: ``default_stt()``): deleting the key must land where the stored value did.
+    default: "str | Callable[[], str]"
     reason: str
     is_coerced: Callable[[object], bool]
 
@@ -1170,7 +1189,15 @@ class CoercedValue:
         """What ``--adopt`` should leave in the file for *stored*: a value to
         write, or ``None`` to delete the key because the default already answers."""
         resolved = self.resolves_to(stored)
-        return None if resolved == self.default else resolved
+        default = self.default() if callable(self.default) else self.default
+        return None if resolved == default else resolved
+
+
+def _stt_provider_default() -> str:
+    """What an absent ``stt.provider`` resolves to, the edition's default included."""
+    from kiro_crew.config.sections_stt import default_stt_provider  # circular import
+
+    return default_stt_provider()
 
 
 def _stt_provider_is_coerced(value: object) -> bool:
@@ -1205,7 +1232,7 @@ COERCED_VALUES: tuple[CoercedValue, ...] = (
     CoercedValue(
         dotted_key="stt.provider",
         resolves_to=_stt_provider_resolution,
-        default="local",
+        default=_stt_provider_default,
         reason=(
             "names a retired speech provider (voice input runs on 'local') or an "
             "unknown one (no recogniser runs, as if it were 'off')"
@@ -1416,7 +1443,7 @@ def render_doctor_section(issues: list[str]) -> None:
     except FileNotFoundError:
         print("  drift:       ✅ no config file yet (current defaults apply)")
         return
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
         print(f"  drift:       ⚠️  could not read {path}: {e}")
         issues.append("stored defaults unreadable")
         return

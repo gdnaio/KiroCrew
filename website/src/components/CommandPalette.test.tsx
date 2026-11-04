@@ -125,6 +125,8 @@ const H = vi.hoisted(() => {
     sessResult,
     allProvider,
     sessionsProvider,
+    // Every openSessionsKey the palette handed useSessionsProvider, in order.
+    sessionsOpenKeys: [] as Array<string | undefined>,
     pagesProvider,
     actionsProvider,
     knowledgeProvider,
@@ -157,7 +159,10 @@ vi.mock('./commandPalette/providers', () => ({
 }))
 vi.mock('./commandPalette/providers/allAggregator', () => ({ useAllAggregator: () => H.allProvider }))
 vi.mock('./commandPalette/providers/sessionsProvider', () => ({
-  useSessionsProvider: () => H.sessionsProvider,
+  useSessionsProvider: (opts?: { openSessionsKey?: string }) => {
+    H.sessionsOpenKeys.push(opts?.openSessionsKey)
+    return H.sessionsProvider
+  },
 }))
 vi.mock('./commandPalette/providers/pagesProvider', () => ({ usePagesProvider: () => H.pagesProvider }))
 vi.mock('./commandPalette/providers/actionsProvider', () => ({
@@ -203,7 +208,25 @@ vi.mock('../store', () => ({
   useAppSelector: (sel: (s: unknown) => unknown) => sel(H.storeState),
 }))
 
+/**
+ * A contributed overlay whose chunk import is pending until the test settles
+ * `promise`, then rejects, the way a chunk hash removed by a deploy does. Stable
+ * identity, so a re-render does not remount it.
+ */
+const failingChunk = vi.hoisted(() => {
+  const state = { promise: Promise.resolve() as Promise<void>, settled: false }
+  const Overlay = () => {
+    if (!state.settled) throw state.promise.then(() => { state.settled = true })
+    throw new Error('chunk gone')
+  }
+  return { state, Overlay }
+})
+vi.mock('../apps/overlayRegistry', () => ({
+  getBuiltinOverlay: () => failingChunk.Overlay,
+}))
+
 import CommandPalette from './CommandPalette'
+import QuickSearchSurface from './QuickSearchSurface'
 import { useCommandPalette, DOUBLE_SHIFT_WINDOW_MS } from '../hooks/useCommandPalette'
 import { SHORTCUTS_ENABLED_KEY } from '../hooks/useKeyboardShortcuts'
 import { QUICK_SEARCH_SHORTCUT_KEY } from '../lib/quickSearchShortcut'
@@ -215,6 +238,7 @@ afterEach(() => {
   H.nav.current = null
   H.storeState.dashboard.slots = []
   H.storeState.dashboard.unreadSlots = []
+  H.sessionsOpenKeys.length = 0
   H.storeState.chat.slotStatusDetail = {}
   // localStorage is file-scoped, not per-test: a chat-config write (e.g. the
   // simplifiedToolNames toggle test) would otherwise persist into siblings.
@@ -388,6 +412,25 @@ describe('useCommandPalette — configurable activation', () => {
     expect(result.current.open).toBe(true)
   })
 
+  it('double-shift mode: Ctrl+K/⌘K does NOT open the palette (issue #20363)', () => {
+    // Switching to double-Shift is how users reclaim Ctrl+K (the terminal
+    // "clear to end of line" and many inputs' own binding). The alias must not
+    // keep firing, or the setting is useless — the reported bug. Ctrl+K and ⌘K
+    // both fall through to the focused input.
+    localStorage.setItem(QUICK_SEARCH_SHORTCUT_KEY, JSON.stringify({ mode: 'double-shift' }))
+    const { result } = renderHook(() => useCommandPalette())
+    act(() => { fireEvent.keyDown(window, { key: 'k', ctrlKey: true }) })
+    expect(result.current.open).toBe(false)
+    act(() => { fireEvent.keyDown(window, { key: 'k', metaKey: true }) })
+    expect(result.current.open).toBe(false)
+    // The chosen double-Shift gesture still works.
+    act(() => {
+      fireEvent.keyDown(window, { key: 'Shift' })
+      fireEvent.keyDown(window, { key: 'Shift' })
+    })
+    expect(result.current.open).toBe(true)
+  })
+
   it('mod-k mode: ⌘K/Ctrl+K toggles, but double-Shift no longer opens', () => {
     localStorage.setItem(QUICK_SEARCH_SHORTCUT_KEY, JSON.stringify({ mode: 'mod-k' }))
     const { result } = renderHook(() => useCommandPalette())
@@ -431,6 +474,16 @@ describe('CommandPalette — render', () => {
     // The visible tab strip is gone — scoping is prefix+Tab / sigil driven.
     expect(screen.queryByRole('tab')).toBeNull()
     expect(screen.getByPlaceholderText('Search for anything')).toBeInTheDocument()
+  })
+
+  it('keys the sessions search on the open tab set, so a tab change re-fetches', () => {
+    H.storeState.dashboard.slots = [{ key: 'chat-b' }, { key: 'chat-a' }]
+    const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    expect(H.sessionsOpenKeys.at(-1)).toBe('chat-a\u0000chat-b')
+
+    H.storeState.dashboard.slots = [{ key: 'chat-b' }]
+    rerender(<CommandPalette open onClose={vi.fn()} />)
+    expect(H.sessionsOpenKeys.at(-1)).toBe('chat-b')
   })
 
   it('refreshes recents when a running slot starts a real tool call', async () => {
@@ -523,8 +576,10 @@ describe('CommandPalette — render', () => {
     expect(H.recentsProvider.search).toHaveBeenCalledTimes(1)
 
     localStorage.setItem('mc-chat-config', JSON.stringify({ simplifiedToolNames: false }))
-    window.dispatchEvent(new Event('mc-config-changed'))
-    rerender(<CommandPalette open onClose={vi.fn()} />)
+    await act(async () => {
+      window.dispatchEvent(new Event('mc-config-changed'))
+      rerender(<CommandPalette open onClose={vi.fn()} />)
+    })
 
     await waitFor(() => expect(H.recentsProvider.search).toHaveBeenCalledTimes(2))
   })
@@ -1008,6 +1063,26 @@ describe('CommandPalette — scoped provider error state (issue #1928)', () => {
     expect(screen.queryByText('No matches')).toBeNull()
   })
 
+  it('re-runs the Sessions search when a tab opens, inside the cache window', async () => {
+    H.storeState.dashboard.slots = [{ key: 'chat-a' }]
+    const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search everywhere' }), { target: { value: 'sess' } })
+    await screen.findByText('Sessions')
+    act(() => {
+      fireEvent.keyDown(window, { key: 'Tab' })
+    })
+    await screen.findByText('Session Result')
+    const before = H.sessionsProvider.search.mock.calls.length
+
+    // A tab opens; nothing else changes. The ranking reads `open`, so the
+    // outer palette query must not serve its cached rows.
+    H.storeState.dashboard.slots = [{ key: 'chat-a' }, { key: 'chat-b' }]
+    rerender(<CommandPalette open onClose={vi.fn()} />)
+
+    await waitFor(() => expect(H.sessionsProvider.search.mock.calls.length).toBeGreaterThan(before))
+  })
+
   it('the Retry button refetches the scoped provider and shows the results', async () => {
     H.sessionsProvider.search
       .mockRejectedValueOnce(new Error('transient'))
@@ -1205,5 +1280,47 @@ describe('CommandPalette — focus restore on close', () => {
     rerender(<CommandPalette open={false} onClose={onClose} />)
 
     expect(document.activeElement).not.toBe(prev)
+  })
+})
+
+describe('CommandPalette — fallback for a failed overlay chunk', () => {
+  it('opens on the keys typed before the chunk failed, and Enter acts on them', async () => {
+    // QuickSearchSurface falls back to this palette when the overlay's import rejects.
+    // Keys typed while the import was pending must arrive here: opening on an empty
+    // query shows the recents list, and Enter would switch to the newest session.
+    let release: () => void = () => {}
+    failingChunk.state.settled = false
+    failingChunk.state.promise = new Promise<void>(r => { release = r })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const onClose = vi.fn()
+      render(
+        <QuickSearchSurface
+          owners={{ 'quick-search': { app: 'command-bar', overlayId: 'command-bar' } }}
+          open
+          onClose={onClose}
+        />,
+        { wrapper },
+      )
+      const catcher = document.activeElement as HTMLInputElement
+      expect(catcher.tagName).toBe('INPUT')
+      fireEvent.change(catcher, { target: { value: 'alice' } })
+      await act(async () => { release(); await failingChunk.state.promise })
+
+      const input = await screen.findByRole('textbox', { name: 'Search everywhere' })
+      expect(input).toHaveValue('alice')
+      expect(await screen.findByText('All Result')).toBeInTheDocument()
+      expect(H.allProvider.search).toHaveBeenCalledWith('alice')
+      expect(screen.queryByText('Recent Session')).toBeNull()
+
+      act(() => H.nav.current?.onChoose?.(0, false))
+      expect(H.onActivateAll).toHaveBeenCalledTimes(1)
+      expect(H.onActivateRecent).not.toHaveBeenCalled()
+      expect(onClose).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+      error.mockRestore()
+    }
   })
 })

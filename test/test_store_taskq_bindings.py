@@ -71,6 +71,7 @@ _MEMBERS: dict[str, tuple[str, str | None, str]] = {
     "_open_connection": ("function", "55cc4a2df3bc", "store"),
     "_quarantine_corrupt_file": ("function", "06c325f39971", "store"),
     "_record_incarnation": ("function", "488187349949", "store"),
+    "_release_settled_holds": ("function", "6806e867af4e", "store"),
     "_rollback": ("staticmethod", "9dd8201bdc07", "store"),
     "_writer_executor": ("function", "9d39d0b32056", "store"),
     "accept": ("function", "9271fcba0045", "store"),
@@ -87,17 +88,21 @@ _MEMBERS: dict[str, tuple[str, str | None, str]] = {
     "count_by_state": ("function", "d18b0d78226c", "store_reads"),
     "count_pending": ("function", "fccf5b871169", "store_reads"),
     "default_path": ("classmethod", "13e9c8d66d64", "store"),
+    "dispatch_open": ("function", "3d60a8cc0b0b", "store"),
     "defer": ("function", "47ec57e9ee6a", "store"),
     "deferred_longer_than": ("function", "766523931bac", "store"),
     "doctor_lines": ("function", "6806e867af4e", "store"),
     "enter_wait": ("function", "233981a63998", "store_waits"),
     "events": ("function", "dcbc79f76625", "store_events"),
     "expedite": ("function", "ee48a96a86fb", "store"),
+    "fence_dispatch": ("function", "6107f8cd3661", "store"),
     "fetch_dispatchable": ("function", "7e6bf916bc42", "store_reads"),
     "fetch_dispatchable_fair": ("function", "49927490a5d6", "store_reads"),
     "fetch_pending_by_batch": ("function", "7a679d452d1e", "store_reads"),
     "finish": ("function", "8a4938b244d9", "store"),
     "get": ("function", "c698159610c8", "store_reads"),
+    "held_until_settled": ("function", "6806e867af4e", "store"),
+    "hold_until_settled": ("function", "2b842e351101", "store"),
     "incarnation": ("property", "bb418bb7ece8", "store"),
     "insert_if_absent": ("function", "b306bf988231", "store"),
     "is_open": ("property", "a6632a57e602", "store"),
@@ -121,17 +126,26 @@ _MEMBERS: dict[str, tuple[str, str | None, str]] = {
     "post": ("function", "b31cc9bb4ff4", "store"),
     "previous_incarnation": ("property", "f21e39ec5ffb", "store"),
     "quarantined_to": ("data", None, "store"),
+    "queued_rows": ("function", "234e88b93896", "store_reads"),
     "record_progress": ("function", "d84afe8169cd", "store"),
     "release_lease": ("function", "ae22938dd735", "store"),
     "renew_lease": ("function", "159082685ec1", "store"),
     "restamp_accepted_by": ("function", "b00a4740ad36", "store"),
     "run": ("coroutine", "73fb713b0e67", "store"),
     "state_of": ("function", "b76f80fb2e09", "store_reads"),
+    "storage_bytes": ("function", "898eb304ecf8", "store_work"),
+    "storage_charge": ("function", "431f7367ff03", "store_work"),
     "transition": ("function", "133959325b30", "store"),
     "update_wait": ("function", "233981a63998", "store_waits"),
     "waiting_rows": ("function", "ab9ff9d81fb7", "store_waits"),
     "wake_wait": ("function", "05452748d518", "store_waits"),
     "window": ("property", "fa6cfecd5574", "store"),
+    "work_by_scope": ("function", "a77debf4dcba", "store_work"),
+    "work_compare_and_set": ("function", "18dedc32d302", "store_work"),
+    "work_get": ("function", "730e45f2e0da", "store_work"),
+    "work_insert_or_get": ("function", "c97b5dd8ed08", "store_work"),
+    "work_purge": ("function", "5bad78d2e1c5", "store_work"),
+    "work_rows": ("function", "f26ed91926c1", "store_work"),
 }
 
 #: Every module-level name the one-module ``store.py`` bound. The facade still binds each.
@@ -641,7 +655,7 @@ def test_an_owner_that_logs_uses_the_store_logger(owner: str) -> None:
 #: Every class an owner defines -> the ``__module__`` it carries. ``TaskStoreUnavailable``
 #: keeps the facade's name, because a traceback and ``subagent._describe_exception`` render
 #: a raised class as ``module.qualname``.
-_CLASS_MODULES = {"TaskStoreUnavailable": _FACADE}
+_CLASS_MODULES = {"TaskStoreUnavailable": _FACADE, "WorkRow": "kiro_crew.taskq.store_work"}
 
 
 def test_each_class_an_owner_defines_carries_its_frozen_module() -> None:

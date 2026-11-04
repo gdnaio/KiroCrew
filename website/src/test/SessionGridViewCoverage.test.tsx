@@ -24,6 +24,7 @@ import { renderWithProviders } from './helpers'
 import { api, ApiError } from '../api/client'
 import { emitSlotFocused } from '../hooks/useWebSocket'
 import type { GridNode } from '../hooks/useSessionGrid'
+import { crewModePreviewOn } from './crewModePreview'
 
 vi.mock('../api/client')
 
@@ -39,29 +40,34 @@ vi.mock('../components/ChatPane', () => ({
   default: ({
     slotKey,
     focused,
+    pushToTalk,
     onFocus,
     onRemove,
     onSplitRight,
     onSplitDown,
+    onOpenFull,
     leading,
     onFileOpen,
   }: {
     slotKey: string
     focused?: boolean
+    pushToTalk?: boolean
     onFocus?: () => void
     onRemove?: () => void
     onSplitRight?: () => void
     onSplitDown?: () => void
+    onOpenFull?: (slot: string, anchorTs?: string, anchorMid?: string) => void
     leading?: { inset?: boolean; control?: React.ReactNode }
     onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
   }) => (
-    <div data-testid={`pane-${slotKey}`} data-focused={focused ? 'yes' : 'no'} data-leading={leading ? (leading.inset ? 'inset' : 'control') : 'none'}>
+    <div data-testid={`pane-${slotKey}`} data-focused={focused ? 'yes' : 'no'} data-ptt={pushToTalk ? 'yes' : 'no'} data-leading={leading ? (leading.inset ? 'inset' : 'control') : 'none'}>
       {leading?.control}
       {focused !== undefined && <PaneDim dimmed={!focused} />}
       <button type="button" aria-label={`focus ${slotKey}`} onClick={onFocus} />
       <button type="button" aria-label={`remove ${slotKey}`} onClick={onRemove} />
       <button type="button" aria-label={`right ${slotKey}`} onClick={onSplitRight} />
       <button type="button" aria-label={`down ${slotKey}`} onClick={onSplitDown} />
+      <button type="button" aria-label={`open full ${slotKey}`} onClick={() => onOpenFull?.(slotKey, 'ts-1', 'mid-1')} />
       <button type="button" aria-label={`open file ${slotKey}`} onClick={() => onFileOpen?.('/tmp/report.pdf')} />
     </div>
   ),
@@ -78,6 +84,7 @@ type Slot = {
   messages?: number
   agent?: string
   last_activity_ts?: string
+  crew_root?: string
 }
 
 const leaf = (id: string, slot?: string): GridNode =>
@@ -149,6 +156,7 @@ describe('SessionGridView — entry seeding', () => {
   it('splits the current session in place, session pane beside a fresh picker', async () => {
     seedApi([{ key: 'a', title: 'Alpha' }])
     renderGrid('a')
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
 
     expect(await screen.findByTestId('pane-a')).toBeTruthy()
     expect(pickers()).toHaveLength(1)
@@ -183,6 +191,7 @@ describe('SessionGridView — entry seeding', () => {
     })
     seedApi([{ key: 'a' }, { key: 'b' }, { key: 'c' }])
     renderGrid('a', { control: <button type="button" aria-label="toggle sessions" /> })
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
 
     expect((await screen.findByTestId('pane-a')).getAttribute('data-leading')).toBe('control')
     expect(screen.getByTestId('pane-b').getAttribute('data-leading')).toBe('none')
@@ -206,6 +215,7 @@ describe('SessionGridView — entry seeding', () => {
     seedStore('a', { type: 'split', id: 'root', dir: 'col', sizes: [0.5, 0.5], children: [leaf('l-p'), leaf('l-a', 'a')] })
     seedApi([{ key: 'a' }])
     renderGrid('a', { inset: true })
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
     await screen.findByTestId('pane-a')
     expect(screen.getByTestId('pane-a').getAttribute('data-leading')).toBe('none')
     const pickerHeader = onlyPicker().firstElementChild as HTMLElement
@@ -220,6 +230,7 @@ describe('SessionGridView — entry seeding', () => {
     seedStore('a', { type: 'split', id: 'root', dir: 'col', sizes: [0.5, 0.5], children: [leaf('l-a', 'a'), leaf('l-b', 'b')] })
     seedApi([{ key: 'a' }, { key: 'b' }])
     renderGrid('a')
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
     await screen.findByTestId('pane-b')
     const dimOf = (id: string) => screen.getByTestId(`pane-${id}`).querySelector('[data-pane-dim]') as HTMLElement
     expect(dimOf('a').dataset.paneDim).toBe('off')
@@ -240,6 +251,7 @@ describe('SessionGridView — entry seeding', () => {
     seedStore('a', { type: 'split', id: 'root', dir: 'col', sizes: [0.5, 0.5], children: [leaf('l-a', 'a'), leaf('l-b', 'b')] })
     seedApi([{ key: 'a' }, { key: 'b' }])
     renderGrid('a')
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
     await screen.findByTestId('pane-b')
     const dimOf = (id: string) => screen.getByTestId(`pane-${id}`).querySelector('[data-pane-dim]') as HTMLElement
     expect(dimOf('a').style.opacity).toBe('0')
@@ -271,6 +283,7 @@ describe('SessionGridView — entry seeding', () => {
     seedStore('a', splitOf([leaf('l-a', 'a'), leaf('l-b', 'b')]))
     seedApi([{ key: 'a' }, { key: 'b' }])
     renderGrid('a')
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
 
     expect(await screen.findByTestId('pane-a')).toBeTruthy()
     expect(screen.getByTestId('pane-b')).toBeTruthy()
@@ -294,7 +307,17 @@ describe('SessionGridView — collapse rules', () => {
 
     fireEvent.click(within(onlyPicker()).getByLabelText('Close cell'))
 
+    // The grid collapsing itself is not the user opening the chat (#23564):
+    // no anchor and no gesture flag.
     await waitFor(() => expect(onCollapse).toHaveBeenCalledWith('a'))
+  })
+
+  it('a pane\'s open-full click collapses as a gesture, keeping its anchor', async () => {
+    const { onCollapse } = renderGrid('a')
+
+    fireEvent.click(screen.getByLabelText('open full a'))
+
+    expect(onCollapse).toHaveBeenCalledWith('a', 'ts-1', 'mid-1', true)
   })
 
   it('falls back to the loading surface once every pane is closed', async () => {
@@ -380,6 +403,7 @@ describe('SessionGridView — healing a restored layout', () => {
     seedStore('a', splitOf([leaf('l-a', 'a'), leaf('l-b', 'b')]))
     seedApi([{ key: 'a' }, { key: 'b' }])
     const { onCollapse, onClose } = renderGrid('a')
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
 
     await waitFor(() => expect(vi.mocked(api).chatSlots).toHaveBeenCalled())
     expect(screen.getByTestId('pane-a')).toBeTruthy()
@@ -422,8 +446,40 @@ describe('SessionGridView — slot-focus intent signal', () => {
     seedStore('a', splitOf([leaf('l-a', 'a'), leaf('l-b', 'b')]))
     seedApi([{ key: 'a' }, { key: 'b' }])
     renderGrid('a')
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
 
     await waitFor(() => expect(vi.mocked(emitSlotFocused).mock.calls.at(-1)).toEqual(['a']))
+  })
+})
+
+describe('SessionGridView — dictation key ownership', () => {
+  const ptt = (slot: string) => screen.getByTestId(`pane-${slot}`).getAttribute('data-ptt')
+
+  it('arms the key on the focused pane only, and moves it with focus', async () => {
+    seedStore('a', splitOf([leaf('l-a', 'a'), leaf('l-b', 'b')]))
+    seedApi([{ key: 'a' }, { key: 'b' }])
+    renderGrid('a')
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    await screen.findByTestId('pane-b')
+
+    fireEvent.click(screen.getByLabelText('focus a'))
+    await waitFor(() => expect(ptt('a')).toBe('yes'))
+    expect(ptt('b')).toBe('no')
+
+    fireEvent.click(screen.getByLabelText('focus b'))
+    await waitFor(() => expect(ptt('b')).toBe('yes'))
+    expect(ptt('a')).toBe('no')
+  })
+
+  it('arms no pane while a placeholder holds focus', async () => {
+    renderGrid('a')
+    await screen.findByTestId('pane-a')
+    fireEvent.click(screen.getByLabelText('focus a'))
+    await waitFor(() => expect(ptt('a')).toBe('yes'))
+
+    fireEvent.mouseDown(onlyPicker())
+
+    await waitFor(() => expect(ptt('a')).toBe('no'))
   })
 })
 
@@ -439,6 +495,7 @@ describe('SessionGridView — leaf rendering', () => {
     )
     seedApi([{ key: 'a' }, { key: 'b' }])
     renderGrid('a')
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
 
     expect(await screen.findByText('Terminal pane — coming in Phase 2')).toBeTruthy()
   })
@@ -450,6 +507,7 @@ describe('SessionGridView — leaf rendering', () => {
     )
     seedApi([{ key: 'a' }, { key: 'b' }])
     renderGrid('a')
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
 
     await screen.findByTestId('pane-a')
     expect(pickers()).toHaveLength(1)
@@ -476,6 +534,7 @@ describe('SessionGridView — per-pane file opener (#9921)', () => {
     seedApi([{ key: 'a' }, { key: 'b' }])
     const onFileOpen = vi.fn()
     renderGrid('a', undefined, onFileOpen)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
     await screen.findByTestId('pane-b')
 
     fireEvent.click(screen.getByLabelText('open file b'))
@@ -488,6 +547,7 @@ describe('SessionGridView — per-pane file opener (#9921)', () => {
     seedApi([{ key: 'a' }, { key: 'b' }])
     const onFileOpen = vi.fn()
     renderGrid('a', undefined, onFileOpen)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
     await screen.findByTestId('pane-b')
 
     fireEvent.click(screen.getByLabelText('open file a'))
@@ -500,6 +560,7 @@ describe('SessionGridView — per-pane file opener (#9921)', () => {
   it('renders a pane without an opener when the host supplies none', async () => {
     seedApi([{ key: 'a' }])
     renderGrid('a')
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
     const pane = await screen.findByTestId('pane-a')
     // The stub's open-file button is inert (onFileOpen undefined); clicking it
     // must not throw. Pinning that the pane still renders is enough.
@@ -600,12 +661,28 @@ describe('SessionGridView — picker list', () => {
     expect(rows[2].textContent).toContain('0 msgs')
   })
 
-  it('falls back to the slot key when a session has no title', async () => {
-    seedApi([{ key: 'untitled-slot' }])
-    renderGrid(null)
+  it('labels an untitled session "Untitled session", never its slot key (#20873)', async () => {
+    // No title, a title equal to the key, and a named control.
+    seedApi([
+      { key: 'chat-9-1785440411', last_activity_ts: '2026-01-03T00:00:00Z' },
+      { key: 'chat-8-1785440400', title: 'chat-8-1785440400', last_activity_ts: '2026-01-02T00:00:00Z' },
+      { key: 'named-slot', title: 'Named work', last_activity_ts: '2026-01-01T00:00:00Z' },
+    ])
+    renderGrid('a')
 
-    await waitFor(() => expect(rowsOf(onlyPicker())).toHaveLength(1))
-    expect(rowsOf(onlyPicker())[0].textContent).toContain('untitled-slot')
+    await waitFor(() => expect(rowsOf(onlyPicker())).toHaveLength(3))
+    const rows = rowsOf(onlyPicker())
+    expect(rows[0].textContent).toContain('Untitled session')
+    expect(rows[0].textContent).not.toContain('chat-9-1785440411')
+    expect(rows[1].textContent).toContain('Untitled session')
+    expect(rows[1].textContent).not.toContain('chat-8-1785440400')
+    expect(rows[2].textContent).toContain('Named work')
+
+    // The key still finds the untitled row, and picking it opens that key.
+    fireEvent.change(screen.getByPlaceholderText('Search sessions…'), { target: { value: '1785440411' } })
+    expect(rowsOf(onlyPicker())).toHaveLength(1)
+    fireEvent.click(rowsOf(onlyPicker())[0])
+    expect(await screen.findByTestId('pane-chat-9-1785440411')).toBeTruthy()
   })
 
   it('filters by title, key and agent', async () => {
@@ -706,6 +783,20 @@ describe('SessionGridView — picker controls', () => {
     expect(m.forkChatSlot).toHaveBeenCalledWith('a')
   })
 
+  // The child's sidebar row sits in the source's folder, which can be collapsed;
+  // the sidebar opens the path from this request without touching the filters.
+  it('asks the sidebar to open the forked child\'s folder path', async () => {
+    const m = seedApi([{ key: 'a' }, { key: 'zeta', title: 'Zeta' }])
+    m.forkChatSlot = vi.fn().mockResolvedValue({ ok: true, key: 'forked-1', folder_id: 'fB' })
+    const { store } = renderGrid('a')
+    await waitFor(() => expect(rowsOf(onlyPicker())).toHaveLength(1))
+
+    fireEvent.click(within(onlyPicker()).getByRole('button', { name: 'Fork' }))
+
+    expect(await screen.findByTestId('pane-forked-1')).toBeTruthy()
+    expect(store.getState().chat.revealRequest).toMatchObject({ kind: 'session', target: 'forked-1', openFoldersOnly: true, folderId: 'fB' })
+  })
+
   it('leaves the cell empty when the fork is refused', async () => {
     const m = seedApi([{ key: 'a' }])
     m.forkChatSlot = vi.fn().mockResolvedValue({ ok: false, key: 'forked-1' })
@@ -746,14 +837,36 @@ describe('SessionGridView — picker controls', () => {
     const m = seedApi([{ key: 'a' }])
     m.forkChatSlot = vi.fn().mockRejectedValue(overCapacity())
     renderGrid('a')
+    const fork = within(onlyPicker()).getByRole('button', { name: 'Fork' })
+    // Wait for the slot list: until it loads the source is unknown and keeps its key.
+    await waitFor(() => expect(fork.getAttribute('title')).toBe('Fork Untitled session (child session)'))
 
-    fireEvent.click(within(onlyPicker()).getByRole('button', { name: 'Fork' }))
+    fireEvent.click(fork)
 
     const notice = await screen.findByTestId('grid-fork-error')
     // Several panes can be visible, so "This conversation" named none of them, and the
     // source is already open in a pane, so "Open it" asked for something already done.
-    expect(notice.textContent).toContain('“a”')
+    // The source is untitled, so it is named "Untitled session", never its key (#23084).
+    expect(notice.textContent).toContain('“Untitled session”')
+    expect(notice.textContent).not.toContain('“a”')
     expect(notice.textContent).not.toContain('Open it')
+  })
+
+  it.each([
+    ['an untitled source', undefined, 'Untitled session'],
+    ['a titled source', 'Zeta notes', 'Zeta notes'],
+  ])('the Fork tooltip and the refused-fork notice name %s by its label (#23084)', async (_case, title, shown) => {
+    const m = seedApi([{ key: 'a', title }])
+    m.forkChatSlot = vi.fn().mockRejectedValue(overCapacity())
+    renderGrid('a')
+    const fork = within(onlyPicker()).getByRole('button', { name: 'Fork' })
+    // Waiting on the label also waits for the slot list to load.
+    await waitFor(() => expect(fork.getAttribute('title')).toBe(`Fork ${shown} (child session)`))
+
+    fireEvent.click(fork)
+
+    const notice = await screen.findByTestId('grid-fork-error')
+    expect(notice.textContent).toContain(`“${shown}”`)
   })
 
   it('still shows the pane notice when the config lookup fails too', async () => {
@@ -789,7 +902,7 @@ describe('SessionGridView — picker controls', () => {
     expect(fork.getAttribute('title')).toBe('No session to fork yet')
   })
 
-  it('names the fork source by title, falling back to its slot key', async () => {
+  it('names the fork source by title, falling back to its slot key when the slot list lacks it', async () => {
     seedApi([{ key: 'a', title: 'Alpha' }])
     const { unmount } = renderGrid('a')
 
@@ -812,6 +925,7 @@ describe('SessionGridView — picker controls', () => {
     seedStore('a', splitOf([leaf('l-a', 'a'), leaf('l-b', 'b'), leaf('l-p')]))
     seedApi([{ key: 'a', title: 'Alpha' }, { key: 'b', title: 'Bravo' }])
     renderGrid('a')
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
     await screen.findByTestId('pane-b')
 
     fireEvent.click(screen.getByLabelText('focus b'))
@@ -845,3 +959,20 @@ describe('SessionGridView — picker controls', () => {
     await waitFor(() => expect(screen.getByTestId('pane-a').getAttribute('data-focused')).toBe('no'))
   })
 })
+
+describe('SessionGridView — Crew Mode workers (edge review R2 F4)', () => {
+  it("never offers a Crew Mode worker in a pane's picker, even one waiting on approval", async () => {
+    seedApi([
+      { key: 'a', title: 'Alpha' },
+      { key: 'root', title: 'Conductor' },
+      { key: 'w', title: 'Worker', crew_root: 'root', pending_approval: true },
+    ])
+    renderGrid('a')
+    await waitFor(() => expect(rowsOf(onlyPicker())).toHaveLength(1))
+    expect(rowsOf(onlyPicker())[0].textContent).toContain('Conductor')
+    expect(within(onlyPicker()).queryByText('Worker')).toBeNull()
+  })
+})
+
+// Last, after the file's own hooks that clear localStorage: Crew Mode is a feature preview.
+crewModePreviewOn()

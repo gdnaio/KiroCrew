@@ -263,7 +263,7 @@ _WARM_SPAWN_TIMEOUT_SECONDS = 90.0
 _WARM_SESSION_TIMEOUT_SECONDS = 90.0
 _WARM_SESSION_DESTROY_TIMEOUT_SECONDS = 10.0
 #: How long to keep waiting for a handle whose create we already gave up on. Short, because
-#: this only buys back a session already on its way; see ``_abandon_session_creation``.
+#: this only buys back a session already on its way; see ``_abandon_session_creation_locked``.
 _WARM_SESSION_REAP_TIMEOUT_SECONDS = 10.0
 _WARM_KILL_TIMEOUT_SECONDS = 20.0
 #: One bounded drain window. A run stops after this many consecutive quiet windows,
@@ -1008,7 +1008,15 @@ class _WarmMintRuntime:
             )
             handed_over = True
         except Exception as exc:  # noqa: BLE001 — degrade to the cold path
-            logger.warning("Shared mint process spawn failed: %s", type(exc).__name__)
+            # Carry the exception's OWN message, not only its class: AcpRuntimeError,
+            # SandboxUnavailableError and the spawn gates each author a sentence that
+            # names what failed and the remedy, and the cold path that follows hides the
+            # same failure per provider, so the class name alone leaves an operator no
+            # way to tell a missing kiro-cli from a sandbox a host cannot provide. The
+            # message text these classes build is operator-facing and carries no
+            # credential; the full traceback goes to debug for a developer.
+            logger.warning("Shared mint process spawn failed: %s: %s", type(exc).__name__, exc)
+            logger.debug("Shared mint process spawn failed", exc_info=True)
             return None
         finally:
             # A ``finally``, not an ``except Exception``: the stand-down above has already

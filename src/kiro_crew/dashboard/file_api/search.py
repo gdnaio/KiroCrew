@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         _WALK_SKIP_DIRS,
         _WALK_TIME_BUDGET_SECS,
         DashboardState,
+        _batch_stall_path,
         _PathProbeBusy,
         _probe_busy_response,
         _run_path_probe,
@@ -264,9 +265,14 @@ async def api_file_search(request: web.Request) -> web.Response:
             return bool(proj) and os.path.isdir(proj), os.path.isdir(mc_workspace)
 
         # Off-loop: two isdir probes on operator-configured paths, either of
-        # which may sit on a network mount.
+        # which may sit on a network mount. Keyed only when both roots share
+        # one mount, the batch rule: a key on either root alone would let a
+        # dead workspace mount refuse a healthy project dir, or the reverse.
         try:
-            proj_is_dir, workspace_is_dir = await _run_path_probe(_probe_fallback_roots)
+            proj_is_dir, workspace_is_dir = await _run_path_probe(
+                _probe_fallback_roots,
+                stall_path=_batch_stall_path([r for r in (proj, mc_workspace) if r]),
+            )
         except _PathProbeBusy:
             return _probe_busy_response(resource=proj, operation="file_search", caller=caller)
         if proj_is_dir:
@@ -288,11 +294,17 @@ async def api_file_search(request: web.Request) -> web.Response:
         else:
             safe_roots.append(r)
 
-    # Fast path: use in-memory index when available for a single scoped project
+    # Fast path: use the in-memory index for a single scoped project. ``ensure``
+    # builds one in the background the first time a root is searched and returns
+    # ``None`` until it is ready, so the first search falls through to the walk
+    # below rather than blocking on the build. ``idx.usable`` is false for a
+    # truncated root (over the entry cap) or a walk-only root (a build that
+    # timed out or failed, or a macOS home root, whose index would skip the
+    # TCC-gated folders the scoped walk keeps), all of which take the walk.
     state: DashboardState = request.app["state"]
     if scoped and len(safe_roots) == 1:
-        idx = state.file_indexes.get(safe_roots[0])
-        if idx and idx.is_ready and not idx.truncated:
+        idx = await state.file_indexes.ensure(safe_roots[0])
+        if idx and idx.usable:
             results = await asyncio.to_thread(idx.search, query, _fuzzy_score, max_results, kinds)
             trimmed = [{k: v for k, v in r.items() if k != "_score"} for r in results]
             _sel().log_api_access(
@@ -457,7 +469,9 @@ async def api_file_search(request: web.Request) -> web.Response:
     # probe slot too: a walk into a dead mount would otherwise pin a
     # default-executor worker exactly as an unbounded stat does.
     try:
-        results = await _run_path_probe(_walk_file_search, transfer=True)
+        results = await _run_path_probe(
+            _walk_file_search, transfer=True, stall_path=_batch_stall_path(safe_roots)
+        )
     except _PathProbeBusy:
         return _probe_busy_response(resource=f"q={query}", operation="file_search", caller=caller)
 

@@ -6,6 +6,7 @@ cannot set or clear the list, and an ambient operator value wins verbatim.
 
 from __future__ import annotations
 
+import os
 import sys
 
 import pytest
@@ -291,7 +292,16 @@ def test_operator_kiro_bin_override_refuses_deferral_without_probing(tmp_path, m
     assert kiro_cli.mandatory_mcps_drop_allowed(str(pinned)) is False
 
 
-def test_posix_launcher_without_chat_sibling_refuses_deferral(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("version", "allowed"),
+    [
+        ((2, 37, 1), False),  # a 2.x launcher alone execs a PATH kiro-cli-chat
+        (None, False),  # unknown version: could be that launcher
+        ((3, 0, 0), True),  # 3.x standalone: kiro-cli is the chat binary
+    ],
+    ids=["old-launcher", "unknown", "standalone"],
+)
+def test_posix_kiro_cli_without_chat_sibling(version, allowed, tmp_path, monkeypatch) -> None:
     if sys.platform == "win32":
         pytest.skip("Windows ships one self-contained kiro-cli.exe")
     monkeypatch.delenv("KIROCREW_KIRO_BIN", raising=False)
@@ -299,9 +309,110 @@ def test_posix_launcher_without_chat_sibling_refuses_deferral(tmp_path, monkeypa
     pinned.write_text("executable")
     pinned.chmod(0o755)
     monkeypatch.setattr(kiro_cli, "pin_kiro_cli", lambda: (str(pinned), False))
+    probed = []
 
-    def probe(_binary):
-        pytest.fail("A launcher without its chat sibling must not be probed")
+    def probe(binary):
+        if binary != str(pinned):
+            pytest.fail(f"Untrusted version probe: {binary}")
+        probed.append(binary)
+        return version
 
     monkeypatch.setattr(kiro_cli, "kiro_cli_version_at", probe)
-    assert kiro_cli.mandatory_mcps_drop_allowed(str(pinned)) is False
+    assert kiro_cli.mandatory_mcps_drop_allowed(str(pinned)) is allowed
+    assert set(probed) == {str(pinned)}
+
+
+class _ShimResolver:
+    """An edition resolver that swaps one managed launcher for its install."""
+
+    def __init__(self, mapping: dict[str, str]) -> None:
+        self.mapping = mapping
+        self.calls: list[str] = []
+
+    def resolve_executable(self, executable: str) -> str:
+        self.calls.append(executable)
+        return self.mapping.get(executable, executable)
+
+
+def _executable(path) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("executable")
+    path.chmod(0o755)
+    return str(path)
+
+
+@pytest.fixture
+def managed_launcher(tmp_path, monkeypatch):
+    """A toolbox-style shim with no kiro-cli-chat beside it, and the install behind it."""
+    if sys.platform == "win32":
+        pytest.skip("Windows has no chat sibling")
+    monkeypatch.delenv("KIROCREW_KIRO_BIN", raising=False)
+    shim = _executable(tmp_path / "shim-bin" / "kiro-cli")
+    real = _executable(tmp_path / "install" / "bin" / "kiro-cli")
+    chat = _executable(tmp_path / "install" / "bin" / "kiro-cli-chat")
+    resolver = _ShimResolver({shim: real})
+    monkeypatch.setattr(
+        "kiro_crew.sandbox.current_context",
+        lambda: type("Ctx", (), {"agent_executable": resolver})(),
+    )
+    monkeypatch.setattr(kiro_cli, "pin_kiro_cli", lambda: (shim, False))
+    versions = {real: (2, 27, 0), chat: (2, 27, 0)}
+    probed: list[str] = []
+
+    def probe(binary):
+        if binary not in versions:
+            pytest.fail(f"Untrusted version probe: {binary}")
+        probed.append(binary)
+        return versions[binary]
+
+    monkeypatch.setattr(kiro_cli, "kiro_cli_version_at", probe)
+    return {
+        "shim": shim,
+        "real": real,
+        "chat": chat,
+        "tmp": tmp_path,
+        "resolver": resolver,
+        "versions": versions,
+        "probed": probed,
+    }
+
+
+def test_a_managed_launcher_is_judged_by_the_install_it_resolves_to(managed_launcher) -> None:
+    """argv[0] is the shim; the resolver names the install that actually runs."""
+    assert kiro_cli.mandatory_mcps_drop_allowed(managed_launcher["shim"]) is True
+    assert managed_launcher["probed"] == [managed_launcher["real"], managed_launcher["chat"]]
+
+
+def test_a_managed_shim_over_a_standalone_install_defers(managed_launcher) -> None:
+    """Toolbox's 3.x layout: a shim over one kiro-cli, no kiro-cli-chat anywhere."""
+    os.remove(managed_launcher["chat"])
+    managed_launcher["versions"][managed_launcher["real"]] = (3, 0, 0)
+    assert kiro_cli.mandatory_mcps_drop_allowed(managed_launcher["shim"]) is True
+    assert set(managed_launcher["probed"]) == {managed_launcher["real"]}
+
+
+@pytest.mark.parametrize("case", ["no-chat-sibling", "old-install", "old-chat", "other-install"])
+def test_a_resolved_install_that_fails_any_check_keeps_crew_servers(case, managed_launcher) -> None:
+    shim = managed_launcher["shim"]
+    spawned = shim
+    if case == "no-chat-sibling":
+        os.remove(managed_launcher["chat"])
+    if case == "old-install":
+        managed_launcher["versions"][managed_launcher["real"]] = (2, 26, 0)
+    if case == "old-chat":
+        managed_launcher["versions"][managed_launcher["chat"]] = (2, 26, 0)
+    if case == "other-install":
+        other_shim = _executable(managed_launcher["tmp"] / "other-shim" / "kiro-cli")
+        other = _executable(managed_launcher["tmp"] / "other" / "bin" / "kiro-cli")
+        managed_launcher["resolver"].mapping[other_shim] = other
+        spawned = other_shim
+    assert kiro_cli.mandatory_mcps_drop_allowed(spawned) is False
+
+
+def test_an_operator_kiro_bin_override_refuses_before_resolving(
+    managed_launcher, monkeypatch
+) -> None:
+    monkeypatch.setenv("KIROCREW_KIRO_BIN", managed_launcher["shim"])
+    assert kiro_cli.mandatory_mcps_drop_allowed(managed_launcher["shim"]) is False
+    assert managed_launcher["resolver"].calls == []
+    assert managed_launcher["probed"] == []

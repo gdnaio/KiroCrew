@@ -77,6 +77,11 @@ from kiro_crew import (
 from kiro_crew._facade_compose import compose as _facade_compose
 from kiro_crew.acp.client import AcpError, AcpProcessDied
 from kiro_crew.agent_sdk import AgentTurnUsage
+from kiro_crew.agent_sdk.mcp_problems import (
+    UNATTENDED_MCP_WAIT_SECS,
+    declared_mcp_not_ready_note,
+    wait_for_declared_mcp,
+)
 from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.autonudge import (
     APPROVAL_STALL_REASON,
@@ -125,6 +130,7 @@ from kiro_crew.config.loader import (
 )
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.constants import (
+    LEAKED_TOOL_CALL_NOTE,
     NO_TOOL_CALLS_NOTE,
     SUBAGENT_COMPLETION_META_KEY,
 )
@@ -148,13 +154,14 @@ from kiro_crew.dashboard.chat_persistence import (
     wait_for_unwinding_turns,
 )
 from kiro_crew.dashboard.chat_runner import (
-    _arm_queued_delivery_settlement,
     _auto_approve_reason,
     _resolve_channel_target,
     _retire_sessions_on_identity_change,
     _run_chat,
     _slot_is_trusted,
+    _start_next_queued_turn,
     drain_idle_parent_queue_for_stall,
+    idle_slot_admits_drain,
     turn_stats_meta,
 )
 from kiro_crew.dashboard.chat_utils import (
@@ -214,7 +221,11 @@ from kiro_crew.dashboard.state import (
     load_window_off_loop,
 )
 from kiro_crew.dashboard.token_auth import MAX_SESSION_TTL_SECS, generate_token
-from kiro_crew.dashboard.turn_dispatch import bounded_chat_turn, spawn_guarded_turn
+from kiro_crew.dashboard.turn_dispatch import (
+    bounded_chat_turn,
+    mark_turn_unstarted,
+    spawn_guarded_turn,
+)
 from kiro_crew.embeddings import (
     embedding_model_is_custom,
     get_shared_embedder,
@@ -239,7 +250,11 @@ from kiro_crew.executors import (
 )
 from kiro_crew.frontend import build_frontend_async
 from kiro_crew.gateway_restart import resolve_restart_launcher, supervisor_reentry
-from kiro_crew.gateway_shutdown_budget import GRACEFUL_SHUTDOWN_SECS, UPDATE_INSTALLER_STOP_SECS
+from kiro_crew.gateway_shutdown_budget import (
+    GRACEFUL_SHUTDOWN_SECS,
+    PERSISTENCE_DRAIN_GRACE_SECS,
+    UPDATE_INSTALLER_STOP_SECS,
+)
 from kiro_crew.heartbeat import (
     HEARTBEAT_TASK_TIMEOUT_SECS,
     HeartbeatService,
@@ -267,6 +282,7 @@ from kiro_crew.llm_helpers import (
     annotate_model_fallback,
     append_fallback_story,
     configured_fallback_chain,
+    engine_attributed_model,
     provider_fallback_active,
     provider_last_turn_usage,
     provider_model_pin_partial,
@@ -347,7 +363,8 @@ from kiro_crew.monitoring.models import (
     monitor_state_public_dict,
 )
 from kiro_crew.notifications.bus import MONITOR_CHANNEL
-from kiro_crew.platform import boot_platform
+from kiro_crew.parent_turns import ledger_of, note_turn_landed, settle_turn, settles_at_release
+from kiro_crew.platform import boot_platform, release_apply
 from kiro_crew.platform.bootstrap import apply_kas_cli_floor
 from kiro_crew.platform.context import (
     PlatformCompositionError,
@@ -376,6 +393,7 @@ from kiro_crew.platform.update_capability import (
     AutoUpdateEffect,
     auto_update_effect,
 )
+from kiro_crew.platform.update_fetch import fetch_and_pin_upstream
 from kiro_crew.platform.update_governance import (
     commits_ahead,
     git_command_env,
@@ -405,7 +423,7 @@ from kiro_crew.security import (
     redact_exfiltration_urls,
 )
 from kiro_crew.security.readonly_bash import command_invokes_git, is_read_only_bash
-from kiro_crew.sel import flush_audit_queue_before_hard_exit, sel
+from kiro_crew.sel import flush_audit_queue, flush_audit_queue_before_hard_exit, sel
 from kiro_crew.service.common import restart_command_hint
 from kiro_crew.session import (
     HEARTBEAT_KEY,
@@ -479,6 +497,10 @@ from kiro_crew.slack.gateway_runtime.cron_dispatch import (
     claim_vet_bound,
     cron_job_env_without_reserved,
 )
+from kiro_crew.slack.gateway_runtime.cron_failure import (
+    _failure_alert_due,
+    _log_held_alert,
+)
 from kiro_crew.slack.gateway_runtime.cron_fire import (
     _annotate_model_downgrade,
     _cron_extra_env,
@@ -498,6 +520,7 @@ from kiro_crew.slack.gateway_runtime.cron_verdict import (
     _result_hash,
 )
 from kiro_crew.slack.gateway_runtime.exit_path import (
+    _FORCE_EXIT_DEADLINE_SECS,
     _MARKER_WRITE_WAIT_SECS,
 )
 from kiro_crew.slack.gateway_runtime.heartbeat_turns import (
@@ -516,10 +539,15 @@ from kiro_crew.slack.gateway_runtime.nudge_channel_fire import (
 from kiro_crew.slack.gateway_runtime.process_entry import (
     _SIGNING_KEY_PREFLIGHT_TIMEOUT_SECS,
     BOOT_RESTART_HINT,
+    _kas_floor_gates_spawns,
     _live_session_agents,
     _live_session_work_dirs,
+    _main_stored_as_kiro,
+    _reconcile_live_config_with_kiro_verdict,
     _run_signing_key_preflight_bounded,
+    _start_coder_retention,
     _start_kas_cli_floor,
+    _stop_session_environments,
     _sweep_predecessor_session_work_dirs,
     run_gateway,
     signing_key_preflight,
@@ -531,13 +559,23 @@ from kiro_crew.slack.gateway_runtime.runtime_charge import (
     _apply_gate_verdict,
     _charge_failure,
     _cron_failure_attribution,
+    _streak_after_charge,
 )
 from kiro_crew.slack.gateway_runtime.service_boot import (
     _PROFILE_PROJECTION_POLL_S,
 )
 from kiro_crew.slack.gateway_runtime.subagent_injection import (
     _MAX_INJECT_ATTEMPTS,
+    INLINE_CONFIRMED,
+    INLINE_DELIVER,
+    INLINE_PENDING,
+    _delivered_inline,
     _injection_slot_busy,
+    _inline_verdict,
+    _notify_subagent_tab_gone,
+    _ParkedCompletion,
+    _settle_owed,
+    _skip_inline_collected,
 )
 from kiro_crew.slack.gateway_runtime.subagent_report import (
     SUBAGENT_DIGEST_CHUNK_SIZE,
@@ -615,6 +653,7 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.state import _ChatSlot
     from kiro_crew.discord.client import DiscordClient
     from kiro_crew.imessage.client import IMessageClient
+    from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
     from kiro_crew.memory_startup import MemoryStartup
     from kiro_crew.messaging.registry import ChannelDescriptor
     from kiro_crew.providers.base import LLMProvider
@@ -683,6 +722,7 @@ class GatewayOrchestrator:
     _json_ready: bool
     _approval_mode: str | None
     _test_mode: bool
+    _boot_kiro_service: KiroPrerequisiteService | None
     _app_token: str
     _bot_token: str
     _owner_id: str
@@ -695,6 +735,7 @@ class GatewayOrchestrator:
     _channel_transports_started: bool
     _channel_restart_tasks: set[asyncio.Task[None]]
     _channel_restart_gen: dict[str, int]
+    _session_environments_ready: bool
     _config_subs: list[Subscription]
     slack: RealSlackClient | None
     sessions: SessionManager | None
@@ -712,6 +753,9 @@ class GatewayOrchestrator:
     _subagent_coalescer_inst: "SubagentEventCoalescer | None"
     _batch_progress: dict[str, dict]
     _cron_injecting: dict[str, int]
+    _cron_runs_holding: set[asyncio.Task[Any]]
+    _inline_parked: dict[Any, list[_ParkedCompletion]]
+    _inline_tasks: set[asyncio.Task[Any]]
     _running_script_ids: set[str]
     task_runner: TaskRunner | None
     _runner_admission: Any
@@ -729,6 +773,7 @@ class GatewayOrchestrator:
     _marker_write_task: "asyncio.Task[None] | None"
     _sign_in_refresher_task: "asyncio.Task[None] | None"
     _marker_clear_pending: threading.Event
+    _force_exit_claimed: threading.Event
     _dashboard_runner: web.AppRunner | None
     _handler_tasks: set[asyncio.Task]
     _session_tasks: dict[str, asyncio.Task]
@@ -746,12 +791,16 @@ class GatewayOrchestrator:
     _pending_update_respawn: Callable[[], str] | None
     _pending_update_mandatory: bool
     _pending_update_mandatory_key: str
+    _pending_update_version: str
     _mandatory_update_deferred_at: float | None
     _mandatory_update_deferred_key: str | None
     _wheel_update_noticed: set[str]
     _mcp_gateway_manager: GatewayManager | None
     _mcp_resolve_prefetch: asyncio.Task[None] | None
     _mcp_target_env: dict[str, str]
+    _mcp_overlay_refresh_lock: asyncio.Lock | None = None
+    _mcp_rewrite_inputs: dict[str, Any] | None = None
+    _mcp_rewrite_policy: dict[str, Any] | None = None
     _mcp_resolve_home: str
     # The channel hoists' fields (gateway_runtime/channel_boot.py):
     _wecom_bot_id: str
@@ -886,6 +935,8 @@ class GatewayOrchestrator:
     # gateway_runtime/cron_fire.py
     _init_cron = _cron_fire._init_cron
     _cron_capture = _cron_fire._cron_capture
+    _record_bound_script_failure = _cron_fire._record_bound_script_failure
+    _alert_cron_timeout = _cron_fire._alert_cron_timeout
     _resolve_cron_agent = _cron_fire._resolve_cron_agent
     _acquire_with_model_fallback = _cron_fire._acquire_with_model_fallback
     _retained_session_agent_mismatch = _cron_fire._retained_session_agent_mismatch
@@ -905,6 +956,8 @@ class GatewayOrchestrator:
     _init_heartbeat = _heartbeat._init_heartbeat
     # gateway_runtime/nudge_channel_fire.py
     _fire_slack_nudge = _nudge_chan._fire_slack_nudge
+    _fire_slack_inner_nudge = _nudge_chan._fire_slack_inner_nudge
+    _bookkeeping_section = _nudge_chan._bookkeeping_section
     _fire_dm_nudge = _nudge_chan._fire_dm_nudge
     _fire_discord_nudge = _nudge_chan._fire_discord_nudge
     _fire_webex_nudge = _nudge_chan._fire_webex_nudge
@@ -929,6 +982,13 @@ class GatewayOrchestrator:
     _route_subagent_to_tab = _subagent_injection._route_subagent_to_tab
     _inject_subagent_into_channel_parent = _subagent_injection._inject_subagent_into_channel_parent
     _finish_subagent_cron_or_notify = _subagent_injection._finish_subagent_cron_or_notify
+    _park_inline = _subagent_injection._park_inline
+    _settle_inline = _subagent_injection._settle_inline
+    _finish_parked = _subagent_injection._finish_parked
+    _route_parked_in_tab = _subagent_injection._route_parked_in_tab
+    _parent_tab = _subagent_injection._parent_tab
+    _route_completion = _subagent_injection._route_completion
+    _reset_cron_parent_when_idle = _subagent_injection._reset_cron_parent_when_idle
 
     @staticmethod
     def _notif_meta(parent_key: str | None) -> dict[str, str] | None:
@@ -1015,6 +1075,7 @@ class GatewayOrchestrator:
     _stop_mcp_broker = _mcp_broker._stop_mcp_broker
     _apply_mcp_gateway_enabled = _mcp_broker._apply_mcp_gateway_enabled
     _apply_mcp_stub = _mcp_broker._apply_mcp_stub
+    _refresh_mcp_overlays = _mcp_broker._refresh_mcp_overlays
     _wire_mcp_gateway_dashboard = _mcp_broker._wire_mcp_gateway_dashboard
 
     # ------------------------------------------------------------------
@@ -1071,9 +1132,11 @@ class GatewayOrchestrator:
     _connect_slack = _channel_lifecycle._connect_slack
     # gateway_runtime/exit_path.py
     _shutdown = _exit._shutdown
+    _stop_services_and_sessions = _exit._stop_services_and_sessions
     _write_marker_worker = _exit._write_marker_worker
     _install_shutdown_signal_handlers = _exit._install_shutdown_signal_handlers
     _shutdown_and_exit = _exit._shutdown_and_exit
+    _park_if_force_exit_claimed = _exit._park_if_force_exit_claimed
     # gateway_runtime/service_boot.py
     _auto_open_dashboard = _boot._auto_open_dashboard
     _init_services = _boot._init_services
@@ -1095,6 +1158,7 @@ class GatewayOrchestrator:
     _hoist_imessage = _channel_boot._hoist_imessage
     _hoist_teams = _channel_boot._hoist_teams
     _SLACK_APPLIER_PREFIXES = _channel_boot._SLACK_APPLIER_PREFIXES
+    _on_session_environment_config_change = _channel_boot._on_session_environment_config_change
     _register_config_appliers = _channel_boot._register_config_appliers
     _start_channel_transports = _channel_boot._start_channel_transports
 
@@ -1106,6 +1170,7 @@ class GatewayOrchestrator:
     channel_restarts_settled = _channel_lifecycle.channel_restarts_settled
     restart_channel = _channel_lifecycle.restart_channel
     _forget_superseded_start = _channel_lifecycle._forget_superseded_start
+    _publish_teams_webhook = _channel_lifecycle._publish_teams_webhook
     _close_channel_locked = _channel_lifecycle._close_channel_locked
     _on_slack_config_change = _channel_lifecycle._on_slack_config_change
     _on_default_agent_config_change = _channel_lifecycle._on_default_agent_config_change
@@ -1175,3 +1240,5 @@ _AGENTS_JANITOR_TASK: "asyncio.Task[None] | None" = None
 _AGENT_SCRATCH_SWEEP_TASK: "asyncio.Task[None] | None" = None
 #: Strong ref for the kiro-cli log cap loop.
 _KIRO_CLI_LOG_CAP_TASK: "asyncio.Task[None] | None" = None
+#: Strong ref for the archived-session workspace retention sweeper.
+_CODER_RETENTION_TASK: "asyncio.Task[None] | None" = None

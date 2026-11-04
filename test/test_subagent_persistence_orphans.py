@@ -18,7 +18,6 @@ lives in ``subagent_persistence_helpers.py``.
 from __future__ import annotations
 
 import json
-import time
 
 import pytest
 from subagent_persistence_helpers import (  # noqa: F401 -- the fixture is requested by name
@@ -381,11 +380,13 @@ class TestOrphanReconciliation:
         with (
             patch.object(manager, "_is_pid_alive", return_value=True),
             patch.object(manager, "_is_orphan_process", return_value=True) as mock_check,
-            patch.object(manager, "_kill_orphan_pid"),
+            patch.object(manager, "_kill_orphan_pid", return_value=None),
         ):
             await manager._reconcile_orphans()
 
         mock_check.assert_called_once_with(88888, 1234567890.5)
+        ts = json.loads((agent_root / "orphan_ts" / "tombstone.json").read_text(encoding="utf-8"))
+        assert (ts["cause"], ts["recovery_action"]) == ("gateway_restart", "notification_pending")
 
     @pytest.mark.asyncio
     async def test_already_tombstoned_skipped(self, agent_root):
@@ -399,7 +400,6 @@ class TestOrphanReconciliation:
         create_agent_folder("already_dead", task="t")
         write_tombstone("already_dead", cause="timeout", recovery_action="delivered")
 
-        # Should not re-tombstone
         await manager._reconcile_orphans()
         ts = json.loads(
             (agent_root / "already_dead" / "tombstone.json").read_text(encoding="utf-8")
@@ -420,7 +420,6 @@ class TestOrphanReconciliation:
         manager._agents["tracked1"] = SubagentInfo(id="tracked1", task="t")
 
         await manager._reconcile_orphans()
-        # No tombstone — it's tracked
         assert not (agent_root / "tracked1" / "tombstone.json").exists()
 
 
@@ -561,7 +560,6 @@ class TestOrphanNotification:
         ):
             await manager._notify_orphan("notif_redact", state, True)
 
-        # _redact must have been called before injection
         mock_redact.assert_called()
         assert injected_msg is not None
         assert injected_msg.startswith("[REDACTED]")
@@ -654,24 +652,28 @@ class TestReaperPrunesTombstones:
     """Verify the reaper loop calls prune_stale_tombstones."""
 
     @pytest.mark.asyncio
-    async def test_reaper_prunes_old_tombstones(self, agent_root):
+    async def test_reaper_prunes_old_tombstones(self, agent_root, manual_clock, monkeypatch):
         """Old tombstoned folders are pruned during reaper sweep."""
+        from kiro_crew import subagent_persistence
         from kiro_crew.subagent_persistence import (
             create_agent_folder,
             prune_stale_tombstones,
             write_tombstone,
         )
 
-        # Create an old tombstoned folder (8 days)
+        # The prune's "now" and the tombstone writer's "died" stamp read one frozen
+        # clock, so a death stamp is an exact offset from the instant the prune uses.
+        manual_clock.install(monkeypatch, subagent_persistence)
+
+        # Eight days old: past the 7-day prune cutoff.
         create_agent_folder("old_tomb", task="t")
         write_tombstone("old_tomb", cause="timeout", recovery_action="delivered")
         ts_path = agent_root / "old_tomb" / "tombstone.json"
         ts = json.loads(ts_path.read_text(encoding="utf-8"))
-        # flake-ok: an 8-day-old stamp against the 7-day cutoff leaves a day of margin; never a wait or a deadline; moved verbatim
-        ts["died"] = time.time() - (8 * 86400)
+        ts["died"] = manual_clock.time() - (8 * 86400)
         ts_path.write_text(json.dumps(ts))
 
-        # Create a recent tombstoned folder (1 day)
+        # Fresh tombstone: inside the cutoff, so it is kept.
         create_agent_folder("new_tomb", task="t")
         write_tombstone("new_tomb", cause="timeout", recovery_action="delivered")
 

@@ -7,8 +7,9 @@ Each function here whose first parameter is ``self`` is an ``AcpClient`` method:
 class binds it by name, so it reads and writes the session's own state on the instance,
 and a patch of the method on the class or on an instance reaches every caller.
 
-Instance fields written: ``_claude_compaction_pending``, ``_codex_compaction_pending``,
-``_compaction_failed_at``, ``_mcp_notifications``, ``last_compaction_transient``.
+Instance fields written: ``_between_turn_credits``, ``_claude_compaction_pending``,
+``_codex_compaction_pending``, ``_compaction_failed_at``, ``_mcp_notifications``,
+``last_compaction_transient``.
 
 Instance fields read: ``_model``, ``_resolved_model_id``, ``last_prompt_stats``,
 ``memory_mode``.
@@ -118,7 +119,16 @@ def _backfill_context_window(self: AcpClient, pct: float) -> None:
     self.last_prompt_stats.backfill_context_window(pct, self._resolved_model_id or self._model)
 
 
-def _track_metadata(self: AcpClient, msg: JsonRpcMessage) -> None:
+def _track_metadata(self: AcpClient, msg: JsonRpcMessage, *, between_turns: bool = False) -> None:
+    """Fold one ``_kiro.dev/metadata`` (or compaction-status) frame into the stats.
+
+    *between_turns* is for the readers that run after a turn has billed its
+    ``EVENT_COMPLETE`` (``wait_for_compaction`` and its grace drain). Their
+    credits are held in ``_between_turn_credits`` instead of the stats window,
+    which the next turn's ``carry_over()`` replaces before anything bills it;
+    that next turn adds the held amount once. The caller says which window it
+    reads for, because ``_turn_done`` cannot: ``stream_command`` never clears it.
+    """
     params = msg.params or {}
     # Content-filter refusal envelope. Opt-in by membership (H6): a harness
     # that has not demonstrated the payload does not have its metadata
@@ -141,14 +151,23 @@ def _track_metadata(self: AcpClient, msg: JsonRpcMessage) -> None:
     # kiro streams per-turn billing as meteringUsage entries (unit="credit").
     # Accumulate across the turn's metadata notifications; reset per turn by
     # the AcpPromptStats re-init in _dispatch_events/send_message_stream.
+    credits = 0.0
     metering = params.get("meteringUsage")
     if isinstance(metering, list):
         for entry in metering:
             if isinstance(entry, dict) and entry.get("unit") == "credit":
                 try:
-                    self.last_prompt_stats.credits += float(entry.get("value", 0) or 0)
+                    credits += float(entry.get("value", 0) or 0)
                 except (TypeError, ValueError):
                     pass
+    if between_turns:
+        self._between_turn_credits = getattr(self, "_between_turn_credits", 0.0) + credits
+    else:
+        self.last_prompt_stats.credits += credits
+        # Per-call context readings and the metered call count, shared with the
+        # AcpSessionHandle tracker so both transports report the same turn. A
+        # between-turns frame belongs to no turn's window, like its credits.
+        self.last_prompt_stats.note_metadata_frame(pct_f, metering)
 
 
 def _handle_compaction_status(self: AcpClient, msg: JsonRpcMessage) -> None:
@@ -311,42 +330,21 @@ def _codex_compaction_event(self: AcpClient, msg: JsonRpcMessage) -> AcpEvent | 
 def _settle_codex_compaction(self: AcpClient, reason: str) -> AcpEvent | None:
     """Close out a codex compaction whose terminal never arrived, or None.
 
-    Called at the turn's terminal. ``None`` -- the ordinary case -- means no
-    codex compaction was in flight, or one was and it already reported.
+    Called at the turn's terminal; ``None`` means nothing was pending.
 
-    The verdict is ``failed``, and that is the opposite of what the claude
-    twin synthesizes. The two harnesses differ in what a MISSING terminal
-    means. claude-agent-acp sends its ``Compacting completed.`` text only for
-    a MANUAL ``/compact``; an automatic mid-turn compaction takes a different
-    path and emits no text at all, so for claude a turn that ends naturally
-    after a ``started`` is evidence the compaction finished. codex-acp sends
-    its terminal for BOTH -- the capture shows the marked
-    ``tool_call_update`` on a manual ``/compact`` and on a native
-    ``model_auto_compact_token_limit`` compaction alike -- so here a missing
-    terminal is evidence the compaction did NOT finish. Reporting
-    ``completed`` would reset the context meter against a window nobody
-    summarized.
+    The verdict is ``failed``, the opposite of the claude twin. claude-agent-acp
+    sends ``Compacting completed.`` only for a manual ``/compact``, so a missing
+    terminal there implies success. codex-acp sends its marked
+    ``tool_call_update`` for both manual and ``model_auto_compact_token_limit``
+    compactions, so here a missing terminal means it did NOT finish, whatever
+    the *reason* (a cancelled turn did not compact either).
 
-    One arm for every *reason*, unlike its claude twin, and for the same
-    reason the verdict differs: this is not an inference from how the turn
-    ended, it is the absence of a frame codex always sends on success. A turn
-    cancelled mid-compaction did not compact either.
-
-    Three things it deliberately does NOT do:
-
-    * reset the context counts -- nothing was summarized, so the pre-compaction
-      numbers are still the true ones;
-    * arm the post-failure budget (``_compaction_failed_at``) -- that budget
-      exists to bound a wait for a turn that may never end, and this runs AT
-      the end of the turn, so arming it would charge the NEXT turn's idle
-      clock for this one's failure;
-    * claim the failure is retryable. ``last_compaction_transient`` is set
-      False because an inferred failure carries no reason to classify, and
-      False is the value that does not promise a user a retry will help.
-
-    The title is text this module authors, not text a backend echoed, so it
-    needs no redaction -- and it is there so the surfaces that render a
-    failure reason stop collapsing this case to "unknown error".
+    It deliberately does NOT reset the context counts (nothing was summarized),
+    does NOT arm ``_compaction_failed_at`` (that would charge the NEXT turn's
+    idle clock), and sets ``last_compaction_transient`` False (an inferred
+    failure has no reason to classify, so no retry is promised). The title is
+    authored here, so it needs no redaction; it keeps the failure from showing
+    as "unknown error".
     """
     if not self._codex_compaction_pending:
         return None
@@ -428,7 +426,7 @@ async def wait_for_compaction(self: AcpClient, timeout: float = COMPACT_WAIT_TIM
             status = params.get("status", {})
             s_type = status.get("type", "") if isinstance(status, dict) else str(status)
             if s_type in ("completed", "failed"):
-                self._track_metadata(msg)
+                self._track_metadata(msg, between_turns=True)
                 if s_type == "completed":
                     await self._drain_post_compaction_metadata()
                 # Redact the backend-echoed summary before it reaches callers
@@ -443,7 +441,7 @@ async def wait_for_compaction(self: AcpClient, timeout: float = COMPACT_WAIT_TIM
                     summary = compaction_failure_detail(params)
                 return {"type": s_type, "summary": summary}
         elif msg.is_method(METHOD_METADATA):
-            self._track_metadata(msg)
+            self._track_metadata(msg, between_turns=True)
         else:
             # Don't drop — buffer for later processing
             if msg.method and not msg.id:
@@ -479,7 +477,7 @@ async def _drain_post_compaction_metadata(
         if msg is None:
             continue
         if msg.is_method(METHOD_METADATA):
-            self._track_metadata(msg)
+            self._track_metadata(msg, between_turns=True)
             if (msg.params or {}).get("contextUsagePercentage") is not None:
                 return
             continue

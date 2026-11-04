@@ -31,6 +31,7 @@ from kiro_crew import (
     snapshot_components,
     snapshot_merge,
     snapshot_merge_driver,
+    snapshot_order,
     snapshot_restore,
 )
 
@@ -83,6 +84,7 @@ OWNERS: dict[str, tuple[str, ...]] = {
         "DatabaseCopyFailed",
         "EXPORT_MANIFEST_VERSION",
         "MANIFEST_VERSION",
+        "MAX_ARCHIVE_GIB_CEILING",
         "ManifestUnreadable",
         "SKIP_DB_UNPINNED_SOURCE",
         "_ArchiveTooLarge",
@@ -93,6 +95,7 @@ OWNERS: dict[str, tuple[str, ...]] = {
         "_FIRST_VERSION_WITH_NAMED_STORES",
         "_MAX_ARCHIVE_BYTES",
         "_MAX_ARCHIVE_MEMBERS",
+        "_bound_gib",
         "_bundle_carries_named_stores",
         "_chain_is_link_free",
         "_copy_database_consistently",
@@ -106,6 +109,7 @@ OWNERS: dict[str, tuple[str, ...]] = {
         "_print_manifest",
         "_refuse_if_changed_since",
         "_refuse_oversized_archive",
+        "_refuse_oversized_tree",
         "_refuse_unsound_required_capture",
         "_rejection_recording_filter",
         "_report_skip",
@@ -114,6 +118,7 @@ OWNERS: dict[str, tuple[str, ...]] = {
         "_staging_ignore",
         "_staging_is_pinned",
         "_terminal_safe",
+        "archive_byte_bound",
     ),
     "kiro_crew.snapshot_restore": (
         "NamedStoresInUse",
@@ -182,18 +187,25 @@ OWNERS: dict[str, tuple[str, ...]] = {
         "_copy_notifications",
         "_do_merge",
     ),
+    # The newest-first order `--list` and the `--keep` prune share.
+    "kiro_crew.snapshot_order": ("newest_first",),
     # What the facade itself defines: the two commands and the outbound redaction seam
     # (every redaction call name stays in this one module).
     "kiro_crew.snapshot": (
         "EXIT_INCOMPLETE",
         "RedactionFailed",
         "_DASHBOARD_PORT",
+        "_MAX_ARCHIVE_GIB_HELP",
+        "_archive_bound_from_args",
         "_audit",
+        "_cron_names",
         "_default_snapshot_dir",
+        "_hold_back_executables",
         "_is_gateway_running",
         "_list_components",
         "_redacted_upload_copy",
         "_redactor",
+        "_report_held_back",
         "_report_redacted_bundle",
         "_report_redaction",
         "_report_unredacted_upload",
@@ -213,6 +225,7 @@ _MODULES = {
     "kiro_crew.snapshot_merge": snapshot_merge,
     "kiro_crew.snapshot_build": snapshot_build,
     "kiro_crew.snapshot_merge_driver": snapshot_merge_driver,
+    "kiro_crew.snapshot_order": snapshot_order,
 }
 
 #: Which owners each owner may import. The facade imports all of them; nothing imports
@@ -237,6 +250,7 @@ ALLOWED_IMPORTS: dict[str, frozenset[str]] = {
             "kiro_crew.snapshot_merge",
         }
     ),
+    "kiro_crew.snapshot_order": frozenset(),
 }
 
 _OWNER_MODULES = tuple(m for m in OWNERS if m != "kiro_crew.snapshot")

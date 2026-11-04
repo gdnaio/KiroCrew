@@ -286,6 +286,13 @@ async def _init_autonudge(self: GatewayOrchestrator) -> None:
 
             def _publish(frame: dict = _frame) -> None:
                 broadcast("autonudge_state", frame)
+                # A worker's loop is half of its conductor row's stale reading.
+                try:
+                    from kiro_crew.dashboard import crew_work
+
+                    crew_work.worker_loop_moved(str(frame.get("slot") or ""))
+                except Exception:  # pragma: no cover - a row refresh never costs the frame
+                    pass
 
             # Per-member event log: a member's DM-slot patrol started or
             # stopped. The log -- not the loop -- is what the Crew Members
@@ -854,7 +861,13 @@ def _notify_nudge_expired(self: GatewayOrchestrator, loop: NudgeLoop) -> bool:
         # the cap is raised) sees that literal unchanged.
         owed = ""
         if loop.monitor:
-            owed = str(getattr(loop.monitor, "terminal_pending", "") or "")
+            # A landed turn awaiting settlement keeps the same fact in
+            # ``terminal_delivered``.
+            owed = str(
+                getattr(loop.monitor, "terminal_pending", "")
+                or getattr(loop.monitor, "terminal_delivered", "")
+                or ""
+            )
         terminal = loop.stopped_reason == MONITOR_TERMINAL_REASON or bool(owed)
         if not terminal and not capped_out and runtime_budget_exceeded(loop):
             title = "Monitoring loop spent its time budget"

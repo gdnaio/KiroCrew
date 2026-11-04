@@ -46,7 +46,10 @@ POD_RUNTIME_CLIENT = Path(__file__).resolve().parent.parent / "src/kiro_crew/pod
 POD_CONFIG = Path(__file__).resolve().parent.parent / "src/kiro_crew/pod/config.py"
 #: ``generate_token`` is defined in the token-auth tokens owner; the token_auth facade serves it.
 TOKEN_AUTH = Path(__file__).resolve().parent.parent / "src/kiro_crew/dashboard/token_auth_tokens.py"
-TOKEN_HANDLER = Path(__file__).resolve().parent.parent / "src/kiro_crew/dashboard/handlers/core.py"
+#: ``api_token_local`` is defined in the local token owner; the core handlers facade serves it.
+TOKEN_HANDLER = (
+    Path(__file__).resolve().parent.parent / "src/kiro_crew/dashboard/handlers/core_local_token.py"
+)
 #: ``_pod_status`` is defined in the Dev Fleet pods owner; the worktree_ops facade serves it.
 WORKTREE_OPS = (
     Path(__file__).resolve().parent.parent
@@ -67,7 +70,7 @@ def _bash_works() -> bool:
         return False
     try:
         probe = subprocess.run(
-            ["bash", "-c", "echo ok"], capture_output=True, text=True, timeout=15
+            ["bash", "-c", "echo ok"], capture_output=True, text=True, encoding="utf-8", timeout=15
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -107,6 +110,7 @@ def _run(
         env={"HOME": home, "PATH": path},
         capture_output=True,
         text=True,
+        encoding="utf-8",
         input=stdin,
     )
 
@@ -169,6 +173,7 @@ def test_guard_works_without_any_readlink_at_all(symlinked_home, tmp_path):
         env={"HOME": symlinked_home, "PATH": f"{empty}:/usr/bin:/bin"},
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     # basename/dirname/cd/pwd are all we may rely on
     assert res.returncode == 0, res.stdout + res.stderr
@@ -982,6 +987,8 @@ def test_bad_live_port_falls_back_to_the_default_and_warns(tmp_path, bad):
         " 5476 ",
         "\uff19\uff11\uff12\uff13",
         "\u0669\u0661\u0662\u0663",
+        "\u00b2",
+        "-1",
     ],
 )
 def test_the_refused_set_follows_the_producers_own_parse_of_the_variable(tmp_path, raw):

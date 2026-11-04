@@ -5,7 +5,7 @@
  * Tests the ChatInput component directly to avoid ChatPage's complex dependencies.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, act } from '@testing-library/react'
+import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -108,11 +108,13 @@ describe('ChatInput reasoning effort on the model chip', () => {
     expect(screen.getByTestId('composer-model-chip')).toHaveAccessibleName('Model: claude-opus-4.7')
   })
 
-  it('shows disabled state when running, and still names the level', () => {
+  it('stays enabled when running, still names the level, and says a pick applies next', () => {
     renderInput({ isRunning: true })
-    const btn = screen.getByTitle('Stop the current response to switch model · Reasoning effort: High')
-    expect(btn).toBeDisabled()
-    expect(btn).toHaveAccessibleName('Stop the current response to switch model · Reasoning effort: High')
+    const btn = screen.getByTestId('composer-model-chip')
+    expect(btn).toBeEnabled()
+    expect(btn).toHaveAccessibleName(
+      'Model: claude-opus-4.7 · Reasoning effort: High\nYour next message runs on the model you pick. This reply finishes on the model it started with.',
+    )
   })
 
   it('EFFORT_LABEL_KEY covers all valid values incl xhigh', () => {
@@ -147,6 +149,19 @@ describe('ChatInput reasoning effort on the model chip', () => {
     expect(modelSupportsEffort('deepseek-3.2')).toBe(false)
     expect(modelSupportsEffort('minimax-m2.5')).toBe(false)
     expect(modelSupportsEffort('glm-5')).toBe(false)
+  })
+
+  it('modelSupportsEffort offers Haiku 5.5 and later, never older Haiku (#26173)', () => {
+    // kiro-cli accepts /effort on claude-haiku-5.5 and refuses it on 4.5.
+    expect(modelSupportsEffort('claude-haiku-5.5')).toBe(true)
+    expect(modelSupportsEffort('global.anthropic.claude-haiku-5-5[1m]')).toBe(true)
+    expect(modelSupportsEffort('claude-haiku-5.6')).toBe(true)
+    expect(modelSupportsEffort('claude-haiku-6')).toBe(true)
+    expect(modelSupportsEffort('claude-haiku-4.5')).toBe(false)
+    expect(modelSupportsEffort('anthropic.claude-haiku-4-5-20251001-v1:0')).toBe(false)
+    expect(modelSupportsEffort('claude-3-5-haiku-20241022')).toBe(false)
+    expect(modelSupportsEffort('claude-haiku-5')).toBe(false)
+    expect(modelSupportsEffort('claude-haiku')).toBe(false)
   })
 })
 
@@ -264,7 +279,7 @@ describe('ReasoningEffortDropdown', () => {
       // The pick is no longer the newest intent...
       expect(pendingSlotSwitchTarget('reasoning_effort', 's1')).toBe('max')
       // ...so the debounce firing must NOT put 'xhigh' on the wire.
-      await vi.advanceTimersByTimeAsync(200)
+      await act(async () => { await vi.advanceTimersByTimeAsync(200) })
       expect(mockApi.chatSlotReasoningEffort).not.toHaveBeenCalledWith('s1', 'xhigh')
       await race
     } finally {
@@ -276,9 +291,12 @@ describe('ReasoningEffortDropdown', () => {
     mockApi.chatSlotReasoningEffort.mockRejectedValueOnce(new Error('boom'))
     const { store } = renderDropdown()
     const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
-    await vi.waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('4'))
+    await waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('4'))
     fireEvent.keyDown(slider, { key: 'ArrowRight' })
-    await vi.waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalled())
+    await waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalled())
+    // The failure rolls the popover back to the authoritative level, which
+    // lands after the rejected persist. Wait for that before reading the store.
+    await waitFor(() => expect(slider.getAttribute('aria-valuetext')).toBe('High'))
     // The failed pick changed nothing server-side; the store keeps the
     // pre-pick value (the popover's own optimistic label is local-only).
     expect(store.getState().dashboard.slots.find(s => s.key === 's1')?.reasoning_effort).toBe('high')
@@ -289,13 +307,13 @@ describe('ReasoningEffortDropdown', () => {
     mockApi.chatSlotReasoningEffort.mockRejectedValueOnce(new Error('effort rejected'))
     const { store } = renderDropdown()
     const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
-    await vi.waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('4'))
+    await waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('4'))
 
     fireEvent.keyDown(slider, { key: 'ArrowRight' })
     expect(slider.getAttribute('aria-valuetext')).toBe('Extra High')
 
-    await vi.waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'xhigh'))
-    await vi.waitFor(() => expect(slider.getAttribute('aria-valuetext')).toBe('High'))
+    await waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'xhigh'))
+    await waitFor(() => expect(slider.getAttribute('aria-valuetext')).toBe('High'))
     expect(store.getState().chat.agentSwitchNotice?.message).toBe('effort rejected')
   })
 
@@ -312,18 +330,20 @@ describe('ReasoningEffortDropdown', () => {
       fireEvent.keyDown(slider, { key: 'ArrowRight' })
       expect(slider.getAttribute('aria-valuetext')).toBe('Extra High')
 
-      await vi.advanceTimersByTimeAsync(150)
+      await act(async () => { await vi.advanceTimersByTimeAsync(150) })
       expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'xhigh')
       expect(pendingSlotSwitchTarget('reasoning_effort', 's1')).toBe('xhigh')
 
-      await vi.advanceTimersByTimeAsync(SWITCH_CONFIRM_TIMEOUT_MS)
+      await act(async () => { await vi.advanceTimersByTimeAsync(SWITCH_CONFIRM_TIMEOUT_MS) })
       await vi.waitFor(() => expect(slider.getAttribute('aria-valuetext')).toBe('High'))
       await vi.waitFor(() => expect(store.getState().chat.agentSwitchNotice?.message).toBe(
         'Switch not confirmed yet — it will apply if the connection recovers.',
       ))
     } finally {
-      resolveRequest({ reasoning_effort: 'xhigh' })
-      await vi.advanceTimersByTimeAsync(0)
+      await act(async () => {
+        resolveRequest({ reasoning_effort: 'xhigh' })
+        await vi.advanceTimersByTimeAsync(0)
+      })
       vi.useRealTimers()
     }
   })
@@ -465,12 +485,15 @@ describe('ReasoningEffortDropdown', () => {
 
   it('syncs the default thumb when live levels arrive asynchronously', async () => {
     mockApi.effortLevels.mockResolvedValueOnce(['low', 'max'])
-    renderDropdown({ currentEffort: '', defaultEffort: 'max' })
+    const { store } = renderDropdown({ currentEffort: '', defaultEffort: 'max' })
     const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
-    await vi.waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('1'))
+    await waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('1'))
     const toggle = screen.getByRole('switch', { name: 'Use default effort (Max)' })
     fireEvent.click(toggle)
-    await vi.waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'max'))
+    await waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'max'))
+    // The debounced persist writes the slot row after the mock resolves; wait
+    // for that write so it lands inside the waiting window, not after the test.
+    await waitFor(() => expect(store.getState().dashboard.slots.find(s => s.key === 's1')?.reasoning_effort).toBe('max'))
   })
 
   it('keeps the remembered concrete pick while persisting default inheritance', async () => {

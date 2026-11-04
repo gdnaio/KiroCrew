@@ -43,7 +43,7 @@ The configuration shape is:
     "model_route": {
       "simple": "claude-haiku-4.5",
       "medium": "claude-opus-4.8",
-      "complex": "claude-fable-5.1"
+      "complex": "claude-opus-5.5"
     },
 
     "provider": {
@@ -56,7 +56,7 @@ The configuration shape is:
 }
 ```
 
-Create the API-key secret through the existing [secrets vault](secrets-vault.md) under the name `TYPESAFE_API_KEY`; that is the only vault entry this feature reads, and only for the default Jev endpoint. The reference above is a placeholder, not a working key.
+Create the API-key secret through the existing [secrets vault](secrets-vault.md) under the name `TYPESAFE_API_KEY`; that is the only vault entry this feature reads. The key is sent only to the endpoint your consent was recorded for (and never to a literal loopback IP such as `127.0.0.1` or `[::1]`; the name `localhost` counts as remote and does receive the key). The reference above is a placeholder, not a working key.
 
 `bucket` chooses a percentage of sessions. It is a fixed sample, not a random draw per message. A session stays selected or unselected while its key and bucket remain unchanged. `0` samples none and `100` samples all otherwise eligible sessions. Its default is `100`, so with the switch on and no `bucket` set, every otherwise-eligible session is sampled. A value that is not a whole number reads as `0`, so a typo never widens the sample.
 
@@ -77,6 +77,55 @@ This setting alone changes nothing: a chat is only routed while it is not pinned
 `skills.max_triggered` must be greater than zero to allow automatic selection. Its default is zero, which disables automatic selection even when the Decisions switch is on. Jev selects at most one skill and does not raise that limit.
 
 After setting the provider and sampling values, enable the switch only if the data transfer below is acceptable. Turn it off to return to normal trigger matching. Old `preview` and per-point mode values do not enable this new behavior.
+
+## Using Cloudflare Clef
+
+Cloudflare's Clef decision model on Workers AI answers the same questions in the same format as Jev, so it works as the Decisions provider. Cloudflare wraps its answer in a `result` object, and Kiro Crew reads either shape. A failure reply carries no `answers` and is refused like any other unusable answer, and nothing from it is logged.
+
+Set `provider` in `config.json` by hand (the Decision model picker only offers Jev and local models), using your own Cloudflare account id:
+
+```json
+{
+  "decisions": {
+    "provider": {
+      "endpoint": "https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run/@cf/cloudflare/clef-flash",
+      "api_key": "secret://TYPESAFE_API_KEY",
+      "model": "clef-flash",
+      "timeout_ms": 3000
+    }
+  }
+}
+```
+
+- `model` must be `clef` or `clef-flash`, matching the model in the endpoint path (`@cf/cloudflare/clef` or `@cf/cloudflare/clef-flash`).
+- Store a Cloudflare API token that can run Workers AI in the [secrets vault](secrets-vault.md) under `TYPESAFE_API_KEY`. The name is fixed, whichever provider the key belongs to. It is sent as `Authorization: Bearer <token>`.
+- Changing the endpoint withdraws your consent: turn the Decisions switch off and on again on the card, which shows the Cloudflare address you are agreeing to send messages to.
+- Pricing, rate limits and latency are Cloudflare's; see the [Clef model page](https://developers.cloudflare.com/workers-ai/models/clef/). Kiro Crew keeps its connection to the provider open between decisions, so only the first decision after a quiet spell pays the connection set-up (over a second to Cloudflare's API); raise `timeout_ms` if that one, or a busy model, times out, and remember that a slow answer only means the decision falls back.
+
+## Using a model on Amazon SageMaker
+
+A System One model you host yourself on an Amazon SageMaker real-time endpoint can answer decisions. The endpoint's container must accept the same JSON body Jev does (`/v1/systemone`) on SageMaker's `/invocations` route and answer with the same JSON. This is off unless you set it. Set `provider` in `config.json` by hand:
+
+```json
+{
+  "decisions": {
+    "provider": {
+      "endpoint": "sagemaker://my-argus-endpoint?region=us-west-2&profile=research",
+      "model": "argus-9b",
+      "timeout_ms": 8000
+    }
+  }
+}
+```
+
+- `endpoint` is `sagemaker://<endpoint-name>?region=<aws-region>`, with an optional `&profile=<aws-profile>` naming a profile from your AWS config files. Without `profile` the usual AWS credential chain is used (environment, config files, instance role). Nothing else may appear in the address; anything else is refused.
+- The request is SageMaker's `InvokeEndpoint`, signed with your AWS credentials (SigV4). No API key is read and `api_key` is ignored. The credentials need `sagemaker:InvokeEndpoint` on that endpoint only.
+- Install `boto3` (`pip install 'boto3>=1.34,<2'`) in the environment Kiro Crew runs in. Without it each decision fails with a clear error and falls back.
+- `timeout_ms` is the budget for the whole decision. A throttled or not-ready answer is retried, at most 3 attempts in total, and only while the budget has time left; a timeout is not retried. Set it with the endpoint's latency in mind.
+- Changing the endpoint name, the region or the profile withdraws your consent, the same as changing any other endpoint: turn the Decisions switch off and on again.
+- Requests always go to `runtime.sagemaker.<region>.amazonaws.com` (`.amazonaws.com.cn` in China regions), even if `AWS_ENDPOINT_URL` or your AWS config names another endpoint. An organisation's endpoint allow or deny list is checked against that host. The isolated AWS partitions are not supported.
+- A request that carries images (`assets`) or a Box question sends the custom attribute `TypeSafe-Danger-Zone-Images=true` in place of the HTTP header of that name, because `InvokeEndpoint` carries no other headers. Images travel inline as `data_base64`, and the whole request must stay under SageMaker's 25 MB limit. No decision point sends images yet; the client (`impl_sagemaker.invoke`, `box_answers`) is there for vision models with a Box head.
+- Errors name the cause without quoting your messages, images or credentials: no credentials, AWS refused the credentials, no endpoint by that name in that region, the endpoint is not ready, still throttled after every attempt, a timeout, or the container's error status.
 
 ## Running a model on this machine
 

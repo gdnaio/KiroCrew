@@ -138,10 +138,10 @@ def _hermes_windows_root(env: Mapping[str, str]) -> Path | None:
     ``~/.hermes`` default: it is where Hermes lives on Windows.
     """
     local_app_data = env.get("LOCALAPPDATA", "").strip()
-    windows_root = Path(local_app_data) / "hermes" if local_app_data else None
-    if windows_root is not None and windows_root.exists():
-        return windows_root
-    return None
+    if not local_app_data:
+        return None
+    windows_root = Path(local_app_data) / "hermes"
+    return windows_root if windows_root.exists() else None
 
 
 def _hermes_schedule_has_unsupported_semantics(record: dict[str, Any]) -> bool:
@@ -337,9 +337,7 @@ def _hermes_skill_lock_names(data: Any, skills_root: Path) -> set[str]:
     containers: list[dict[Any, Any] | list[Any]] = []
     for key in ("skills", "installed"):
         container_value = data.get(key)
-        if isinstance(container_value, dict):
-            containers.append(container_value)
-        elif isinstance(container_value, list):
+        if isinstance(container_value, (dict, list)):
             containers.append(container_value)
     names: set[str] = set()
     for container in containers:
@@ -413,17 +411,22 @@ def _scan_hermes(scan: _Scan) -> None:
             unsupported=True,
             count=unsupported_memory_databases,
         )
-    configs = _parse_configs(
-        scan,
-        [
-            config
-            for root in roots
-            for config in (
-                (root / "config.yaml", root, "yaml"),
-                (root / "config.yml", root, "yaml"),
-            )
-        ],
-    )
+    # Each profile is its own HERMES_HOME, so keep its parsed config beside it:
+    # a cron job with no zone of its own runs on its profile's timezone.
+    root_configs = [
+        (
+            root,
+            _parse_configs(
+                scan,
+                [
+                    (root / "config.yaml", root, "yaml"),
+                    (root / "config.yml", root, "yaml"),
+                ],
+            ),
+        )
+        for root in roots
+    ]
+    configs = [config for _root, parsed in root_configs for config in parsed]
     _diagnose_unsupported_config(scan, configs)
     _add_mcp_configs(scan, configs)
     for root in roots:
@@ -433,21 +436,22 @@ def _scan_hermes(scan: _Scan) -> None:
             excluded_parts=_HERMES_SKILL_EXCLUDED_PARTS,
             excluded_names=_hermes_managed_skill_names(scan, root),
         )
-    schedule_paths = [
-        path for root in roots for path in (root / "cron" / "jobs.json",) if path.is_file()
-    ]
-    default_timezone = ""
-    for config in configs:
-        timezone_value = config.get("timezone")
-        if isinstance(timezone_value, str) and timezone_value:
-            default_timezone = timezone_value
-            break
-    _add_hermes_json_schedules(
-        scan,
-        schedule_paths,
-        scan.root,
-        default_timezone=default_timezone,
-    )
+    for root, root_parsed in root_configs:
+        schedule_path = root / "cron" / "jobs.json"
+        if not schedule_path.is_file():
+            continue
+        default_timezone = ""
+        for config in root_parsed:
+            timezone_value = config.get("timezone")
+            if isinstance(timezone_value, str) and timezone_value:
+                default_timezone = timezone_value
+                break
+        _add_hermes_json_schedules(
+            scan,
+            [schedule_path],
+            scan.root,
+            default_timezone=default_timezone,
+        )
     settings: dict[str, Any] = {}
     for config in configs:
         _merge_missing(settings, _settings_from(config, "hermes"))

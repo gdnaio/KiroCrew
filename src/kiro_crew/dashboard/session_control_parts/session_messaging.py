@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.context_assembly.markers import _apply_marker_spans, _marker_spans
+from kiro_crew.dashboard import session_managers
 from kiro_crew.dashboard.chat_delivery import sanitize_outbound
 from kiro_crew.dashboard.relay_archive import (
     RELAY_ARCHIVE_CODE,
@@ -25,7 +26,6 @@ from kiro_crew.dashboard.session_control_parts.caller_access import (
     SessionControlError,
     _audit,
     _caller_is_ownership_fenced,
-    _created_by_other,
     caller_slot_key,
     prewarm_enabled_check,
 )
@@ -210,6 +210,26 @@ def _retain_orphaned_steer_delivery(
     task.add_done_callback(_done)
 
 
+def _start_auto_tag(state: DashboardState, slot: Any) -> None:
+    """Tag a session whose turn this send started, as a typed message would.
+
+    The composer starts auto-tagging on every send (``chat_api.chat_send``). A
+    session that only ever receives ``session_send`` never passes through it,
+    so without this its sidebar row carries no project tag. Only the run arm
+    calls this: the user row is already on the transcript there, so the topic
+    pass reads the right first message. ``maybe_auto_tag``'s own once-guard
+    makes a repeat call free.
+    """
+    if getattr(slot, "_auto_tagged", False):
+        return
+    # Deferred for the same import cycle `_run_chat` documents in `send_to_target`.
+    from kiro_crew.dashboard.chat_auto_tag import maybe_auto_tag
+
+    task = asyncio.create_task(maybe_auto_tag(state, slot))
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
 async def send_to_target(
     state: "DashboardState",
     *,
@@ -344,9 +364,13 @@ async def send_to_target(
             raise
 
     # Deferred for the same import cycle `stop_target` documents.
-    from kiro_crew.dashboard.chat_runner import _run_chat
+    from kiro_crew.dashboard import session_deliver
 
     caller_key = caller_slot_key(state, caller_session_key)
+    if caller_key and getattr(slot, "_created_by", "") == caller_key:
+        # The live witness that this child's creator still drives it, so its
+        # turn ends may report back (``dashboard.mate_thread_wakes``).
+        slot._reports_to_creator = True
     # Sanitized on the same grounds as the steer path (``chat_delivery`` sanitizes
     # before ``slot.append``): this body comes from ANOTHER session and is persisted
     # into — and broadcast from — the target's transcript, so raw content must never
@@ -380,14 +404,6 @@ async def send_to_target(
         # an idle slot there is nothing to inject and the queue-or-run arm below is
         # the whole delivery.
         #
-        # Deferred import for the cycle `_run_chat` above documents.
-        from kiro_crew.dashboard.chat_delivery import (
-            STEER_REQUEUED,
-            STEER_STEERED,
-            STEER_UNAVAILABLE,
-            steer_into_running_turn,
-        )
-
         # Captured BEFORE the RPC and synchronous with the gate above -- no await
         # separates `authorize_target` from here -- so this IS the containment the
         # authorization cleared, recorded in the drain's own vocabulary so the
@@ -421,8 +437,8 @@ async def send_to_target(
         # surface. The requeue reads it to decide `directive_user_origin`, and a
         # peer must not inherit the composer's exemption from the LINKED drop.
         async def _steer_delivery() -> str:
-            return await steer_into_running_turn(
-                state, slot, prompt, user_origin=False, admission=admission
+            return await session_deliver.deliver(
+                state, slot, prompt, session_deliver.peer(steer=True), admission=admission
             )
 
         delivery_progress.steer_await_entered = True
@@ -434,10 +450,10 @@ async def send_to_target(
         # directly, the cancellation unwinds THROUGH the RPC and skips that
         # coroutine's single reconciliation tail, while the bytes may already have
         # reached kiro-cli: the turn then runs text no `slot.append` recorded, and
-        # `_steer_delivery_ids` / `_steer_send_ids` / `_steer_user_origin` /
-        # `_steer_admissions` are never popped. Nothing else pops them --
-        # `_settle_consumed_steers` clears only the attachment and decision-strip
-        # maps, and `_requeue_unconsumed_steers` returns early once settling emptied
+        # `_steer_delivery_ids` / `_steer_send_ids` are never popped. Nothing else
+        # pops them -- `_settle_consumed_steers` releases the steer's provenance,
+        # attachment and decision-strip records but neither id map, and
+        # `_requeue_unconsumed_steers` returns early once settling emptied
         # `_pending_steers`. The surviving `_steer_delivery_ids` entry then refuses
         # this exact text on that slot forever (the one-per-text guard reads that
         # dict) and `retained_steer_count` never falls back below
@@ -480,11 +496,12 @@ async def send_to_target(
                     slot.key,
                 )
                 return
-            slot.enqueue_or_run_prompt(
-                prompt,
-                _run_chat,
+            await session_deliver.deliver(
                 state,
-                extra_meta=send_origin_meta(state, caller_key),
+                slot,
+                prompt,
+                session_deliver.peer(steer=False),
+                queue_meta=send_origin_meta(state, caller_key),
             )
             logger.info(
                 "session_send: orphaned steer to %s came back unavailable and was "
@@ -499,16 +516,16 @@ async def send_to_target(
             _retain_orphaned_steer_delivery(
                 _steer_task,
                 slot.key,
-                unavailable_outcome=STEER_UNAVAILABLE,
+                unavailable_outcome=session_deliver.NOT_DELIVERED,
                 on_unavailable=_queue_after_orphaned_unavailable,
             )
             raise
-        steered = outcome == STEER_STEERED
+        steered = outcome == session_deliver.DELIVERED_STEERED
         # The turn ended while the steer RPC was suspended and its teardown moved
         # the text onto the queue: it WILL run, and taking the queue arm below
         # would deliver it a second time. Reported as a queued delivery, which is
         # what it now is.
-        requeued = outcome == STEER_REQUEUED
+        requeued = outcome == session_deliver.DELIVERED_REQUEUED
         if requeued and state._slots.get(slot.key) is not slot:
             # The teardown queued this text on THIS slot object, and the key has
             # since stopped resolving to it -- the target was closed and recreated
@@ -654,7 +671,7 @@ async def send_to_target(
         # and a requeued steer waits for the next like any queued message.
         started = False
     else:
-        # `_run_chat` is passed straight through, NOT wrapped in
+        # `deliver` passes `_run_chat` straight through, NOT wrapped in
         # `state.run_background_turn`: that cap is structurally unreachable here.
         # `run_background_turn` returns the coroutine untouched for an attended slot
         # (`state_parts/dashboard_services.py`, "this wrapper is inert"), `_ChatSlot.unattended` is
@@ -663,18 +680,24 @@ async def send_to_target(
         # function can reach is ever unattended, and a wrapper would only add a
         # never-taken timeout arm. The composer's own queued path does the same
         # (`server.py` passes `_run_chat` directly).
-        started = bool(
-            slot.enqueue_or_run_prompt(
-                prompt,
-                _run_chat,
+        # No suspension inside: the non-steer peer arm is the synchronous
+        # queue-or-run call, so no cancellation can enter this await.
+        started = (
+            await session_deliver.deliver(
                 state,
+                slot,
+                prompt,
+                session_deliver.peer(steer=False),
                 # Only the QUEUE arm keeps it (the run arm has no entry): a
                 # delivery that waits is the one a later drain can drop, and this
                 # stamp is what lets that drop be reported back to us instead of
                 # ending at the target's own transcript.
-                extra_meta=send_origin_meta(state, caller_key),
+                queue_meta=send_origin_meta(state, caller_key),
             )
+            == session_deliver.DELIVERED_TURN
         )
+        if started:
+            _start_auto_tag(state, slot)
     try:
         state.push_slots_update()
     except Exception:  # pragma: no cover - sidebar refresh is best-effort
@@ -760,11 +783,12 @@ def _timeout_delivery_observation(
 
 
 def broadcast_audience(state: "DashboardState", caller_key: str) -> list[str]:
-    """The slot keys *caller_key* created and can still address, sorted.
+    """The slot keys *caller_key* manages and can still address, sorted.
 
-    The DEFAULT audience of a broadcast: a conductor's own workers. Read from the
-    live slots' ``_created_by`` — the same field the ownership fence
-    (:func:`_created_by_other`) reads — so the default audience is by construction
+    The DEFAULT audience of a broadcast: a conductor's own workers, the ones it
+    created and the ones handed to it. Read from :func:`session_managers.holder`
+    (the creator until a ``session_handoff`` names another) -- the manager the
+    fence reads for ``send`` -- so the default audience is by construction
     a subset of what the fence would admit, and an audience this returns can still
     be refused per target (a worker that went incognito, gained a channel mirror,
     or is an app's) by the gate each delivery runs. Nothing here authorizes.
@@ -780,7 +804,7 @@ def broadcast_audience(state: "DashboardState", caller_key: str) -> list[str]:
     out = [
         key
         for key, slot in list(state._slots.items())
-        if key != caller_key and not _created_by_other(slot, caller_key)
+        if key != caller_key and session_managers.holder(slot) == caller_key
     ]
     return sorted(out)
 
@@ -807,6 +831,7 @@ async def broadcast_to_targets(
     message: str,
     mode: str,
     targets: "list[str] | None" = None,
+    all_created: bool = False,
     caller_fenced: bool | None = None,
 ) -> dict[str, Any]:
     """Deliver *message* to several sessions at once, one at a time.
@@ -818,10 +843,17 @@ async def broadcast_to_targets(
     the first; one telling them "stop, the issue was already fixed" wants the
     second, and the difference is worth eight turns of latency.
 
-    ``targets`` omitted means :func:`broadcast_audience` — the sessions this caller
-    created. Naming them explicitly is for the subset case, and every named target
-    goes through the same :func:`authorize_target` gate, so an explicit list can
-    only ever be as permissive as one send at a time.
+    A call selects its audience in exactly one of two ways. ``targets`` names the
+    sessions, or ``all_created=True`` means :func:`broadcast_audience` — every
+    session this caller created. ``targets`` that is absent, ``None`` or empty
+    selects nobody, so a call with neither is refused ``target_required`` and a call
+    with both is refused ``audience_conflict``; nothing is sent in either case.
+    The default is deliberately NOT the whole fleet: some clients drop an empty
+    list from a tool call, so ``targets=[]`` reaches this function as an omission,
+    and an omission that meant "everyone" would turn a caller's empty audience into
+    a fleet-wide send. Every named target goes through the same
+    :func:`authorize_target` gate, so an explicit list can only ever be as
+    permissive as one send at a time.
 
     PARTIAL DELIVERY IS THE NORMAL OUTCOME and the return shape says so per
     target. A target closed between the audience read and its own delivery, one
@@ -892,7 +924,23 @@ async def broadcast_to_targets(
         ownership_fenced=ownership_fenced,
     )
 
-    explicit = targets is not None
+    # An empty list and an absent one are the same thing here: the bytes a client
+    # that drops empty containers sends are identical for both, so the answer must
+    # not depend on telling them apart.
+    explicit = bool(targets)
+    if explicit and all_created:
+        raise SessionControlError(
+            "pass targets or all: true, not both",
+            code="audience_conflict",
+            status=400,
+        )
+    if not explicit and not all_created:
+        raise SessionControlError(
+            "no audience selected: name the sessions in targets, or pass "
+            "all: true to reach every session you created",
+            code="target_required",
+            status=400,
+        )
     if explicit:
         # THE CAP, CHECKED BEFORE ANYTHING RESOLVES. Below the resolution loop this
         # check is correct and useless: reaching it costs one `_resolve_slot` per
@@ -936,13 +984,14 @@ async def broadcast_to_targets(
                 seen.add(identity)
                 audience.append(slot.key if slot is not None else name)
         if not audience:
-            # The caller named targets and not one of them is usable. Both silent
-            # answers are wrong here: falling back to the default audience turns a
-            # malformed argument into an accidental fleet-wide send, and reporting
-            # "delivered 0 of 0" hides a call that never had a chance of working.
+            # The caller named targets and not one of them is usable (every name was
+            # blank). Both silent answers are wrong here: falling back to the
+            # all-created audience turns a malformed argument into an accidental
+            # fleet-wide send, and reporting "delivered 0 of 0" hides a call that
+            # never had a chance of working.
             raise SessionControlError(
-                "targets was given but names no session; omit it to reach every "
-                "session you created",
+                "targets was given but names no session; name the sessions, or "
+                "pass all: true to reach every session you created",
                 code="target_required",
                 status=400,
             )

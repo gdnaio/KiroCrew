@@ -34,6 +34,7 @@ from kiro_crew.dashboard.listener_guard import (
     listener_guard_exit_code,
     probe_target,
 )
+from kiro_crew.testing.wait import async_wait_until
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -93,11 +94,7 @@ def _listening_socket(site: web.TCPSite) -> socket.socket:
 
 
 async def _wait_until(pred: Any, *, timeout: float = 5.0) -> None:
-    deadline = asyncio.get_running_loop().time() + timeout
-    while not pred():
-        if asyncio.get_running_loop().time() > deadline:
-            raise AssertionError("condition not met in time")
-        await asyncio.sleep(0.01)
+    await async_wait_until(pred, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -438,13 +435,13 @@ async def test_recovery_never_calls_site_stop(monkeypatch: Any) -> None:
         dead = guard.site
         # A live client connection the rebind must neither wait for nor drop.
         held = socket.create_connection(("127.0.0.1", served.port), timeout=2.0)
-        monkeypatch.setattr(guard, "listener_open", lambda: False)
-        monkeypatch.setattr(web.TCPSite, "stop", _forbidden_stop, raising=False)
         try:
-            assert await guard.check_now("test") is True
+            # Restored before the served context exits: runner.cleanup() stops the sites.
+            with monkeypatch.context() as mp:
+                mp.setattr(guard, "listener_open", lambda: False)
+                mp.setattr(web.TCPSite, "stop", _forbidden_stop, raising=False)
+                assert await guard.check_now("test") is True
         finally:
-            # Undone inside the context: runner.cleanup() below stops the sites.
-            monkeypatch.undo()
             held.close()
         assert guard.site is not dead
         assert dead not in served.runner.sites

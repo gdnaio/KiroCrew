@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from kiro_crew.auth.login.portal import (
 from kiro_crew.auth.provider import KasAuthProvider, NotAuthenticated
 from kiro_crew.auth.refresh import (
     IdentitySignedOut,
+    RefreshBlocked,
     RefreshError,
     RefreshRejected,
     ensure_fresh,
@@ -195,6 +197,42 @@ async def test_builder_id_start_device_authorization_ok_and_failure():
         )
 
 
+@pytest.mark.parametrize(
+    "description, advice",
+    [
+        # Both bodies are what SSO-OIDC answered when probed: an unknown host or
+        # path, and a well-formed portal looked up in the wrong region.
+        ("Invalid start url provided", "access portal URL"),
+        ("Invalid request", "in region eu-west-1"),
+    ],
+)
+async def test_idc_start_url_refusal_says_what_to_change(description, advice):
+    body = json.dumps({"error": "invalid_request", "error_description": description})
+    session = _FakeSession([_FakeResp(400, body)])
+    with pytest.raises(builder_id.StartUrlRejectedError) as raised:
+        await builder_id.start_device_authorization(
+            RegisteredClient("cid", "csec"),
+            region="eu-west-1",
+            start_url="https://acme.awsapps.com/start",
+            session=session,
+        )
+    message = str(raised.value)
+    assert advice in message
+    assert "https://acme.awsapps.com/start" in message
+    assert f"(AWS: {description})" in message
+
+
+async def test_builder_id_400_is_not_blamed_on_a_start_url():
+    """Builder ID's start URL is Crew's own constant, so its refusal stays generic."""
+    body = json.dumps({"error": "invalid_request", "error_description": "Invalid request"})
+    session = _FakeSession([_FakeResp(400, body)])
+    with pytest.raises(BuilderIdAuthError) as raised:
+        await builder_id.start_device_authorization(
+            RegisteredClient("cid", "csec"), region="us-east-1", session=session
+        )
+    assert not isinstance(raised.value, builder_id.StartUrlRejectedError)
+
+
 async def test_builder_id_poll_slow_down_then_token():
     client = RegisteredClient("cid", "csec")
     session = _FakeSession(
@@ -292,8 +330,14 @@ async def test_refresh_sso_oidc_needs_client_creds(tmp_path: Path):
         refresh_token="r",
     )  # no client_id/secret
     store.save(tok)
-    with pytest.raises(RefreshError, match="client credentials"):
+    # A missing local precondition is RefreshBlocked: permanent like a rejection
+    # (a reader maps both to "sign in again"), still a RefreshError for every
+    # existing handler, and no issuer was asked so no rejection marker lands.
+    with pytest.raises(RefreshBlocked, match="client credentials"):
         await ensure_fresh(store, tok, session=_FakeSession([]))
+    assert issubclass(RefreshBlocked, RefreshError)
+    assert not issubclass(RefreshBlocked, RefreshRejected)
+    assert store.refresh_rejected("builder_id") is None
 
 
 async def test_refresh_sso_oidc_success(tmp_path: Path):

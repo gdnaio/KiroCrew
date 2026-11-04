@@ -488,6 +488,22 @@ async def _verify_unix_peer(
             # before claim, a cron script, a pooled MCP backend outside this
             # manager.
             return None
+        bound = _bound_session_keys_on_chain(tenancy.chain)
+        if declared in bound:
+            # The roster is complete and omits the declared key, but the
+            # gateway's own ownership tables place it on this process. That is
+            # a ``spawn_run`` shared subagent: the roster is built from the
+            # session manager, which never registers a shared session, so the
+            # parent's turn publishes a roster naming only the parent while the
+            # subagent's stubs declare the subagent's key. The tenancy claim is
+            # in this process's memory, which an agent cannot edit, so it is
+            # positive evidence the process hosts the session -- and the parent
+            # sharing that process can read the key, so the declaration is
+            # still admitted only on a token naming it, exactly like any other
+            # co-tenant.
+            return await _attest_shared(
+                "mapping omits a session the ownership tables bind here", hosts=len(bound)
+            )
         _sel_fn().log_api_access(
             caller=declared,
             forwarded=is_proxied_request(request),
@@ -587,8 +603,8 @@ def derive_caller_app(
         # its own name ("when set, _run_chat uses this as session key" --
         # ``DashboardState``), so the caller presents that key and the lookup
         # above cannot find it. Without this the slot's ``_app`` is invisible
-        # and the caller reads as the person: the very shape this fix exists to
-        # end, since the slot IS there and may carry an owner.
+        # and the caller reads as the person: the very shape this lookup exists
+        # to end, since the slot IS there and may carry an owner.
         linked = _slot_by_linked_key(slots, sk)
         owner = str(getattr(linked, "_app", "") or "") if linked is not None else ""
         if owner:
@@ -934,7 +950,7 @@ def effective_request_app(state: object, request: web.Request) -> str:
 
 
 #: Request key under which the chat folder/tag gate
-#: (``handlers/_shared.py``'s ``private_chat_route_refusal``) stamps the VERIFIED
+#: (``handlers/_shared_route_guards.py``'s ``private_chat_route_refusal``) stamps the VERIFIED
 #: member principal (``member:<store>``) when it admits a member caller. The
 #: constant lives HERE, the lowest layer, so the gate that writes it and
 #: :func:`folder_principal` that reads it share one key and cannot drift.

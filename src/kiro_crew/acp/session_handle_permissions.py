@@ -11,11 +11,13 @@ and a patch of the method on the class or on an instance reaches every caller.
 Instance fields written: ``_audit_tasks``, ``_permission_gate_events``,
 ``_permission_options``.
 
-Instance fields read: ``_config_options``, ``_runtime``, ``_session_id``,
+Instance fields read: ``_config_options``, ``_runtime``, ``_session_id``, ``_session_key``,
 ``_tool_call_cache_overflow``, ``_tool_call_diff_path``,
 ``_tool_call_harness_tool_name``, ``_tool_call_input_redacted``, ``_tool_call_inputs``,
 ``_tool_call_is_shell``, ``_tool_call_mcp_server``, ``_tool_call_raw_params``,
-``_tool_call_tool_name``, ``mirror_used``, ``spec_denied_tools``.
+``_tool_call_tool_name``, ``kas_crew_answered``, ``kas_crew_answered_commands``,
+``kas_spec_shell_allowlist``, ``kas_spec_write_allowlist``, ``_bound_cwd``,
+``mirror_used``, ``spec_denied_tools``.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from kiro_crew import acp_tool_gate, permission_floor
+from kiro_crew import acp_tool_gate, mediated_request_capability, permission_floor
 from kiro_crew.acp._dispatch import (
     TOOL_CALL_CACHE_MAX_ENTRIES,
     TOOL_CALL_CACHE_MAX_PAYLOAD_CHARS,
@@ -46,7 +48,10 @@ from kiro_crew.acp.types import (
     AcpEvent,
     JsonRpcMessage,
 )
+from kiro_crew.agent_sdk.backends import ACP_BACKENDS_SHARED_RUNTIME_CHILD_CALLS_MARKED
 from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED, emit_counter
+from kiro_crew.security.deny_waiver import child_calls_marked
+from kiro_crew.session_environment import WORKSPACE_SERVER_NAME
 from kiro_crew.trust_patterns import GrantDeadline, GrantEnded, grant_deadline_guard
 
 if TYPE_CHECKING:
@@ -66,6 +71,7 @@ async def approve_tool(
     *,
     deadline: GrantDeadline | None = None,
     withdraw_if: Callable[[], bool] | None = None,
+    deny_waivers: frozenset[str] = frozenset(),
 ) -> bool:
     """Approve a pending permission request.
 
@@ -94,15 +100,29 @@ async def approve_tool(
     :class:`~kiro_crew.permission_floor.ApprovalWithdrawn` is raised. Under
     the lock it is read ahead of the runtime's liveness check, which
     ``deadline`` follows.
+
+    ``deny_waivers`` reach the floor's gate unchanged, as on
+    ``AcpClient.approve_tool``.
     """
     gate_event = self._permission_gate_events.pop(request_id, None)
+    # Taken first, before any await: it records the session's cancellation
+    # generation, so a turn Stop at any point after this leaves no grant behind.
+    capability = mediated_request_capability.ApprovalMint(self._session_key or "", gate_event)
     # No recorded event means no request this transport built, so there is
     # nothing the floor could judge: refuse rather than approve unjudged.
     if gate_event is None:
         reason: str | None = permission_floor.REASON_NO_EVENT
     else:
-        reason = await asyncio.to_thread(permission_floor.refusal_for, gate_event)
+        if deny_waivers:
+            reason = await asyncio.to_thread(
+                permission_floor.refusal_for, gate_event, deny_waivers=deny_waivers
+            )
+        else:
+            reason = await asyncio.to_thread(permission_floor.refusal_for, gate_event)
     if reason is not None:
+        # Same as ``AcpClient.approve_tool``: drop any earlier grant for this call
+        # id now, since ``reject_tool`` below finds the gate event already popped.
+        mediated_request_capability.invalidate_for_gate_event(self._session_key or "", gate_event)
         logger.warning(
             "approve_tool: security floor rejected req=%s: %s",
             _loggable_request_id(request_id),
@@ -141,14 +161,27 @@ async def approve_tool(
     recheck: dict[str, Callable[[], None]] = {}
     if withdraw_if is not None:
         recheck["withdrawal_check"] = lambda: permission_floor.raise_if_withdrawn(withdraw_if)
-    if deadline is not None:
-        recheck["before_write"] = grant_deadline_guard(deadline, request_id)
+    # Same mediated-secret capability mint as ``AcpClient.approve_tool``: minted
+    # last under the write lock (after the withdrawal, the runtime's liveness
+    # check and the grant deadline), revoked unless the answer actually went out.
+    grant_check = grant_deadline_guard(deadline, request_id) if deadline is not None else None
+
+    def before_write() -> None:
+        if grant_check is not None:
+            grant_check()
+        capability.mint()
+
+    # An approval with nothing to check under the lock is sent as before.
+    if grant_check is not None or capability.applies:
+        recheck["before_write"] = before_write
+    sent = False
     try:
         await self._runtime.send_response(
             request_id,
             {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": resolved_id}},
             **recheck,
         )
+        sent = True
     except GrantEnded:
         # Nothing was written: put the request back exactly as it was.
         if gate_event is not None:
@@ -159,6 +192,8 @@ async def approve_tool(
     except permission_floor.ApprovalWithdrawn:
         self._restore_withdrawn(request_id, gate_event, recorded)
         raise
+    finally:
+        capability.settle(sent=sent)
     if deadline is not None:
         # Answered only now: until the write the request was still pending.
         self._end_human_wait()
@@ -190,7 +225,10 @@ async def reject_tool(self: AcpSessionHandle, request_id: str | int) -> None:
     later tool call in it without prompting.
     """
     recorded = self._permission_options.pop(request_id, None)
-    self._permission_gate_events.pop(request_id, None)
+    gate_event = self._permission_gate_events.pop(request_id, None)
+    # A deny (or cancel) invalidates any mediated-secret grant minted for this
+    # call id (see ``AcpClient.reject_tool``).
+    mediated_request_capability.invalidate_for_gate_event(self._session_key or "", gate_event)
     # Answered (see approve_tool) — a rejection ends the human wait too.
     self._end_human_wait()
     self._note_steering_denial()
@@ -573,6 +611,29 @@ async def apply_session_permission_routing(self: AcpSessionHandle) -> None:
     )
 
 
+def _remote_workdir(remote_workspace: object) -> str:
+    """The guest workdir of an attached remote workspace; empty when unreadable, which
+    leaves its tools unmapped rather than anchored somewhere else."""
+    workdir = remote_workspace.get("workdir") if isinstance(remote_workspace, dict) else None
+    return workdir if isinstance(workdir, str) else ""
+
+
+def _is_native_child_call(handle: AcpSessionHandle, event: AcpEvent) -> bool:
+    """Whether *event* is a native KAS sub-agent's tool call on this session.
+
+    Such a call carries this session's own id; the KAS update handler records its
+    scoped tool-call id when the ``agentSubtaskId`` frame arrives. An event naming
+    no tool call cannot be told apart, so it counts as a child (no grant).
+    """
+    tool_call_id = getattr(event, "tool_call_id", "") or ""
+    if not tool_call_id:
+        return True
+    child_ids = getattr(handle, "_native_child_tool_call_ids", None)
+    if child_ids is None:
+        return False
+    return scoped_tool_cache_key(handle._session_id, tool_call_id) in child_ids
+
+
 def _build_permission_event(self: AcpSessionHandle, msg: JsonRpcMessage) -> AcpEvent | None:
     """Build an AcpEvent for a permission request via the shared parser.
 
@@ -582,6 +643,7 @@ def _build_permission_event(self: AcpSessionHandle, msg: JsonRpcMessage) -> AcpE
     AcpClient. Records the advertised optionIds so approve/reject echo them.
     """
     _perm_params = msg.params if isinstance(msg.params, dict) else {}
+    _remote = getattr(self._runtime, "_remote_workspace", None)
     event, recorded = build_permission_event(
         msg,
         tool_input_cache=self._tool_call_inputs,
@@ -601,6 +663,10 @@ def _build_permission_event(self: AcpSessionHandle, msg: JsonRpcMessage) -> AcpE
         cache_scope=str(_perm_params.get("sessionId") or self._session_id),
         kas_consent_meta=self._runtime.acp_backend == ACP_BACKEND_KAS,
         harness_backend=self._runtime.acp_backend,
+        # Set only on a runtime that attached a remote workspace server, with the
+        # guest workdir its relative path arguments resolve in.
+        remote_workspace_server=(WORKSPACE_SERVER_NAME if _remote is not None else ""),
+        remote_workspace_root=_remote_workdir(_remote),
     )
     if event is None:
         return None
@@ -616,6 +682,28 @@ def _build_permission_event(self: AcpSessionHandle, msg: JsonRpcMessage) -> AcpE
     # structured context; the low-fidelity downgrade applies only when the
     # provenance flags say the context never arrived (frame race, drop).
     frame_sid = str((msg.params or {}).get("sessionId") or "")
+    # Whether the child marks below can be trusted for this backend: only a
+    # backend this transport is proven to tell sub-agent calls apart for
+    # (``security.deny_waiver``) is offered a deny override at all.
+    event.child_calls_marked = child_calls_marked(
+        getattr(self._runtime, "acp_backend", None), ACP_BACKENDS_SHARED_RUNTIME_CHILD_CALLS_MARKED
+    )
     if frame_sid and frame_sid != self._session_id:
         event.sub_session_id = frame_sid
+    elif self._runtime.acp_backend == ACP_BACKEND_KAS and _is_native_child_call(self, event):
+        # A native KAS sub-agent's call carries this session's id, so mark it:
+        # the dashboard keeps the parent's deny overrides away from it.
+        event.native_child_call = True
+    elif self._runtime.acp_backend == ACP_BACKEND_KAS:
+        # What this session's own agent granted and the KAS policy kept at ask,
+        # so the gate can answer the request itself after its checks. A child's
+        # request runs another agent's spec, so it never carries this: neither
+        # one under a foreign sessionId, nor a native KAS sub-agent's tool call,
+        # which shares this session's id and is told apart by the id its
+        # agentSubtaskId frame recorded.
+        event.spec_granted_builtins = frozenset(getattr(self, "kas_crew_answered", ()))
+        event.spec_granted_commands = tuple(getattr(self, "kas_crew_answered_commands", ()))
+        event.spec_shell_allowlist = getattr(self, "kas_spec_shell_allowlist", None)
+        event.spec_write_allowlist = getattr(self, "kas_spec_write_allowlist", None)
+        event.spec_write_cwd = str(getattr(self, "_bound_cwd", "") or "")
     return event

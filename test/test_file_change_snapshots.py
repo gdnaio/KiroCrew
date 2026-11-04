@@ -3,7 +3,8 @@
 Covers:
   * ``_truncate_snapshot`` — caps content at 200KB.
   * ``_safe_read_snapshot`` — reads through the descriptor gate; rejects sensitive
-    paths and hardlink/symlink aliases of them.
+    paths, hardlink/symlink aliases of them, and a protected directory that is
+    itself a symlink.
   * ``_snapshot_write_target`` — captures before-content for write tools only.
   * ``_flush_file_changes`` — dedups, scrubs credentials, attaches to last assistant message
     or creates a synthetic one when the turn aborts before any assistant text.
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -40,11 +42,13 @@ from kiro_crew.acp.types import (
     STOP_REASON_END_TURN,
     AcpEvent,
 )
+from kiro_crew.dashboard.chat_persistence import _build_message_entry
 from kiro_crew.dashboard.chat_runner import (
     _MAX_SNAPSHOT,
     _flush_file_changes,
     _note_reply_row,
-    _run_chat,
+    _on_clear_status,
+    _record_turn_snapshot,
     _safe_read_snapshot,
     _snapshot_write_target,
     _truncate_snapshot,
@@ -437,15 +441,8 @@ class TestFlushFileChanges:
         covers the reset that IS observable). What is left is code intent, so it
         stays a narrow AST check, counted in ``test_source_pin_budget.py``.
         """
-        tree = ast.parse(inspect.getsource(_run_chat))
-        [clear] = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Compare)
-            and isinstance(node.test.comparators[0], ast.Name)
-            and node.test.comparators[0].id == "EVENT_CLEAR_STATUS"
-        ]
+        # The EVENT_CLEAR_STATUS arm's body is the clear phase's, ``_on_clear_status``.
+        [clear] = ast.parse(inspect.getsource(_on_clear_status)).body
         resets = {
             target.id
             for stmt in clear.body
@@ -852,9 +849,9 @@ class TestStrReplaceFullBeforeReconstruction:
         assert result["content"] == self.BEFORE
 
     def test_replace_all_declines_reconstruction(self, tmp_path: Path):
-        """Server review finding: replaceAll doesn't enforce oldStr
+        """A ``replaceAll`` edit doesn't enforce oldStr
         uniqueness, so reversing every newStr occurrence over-reverts any
-        that pre-existed (NEW\\nOLD\\nOLD edited with replaceAll fabricated
+        that pre-existed (NEW\\nOLD\\nOLD edited with replaceAll would show
         +3/−3 instead of +2/−2). Reconstruction declines; fragment chain
         applies."""
         f = tmp_path / "multi.txt"
@@ -910,9 +907,9 @@ class TestStrReplaceFullBeforeReconstruction:
         assert result["content"] == "line 2\n"
 
     def test_ambiguous_new_str_declines_reconstruction(self, tmp_path: Path):
-        """Full-scope review finding: post-write content with MULTIPLE newStr
+        """Post-write content with MULTIPLE newStr
         occurrences (newStr pre-existed elsewhere) makes the edit site
-        ambiguous — reversing an arbitrary occurrence attributed the edit to
+        ambiguous — reversing an arbitrary occurrence would attribute the edit to
         the wrong line. Reconstruction declines; fragment chain applies."""
         f = tmp_path / "ambig.txt"
         f.write_text("NEW\nNEW\n")  # true before was "NEW\nOLD\n" — unknowable
@@ -926,10 +923,10 @@ class TestStrReplaceFullBeforeReconstruction:
         assert result["content"] == "OLD"
 
     def test_post_write_masquerading_as_pre_write_declines(self, tmp_path: Path):
-        """Server review finding: strReplace("ab"→"a") on "aabb" yields "aab",
+        """The edit strReplace("ab"→"a") on "aabb" yields "aab",
         which contains exactly one "ab" and so looks pre-write-plausible —
-        but it IS the post-write state. Classifying it pre-write recorded
-        the after as the before and erased the edit from the chip. With
+        but it IS the post-write state. Classifying it pre-write would record
+        the after as the before and erase the edit from the chip. With
         newStr present and non-unique, post-write cannot be excluded →
         decline."""
         f = tmp_path / "masquerade.txt"
@@ -944,7 +941,7 @@ class TestStrReplaceFullBeforeReconstruction:
         assert result["content"] == "ab"
 
     def test_seam_reformation_declines(self, tmp_path: Path):
-        """Server review finding: oldStr can re-form across the replacement
+        """The oldStr needle can re-form across the replacement
         seam (oldStr='ab', newStr='a', before='abb' → after='ab'), making
         the disk content valid as BOTH states. Dual-hypothesis
         classification declines instead of misclassifying as pre-write."""
@@ -960,7 +957,7 @@ class TestStrReplaceFullBeforeReconstruction:
         assert result["content"] == "ab"
 
     def test_special_file_declines(self):
-        """Server review finding: /dev/zero stats as 0 bytes but reads
+        """/dev/zero stats as 0 bytes but reads
         unboundedly — the S_ISREG gate declines non-regular files before
         any read."""
         result = _snapshot_write_target(
@@ -1016,9 +1013,9 @@ class TestStrReplaceFullBeforeReconstruction:
         assert len(result["content"]) < _MAX_SNAPSHOT + 500
 
     def test_pre_write_with_coincidental_new_str_is_before(self, tmp_path: Path):
-        """Server review finding: pre-write file containing BOTH needles
+        """A pre-write file containing BOTH needles
         (newStr coincidentally pre-exists) must classify as before —
-        reversing the unrelated newStr occurrence fabricated a changed line.
+        reversing the unrelated newStr occurrence would fabricate a changed line.
         oldStr present with oldStr ⊄ newStr PROVES pre-write (strReplace
         consumes every oldStr occurrence)."""
         f = tmp_path / "both.txt"
@@ -1051,7 +1048,7 @@ class TestStrReplaceFullBeforeReconstruction:
         assert result["content"] == "head\nvalue = 1\ntail\n"
 
     def test_oversized_file_declines_reconstruction(self, tmp_path: Path, monkeypatch):
-        """Server review finding: the synchronous reconstruction read runs on
+        """The synchronous reconstruction read runs on
         the event loop — files past _MAX_RECONSTRUCT_BYTES decline and fall
         through to the fragment chain instead of stalling the loop."""
         import kiro_crew.dashboard.chat_runner as cr
@@ -1227,3 +1224,77 @@ class TestContentBlockRedactionAndTruncation:
         # If redact_exfiltration_urls masks the URL, it should differ from raw
         # The entry should still exist (before != after)
         assert "file_changes" in meta
+
+
+# ── a protected directory that is itself a symlink ─────────────────────────
+
+#: An ordinary line no credential pattern recognises, so redaction cannot be what
+#: keeps it out of a chip: only the path refusal can.
+_PRIVATE_NOTE = "private-note-marker-7f3a"
+
+
+@pytest.fixture(params=[(".aws", "credentials"), (".ssh", "id_ed25519")], ids=["aws", "ssh"])
+def symlinked_secret(request, tmp_path: Path, monkeypatch) -> list[str]:
+    """Spellings of a dummy secret reached through a protected dir that is a SYMLINK.
+
+    ``<home>/.aws`` points at a directory OUTSIDE the home, so the store sits
+    outside every lexical anchor: only the target that protected entry resolves
+    to, which the target set carries, fences it by its real path. Returns the
+    absolute, ``~`` and real-path spellings.
+    """
+    protected_dir, leaf = request.param
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / leaf).write_text(f"[default]\n# {_PRIVATE_NOTE}\n", encoding="utf-8")
+    (home / protected_dir).symlink_to(outside, target_is_directory=True)
+    # Path.home() reads USERPROFILE on Windows and never HOME; pin both.
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    spelled = home / protected_dir / leaf
+    assert not spelled.resolve().is_relative_to(home), "precondition: the target is outside"
+    return [str(spelled), f"~/{protected_dir}/{leaf}", os.path.realpath(spelled)]
+
+
+@requires_symlinks
+class TestSymlinkedProtectedDirectory:
+    """``~/.aws`` may itself be a symlink to a directory outside the home. The
+    store is refused on every surface that feeds a file chip, through its
+    protected spelling and through its real path alike."""
+
+    def test_write_target_refuses_the_protected_spelling(self, symlinked_secret):
+        for spelling in symlinked_secret:
+            for command in ("create", "strReplace", "insert"):
+                assert _snapshot_write_target({"command": command, "path": spelling}) is None
+            # The content block's own before-text does not get past the refusal.
+            assert (
+                _snapshot_write_target(
+                    {"command": "strReplace", "path": spelling},
+                    diff_old_text="[default]\n",
+                    diff_path=spelling,
+                )
+                is None
+            )
+
+    def test_snapshot_read_refuses_the_protected_spelling(self, symlinked_secret):
+        for spelling in symlinked_secret:
+            assert _safe_read_snapshot(spelling) is None
+
+    def test_flush_keeps_the_contents_out_of_live_meta_and_history(self, symlinked_secret):
+        """The write chain records nothing for the protected spelling, and the flush
+        reads each AFTER through the same gate, so an entry that reached the
+        accumulator anyway adds nothing either -- not even the line redaction cannot
+        recognise -- to the live meta or to the history entry built from it."""
+        slot = _make_slot_with_assistant_message()
+        for spelling in symlinked_secret:
+            snapshot = _snapshot_write_target({"command": "strReplace", "path": spelling})
+            if snapshot is not None:
+                _record_turn_snapshot(slot, snapshot)
+        # Hand-built, so the flush's own after-read is under test as well.
+        for spelling in symlinked_secret:
+            slot._file_changes.append({"path": spelling, "content": ""})
+        _flush_file_changes(slot)
+        message = slot.messages[-1]
+        assert _PRIVATE_NOTE not in json.dumps(message.get("meta", {}))
+        assert _PRIVATE_NOTE not in json.dumps(_build_message_entry(message))

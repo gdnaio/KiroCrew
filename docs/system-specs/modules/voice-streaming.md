@@ -2,12 +2,13 @@
 
 ## Overview
 
-Dashboard text-to-speech has three providers: the host's built-in speech engine,
-local Piper, and Amazon Polly. `voice_reply.DEFAULT_PROVIDER` selects the
+Dashboard text-to-speech has two providers: the host's built-in speech engine
+and Amazon Polly. `voice_reply.DEFAULT_PROVIDER` selects the
 built-in engine unless configuration selects a valid provider, because it is the
 only one that needs nothing installed on macOS and Windows.
-`chat_voice.api_voice_synthesize()` streams local Piper PCM as small WAV chunks,
-sends built-in-engine output as one WAV chunk, and streams Polly sentences as MP3.
+`chat_voice.api_voice_synthesize()` sends built-in-engine output as one WAV
+chunk and streams Polly sentences as MP3. The local `piper` provider was removed
+([#23154](https://github.com/kirodotdev/KiroCrew/issues/23154)).
 Every synthesis has a request identity so the browser can reject audio from a
 stopped request.
 
@@ -76,11 +77,6 @@ Two properties are load-bearing:
   `test_spawn_audit.py::FIRST_PARTY_SPAWNS` with that reasoning, and
   `test_sapi_claims_the_first_party_carve_out` asserts on the REAL argv that
   neither the voice nor the text appears in it.
-
-  One consequence to keep in view: Piper keeps no carve-out, so fixing its
-  `Scripts\piper.exe` resolution makes `is_available()` report it usable while a
-  spawn still fails closed on Windows without the global opt-in — Piper there is
-  found, not yet audible.
 - **Text never reaches argv.** `say` and `espeak-ng` read it on stdin. SAPI
   reads it from a temp file whose path is interpolated into a base64
   `-EncodedCommand` payload, so no quoting decision is made about model output.
@@ -123,10 +119,22 @@ Telegram and dashboard paths. Three rules:
   decision an operator made. The type is checked before the membership test,
   because `config.json` can hold a list or dict where a string belongs and
   `in VALID_PROVIDERS` would raise on those.
-- An **unnamed** provider on a section that already carries `piper_model` keeps
-  Piper. That section is a working Piper install from before the built-in engine
-  became the default, and resolving it to the default would silently downgrade it
-  to a lower-quality voice on upgrade.
+- A removed provider (`voice_reply.REMOVED_PROVIDERS`, today `piper`) resolves
+  to `DEFAULT_PROVIDER`, and an unnamed provider on a section that still carries
+  `piper_model` resolves like any absent provider (`default_provider()`, which
+  is `DEFAULT_PROVIDER` on a standalone install), each with one warning per
+  process naming the removal. The
+  section's `piper_*` keys stay in `config.json` unread, so a downgrade still
+  finds them, and no file on disk is touched.
+
+### Registered providers
+
+A composed edition can add TTS providers through the `speech` slot on `PlatformContext` (`SpeechProviderRegistry.tts_providers()`; see `platform-context.md`). The default registry adds none, so a standalone install has exactly `VALID_PROVIDERS`. `voice_reply.valid_providers()` is the built-ins plus the registered names.
+
+- **Collision rule.** A registered name may not be a built-in (`polly`, `system`) or a removed provider (`piper`), may not be blank and may not repeat. `speech_providers.validate_speech_registry` refuses any of these at boot with `PlatformCompositionError`, so an edition can add a provider but never replace one.
+- **Default precedence.** A stored provider always wins. Only an absent, null or empty value takes `voice_reply.default_provider()`: the edition's `default_tts()` when it names a selectable provider, else `DEFAULT_PROVIDER`. An invalid stored value still falls back to `DEFAULT_PROVIDER`, never to the edition default, for the same reason it never falls back to Polly.
+
+`GET /api/voice/config` serves the same `providers` list the STT config does (`stt-streaming.md` § "The capability `providers` list"): a built-in row is `{name, builtin: true}` with no probe, a registered row carries `name`, `label`, `builtin`, `available`, `reason`, `action`, `error`; built-ins first in `system`, `polly` order. The Settings picker (`VoicePanel`) renders its options from it and falls back to its own `PROVIDER_OPTIONS` when the list is absent. A registered provider shows none of the built-in field sets; when it cannot run, `SpeechProviderNotice` shows its `reason` under the picker: through `ErrorNotice`, with the agent hand-off, when `error` says its check timed out or raised, and otherwise as status text with any sign-in hint.
 
 ## Components
 
@@ -134,8 +142,7 @@ Telegram and dashboard paths. Three rules:
 |---|---|---|
 | Dashboard routes | `dashboard.routes.sessions.register()` | Registers synthesis, cancellation, configuration, both voice catalogues, and synthesis shutdown cleanup. |
 | Voice endpoints | `dashboard.chat_voice.api_voice_config()`, `api_voice_synthesize()`, `api_voice_cancel()`, `api_voice_voices()`, and `api_voice_system_voices()` | Read and persist configuration, synthesize and interrupt dashboard speech, and return the Polly and built-in-engine catalogues. |
-| Provider implementation | `voice_reply.synthesize_speech()`, `streaming_piper_reply()`, `streaming_voice_reply()`, and `stitch_mp3s()` | Redacts text, selects a provider, streams local PCM, and joins completed Polly chunks. |
-| Resident local voice | `piper_runtime.PiperRuntime`, `piper_worker.serve()` | Owns one sandboxed Piper model and serial framed requests, with cancellation, idle, model-change, and shutdown cleanup. |
+| Provider implementation | `voice_reply.synthesize_speech()`, `streaming_voice_reply()`, and `stitch_mp3s()` | Redacts text, selects a provider, and joins completed Polly chunks. |
 | Streaming playback | `website/src/hooks/websocket/voicePlayback.ts`, `website/src/lib/voicePlayback.ts` | Detects speech boundaries, coalesces pending requests, schedules PCM on one audio clock, and handles interruption. `website/src/hooks/useWebSocket.ts` composes it and routes the `voice_*` frames and the stream and turn boundaries to it. |
 | Playback failures | `website/src/components/VoicePlaybackNotice.tsx` | Displays localized playback or provider failures and retains their machine code in the error report. |
 | Settings | `website/src/pages/settings/VoicePanel.tsx` | Updates auto-speak, provider, and the selected provider's settings; fetches each provider's voice catalogue only while that provider is selected. |
@@ -168,9 +175,7 @@ after a newer response starts.
 
 For Polly, `api_voice_synthesize()` iterates
 `voice_reply.streaming_voice_reply()`, broadcasts each `voice_chunk`, then
-uses `stitch_mp3s()` to broadcast `voice_complete`. For Piper,
-`_synthesize_piper_stream()` broadcasts `voice_chunk` frames while the child
-still runs and collects bounded PCM for one WAV `voice_complete` replay clip.
+uses `stitch_mp3s()` to broadcast `voice_complete`.
 The built-in engine broadcasts its completed WAV. Only the explicit Polly
 provider reaches the Polly branch; a future provider cannot silently reach a
 paid AWS service. Both event types include `audioMime` and echo the synthesis `request_id`.
@@ -241,94 +246,14 @@ error journal at the WebSocket playback owner before dispatching the UI event.
 Thus failures are recorded even when ChatPage is unmounted. The notice consumes
 the same report without creating a duplicate; it owns only page-local recovery.
 
-## Local synthesis pipeline
+## Admission
 
-When no custom `piper_binary` is configured and the gateway interpreter has a
-compatible Piper Python API, `streaming_piper_reply()` uses the dashboard's
-`PiperRuntime`. API capability probing runs off the event loop and never loads
-a voice in the gateway. The owned `python -m kiro_crew.piper_worker` subprocess
-loads `PiperVoice` once and serves serial requests over stdin/stdout. Every
-bounded frame has a type and request identity; PCM additionally carries its
-sample rate. Explicit `ready`, `done`, and `error` frames establish lifecycle and
-request boundaries without relying on quiet periods or process exit.
-
-The dashboard owns at most one loaded Piper model. Changed model/config paths,
-sizes, or modification times retire the old worker before a replacement starts.
-The dashboard admits at most two syntheses: the resident path runs one and can
-queue one, with its 180-second deadline covering both the wait and synthesis.
-Each browser already serializes its sentence requests; the waiter serves
-concurrent clients. Further requests receive HTTP 429 with `voice_busy`, which is
-retryable after the outstanding work finishes. Cancelled work continues to occupy
-capacity until its subprocess and sandbox resources have been reaped. Two clients
-interrupting together can therefore receive 429 for their immediate replacements;
-they can retry Read aloud once cancellation finishes. Releasing admission before
-reaping would let repeated interrupts exceed the model/process bound.
-Successful requests retain it for up to 120 seconds of inactivity. Cancellation,
-an early generator close, malformed output, or a request timeout kills and reaps
-the active worker; a cancelled waiter does not kill another request's worker.
-Application shutdown closes the runtime after cancelling active HTTP requests.
-The first request after startup, eviction, or cancellation still pays the model's
-cold-load and initial phonemizer cost; residency improves subsequent requests,
-not cold inference. Cleanup runs in a tracked, shielded task so repeated
-cancellation cannot abandon the child or its sandbox launcher; the next start
-and shutdown join any outstanding reap before proceeding.
-
-An explicit `piper_binary` or a missing/incompatible Python API retains the CLI
-fallback with `--output-raw`. It loads one model for all phrases in that request.
-Its raw PCM has no reliable per-line end marker, so EOF defines completion. The
-CLI is not reused across requests by guessing that silence means completion.
-Its request retains and shields the bounded reap and sandbox-file cleanup task
-until completion, including when another stop or shutdown cancels it again.
-
-A successful gateway API probe does not guarantee that the isolated worker can
-import and run Piper. If that worker fails before sending any PCM, a synthesis
-or protocol failure, or a non-permission OS failure, can use the discovered CLI
-after the worker is reaped. No available CLI preserves the original failure.
-After any PCM, failure is propagated without replay. Cancellation, timeout,
-sandbox or permission refusal, invalid request/model settings and output limits
-never trigger fallback. One outer 180-second deadline covers both attempts,
-including capability probing and queueing; fallback does not reset the budget.
-Both timeout scopes use `piper_runtime.REQUEST_TIMEOUT_SECONDS`; the runtime
-retains its own bound when called directly. The worker, resident reader, and CLI
-reader share `piper_worker.MAX_AUDIO_BYTES`.
-
-Both paths use `split_sentences()` for CJK/Latin punctuation and newlines, and
-`_piper_phrases()` bounds unpunctuated phrases while preserving their tails.
-
-The model JSON declares the actual sample rate. Invalid or absent audio format
-is a coded failure before spawn; a guessed rate would change pitch and playback
-speed. PCM is signed little-endian mono Int16. Pipe reads are bounded by
-`_PIPER_CHUNK_SECONDS`, and an odd trailing byte carries into the next read.
-`pcm_to_wav()` wraps complete samples for immediate browser decoding. Replay
-encoding runs off the event loop. Piper's own inference still determines when
-the first samples become available; chunk size is not a promised synthesis
-latency.
-
-Model and configuration paths pass the shared sensitive-path gate before the
-gateway reads configuration or starts a worker. Protected paths and paths whose
-resolution stalls fail closed with `voice_model_path_forbidden`; the refusal
-does not include file contents.
-
-The provider bounds total output and runtime and drains stderr concurrently;
-the CLI retains only a bounded diagnostic tail and the resident worker discards
-native diagnostics instead of retaining user text. CLI failure logs pass that
-tail through `redact_log_via_context`, preserving an installed credential policy
-and withholding diagnostic text when its composition fails. Cancellation, timeout, output
-overflow, and early generator closure kill and reap the child before removing
-sandbox resources. The worker uses the same standard sandbox and subprocess
-resource ceilings as the CLI, without an unconfined first-party exception.
-Both dashboard Piper spawn paths remove credential-bearing environment keys
-with the shared `scrub_env` helper and prepare cgroup argv off the event loop,
-matching the upstream built-in engine's controls without changing sandbox policy.
-Unsupported sandbox environments still fail closed. The dashboard explicitly
-closes the generator even when a request is interrupted while it is suspended
-at a yield. `test/test_voice_streaming.py` verifies first PCM before child exit
-through real OS pipes, odd-byte alignment, full replay, errors, and cancellation.
-`test/test_piper_runtime.py` additionally exercises real framed pipes, reuse,
-model replacement, active and waiting cancellations, protocol limits, idle
-eviction, and shutdown. Malformed requests and invalid provider PCM retire the
-worker without a success frame or processing the next request; entrypoint tests
-also verify that model-load failures return a bounded error without native text.
+The dashboard admits at most two syntheses (`chat_voice._MAX_ACTIVE_SYNTHESES`).
+Each browser already serializes its sentence requests; further requests receive
+HTTP 429 with `voice_busy`, which is retryable after the outstanding work
+finishes. Cancelled work keeps its slot until the request task has unwound.
+`test/test_voice_streaming.py` covers request identity, cancellation before and
+during synthesis, and malformed requests.
 
 ## Interruption
 
@@ -336,8 +261,18 @@ also verify that model-load failures return a bounded error without native text.
 Read aloud request. This replaces a prior synthesis even during model loading,
 before any audio has started. `useVoiceInput` also dispatches it when an actual
 batch or streaming recording starts, before microphone acquisition, so the
-recognizer does not capture ongoing synthesized speech. Hover prewarming does
-not interrupt playback. Clicking Read aloud while audio plays stops it.
+recognizer does not capture ongoing synthesized speech. That covers every
+surface built on the hook: the chat composer and the document comment boxes'
+`CommentVoiceButton` (selection comment, image-box comment and thread reply;
+`stt-streaming.md` § "Comment-box dictation"), so pressing a comment box's mic
+stops a reply being read aloud. Hover prewarming does
+not interrupt playback. Clicking Read aloud while audio plays stops it, on
+whichever reply it is clicked, so while `voicePlaying` is set the More menu
+item reads "Stop reading" with a stop glyph (`SpeakMenuItem`). While audio
+is still being prepared a click starts that reply instead, so the item keeps
+reading "Read aloud" until playback begins. The item reads the store only
+under a react-redux Provider, because the app SDK's `ChatEmbed` renders
+`AssistantMessage` with no store.
 The playback owner (`website/src/hooks/websocket/voicePlayback.ts`) maps the
 event to `stopVoice()`, which stops scheduled PCM sources,
 pauses an active media element, revokes queued blob URLs, invalidates pending
@@ -375,17 +310,21 @@ the patch applied to the live `_vc`, so a failed write never leaves the gateway
 running a value the file does not hold. A failed write answers non-2xx with a
 `code`: 500 `config_corrupt` (config.json unreadable), 400
 `config_write_refused`, or 500 `config_write_failed`; success is `{"ok": true}`.
+A `provider` or `engine` the server does not know (or a non-string one) is left
+unsaved while the rest of the patch applies, and the 200 then also carries
+`warnings`: one `{field, code, message}` per such field, with code
+`voice_provider_unknown` or `voice_engine_unknown`.
 
 | Setting | Meaning |
 |---|---|
-| `provider` | Resolved by `voice_reply.resolve_configured_provider()` for every reader; invalid values fall back to `voice_reply.DEFAULT_PROVIDER`, and an unnamed provider beside a configured `piper_model` keeps Piper. |
+| `provider` | Resolved by `voice_reply.resolve_configured_provider()` for every reader; invalid values and the removed `piper` fall back to `voice_reply.DEFAULT_PROVIDER`. |
 | `enabled` | Enables global Slack voice replies. |
 | `auto_speak` | Enables dashboard auto-speak; `api_voice_config()` exposes it as `autoSpeak`. |
 | `voice_id`, `engine`, `pitch` | Polly synthesis settings. The dashboard synthesis endpoint accepts per-request overrides on the Polly path only, as body fields `voice` (not `voice_id`), `engine`, `rate` and `pitch`. |
 | `rate` | Speech rate as a percentage. Shared by Polly and the built-in engine, which converts it to words per minute or to SAPI's `-10..10`. |
 | `system_voice` | The built-in engine's own voice selector; empty means the OS default voice. |
+| `language_code` | BCP-47 tag for spoken replies (`en-US`, `zh-CN`), checked by `voice_reply.validated_language_code()`; empty means each provider's own default language. Handed to edition providers as `voice_config["language_code"]`; Polly and the built-in engine ignore it and speak the language of the selected voice. A malformed stored value reads as empty; the PUT refuses one with 400 `voice_language_invalid`. The GET also serves `language_codes`, the picker's choices: `""`, `speech_languages.COMMON_LANGUAGE_CODES` (the list the STT picker offers), then a stored code outside it. |
 | `aws_profile`, `region` | Passed to the AWS CLI by the Polly provider. |
-| `piper_binary`, `piper_model`, `piper_model_config`, `piper_length_scale` | Piper executable, model, optional model configuration, and validated speed setting. `validate_length_scale()` rejects invalid or non-positive values. |
 
 `dashboard.routes.sessions.register()` registers:
 
@@ -408,7 +347,12 @@ AWS CLI is unavailable. It checks that Polly is the active provider and that
 `aws_consent.refuse_and_log()` grants consent before it invokes
 `aws polly describe-voices`. Those gates keep a direct API request from
 silently using ambient AWS credentials for a provider the operator did not
-select or authorize.
+select or authorize. Both gates run before the cache too, so a cached catalogue
+is served only while Polly is the confirmed provider, and the cache is keyed by
+the `(aws_profile, region)` it was read with: after either changes, the next
+request reads the catalogue again. The handler reads that pair once, so the
+consent check, the cache key and the `describe-voices` command always name the
+same account and region even when a config PUT lands mid-request.
 
 ## Provider safety
 
@@ -436,8 +380,31 @@ Text-to-speech settings link. A refusal while the consent stands (the account co
 not be re-checked, or the consent changed during the check) returns no audio for
 that sentence, and the next sentence is checked again.
 
-`_synthesize_polly()` and `streaming_piper_reply()` run their commands through
-`wrap_argv_async(..., _prepare=wrap_argv)`. `_synthesize_piper()` instead delegates
+
+On the same `raise_refusal=True` path, the one Polly failure #17511 reports —
+the chosen voice or engine is not offered in the request's region, which AWS
+rejects identically for every sentence — is matched from the CLI stderr
+(`_classify_polly_failure`) and raises
+`VoiceSynthesisError("voice_polly_rejected")`, whose notice names the
+voice/engine/region fix. It is the only AWS failure turned into a raise, because
+it is the only one whose fix is the one action the notice names and the only one
+that repeats for every sentence. Every other nonzero exit — a sentence-scoped
+SSML or parameter error, a credential or access error, a transport blip — keeps
+the old `None`/skip-per-sentence behaviour, so the dashboard shows its generic
+notice, which is the honest answer when the remedy is not "change the voice,
+engine or region". A general AWS-error taxonomy is a separate change, not this
+fix. The raise stops at the first sentence rather than being retried once per
+sentence; the AWS message can echo the SSML, so the code's text is fixed and the
+message stays in the log. The unattended callers keep the `None`/text-fallback
+contract on every failure. `voiceFailureMessage()` maps the code to its own
+localized notice. The client's own speech engine does not depend on the AWS
+region, so `voice_polly_rejected` is a client-fallback code alongside
+`voice_unavailable` (`_CLIENT_FALLBACK_CODES` in `chat_voice.py`): its error
+payloads carry `speakable`, and a manual Read aloud that allowed the fallback
+speaks the reply on the client instead of showing the notice.
+
+`_synthesize_polly()` runs its command through
+`wrap_argv_async(..., _prepare=wrap_argv)`. `_synthesize_system()` instead delegates
 to `_run_tts_subprocess()`, which uses `sandboxed_spawn_argv_async()` and the
 credential-scrubbed child environment. Those chokepoints catch
 `SandboxUnavailableError` separately from provider failures, log the sandbox
@@ -482,10 +449,6 @@ surface can show:
   sentence-chunked one; Polly needs its own clause because without it the refusal
   would fall to the generic handler — a 500 with no note — and stay invisible on a
   Polly host, which is the defect itself rather than a cosmetic difference.
-  The `piper` provider takes neither: it has its own streaming path whose runtime
-  converts the refusal into `VoiceSynthesisError("voice_sandbox_unavailable")`,
-  which carries the sandbox's own prose to the HTTP caller but raises no
-  notification; recovering the note there would mean reading the preserved cause.
 - `synthesize_and_deliver()` has no channel for prose, so it still reports "no
   audio" and catches the refusal explicitly so it cannot escape as an unhandled
   error on a voice reply. Both callers drop that signal — Slack's

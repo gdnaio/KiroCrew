@@ -1248,7 +1248,9 @@ class TestNoBlockingCallsOnTheLoop:
 
     #: Module-level helpers in ``routes`` itself that block. The validation gate is
     #: the headline: it resolves and stats before any handler work happens.
-    _BLOCKING_LOCAL_FNS = frozenset({"_project", "_project_for_create", "_safe_relative"})
+    _BLOCKING_LOCAL_FNS = frozenset(
+        {"_name_from_document", "_project", "_project_for_create", "_safe_relative"}
+    )
 
     #: Every ``store`` function that resolves, opens, walks, stats, or writes.
     _BLOCKING_STORE_FNS = frozenset(
@@ -1458,7 +1460,7 @@ class TestNoBlockingCallsOnTheLoop:
         assert offenders == [], offenders
 
     def test_the_reported_gate_is_offloaded_everywhere_it_is_used(self) -> None:
-        """The exact helpers the CI reviewer flagged, at every call site.
+        """The containment helpers are offloaded at every call site.
 
         ``safe_project_dir`` / ``safe_child`` are the containment gate, so they run in
         EVERY path-bearing handler. Each occurrence must therefore be inside a sync
@@ -1523,7 +1525,12 @@ class TestNoBlockingCallsOnTheLoop:
         """The helpers a worker thread runs say so, per the repo convention."""
         import inspect
 
-        for helper in (routes._project, routes._project_for_create, routes._safe_relative):
+        for helper in (
+            routes._name_from_document,
+            routes._project,
+            routes._project_for_create,
+            routes._safe_relative,
+        ):
             doc = inspect.getdoc(helper) or ""
             assert "BLOCKING" in doc, f"{helper.__name__} must document that it blocks"
 
@@ -1840,3 +1847,28 @@ class TestPaperTitleRoute:
             )
         )
         assert _FAKE_AWS_SECRET not in _json_of(response)["title"]
+
+
+def test_each_finished_compile_is_counted_after_the_compile():
+    """``app.task.completed`` counts a Papyrus compile once it has finished."""
+    import ast
+
+    tree = ast.parse(Path(routes.__file__).read_text(encoding="utf-8"))
+    fn = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "_handle_compile"
+    )
+
+    def lines(name: str) -> list[int]:
+        return [
+            n.lineno
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and (n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", ""))
+            == name
+        ]
+
+    (rec_line,) = lines("record_app_task")
+    (compile_line,) = lines("compile_project")
+    assert rec_line > compile_line

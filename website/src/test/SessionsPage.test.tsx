@@ -136,6 +136,24 @@ describe('SessionsPage', () => {
     expect(screen.getByTestId('chat-sid')).toHaveTextContent('s1')
   })
 
+  it('labels an untitled session "Untitled session", never its key, and still opens the key (#20875)', async () => {
+    renderPage([
+      slot('chat-9-1785440411', '', NOW - 60_000),
+      slot('chat-8-1785440400', 'chat-8-1785440400', NOW - 120_000),
+      slot('s-named', 'Named work', NOW - 180_000),
+    ])
+    const untitled = await screen.findByTestId('sessions-row-chat-9-1785440411')
+    expect(untitled).toHaveTextContent('Untitled session')
+    expect(untitled.textContent).not.toContain('chat-9-1785440411')
+    const keyTitled = screen.getByTestId('sessions-row-chat-8-1785440400')
+    expect(keyTitled).toHaveTextContent('Untitled session')
+    expect(keyTitled.textContent).not.toContain('chat-8-1785440400')
+    expect(screen.getByTestId('sessions-row-s-named')).toHaveTextContent('Named work')
+
+    fireEvent.click(untitled)
+    expect(screen.getByTestId('chat-sid')).toHaveTextContent('chat-9-1785440411')
+  })
+
   it('never auto-selects or auto-creates: empty store renders empty state, no slot created', async () => {
     const { store } = renderPage([])
     expect(await screen.findByTestId('empty-state')).toBeInTheDocument()
@@ -162,13 +180,14 @@ describe('SessionsPage', () => {
     expect(screen.getByTestId('sessions-row-s1')).toBeInTheDocument()
   })
 
-  it('renders the page header title and marks the active chip with aria-pressed', async () => {
+  it('renders the page header title and marks the active chip as the checked radio', async () => {
     renderPage([slot('s1', 'A session', NOW - 60_000)], ['s1'])
     expect(await screen.findByTestId('page-title')).toHaveTextContent('All sessions')
     const unreadChip = screen.getByTestId('sessions-chip-unread')
-    expect(unreadChip).toHaveAttribute('aria-pressed', 'false')
+    expect(unreadChip).toHaveAttribute('role', 'radio')
+    expect(unreadChip).toHaveAttribute('aria-checked', 'false')
     fireEvent.click(unreadChip)
-    expect(unreadChip).toHaveAttribute('aria-pressed', 'true')
+    expect(unreadChip).toHaveAttribute('aria-checked', 'true')
   })
 
   it('Unread chip filters to unread sessions and toggles back to All', async () => {

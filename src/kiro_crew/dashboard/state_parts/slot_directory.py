@@ -34,6 +34,7 @@ from kiro_crew.messaging.link import (
     is_channel_session_key,
     split_namespaced_channel_id,
 )
+from kiro_crew.milestones import record as record_milestone
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 if TYPE_CHECKING:
@@ -44,7 +45,8 @@ logger = logging.getLogger("kiro_crew.dashboard.state")
 
 #: The single ceiling on live slots, owned by the module that owns the slot
 #: table (see :meth:`DashboardState.live_slot_count`). Every path that allocates
-#: a slot -- session create, chat fork, session import -- tests ``live_slot_count()``
+#: a slot -- session create, chat fork, session import, the workflow result
+#: fallback (``workflow_inject``) -- tests ``live_slot_count()``
 #: against this one number, so raising the ceiling is a single edit and no entry
 #: point can silently drift to a different limit.
 MAX_LIVE_SLOTS = 500
@@ -270,7 +272,7 @@ def get_slot(self: DashboardState, name: str) -> _ChatSlot | None:
     layer for any construction path that keeps the slot registered while it
     awaits: acquisition must not hand out a not-yet-finalized session.
     ``serialize_slots`` hides it from the payload; resume dedup reads
-    ``_slots`` directly (``_live_slot_resume_response``), so a resuming slot
+    ``_slots`` directly (``_live_slot_resume_payload``), so a resuming slot
     stays discoverable for dedup while acquisition through this door is
     refused.
     """
@@ -563,6 +565,7 @@ def get_or_create_slot(
     slot._on_card_event = self.notify_dashboard_card
     slot._on_question_retired = self._broadcast_question_retired
     slot._coordinator_approvals = self.pending_coordinator_approvals
+    slot._linked_session_busy = self.linked_session_busy
     slot._app = app
     # ``origin`` must be declared by the layer that actually knows it, and
     # an undeclared non-app slot stays UNTAGGED ("") rather than being
@@ -602,6 +605,10 @@ def get_or_create_slot(
         # block must not become a suspension point, or callers could observe
         # a half-configured slot.
         increment_user_session_count_off_loop()
+        # Milestones derive state only from persistent, non-ephemeral chats.
+        # The write runs off-loop and never raises.
+        if not ephemeral and memory_mode in (None, "", "persistent"):
+            record_milestone("chats-opened")
     if memory_mode and memory_mode != "persistent":
         self._restricted_keys.add(f"dashboard:{name}")
     if ephemeral:
@@ -644,6 +651,11 @@ def get_or_create_slot(
             if isinstance(resolved, str) and is_channel_session_key(resolved):
                 slot.linked_session_key = resolved
                 self.note_crew_log_class(slot)
+    # The history key is final now: share the binding of any live alias on it, so
+    # this slot and its peers hold one project directory for their one session.
+    from kiro_crew.dashboard.transcript_binding import bind_transcript
+
+    bind_transcript(self, slot)
     try:
         if self.sessions:
             from kiro_crew.dashboard.chat_utils import effective_session_key

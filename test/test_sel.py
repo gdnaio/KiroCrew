@@ -37,6 +37,7 @@ from conftest import requires_symlinks
 from kiro_crew import platform_compat
 from kiro_crew import sel as kiro_crew_sel
 from kiro_crew.sel import SecurityEvent, SecurityEventLog, _infer_source, sel
+from kiro_crew.testing.wait import async_wait_until, wait_until
 
 
 class TestHmacKeyManagement:
@@ -466,12 +467,20 @@ log.flush()
             for tag in tags
         ]
         try:
-            deadline = time.monotonic() + 60
-            while not all((sync_dir / f"ready-{tag}").exists() for tag in tags):
-                assert time.monotonic() < deadline, "children never became ready"
+
+            def _all_ready() -> bool:
                 for proc in procs:
                     assert proc.poll() is None, f"child exited early: {proc.communicate()}"
-                time.sleep(0.01)
+                return all((sync_dir / f"ready-{tag}").exists() for tag in tags)
+
+            wait_until(
+                _all_ready,
+                timeout=60,
+                describe=lambda: (
+                    "children never became ready: "
+                    f"{sorted(p.name for p in sync_dir.glob('ready-*'))}"
+                ),
+            )
             (sync_dir / "go").write_text("1", encoding="utf-8")
 
             for proc in procs:
@@ -945,15 +954,17 @@ log.flush()
         t2.start()
         try:
             assert entered.wait(5)
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
+
+            def _hold_kind() -> str | None:
                 with kiro_crew_sel._CHAIN_HOLDS_MUTEX:
                     hold = kiro_crew_sel._CHAIN_HOLDS.get(key)
-                    if hold is not None and hold.kind == "prune":
-                        break
-                time.sleep(0.01)
-            else:
-                pytest.fail("prune join never promoted the hold's kind")
+                return None if hold is None else hold.kind
+
+            await async_wait_until(
+                lambda: _hold_kind() == "prune",
+                timeout=5,
+                describe=lambda: f"prune join never promoted the hold's kind: {_hold_kind()!r}",
+            )
             # Pre-fix: the hold still reads "append", so this JOINS -- and in
             # production would wait behind the streaming rewrite.
             with pytest.raises(OSError):
@@ -1367,6 +1378,39 @@ class TestInferSource:
     ])
     def test_infer_source(self, key, expected):
         assert _infer_source(key) == expected
+
+    def test_infer_source_still_files_the_bare_dashboard_key_under_slack(self):
+        # Governance binds a profile through _infer_source, so the audit-label fix
+        # for the dashboard handlers' bare caller leaves it unchanged.
+        assert _infer_source("dashboard") == "slack"
+
+
+class TestDashboardHandlerRowsCarryTheDashboardSource:
+    """The dashboard's own handlers log under the bare caller ``"dashboard"``."""
+
+    def test_a_file_read_row_from_the_dashboard_carries_source_dashboard(self, log, sel_dir):
+        log.log_tool_invocation(
+            session_key="dashboard", tool_name="file_read", outcome="success", resources="/x"
+        )
+        data = json.loads((sel_dir / "security_events.jsonl").read_text(encoding="utf-8"))
+        assert data["source"] == "dashboard"
+        assert data["caller_identity"] == "dashboard"
+
+    def test_an_explicit_source_still_wins(self, log, sel_dir):
+        log.log_tool_invocation(
+            session_key="dashboard", source="cron", tool_name="file_read", outcome="success"
+        )
+        data = json.loads((sel_dir / "security_events.jsonl").read_text(encoding="utf-8"))
+        assert data["source"] == "cron"
+
+    @pytest.mark.parametrize(
+        "key,expected",
+        [("dashboard:slot0", "dashboard"), ("C08HZAWV4TP:thread123", "slack"), ("", "unknown")],
+    )
+    def test_other_keys_keep_their_inferred_source(self, log, sel_dir, key, expected):
+        log.log_tool_invocation(session_key=key, tool_name="file_read", outcome="success")
+        data = json.loads((sel_dir / "security_events.jsonl").read_text(encoding="utf-8"))
+        assert data["source"] == expected
 
 
 class TestSingleton:

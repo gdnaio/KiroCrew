@@ -7,14 +7,16 @@
  */
 import { useEffect, useState, useCallback, useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { useReducedMotion } from 'framer-motion'
 import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import {
   ArrowLeft, Download, Check, Loader2, Power, PowerOff,
   Trash2, RefreshCw, Bot, Zap, ArrowUp,
-  Clock, ChevronLeft, ChevronRight, X, Monitor, Copy, Terminal,
-  Target, Settings2, Star, ShieldAlert,
+  Clock, X, Monitor, Copy, Terminal,
+  Target, Settings2, Star, ShieldAlert, ExternalLink, MoreHorizontal,
 } from 'lucide-react'
+import {
+  DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
+} from '../components/ui/dropdown-menu'
 import { needsDesktopApp } from '../lib/electron'
 import { api } from '../api/client'
 import { isNotFoundError } from '../api/apiError'
@@ -28,16 +30,20 @@ import TrustAppModal, {
 import { isRegistrySourced, normalizeRegistryApp, type RegistryApp } from '../components/appstore/types'
 import AppSource from '../components/appstore/AppSource'
 import { consentTierFor } from '../components/appstore/registryTier'
+import { backendRefusedNotice } from '../components/appstore/backendRefused'
 import { recordEvent } from '../rum'
 import { useTheme } from '../hooks/useTheme'
-import { DOUBLE_TAP_MS, DOUBLE_TAP_SLOP, DOUBLE_TAP_ZOOM, usePinchZoom } from '../hooks/usePinchZoom'
-import { useScrollEdges } from '../hooks/useScrollEdges'
+import { useActionsInFlight } from '../hooks/useActionsInFlight'
+import { useMenuOpensDialog } from '../hooks/useMenuOpensDialog'
 import ErrorNotice from '../components/ErrorNotice'
 import { useConfirm } from '../components/ConfirmDialog'
 import { findReport, recordError } from '../utils/errorReport'
 import { copyCode } from '../utils/clipboard'
+import AppStoreDialog from '../components/appstore/AppStoreDialog'
+import { safeHttpUrl } from '../lib/safeUrl'
 
 import { i18nT } from '../i18n/t'
+import LinkOpenChoices from '../linkOpen/LinkOpenChoices'
 import type { AppContributor } from '../types'
 import {
   appDisplayName, appDescription, appHighlights, appUseCases, appConfiguration,
@@ -45,582 +51,17 @@ import {
 import { isBuiltinServerRow, mergeBuiltinRow } from '../components/appstore/mergeBuiltinRow'
 import { classifyManifestArt, installedArt, installedArtList, installedArtListAligned, installedIcon } from '../components/appstore/useHeroArt'
 import { fmtDateNumeric, fmtCompact, fmtNumber } from '../i18n/format'
-type AppInfo = Pick<RegistryApp, '_registry' | 'provenance'> & {
-  catalogListed?: boolean
-  name: string
-  displayName: string
-  description: string
-  version: string
-  author: string
-  icon?: string
-  iconUrl?: string
-  iconUrlDark?: string
-  // Second-chance icon art: an INSTALLED app's own local route, consulted by
-  // AppIcon only when the primary (usually registry) URL fails to load.
-  iconUrlFallback?: string
-  iconUrlFallbackDark?: string
-  tags?: string[]
-  highlights?: string[]
-  useCases?: string[]
-  configuration?: string[]
-  screenshots?: string[]
-  screenshotsDark?: string[]
-  heroImage?: string
-  heroImageDark?: string
-  heroImageDetail?: string
-  heroImageDetailDark?: string
-  // Second-chance hero/screenshot art (#6864): an INSTALLED app's own local
-  // routes, consulted only when the primary (usually registry) URL fails to
-  // load. Optional because only the installed branch sets them — a
-  // not-installed app has no local bytes, so hide-on-error stays its terminal
-  // state. The screenshot lists are index-aligned with their primaries.
-  heroImageFallback?: string
-  heroImageDarkFallback?: string
-  heroImageDetailFallback?: string
-  heroImageDetailDarkFallback?: string
-  screenshotsFallback?: string[]
-  screenshotsDarkFallback?: string[]
-  repo?: string
-  trustRepository?: string
-  branch?: string
-  /**
-   * GitHub star count baked into git-type third-party rows by the publisher.
-   * Display-only and server-sanitized; built-ins never carry it, so presence
-   * is the display gate.
-   */
-  stargazersCount?: number
-  // Installed state
-  installed: boolean
-  installedVersion?: string
-  enabled?: boolean
-  sessionApprovalConsentPending?: boolean
-  approvedGrants?: { api?: string[]; events?: string[] }
-  managed?: string
-  source?: string
-  installedAt?: string
-  updateAvailable?: boolean
-  // Three-axis classification
-  origin?: string     // "builtin" | "registry" | "local" | "external"
-  resources?: string  // "gateway" | "app"
-  lifecycle?: string  // "gateway" | "app" | "locked"
-  // Platform
-  platform?: { os?: string[]; installMode?: string; clientInstall?: { shell?: string; postInstall?: string }
-    // Set when the app's UI needs the Electron shell (native windows,
-    // global shortcuts, tray). A UX gate only — the marker is client-side.
-    requiresDesktopApp?: boolean }
-  // Manifest (from installed app)
-  manifest?: AppManifest
-}
-
-interface McpServerConfig {
-  url?: string
-  command?: string
-  autoApprove?: string[]
-  [key: string]: unknown
-}
-
-interface AppPermissions {
-  api?: string[]
-  events?: string[]
-  mcpTools?: string[]
-  storage?: boolean
-  cron?: boolean
-  network?: boolean
-  memory?: boolean | string
-  sessionApproval?: boolean
-  [key: string]: unknown
-}
-
-/** A registry app entry from /api/apps/registry — a superset of the fields we
- *  read here, spread into AppInfo when there's no installed app. */
-interface RegistryEntry extends Partial<AppInfo> {
-  name: string
-  updateAvailable?: boolean
-}
-
-/** A registry entry after `normalizeRegistryApp`: its display fields are always
- *  strings (fallbacks filled) and its star count is sanitized. */
-type NormalizedRegistryEntry = RegistryEntry & Pick<AppInfo, 'displayName' | 'description' | 'version' | 'author'>
-
-interface AppManifest {
-  displayName?: string
-  description?: string
-  version?: string
-  author?: string
-  tags?: string[]
-  highlights?: string[]
-  useCases?: string[]
-  configuration?: string[]
-  screenshots?: string[]
-  screenshotsDark?: string[]
-  // Store-listing metadata. For built-in apps these live on the manifest
-  // (preserved through AppManifest.extra) rather than on a registry entry —
-  // built-ins are not part of the /api/apps/registry feed.
-  iconUrl?: string
-  iconUrlDark?: string
-  // Repo-relative icon paths. An external app declares these (the backend
-  // rewrites them into blob-proxy URLs on a registry row); `iconUrl` is the
-  // built-in spelling.
-  iconPath?: string
-  iconPathDark?: string
-  // The repo an external app's art paths are relative to, when the manifest
-  // declares it.
-  repo?: string
-  heroImage?: string
-  heroImageDark?: string
-  heroImageDetail?: string
-  heroImageDetailDark?: string
-  ui?: { pages?: { route?: string; label?: string; icon?: string; iconUrl?: string }[] }
-  // Installed apps carry the platform config here (a registry/catalog entry
-  // exposes it top-level instead); `needsDesktopApp` reads both. Without this the
-  // desktop requirement was invisible on surfaces that pass the manifest shape.
-  platform?: { requiresDesktopApp?: boolean; os?: string[] }
-  agents?: string[]
-  skills?: string[]
-  crons?: { name: string }[]
-  mcpServers?: Record<string, McpServerConfig>
-  permissions?: AppPermissions
-  minKiroCrewVersion?: string
-}
-
-type ScreenshotFailureState = {
-  screensKey: string
-  fallbacksKey: string
-  primary: ReadonlySet<number>
-  fallback: ReadonlySet<number>
-}
-
-const NO_SCREENSHOT_FAILURES: ReadonlySet<number> = new Set()
-
-function recordScreenshotFailure(
-  previous: ScreenshotFailureState,
-  screensKey: string,
-  fallbacksKey: string,
-  index: number,
-  tier: 'primary' | 'fallback',
-): ScreenshotFailureState {
-  // A failure belongs to the generation that rendered the image. The URL lists
-  // are re-armed during render (below), so a handler still holding an older
-  // generation's keys is by definition superseded: drop it rather than let it
-  // resurrect a set the current generation already cleared.
-  if (previous.screensKey !== screensKey || previous.fallbacksKey !== fallbacksKey) {
-    return previous
-  }
-  const primary = new Set<number>(previous.primary)
-  const fallback = new Set<number>(previous.fallback)
-  if (tier === 'primary') primary.add(index)
-  else fallback.add(index)
-  return { screensKey, fallbacksKey, primary, fallback }
-}
-
-// Exported for tests: the per-index latch guards (self-match, '' placeholder
-// skip) are not all reachable through the page once the call site gates the
-// fallback list on a registry-supplied primary.
-
-/** Screenshot zoom bounds. `1` is fit-to-viewport. The ceiling matches the
- *  image viewer's (5), not the diagram viewer's (8): a screenshot is raster
- *  pixels, and 8x would only blur it, while a vector diagram's labels need the
- *  deeper zoom to become readable. */
-const SCREENSHOT_ZOOM_MIN = 1
-const SCREENSHOT_ZOOM_MAX = 5
-/** Travel a one-finger drag must cover before it counts as a pan rather than a
- *  tap — below it the double-tap path is left alone. */
-const DRAG_SLOP = 6
-
-export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: string[]; fallbacks?: string[] }) {
-  const [selected, setSelected] = useState<number | null>(null)
-  const [attachEdges, edges, remeasure] = useScrollEdges<HTMLDivElement>()
-  // Both lists are TYPED string[] but can arrive as arbitrary JSON at
-  // runtime: the registry-only branch spreads the raw (third-party) registry
-  // row into the view model, so a malformed row declaring `screenshots: {}`
-  // or a colliding `screenshotsFallback` key reaches this component as-is,
-  // and a bare `.join`/`.map` would take the whole page down. Same
-  // unknown-typed defensiveness as installedArtList (GPT review finding on
-  // #6886; the `screenshots` case pre-existed as a `.map` crash).
-  const screenList: string[] = Array.isArray(screenshots) ? screenshots : []
-  const fallbackList: string[] = Array.isArray(fallbacks) ? fallbacks : []
-  // Per-thumbnail failure latches: a thumbnail whose primary errored swaps to
-  // ITS OWN fallback; one
-  // whose fallback errored too is hidden — the pre-#6864 terminal state.
-  // Per-index state, not one flag for the strip: one unreachable asset must
-  // not blank its neighbours. `fallbacks` is optional so untouched callers
-  // stay default-inert (the contract #6865 locked for AppIcon).
-  const screensKey = screenList.join('\n')
-  const fallbacksKey = fallbackList.join('\n')
-  // The scroller keeps its box while its thumbnails change (list refetch, a
-  // thumbnail resolving or going terminal), so only this remeasure refreshes
-  // the edge cue; per-image onLoad covers late width settling. The remeasure
-  // effect itself lives below, after the failure latches it depends on.
-  // Re-arm the latches during render rather than in a passive effect. An image
-  // rendered for a new generation can fail BEFORE an effect would run, and the
-  // effect's reset would then erase that real failure and re-show the dead URL.
-  // Adjusting state while rendering re-arms before the new <img> is committed,
-  // and — unlike binding failures to the URL text alone — it clears on EVERY
-  // transition, so returning to an earlier list (theme flip back, refetch)
-  // retries instead of restoring a stale failure. A primary-list change re-arms
-  // both latch sets; a fallback-only change re-arms only the fallback latches.
-  const [failures, setFailures] = useState<ScreenshotFailureState>(() => ({
-    screensKey,
-    fallbacksKey,
-    primary: NO_SCREENSHOT_FAILURES,
-    fallback: NO_SCREENSHOT_FAILURES,
-  }))
-  if (failures.screensKey !== screensKey) {
-    setFailures({
-      screensKey,
-      fallbacksKey,
-      primary: NO_SCREENSHOT_FAILURES,
-      fallback: NO_SCREENSHOT_FAILURES,
-    })
-  } else if (failures.fallbacksKey !== fallbacksKey) {
-    setFailures({
-      screensKey,
-      fallbacksKey,
-      primary: failures.primary,
-      fallback: NO_SCREENSHOT_FAILURES,
-    })
-  }
-  const primaryFailed = failures.screensKey === screensKey
-    ? failures.primary
-    : NO_SCREENSHOT_FAILURES
-  const fallbackFailed = failures.screensKey === screensKey
-    && failures.fallbacksKey === fallbacksKey
-    ? failures.fallback
-    : NO_SCREENSHOT_FAILURES
-
-  // Refresh the edge cue when the thumbnail set changes. A thumbnail going
-  // terminal UNMOUNTS its button (resolvedAt -> ''), shrinking scrollWidth
-  // with no onLoad, no box resize and — at scrollLeft 0 — no scroll event, so
-  // the failure-latch sizes are a dep alongside screensKey: an unmount that
-  // makes the strip fit must clear a now-stale right-edge fade.
-  const failedCount = primaryFailed.size + fallbackFailed.size
-  useEffect(() => { remeasure() }, [screensKey, failedCount, remeasure])
-
-  // ── screenshot magnification (issue #6162) ────────────────────────────────
-  // This lightbox is the third full-viewport magnify overlay, bound by the same
-  // own-your-zoom rule as the image viewer and DiagramLightbox (narrow-viewport.md):
-  // page zoom is off on touch shell-wide, so a phone user has no other way to
-  // inspect a fit-scaled screenshot. Unlike those two, the surface also owns
-  // prev/next navigation and click-to-dismiss, so the shared hook supplies only
-  // the gesture math while the page keeps those interactions.
-  const dialogRef = useRef<HTMLDivElement | null>(null)
-  const imgRef = useRef<HTMLImageElement | null>(null)
-  const reduceMotion = useReducedMotion()
-  // A finished pinch or double-tap synthesises a click; without suppression it
-  // reaches the backdrop handler and closes the viewer the user just zoomed
-  // into (mirrors DiagramLightbox's `suppressClickRef`).
-  const suppressClickRef = useRef(false)
-  const lastTapRef = useRef({ t: 0, x: 0, y: 0 })
-  const [dragging, setDragging] = useState(false)
-  const dragRef = useRef({ id: -1, startX: 0, startY: 0, baseX: 0, baseY: 0, active: false })
-  const open = selected !== null
-  const {
-    zoom, setZoom, pan, setPan, pinching, clampPan,
-    trackPointerDown, trackPointerMove, trackPointerUp, reset,
-  } = usePinchZoom({
-    targetRef: imgRef,
-    // Claim a trackpad gesture anywhere in the overlay, not just over the
-    // image: around a small or portrait screenshot most of the backdrop is
-    // visually part of the viewer (mirrors DiagramLightbox).
-    containRef: dialogRef,
-    // Only while the lightbox is open. It unmounts its viewers by returning
-    // null elsewhere, but the component itself stays mounted and a non-passive
-    // `wheel` listener would otherwise sit on `window` for the page's lifetime.
-    enabled: open,
-    min: SCREENSHOT_ZOOM_MIN,
-    max: SCREENSHOT_ZOOM_MAX,
-    onPinchEnd: () => { suppressClickRef.current = true },
-  })
-
-  // Reset to fit whenever the selected screenshot changes, so a zoom applied to
-  // one screenshot is never inherited by the next (mirrors DiagramLightbox's
-  // reset on `svg` change).
-  useEffect(() => { reset() }, [selected, reset])
-
-  // Re-clamp the pan after a zoom change: the pannable box is a function of the
-  // zoom, so shrinking back toward fit must pull an out-of-range pan back in.
-  useEffect(() => { setPan(p => (zoom <= SCREENSHOT_ZOOM_MIN ? { x: 0, y: 0 } : clampPan(p.x, p.y))) }, [zoom, clampPan, setPan])
-
-  /** Double-tap toggles fit <-> DOUBLE_TAP, anchored where the user tapped so
-   *  the detail they aimed at is what they get. */
-  const onTap = useCallback((e: React.PointerEvent<HTMLImageElement>) => {
-    if (e.pointerType === 'mouse') return
-    const now = Date.now()
-    const last = lastTapRef.current
-    const isDouble = now - last.t < DOUBLE_TAP_MS && Math.hypot(e.clientX - last.x, e.clientY - last.y) < DOUBLE_TAP_SLOP
-    lastTapRef.current = { t: now, x: e.clientX, y: e.clientY }
-    if (!isDouble) return
-    lastTapRef.current = { t: 0, x: 0, y: 0 }
-    suppressClickRef.current = true
-    if (zoom > SCREENSHOT_ZOOM_MIN) { setZoom(SCREENSHOT_ZOOM_MIN); setPan({ x: 0, y: 0 }); return }
-    const cx = window.innerWidth / 2
-    const cy = window.innerHeight / 2
-    const z = DOUBLE_TAP_ZOOM
-    setZoom(z)
-    setPan(clampPan((e.clientX - cx) * (1 - z), (e.clientY - cy) * (1 - z), z))
-  }, [zoom, setZoom, setPan, clampPan])
-
-  const onImgPointerDown = useCallback((e: React.PointerEvent<HTMLImageElement>) => {
-    // Clear here (not on the wrapper) because the <img> stops propagation, so
-    // a wrapper-level clear would never run for an image click.
-    suppressClickRef.current = false
-    // A pinch owns the gesture when it seats; neither the tap nor the pan path
-    // must also run. The first contact already ran through `onTap` and left a
-    // tap candidate, so clear it.
-    if (trackPointerDown(e)) {
-      lastTapRef.current = { t: 0, x: 0, y: 0 }
-      dragRef.current.active = false
-      setDragging(false)
-      return
-    }
-    onTap(e)
-    if (zoom <= SCREENSHOT_ZOOM_MIN) return
-    dragRef.current = { id: e.pointerId, startX: e.clientX, startY: e.clientY, baseX: pan.x, baseY: pan.y, active: true }
-  }, [trackPointerDown, onTap, zoom, pan])
-
-  const onImgPointerMove = useCallback((e: React.PointerEvent<HTMLImageElement>) => {
-    if (trackPointerMove(e)) return
-    const d = dragRef.current
-    if (!d.active || e.pointerId !== d.id) return
-    const dx = e.clientX - d.startX
-    const dy = e.clientY - d.startY
-    // Below the slop the gesture is still a candidate tap; committing to a drag
-    // early would eat the double-tap.
-    if (!dragging && Math.hypot(dx, dy) < DRAG_SLOP) return
-    if (!dragging) {
-      setDragging(true)
-      lastTapRef.current = { t: 0, x: 0, y: 0 }
-    }
-    suppressClickRef.current = true
-    setPan(clampPan(d.baseX + dx, d.baseY + dy))
-  }, [trackPointerMove, dragging, clampPan, setPan])
-
-  const onImgPointerUp = useCallback((e: React.PointerEvent<HTMLImageElement>) => {
-    trackPointerUp(e)
-    const d = dragRef.current
-    if (d.active && e.pointerId === d.id) { d.active = false; if (dragging) setDragging(false) }
-  }, [trackPointerUp, dragging])
-
-  // The effective (post-swap) src for one index — '' when the index is
-  // terminal (primary failed and no usable fallback: absent, an '' alignment
-  // placeholder, identical to the failed primary, or itself failed). Shared
-  // by the thumbnail AND the lightbox, so a thumbnail that swapped to local
-  // art never enlarges to the dead primary URL (review finding on #6886).
-  //
-  // The fallback must be SAME-ORIGIN: for a registry-only app the raw row
-  // spread can deliver attacker-chosen fallback keys, and honouring an
-  // absolute URL here would let a third-party index point this <img> at any
-  // host on load failure, leaking the viewer's address and headers (GPT
-  // security finding on #6886). installedArt already emits only same-origin
-  // routes, so legitimate installed-app fallbacks always pass.
-  const resolvedAt = (i: number): string => {
-    const url = screenList[i]
-    if (!primaryFailed.has(i)) return url
-    const fallback = fallbackList[i] || ''
-    if (!fallback || classifyManifestArt(fallback) !== 'same-origin') return ''
-    return fallback !== url && !fallbackFailed.has(i) ? fallback : ''
-  }
-
-  if (screenList.length === 0) return null
-  // When every thumbnail is terminal, drop the whole section: a bare
-  // "SCREENSHOTS" header over nothing is the empty-box state this fix removes
-  // from the hero, and it stays reachable for non-installed apps.
-  if (!screenList.some((_, i) => resolvedAt(i) !== '')) return null
-
-  return (
-    <>
-      <div className="mb-6">
-        <div className="text-[12px] text-muted uppercase tracking-wider mb-3">{i18nT('pages.appDetailPage.screenshots')}</div>
-        {/* The wrapper exists for the edge cues: absolutely-positioned children
-            of the scroller travel with the scrolled content, so the fades
-            anchor to this non-scrolling parent instead. */}
-        <div className="relative">
-        <div ref={attachEdges} className="flex gap-3 overflow-x-auto pb-2 scrollbar-none">
-          {screenList.map((_, i) => {
-            // Second chance per thumbnail; a terminal index unmounts its
-            // button entirely — the old display:none shape left an invisible,
-            // tabbable "Open screenshot N" button that opened a broken
-            // lightbox for keyboard users.
-            const shown = resolvedAt(i)
-            if (!shown) return null
-            return (
-              <button
-                key={i}
-                type="button"
-                aria-label={i18nT('pages.appDetailPage.open_screenshot', { n: i + 1 })}
-                className="p-0 border-none bg-transparent shrink-0 cursor-pointer"
-                onClick={() => setSelected(i)}
-              >
-                {/* onError is an image-load lifecycle handler (swap to local */}
-                {/* art, then hide broken images), not a user interaction; */}
-                {/* the rule flags onError regardless. */}
-                {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
-                <img
-                  src={shown}
-                  alt={i18nT('pages.appDetailPage.screenshot', { n: i + 1 })}
-                  className="h-40 rounded-lg border border-border hover:border-accent/40 hover:shadow-md transition-all object-cover"
-                  onError={() => {
-                    const tier = primaryFailed.has(i) ? 'fallback' : 'primary'
-                    setFailures(previous => recordScreenshotFailure(
-                      previous, screensKey, fallbacksKey, i, tier,
-                    ))
-                  }}
-                  onLoad={() => remeasure()}
-                />
-              </button>
-            )
-          })}
-        </div>
-        {/* Edge cues: this scroller hides its scrollbar (scrollbar-none), so a
-            gradient is the only signal that thumbnails continue past the
-            clipped edge. from-bg matches the page surface. */}
-        {edges.left && (
-          <div aria-hidden="true" data-testid="app-screenshots-cue-left" className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-r from-bg to-transparent" />
-        )}
-        {edges.right && (
-          <div aria-hidden="true" data-testid="app-screenshots-cue-right" className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-l from-bg to-transparent" />
-        )}
-        </div>
-      </div>
-
-      {/* Lightbox */}
-      {selected !== null && (() => {
-        // Navigation walks the VISIBLE subset: terminal indices have no
-        // thumbnail, so stepping raw indices would land on a blank slide with
-        // a counter that includes the hidden ones (UX review on #6886).
-        // `selected` stays a raw index so thumbnail clicks need no mapping.
-        const visible = screenList.map((_, i) => i).filter(i => resolvedAt(i) !== '')
-        const nextVisible = visible.find(i => i > selected)
-        const prevVisible = [...visible].reverse().find(i => i < selected)
-        return (
-          // Modal backdrop: click-to-dismiss is a mouse affordance; keyboard users
-          // dismiss/navigate via the onKeyDown handler (Escape / arrows) below.
-          // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
-          <div
-            className="fixed inset-0 z-[9999] flex items-center justify-center bg-bg/80 backdrop-blur-xs"
-            onClick={() => {
-              // A pinch, drag or double-tap just finished — that click is gesture
-              // residue and must not dismiss the viewer the user just zoomed into.
-              if (suppressClickRef.current) { suppressClickRef.current = false; return }
-              setSelected(null)
-            }}
-            onKeyDown={e => {
-              if (e.key === 'Escape') setSelected(null)
-              if (e.key === 'ArrowRight' && nextVisible !== undefined) setSelected(nextVisible)
-              if (e.key === 'ArrowLeft' && prevVisible !== undefined) setSelected(prevVisible)
-            }}
-            tabIndex={-1}
-            ref={el => {
-              dialogRef.current = el
-              el?.focus()
-            }}
-            role="dialog"
-            aria-modal="true"
-          >
-            {/* Presentational wrapper: stops backdrop-dismiss when clicking the image. */}
-            <div role="presentation" className="relative max-w-4xl max-h-[80vh] mx-4" onClick={e => e.stopPropagation()}>
-              <img
-                src={resolvedAt(selected)}
-                alt=""
-                ref={imgRef}
-                className="max-w-full max-h-[80vh] rounded-xl shadow-2xl touch-none"
-                style={{
-                  transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
-                  // No transition during a gesture: a pinch already produces a frame
-                  // per move, and easing between them lags the fingers. Nor for a user
-                  // who opted out of motion — a double-tap animates a 2.5x scale.
-                  transition: pinching || dragging || reduceMotion ? 'none' : 'transform 150ms ease-out',
-                  cursor: zoom > SCREENSHOT_ZOOM_MIN ? (dragging ? 'grabbing' : 'grab') : undefined,
-                }}
-                onPointerDown={onImgPointerDown}
-                onPointerMove={onImgPointerMove}
-                onPointerUp={onImgPointerUp}
-                onPointerCancel={onImgPointerUp}
-              />
-              <button className="absolute top-2 right-2 bg-bg/80 rounded-full p-1.5 text-muted hover:text-text" onClick={() => setSelected(null)} aria-label={i18nT('pages.appDetailPage.close')}><X size={18} /></button>
-              {prevVisible !== undefined && (
-                <button className="absolute left-2 top-1/2 -translate-y-1/2 bg-bg/80 rounded-full p-2 text-muted hover:text-text" onClick={e => { e.stopPropagation(); setSelected(prevVisible) }} aria-label={i18nT('pages.appDetailPage.previous')}><ChevronLeft size={20} /></button>
-              )}
-              {nextVisible !== undefined && (
-                <button className="absolute right-2 top-1/2 -translate-y-1/2 bg-bg/80 rounded-full p-2 text-muted hover:text-text" onClick={e => { e.stopPropagation(); setSelected(nextVisible) }} aria-label={i18nT('pages.appDetailPage.next')}><ChevronRight size={20} /></button>
-              )}
-              <div className="absolute bottom-3 left-1/2 -translate-x-1/2 text-[12px] text-muted bg-bg/80 px-3 py-1 rounded-full">{visible.indexOf(selected) + 1} / {visible.length}</div>
-            </div>
-          </div>
-        )
-      })()}
-    </>
-  )
-}
-
-/**
- * Hero banner with a local-art second chance (#6864).
- *
- * Renders `src`; when it fails to LOAD, swaps once to `fallbackSrc` (an
- * installed app's own local route); when that fails too — or no usable
- * fallback exists — unmounts entirely, so no empty bordered box is left where
- * the banner was (the pre-#6864 terminal state, preserved). Latch discipline
- * mirrors AppIcon (#6804): two latches, per-URL resets so a theme flip
- * re-arms, and the self-match guard skipping a fallback identical to the
- * failed primary (when the local candidate already won the precedence,
- * retrying the URL that just errored is a second doomed request).
- */
-// Exported for tests (direct latch-discipline coverage).
-export function HeroBanner({ src, fallbackSrc, isDetail }: { src: string; fallbackSrc?: string; isDetail: boolean }) {
-  // Same-origin gate on the fallback, mirroring resolvedAt in the gallery:
-  // the registry-only raw-row spread can deliver attacker-chosen fallback
-  // keys, and an absolute URL honoured on error would leak the viewer's
-  // address to a third-party host. installedArt only emits same-origin
-  // routes, so real installed-app fallbacks always pass (GPT finding, #6886).
-  const safeFallback = fallbackSrc && classifyManifestArt(fallbackSrc) === 'same-origin' ? fallbackSrc : ''
-  // Re-arm the latches during render rather than in a passive effect. The image
-  // for a new URL can fail BEFORE an effect would run, and the effect's reset
-  // would then erase that real failure and re-show the dead URL. Adjusting
-  // state while rendering re-arms before the new <img> is committed, and —
-  // unlike binding the failure to the URL text alone — it clears on EVERY
-  // transition, so a theme flip back to a previously failed URL retries instead
-  // of restoring a stale failure. A changed primary re-arms both latches; a
-  // fallback that moves on its own (an install completing under a mounted page)
-  // re-arms only the fallback latch.
-  const [latch, setLatch] = useState<{
-    src: string
-    fallback: string
-    primaryFailed: boolean
-    fallbackFailed: boolean
-  }>(() => ({ src, fallback: safeFallback, primaryFailed: false, fallbackFailed: false }))
-  if (latch.src !== src) {
-    setLatch({ src, fallback: safeFallback, primaryFailed: false, fallbackFailed: false })
-  } else if (latch.fallback !== safeFallback) {
-    setLatch({ src, fallback: safeFallback, primaryFailed: latch.primaryFailed, fallbackFailed: false })
-  }
-  const primaryFailed = latch.src === src && latch.primaryFailed
-  const fallbackFailed = latch.src === src
-    && latch.fallback === safeFallback
-    && latch.fallbackFailed
-  const useFallback = primaryFailed && !!safeFallback && safeFallback !== src && !fallbackFailed
-  if (!src || (primaryFailed && !useFallback)) return null
-  return (
-    <div className={`w-full ${isDetail ? 'aspect-[25/6]' : 'aspect-video'} max-h-72 rounded-2xl border border-border overflow-hidden mb-6 bg-[var(--card)]`}>
-      {/* onError is an image-load lifecycle handler (swap to local art, then hide). */}
-      {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
-      <img
-        src={useFallback ? safeFallback : src}
-        alt=""
-        className="w-full h-full object-cover"
-        onError={() => {
-          setLatch(previous => {
-            // Superseded generation: the current render already re-armed these
-            // tokens, so this error is about a URL no longer on screen.
-            if (previous.src !== src || previous.fallback !== safeFallback) return previous
-            return previous.primaryFailed
-              ? { ...previous, fallbackFailed: true }
-              : { ...previous, primaryFailed: true }
-          })
-        }}
-      />
-    </div>
-  )
-}
+import { HeroBanner, ScreenshotGallery } from './AppDetailPageArt'
+import { messageActionGrantLabel } from '../messageActions/messageActionRegistry'
+import AppDetailAdoptionNotice from './AppDetailAdoptionNotice'
+import { selectionActionGrantLabel } from '../selectionActions/selectionActionRegistry'
+import type { AppInfo, NormalizedRegistryEntry, RegistryEntry } from './appDetailPageTypes'
+import { actionGrant } from '../composerActions/composerActionRegistry'
+// The page's parts live in sibling owners that never import this module:
+// `AppDetailPageArt.tsx` (the hero banner and the screenshot gallery, each with
+// its local-art second chance) and `appDetailPageTypes.ts` (the page's view
+// model). Callers import the two art components from this module.
+export { HeroBanner, ScreenshotGallery }
 
 export default function AppDetailPage() {
   const { name } = useParams<{ name: string }>()
@@ -645,6 +86,15 @@ export default function AppDetailPage() {
    * the same reason, and both paths this fix wires need to say it.
    */
   const [successMsg, setSuccessMsg] = useState('')
+  /**
+   * The app enabled, installed or updated, but the host refused its backend
+   * (`backend_refused`). A warning, not a success: nothing runs behind the app.
+   * Stays until the next action, which is the user's chance to act on it.
+   */
+  const [backendRefusedMsg, setBackendRefusedMsg] = useState('')
+  // The page is reused across /apps/detail/:name, so a refusal belongs to the
+  // app it was reported for and goes when the route names another one.
+  useEffect(() => { setBackendRefusedMsg('') }, [name])
   const reconsentMsg = app?.sessionApprovalConsentPending
     ? i18nT('pages.appDetailPage.session_approval_reconsent_notice', { name: appDisplayName(app) })
     : ''
@@ -656,7 +106,22 @@ export default function AppDetailPage() {
   const stagedEvents = app?.approvedGrants
     ? (app.manifest?.permissions?.events || []).filter(e => !(app.approvedGrants?.events || []).includes(e))
     : []
-  const hasStagedGrants = stagedApi.length + stagedEvents.length > 0
+  // Link-preview hosts and text patterns an update widened wait the same way.
+  const stagedLinkHosts = app?.linkPreviewGrant?.stagedHosts || []
+  const stagedLinkPatterns = app?.linkPreviewGrant?.stagedTextPatterns || []
+  const stagedFullUrl = app?.linkPreviewGrant?.stagedFullUrl === true
+  // Message-action reach an update widened (the user role, markdown, a new action).
+  const stagedMessageActions = app?.messageActionGrant?.staged || []
+  const declaredMessageActions = (app?.manifest as { contributes?: { messageActions?: unknown } } | undefined)?.contributes?.messageActions
+  // So do link-open hosts and whole URLs for opened links.
+  const stagedOpenHosts = app?.linkOpenGrant?.stagedHosts || []
+  const stagedOpenFullUrl = app?.linkOpenGrant?.stagedFullUrl === true
+  // A composer button an update added waits the same way.
+  const stagedComposerActions = app?.composerActionGrant?.staged || []
+  // Selection actions an update added or changed (a new source, more text, a new effect).
+  const stagedSelection = app?.selectionActionGrant?.staged || []
+  const declaredSelectionActions = (app?.manifest as { contributes?: { selectionActions?: unknown } } | undefined)?.contributes?.selectionActions
+  const hasStagedGrants = stagedApi.length + stagedEvents.length + stagedLinkHosts.length + stagedLinkPatterns.length + stagedMessageActions.length + stagedOpenHosts.length + stagedComposerActions.length + stagedSelection.length > 0 || stagedFullUrl || stagedOpenFullUrl
   // Shown where the notice was once the owner approves, so the moment is confirmed.
   const [grantsApprovedMsg, setGrantsApprovedMsg] = useState('')
   const enableLabel = app?.sessionApprovalConsentPending
@@ -665,7 +130,9 @@ export default function AppDetailPage() {
   const clearError = useCallback(() => {
     setError('')
   }, [])
-  const [actionLoading, setActionLoading] = useState<string | null>(null)
+  // Each button's spinner reads its own action; `actionBusy` locks every action
+  // button while ANY action runs, since they all change the same app.
+  const { startAction, finishAction, isActionRunning, actionBusy } = useActionsInFlight()
   const [installLog, setInstallLog] = useState('')
   const [showInstallLog, setShowInstallLog] = useState(false)
   const [installDone, setInstallDone] = useState(false)
@@ -701,6 +168,12 @@ export default function AppDetailPage() {
   const [serverHostname, setServerHostname] = useState('')
   const [showUninstallConfirm, setShowUninstallConfirm] = useState(false)
   const [keepData, setKeepData] = useState(true)
+  // The disabled self-managed app's overflow menu opens the uninstall confirm
+  // from a menu item: defer the open past the menu's close, skip its trigger
+  // restore, and have the dialog return focus to the trigger itself.
+  const overflowMenu = useMenuOpensDialog()
+  const overflowTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const uninstallOpenerRef = useRef<HTMLElement | null>(null)
 
   // Contributors row (Details panel). Resolved GitHub repo URL for the app's
   // source, its top contributors, and the fetch's loading state. The row hides
@@ -827,13 +300,21 @@ export default function AppDetailPage() {
             installedVersion: installed.version,
             enabled: installed.enabled,
             sessionApprovalConsentPending: installed.sessionApprovalConsentPending,
+            adoption: installed.adoption,
             approvedGrants: installed.approvedGrants,
+            linkPreviewGrant: installed.linkPreviewGrant,
+            messageActionGrant: installed.messageActionGrant,
+            linkOpenGrant: installed.linkOpenGrant,
+            composerActionGrant: installed.composerActionGrant,
+            selectionActionGrant: installed.selectionActionGrant,
             managed: installed.managed,
             source: installed.source,
             installedAt: installed.installedAt,
             origin: installed.origin,
             resources: installed.resources,
             lifecycle: installed.lifecycle,
+            // Set when boot skipped this built-in; the notice below reads it.
+            unavailable: installed.unavailable,
             updateAvailable: registryEntry.updateAvailable || false,
             // Built-ins never carry a star count (they have no repository of
             // their own) — enforce the invariant here rather than trusting the
@@ -952,13 +433,21 @@ export default function AppDetailPage() {
             installedVersion: installed.version,
             enabled: installed.enabled,
             sessionApprovalConsentPending: installed.sessionApprovalConsentPending,
+            adoption: installed.adoption,
             approvedGrants: installed.approvedGrants,
+            linkPreviewGrant: installed.linkPreviewGrant,
+            messageActionGrant: installed.messageActionGrant,
+            linkOpenGrant: installed.linkOpenGrant,
+            composerActionGrant: installed.composerActionGrant,
+            selectionActionGrant: installed.selectionActionGrant,
             managed: installed.managed,
             source: installed.source,
             installedAt: installed.installedAt,
             origin: installed.origin,
             resources: installed.resources,
             lifecycle: installed.lifecycle,
+            // Set when boot skipped this built-in; the notice below reads it.
+            unavailable: installed.unavailable,
             updateAvailable: registryEntry?.updateAvailable || false,
             manifest: m,
           })
@@ -1034,7 +523,7 @@ export default function AppDetailPage() {
    */
   const runInstall = async (): Promise<'done' | 'trust-required' | 'failed' | 'aborted'> => {
     if (!app) return 'done'
-    setActionLoading('install')
+    startAction('install')
     setInstallLog('')
     setInstallDone(false)
     setShowInstallLog(true)
@@ -1042,6 +531,7 @@ export default function AppDetailPage() {
     // Drop the previous attempt's reason: a retry that fails for a new cause (or
     // is aborted, which has none) must never show the first attempt's.
     installFailureRef.current = { message: '', code: '' }
+    setBackendRefusedMsg('')
     setClientInstall(null)
     installAbortRef.current?.abort()
     const controller = new AbortController()
@@ -1074,7 +564,7 @@ export default function AppDetailPage() {
       if (result.needsClientInstall) {
         setClientInstall(result.clientInstall || app.platform?.clientInstall || {})
         setShowInstallLog(false)
-        setActionLoading(null)
+        finishAction('install')
         return 'done'
       }
       // A refused install is a consent prompt, not an error. The gate runs
@@ -1089,6 +579,7 @@ export default function AppDetailPage() {
       setInstallDone(true)
       if (result.ok) {
         recordEvent('app_install', { app: app.name, source: 'registry', version: app.version })
+        setBackendRefusedMsg(backendRefusedNotice(appDisplayName(app), result))
         await load()
         window.dispatchEvent(new Event('mc:apps-changed'))
       } else {
@@ -1119,7 +610,7 @@ export default function AppDetailPage() {
       // compare by identity to avoid the race where a second invocation
       // replaces the ref before this finally runs.
       if (installAbortRef.current === controller) {
-        setActionLoading(null)
+        finishAction('install')
       }
     }
     return 'done'
@@ -1127,8 +618,9 @@ export default function AppDetailPage() {
 
   /** The single enable path — shared by the action buttons and the trust retry. */
   const runEnable = useCallback(async (name: string) => {
-    await api.enableApp(name, app?.sessionApprovalConsentPending === true)
+    const result = await api.enableApp(name, app?.sessionApprovalConsentPending === true)
     recordEvent('app_enable', { app: name, version: app?.installedVersion || app?.version })
+    setBackendRefusedMsg(backendRefusedNotice(app ? appDisplayName(app) : name, result))
     await load()
     window.dispatchEvent(new Event('mc:apps-changed'))
   }, [app, load])
@@ -1180,7 +672,11 @@ export default function AppDetailPage() {
         // take effect, which the modal reports inline rather than closing on a
         // silent no-op.
         const outcome = await runInstall()
-        if (outcome === 'trust-required') throw new Error(APP_EXECUTION_DENIED)
+        // Carries the code as a property so `isTrustDeniedError` reads it as the
+        // trust refusal it is, the same as a refused enable's response body.
+        if (outcome === 'trust-required') {
+          throw Object.assign(new Error(APP_EXECUTION_DENIED), { code: APP_EXECUTION_DENIED })
+        }
         // The server's own sentence, so the modal can show WHY instead of only
         // the generic copy, with the machine code beside it so the modal can tell
         // a permanent refusal from a failure worth retrying (`errorCode` reads a
@@ -1206,10 +702,11 @@ export default function AppDetailPage() {
       setKeepData(true)
       return
     }
-    setActionLoading(action)
-    let updateResult: { notice?: string } | undefined
+    startAction(action)
+    let updateResult: { notice?: string; backend_refused?: string } | undefined
     clearError()
     setSuccessMsg('')
+    setBackendRefusedMsg('')
     try {
       if (action === 'enable') {
         // Consent to chat control is restated at click time, on the trusted and
@@ -1240,7 +737,10 @@ export default function AppDetailPage() {
       // reaches here is not gated on source, and `handle_update_app` re-clones a
       // registry-sourced app from the registry rather than copying a directory, so
       // each case has to name where the update actually came from.
-      if (action === 'update') {
+      // An update whose backend the host refused gets the warning, not the toast.
+      const refused = action === 'update' ? backendRefusedNotice(appDisplayName(app), updateResult) : ''
+      if (refused) setBackendRefusedMsg(refused)
+      else if (action === 'update') {
         // A widened session-approval grant leaves the app DISABLED pending
         // re-consent (`notice: session_approval_reconsent`). Saying "updated"
         // alone would report success over an app that just stopped running, so
@@ -1270,13 +770,13 @@ export default function AppDetailPage() {
         setError(e instanceof Error ? e.message : i18nT('pages.appDetailPage.failed_to', { action }))
       }
     } finally {
-      setActionLoading(null)
+      finishAction(action)
     }
   }
 
   const confirmUninstall = async () => {
     if (!app) return
-    setActionLoading('uninstall')
+    startAction('uninstall')
     clearError()
     try {
       const res = await api.uninstallApp(app.name, keepData)
@@ -1287,7 +787,7 @@ export default function AppDetailPage() {
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : i18nT('pages.appDetailPage.failed_to_uninstall'))
     } finally {
-      setActionLoading(null)
+      finishAction('uninstall')
       setShowUninstallConfirm(false)
     }
   }
@@ -1343,6 +843,34 @@ export default function AppDetailPage() {
   const agents = app.manifest?.agents || []
   const skills = app.manifest?.skills || []
   const crons = app.manifest?.crons || []
+  // Source-repo and issue-tracker links for the Details card (#9912). The repo
+  // Source-repo and issue-tracker links for the Details card (#9912). The repo
+  // string is third-party manifest/registry input, so it becomes a link ONLY
+  // when it parses as an http(s) URL with no userinfo (safeHttpUrl rejects
+  // javascript:/data: and credential-smuggling forms); anything else falls back
+  // to plain text. `app.repo` is the value the card already DISPLAYS, so the
+  // link's text and its href are built from the SAME string — otherwise the
+  // text could name one repo while the click opened another (`repoUrl` may be
+  // resolved from manifest.repo/trustRepository/source, not app.repo).
+  // `typeof` guard first: `app.repo` is third-party registry data typed as a
+  // string, but an entry can ship `"repo": ["…"]`; safeHttpUrl would URL-coerce
+  // the array to validate yet return the array itself, and `.replace` on it
+  // would throw and blank the whole detail page. A non-string repo stays plain
+  // text, exactly as it rendered before this change.
+  const sourceRepoUrl = typeof app.repo === 'string' && app.repo ? safeHttpUrl(app.repo) : null
+  const sourceRepoHost = (() => {
+    try { return sourceRepoUrl ? new URL(sourceRepoUrl).hostname : '' } catch { return '' }
+  })()
+  // Issue tracker: a GitHub repo's /issues page, built from the same displayed
+  // repo so the link cannot point somewhere the row does not name. Scoped to
+  // GitHub (the only host whose tracker path this knows) and deliberately a
+  // plain outbound LINK, never an in-app flow that files on the user's behalf —
+  // that needs new manifest metadata and a credential/product decision the
+  // maintainer owns (#9912).
+  const issuesUrl =
+    sourceRepoUrl && sourceRepoHost === 'github.com'
+      ? `${sourceRepoUrl.replace(/\/+$/, '').replace(/\.git$/, '')}/issues`
+      : ''
   // Theme-aware hero banner source (mirrors the Browse card resolution).
   // Prefer the wide detail-ratio banner (heroImageDetail*); fall back to the
   // Browse hero, then the opposite theme.
@@ -1440,6 +968,29 @@ export default function AppDetailPage() {
           </div>
         )}
 
+        {/* The action landed but the host refused the app's backend: a failure
+            the server named, so it gets the error surface, not a success. */}
+        {backendRefusedMsg && (
+          <ErrorNotice
+            message={backendRefusedMsg}
+            askAgent
+            onDismiss={() => setBackendRefusedMsg('')}
+            className="mb-4 animate-rise"
+          />
+        )}
+
+        {/* A built-in app the gateway skipped at boot: its page cannot open, so say
+            why here instead of leaving the user with a page that fails silently.
+            It is a caught import error, so it renders through ErrorNotice; the
+            hand-off is safe because this page holds no unsaved state. */}
+        {app.installed && app.unavailable && (
+          <ErrorNotice
+            message={i18nT('pages.appDetailPage.unavailable_notice', { reason: app.unavailable.reason })}
+            askAgent
+            className="mb-4 animate-rise"
+          />
+        )}
+
         {/* Re-consent after an update that widened the session-approval grant.
             Warn-styled like the PR's other session-approval surfaces -- the text
             says "it is now disabled", so a green box would contradict it. Cleared
@@ -1452,6 +1003,16 @@ export default function AppDetailPage() {
             <ShieldAlert size={14} className="mt-[3px] shrink-0 text-warn" />
             <span className="text-text text-sm">{reconsentMsg}</span>
           </div>
+        )}
+
+        {/* A former built-in's move to its published registry copy: blocked, retrying,
+            staged for the next restart, or installed on a host too old for it. */}
+        {app.installed && (
+          <AppDetailAdoptionNotice
+            adoption={app.adoption}
+            name={appDisplayName(app)}
+            builtinOwned={app.origin === 'builtin'}
+          />
         )}
 
         {app.installed && hasStagedGrants && (
@@ -1489,6 +1050,72 @@ export default function AppDetailPage() {
                   </div>
                 </div>
               )}
+              {stagedLinkHosts.length > 0 && (
+                <div>
+                  <div className="text-[13px]">{i18nT('pages.appDetailPage.grants_reconsent_link_hosts')}</div>
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {stagedLinkHosts.map(h => (
+                      <code key={h} className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text">{h}</code>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {stagedLinkPatterns.length > 0 && (
+                <div>
+                  <div className="text-[13px]">{i18nT('pages.appDetailPage.grants_reconsent_link_patterns')}</div>
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {stagedLinkPatterns.map(p => (
+                      <code key={p} className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text break-all">{p}</code>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {stagedFullUrl && (
+                <div className="text-[13px]">{i18nT('pages.appDetailPage.grants_reconsent_link_full_url')}</div>
+              )}
+              {stagedMessageActions.length > 0 && (
+                <div>
+                  <div className="text-[13px]">{i18nT('pages.appDetailPage.grants_reconsent_message_actions')}</div>
+                  <ul className="mt-1 text-[13px] list-disc pl-5" data-testid="staged-message-actions">
+                    {stagedMessageActions.map(e => (
+                      <li key={e}>{messageActionGrantLabel(e, declaredMessageActions)}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {stagedOpenHosts.length > 0 && (
+                <div>
+                  <div className="text-[13px]">{i18nT('pages.appDetailPage.grants_reconsent_link_open_hosts')}</div>
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {stagedOpenHosts.map(h => (
+                      <code key={h} className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text">{h}</code>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {stagedComposerActions.length > 0 && (
+                <div>
+                  <div className="text-[13px]">{i18nT('pages.appDetailPage.grants_reconsent_composer_actions')}</div>
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {stagedComposerActions.map(id => (
+                      <code key={id} className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text">{id}</code>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {stagedSelection.length > 0 && (
+                <div>
+                  <div className="text-[13px]">{i18nT('pages.appDetailPage.grants_reconsent_selection_actions')}</div>
+                  <ul className="mt-1 text-[13px] list-disc pl-5" data-testid="staged-selection-actions">
+                    {stagedSelection.map(e => (
+                      <li key={e}>{selectionActionGrantLabel(e, declaredSelectionActions)}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {stagedOpenFullUrl && (
+                <div className="text-[13px]">{i18nT('pages.appDetailPage.grants_reconsent_link_open_full_url')}</div>
+              )}
               {app.enabled && (
                 <span className="text-[13px] text-muted">{i18nT('pages.appDetailPage.grants_reconsent_undo', { name: appDisplayName(app) })}</span>
               )}
@@ -1500,20 +1127,32 @@ export default function AppDetailPage() {
             <Btn
               primary
               onClick={async () => {
-                setActionLoading('approve_grants')
-                const approved = [...stagedApi, ...stagedEvents].join(', ')
+                startAction('approve_grants')
+                const approved = [...stagedApi, ...stagedEvents, ...stagedLinkHosts, ...stagedLinkPatterns, ...(stagedFullUrl ? ['fullUrl'] : []), ...stagedMessageActions.map(e => messageActionGrantLabel(e, declaredMessageActions)), ...stagedOpenHosts, ...(stagedOpenFullUrl ? ['fullUrl'] : []), ...stagedComposerActions, ...stagedSelection.map(e => selectionActionGrantLabel(e, declaredSelectionActions))].join(', ')
                 try {
-                  await api.enableApp(app.name, false, { api: stagedApi, events: stagedEvents })
+                  const result = await api.enableApp(app.name, false, {
+                    api: stagedApi,
+                    events: stagedEvents,
+                    linkPreviewHosts: stagedLinkHosts,
+                    linkPreviewTextPatterns: stagedLinkPatterns,
+                    linkPreviewFullUrl: stagedFullUrl ? ['fullUrl'] : [],
+                    messageActions: stagedMessageActions,
+                    linkOpenHosts: stagedOpenHosts,
+                    linkOpenFullUrl: stagedOpenFullUrl ? ['fullUrl'] : [],
+                    composerActions: stagedComposerActions.map(actionGrant),
+                    selectionActions: stagedSelection,
+                  })
+                  setBackendRefusedMsg(backendRefusedNotice(appDisplayName(app), result))
                   setGrantsApprovedMsg(i18nT('pages.appDetailPage.grants_approved', { entries: approved }))
                   await load()
                   window.dispatchEvent(new Event('mc:apps-changed'))
                 } catch (e) {
                   setError(e instanceof Error ? e.message : String(e))
                 } finally {
-                  setActionLoading(null)
+                  finishAction('approve_grants')
                 }
               }}
-              disabled={actionLoading === 'approve_grants'}
+              disabled={actionBusy}
             >
               {i18nT('pages.appDetailPage.approve_new_permissions')}
             </Btn>
@@ -1525,6 +1164,7 @@ export default function AppDetailPage() {
             <span className="text-ok text-sm block">{grantsApprovedMsg}</span>
           </div>
         )}
+        {app.installed && <LinkOpenChoices appName={app.name} label={appDisplayName(app)} />}
 
         {/* Error. No special execution-policy branch here any more: an untrusted
             third-party app is refused with `app_execution_denied`, and that
@@ -1585,15 +1225,15 @@ export default function AppDetailPage() {
         />
         {consentDialog}
 
-        {/* Uninstall confirmation modal */}
+        {/* Uninstall confirmation modal. Click-to-dismiss on the backdrop is a
+            mouse affordance; keyboard users close with Escape, and Tab stays
+            inside the dialog (AppStoreDialog). */}
         {showUninstallConfirm && app && (
-          // Modal backdrop: click-to-dismiss is a mouse affordance; keyboard
-          // users dismiss via the Escape handler in onKeyDown below.
-          // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
-          <div className="fixed inset-0 z-[100] flex items-center justify-center bg-bg/60 backdrop-blur-xs animate-rise"
-            onClick={() => setShowUninstallConfirm(false)}
-            onKeyDown={e => { if (e.key === 'Escape') setShowUninstallConfirm(false) }}
-            tabIndex={-1} ref={el => el?.focus()} role="dialog" aria-modal="true" aria-label={i18nT('pages.appDetailPage.confirm_uninstall')}
+          <AppStoreDialog
+            className="fixed inset-0 z-[100] flex items-center justify-center bg-bg/60 backdrop-blur-xs animate-rise"
+            onClose={() => { setShowUninstallConfirm(false); uninstallOpenerRef.current = null }}
+            returnFocusTo={uninstallOpenerRef}
+            aria-label={i18nT('pages.appDetailPage.confirm_uninstall')}
           >
             {/* Presentational wrapper: stops backdrop-dismiss on inner clicks. */}
             {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions, jsx-a11y/click-events-have-key-events */}
@@ -1617,12 +1257,12 @@ export default function AppDetailPage() {
 
               <div className="flex items-center gap-2 justify-end">
                 <Btn onClick={() => setShowUninstallConfirm(false)}>{i18nT('pages.appDetailPage.cancel')}</Btn>
-                <Btn danger onClick={confirmUninstall} disabled={actionLoading === 'uninstall'}>
-                  {actionLoading === 'uninstall' ? i18nT('pages.appDetailPage.removing') : i18nT('pages.appDetailPage.uninstall')}
+                <Btn danger onClick={confirmUninstall} disabled={actionBusy}>
+                  {isActionRunning('uninstall') ? i18nT('pages.appDetailPage.removing') : i18nT('pages.appDetailPage.uninstall')}
                 </Btn>
               </div>
             </div>
-          </div>
+          </AppStoreDialog>
         )}
 
         {/* Hero banner (only when the app ships one, or its local fallback survives a load failure) */}
@@ -1666,8 +1306,8 @@ export default function AppDetailPage() {
             {/* Actions */}
             <div className="flex items-center gap-2 flex-wrap">
               {!app.installed && !clientInstall && (
-                <Btn {...uiLocation('apps.detail.install')} primary onClick={handleInstall} disabled={actionLoading === 'install' || installRefusedForGood} title={installDisabledTitle}>
-                  {actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.installing')}</> : <><Download size={14} /> {i18nT('pages.appDetailPage.install')}</>}
+                <Btn {...uiLocation('apps.detail.install')} primary onClick={handleInstall} disabled={actionBusy || installRefusedForGood} title={installDisabledTitle}>
+                  {isActionRunning('install') ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.installing')}</> : <><Download size={14} /> {i18nT('pages.appDetailPage.install')}</>}
                 </Btn>
               )}
               {!app.installed && clientInstall && (
@@ -1676,7 +1316,7 @@ export default function AppDetailPage() {
               {app.installed && isBuiltin && (
                 <>
                   {app.enabled ? (
-                    <Btn onClick={() => handleAction('disable')} disabled={actionLoading === 'disable'}><PowerOff size={14} /> {i18nT('pages.appDetailPage.disable')}</Btn>
+                    <Btn onClick={() => handleAction('disable')} disabled={actionBusy}><PowerOff size={14} /> {i18nT('pages.appDetailPage.disable')}</Btn>
                   ) : (
                     /* Enable stays available in a browser: enabling is a
                        server-side state change (backend, agents and crons run
@@ -1689,7 +1329,7 @@ export default function AppDetailPage() {
                        store row / feature card keep the badge alone (the decision
                        does not happen there). */
                     <>
-                    <Btn onClick={() => handleAction('enable')} disabled={actionLoading === 'enable'}><Power size={14} /> {enableLabel}</Btn>
+                    <Btn onClick={() => handleAction('enable')} disabled={actionBusy}><Power size={14} /> {enableLabel}</Btn>
                     {desktopOnly && (
                     <span className="text-[13px] text-muted flex items-center gap-1.5">
                       <Monitor size={14} /> {i18nT('pages.appDetailPage.desktop_app_hint')}
@@ -1702,14 +1342,51 @@ export default function AppDetailPage() {
               {app.installed && isSelfManaged && !isBuiltin && (
                 <>
                   <div className="text-[13px] text-ok flex items-center gap-1.5"><Check size={14} /> {i18nT('pages.appDetailPage.installed_version', { version: app.installedVersion })}</div>
-                  {app.updateAvailable && <Btn onClick={handleInstall} disabled={actionLoading === 'install' || installRefusedForGood} title={installDisabledTitle} className="!bg-[var(--info)] !text-white hover:!opacity-80">{actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
-                  {canUninstall && <Btn danger onClick={() => handleAction('uninstall')} disabled={actionLoading === 'uninstall'} title={i18nT('pages.appDetailPage.removes_kirocrew_metadata_only_the_app_itself_is')}><Trash2 size={14} /> {i18nT('pages.appDetailPage.uninstall')}</Btn>}
+                  {app.enabled ? (
+                    <>
+                      {app.updateAvailable && <Btn onClick={handleInstall} disabled={actionBusy || installRefusedForGood} title={installDisabledTitle} className="!bg-[var(--info)] !text-info-fg hover:!opacity-80">{isActionRunning('install') ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
+                      {canUninstall && <Btn danger onClick={() => handleAction('uninstall')} disabled={actionBusy} title={i18nT('pages.appDetailPage.removes_kirocrew_metadata_only_the_app_itself_is')}><Trash2 size={14} /> {i18nT('pages.appDetailPage.uninstall')}</Btn>}
+                    </>
+                  ) : (
+                    /* A self-managed app can be disabled too (Library's menu, or
+                       the gateway holding it until the owner consents to a new
+                       sessionApproval). Without Enable here the consent notice
+                       above pointed at a control this branch never rendered
+                       (#23336). Same handler, label and dialog as the other
+                       branches. Update and Uninstall move into one overflow
+                       menu so the row stays at two controls. */
+                    <>
+                      <Btn onClick={() => handleAction('enable')} disabled={actionBusy}><Power size={14} /> {enableLabel}</Btn>
+                      {(app.updateAvailable || canUninstall) && (
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Btn ref={overflowTriggerRef} aria-label={i18nT('pages.appDetailPage.more_actions', { name: appDisplayName(app) })} disabled={actionBusy}><MoreHorizontal size={14} aria-hidden /></Btn>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="start" onCloseAutoFocus={overflowMenu.onCloseAutoFocus}>
+                            {app.updateAvailable && (
+                              <DropdownMenuItem disabled={actionBusy || installRefusedForGood} title={installDisabledTitle} onSelect={() => { void handleInstall() }}>
+                                <ArrowUp size={12} aria-hidden /> {i18nT('pages.appDetailPage.update')}
+                              </DropdownMenuItem>
+                            )}
+                            {canUninstall && (
+                              <DropdownMenuItem disabled={actionBusy} title={i18nT('pages.appDetailPage.removes_kirocrew_metadata_only_the_app_itself_is')} onSelect={() => {
+                                uninstallOpenerRef.current = overflowTriggerRef.current
+                                overflowMenu.openLayer(() => { void handleAction('uninstall') })
+                              }}>
+                                <Trash2 size={12} aria-hidden /> {i18nT('pages.appDetailPage.uninstall')}
+                              </DropdownMenuItem>
+                            )}
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      )}
+                    </>
+                  )}
                 </>
               )}
               {app.installed && !isSelfManaged && !isBuiltin && (
                 <>
                   {app.enabled ? (
-                    <Btn {...uiLocation('apps.detail.disable')} onClick={() => handleAction('disable')} disabled={actionLoading === 'disable'}><PowerOff size={14} /> {i18nT('pages.appDetailPage.disable')}</Btn>
+                    <Btn {...uiLocation('apps.detail.disable')} onClick={() => handleAction('disable')} disabled={actionBusy}><PowerOff size={14} /> {i18nT('pages.appDetailPage.disable')}</Btn>
                   ) : (
                     /* Enable stays available in a browser: enabling is a
                        server-side state change (backend, agents and crons run
@@ -1719,7 +1396,7 @@ export default function AppDetailPage() {
                        where store rows land, so it was the common path. Same
                        pattern as AppListRow / FeaturedSpotlight rows. */
                     <>
-                    <Btn onClick={() => handleAction('enable')} disabled={actionLoading === 'enable'}><Power size={14} /> {enableLabel}</Btn>
+                    <Btn onClick={() => handleAction('enable')} disabled={actionBusy}><Power size={14} /> {enableLabel}</Btn>
                     {desktopOnly && (
                     /* The consequence is VISIBLE here, not only in `title`. A
                        hover tooltip does not exist on touch and is not reachable
@@ -1736,9 +1413,9 @@ export default function AppDetailPage() {
                   )}
                     </>
                   )}
-                  {canUpdate && app.updateAvailable && <Btn {...uiLocation('apps.detail.update')} onClick={handleInstall} disabled={actionLoading === 'install' || installRefusedForGood} title={installDisabledTitle} className="!bg-[var(--info)] !text-white hover:!opacity-80">{actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
-                  {canUpdate && !app.updateAvailable && <Btn {...uiLocation('apps.detail.sync')} onClick={() => handleAction('update')} disabled={actionLoading === 'update'} title={i18nT('pages.appDetailPage.sync_app_from_its_source_directory')}><RefreshCw size={14} /> {i18nT('pages.appDetailPage.sync')}</Btn>}
-                  {canUninstall && <Btn {...uiLocation('apps.detail.uninstall')} danger onClick={() => handleAction('uninstall')} disabled={actionLoading === 'uninstall'}><Trash2 size={14} /> {i18nT('pages.appDetailPage.uninstall')}</Btn>}
+                  {canUpdate && app.updateAvailable && <Btn {...uiLocation('apps.detail.update')} onClick={handleInstall} disabled={actionBusy || installRefusedForGood} title={installDisabledTitle} className="!bg-[var(--info)] !text-info-fg hover:!opacity-80">{isActionRunning('install') ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
+                  {canUpdate && !app.updateAvailable && <Btn {...uiLocation('apps.detail.sync')} onClick={() => handleAction('update')} disabled={actionBusy} title={i18nT('pages.appDetailPage.sync_app_from_its_source_directory')}><RefreshCw size={14} /> {i18nT('pages.appDetailPage.sync')}</Btn>}
+                  {canUninstall && <Btn {...uiLocation('apps.detail.uninstall')} danger onClick={() => handleAction('uninstall')} disabled={actionBusy}><Trash2 size={14} /> {i18nT('pages.appDetailPage.uninstall')}</Btn>}
                 </>
               )}
             </div>
@@ -2069,7 +1746,37 @@ export default function AppDetailPage() {
           <Card>
             <CardTitle>{i18nT('pages.appDetailPage.details')}</CardTitle>
             <div className="grid gap-1.5 mt-2 text-[13px] text-muted">
-              {app.repo && <div>{i18nT('pages.appDetailPage.repository')} {app.repo}</div>}
+              {app.repo && (
+                sourceRepoUrl ? (
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className="shrink-0">{i18nT('pages.appDetailPage.repository')}</span>
+                    <a
+                      href={sourceRepoUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 text-accent no-underline hover:underline break-all"
+                    >
+                      {app.repo}
+                      <ExternalLink size={12} className="shrink-0" aria-hidden="true" />
+                    </a>
+                  </div>
+                ) : (
+                  <div>{i18nT('pages.appDetailPage.repository')} {app.repo}</div>
+                )
+              )}
+              {issuesUrl && (
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <a
+                    href={issuesUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 text-accent no-underline hover:underline"
+                  >
+                    {i18nT('pages.appDetailPage.report_issue')}
+                    <ExternalLink size={12} className="shrink-0" aria-hidden="true" />
+                  </a>
+                </div>
+              )}
               {typeof app.stargazersCount === 'number' && <div>{i18nT('pages.appDetailPage.github_stars_2', { value: fmtNumber(app.stargazersCount) })}</div>}
               {app.author && <div>{i18nT('pages.appDetailPage.author')} {app.author}</div>}
               {repoUrl && (contribLoading || contributors.length > 0 || contribError) && (

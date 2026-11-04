@@ -92,6 +92,34 @@ PROBE_MAX_CONCURRENCY = 5
 #: let one pass flood the pool the other is protecting.
 
 
+def _spawn_fingerprint(server: McpServerInfo) -> tuple[str, ...] | None:
+    """The process a local probe of *server* starts, as a key; None when it starts none.
+
+    One server is often configured under several names (an IDE entry, an
+    ``mcp.json`` entry, a renamed copy), and each name is its own row. Probing
+    every name at once starts the same heavy process several times in the same
+    instant, and those copies compete for CPU until each misses the probe
+    timeout -- which the quarantine then counts against a server that works.
+    ``probe_all`` therefore runs probes that share this key one after another.
+
+    The key is command plus args, the process that gets started. Env is left out
+    on purpose: two names that differ only in a token still start the same
+    package, and that cost is what this key groups. Each name is still probed
+    with its own env and gets its own verdict; only the timing changes. A
+    remote server opens a connection rather than a process, so it gets no key.
+    """
+    if server.is_remote or not isinstance(server.command, str) or not server.command:
+        return None
+    # ``args`` is unvalidated config JSON, and this runs outside the per-server
+    # ``gather``, so it must not raise: a non-iterable value keys by its repr.
+    raw_args = server.args or []
+    try:
+        args = tuple(str(a) for a in raw_args)
+    except TypeError:
+        args = (repr(raw_args),)
+    return (server.command, *args)
+
+
 async def probe_all() -> list[McpServerInfo]:
     """Discover and probe all configured MCP servers (bounded concurrency).
 
@@ -138,6 +166,15 @@ async def probe_all() -> list[McpServerInfo]:
     # Per-call semaphore: bounds the fan-out within this discovery pass while
     # binding to the currently-running loop (avoids import-time loop capture).
     sem = asyncio.Semaphore(PROBE_MAX_CONCURRENCY)
+    # One lock per started process (see ``_spawn_fingerprint``), so names that
+    # start the same command and args are probed one at a time while other
+    # servers still run in parallel. Taken BEFORE the semaphore: an alias waiting
+    # on its sibling must not hold one of the shared slots while it waits.
+    same_process: dict[tuple[str, ...], asyncio.Lock] = {}
+    for s in servers:
+        key = _spawn_fingerprint(s)
+        if key is not None:
+            same_process.setdefault(key, asyncio.Lock())
     excluded = await asyncio.to_thread(_spawn_excluded)
 
     async def _guarded(s: McpServerInfo) -> McpServerInfo:
@@ -159,7 +196,11 @@ async def probe_all() -> list[McpServerInfo]:
             s.error = ""
             _drop_temp_refusals(s)
             return s
-        async with sem:
+        key = _spawn_fingerprint(s)
+        if key is None:
+            async with sem:
+                return await probe_server(s)
+        async with same_process[key], sem:
             return await probe_server(s)
 
     results = await asyncio.gather(
@@ -605,8 +646,11 @@ def register_servers_for_cc(
     if mcp_json_path.is_file():
         try:
             text = mcp_json_path.read_text(encoding="utf-8")
-        except OSError:
-            text = ""
+        except (OSError, UnicodeDecodeError):
+            # Unreadable is not empty: writing the discovered servers over it
+            # would replace every entry the user has there.
+            logger.warning("Not registering MCP servers in %s: it cannot be read", mcp_json_path)
+            return False
         if has_json_comments(text):
             # Written back as plain JSON below, which would drop the comments.
             logger.warning(
@@ -615,9 +659,20 @@ def register_servers_for_cc(
             )
             return False
         try:
-            existing = loads_user_json(text)
+            loaded = loads_user_json(text)
         except json.JSONDecodeError:
-            existing = {}
+            loaded = None
+        if not isinstance(loaded, dict) or not isinstance(
+            loaded.setdefault("mcpServers", {}), dict
+        ):
+            # The user's text, not an empty document: refuse rather than
+            # replace it with one holding only the discovered servers.
+            logger.warning(
+                "Not registering MCP servers in %s: it is not an MCP config document",
+                mcp_json_path,
+            )
+            return False
+        existing = loaded
 
     mcp = existing.setdefault("mcpServers", {})
     changed = False
@@ -733,13 +788,16 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _managed_tools_in_process,
         _resolved_managed_invocation,
         managed_server_is_session_bound,
+        managed_tool_names_for_policy,
     )
     from kiro_crew.mcp_discovery_probe import (  # noqa: F401
         _MAX_BANNER_LINES,
         _probe_on_private_loop,
         _read_stdio_jsonrpc_response,
         _redact_temp_refusal_text,
+        _served_by_gateway,
         _temp_refusal_records,
+        secret_reference_refusal,
     )
     from kiro_crew.mcp_discovery_probe_state import (  # noqa: F401
         _ISO_DATE,
@@ -772,12 +830,14 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.mcp_discovery_remote import (  # noqa: F401
         _CHALLENGE_PARAM_RE,
         _MAX_CHALLENGE_LEN,
+        _MAX_REDIRECT_TARGET_LEN,
         _expand_header_placeholders,
         _header_reference_unresolved,
         _is_bearer_challenge,
         _needs_authorization,
         _probe_remote,
         _read_jsonrpc_response,
+        _redirect_error,
         _runtime_grant_present,
     )
     from kiro_crew.mcp_discovery_server_info import (  # noqa: F401
@@ -812,6 +872,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         mcp_search_path,
         resolved_command_casing,
         sanitize_spec_env,
+        saved_command_casing,
         spec_path_key,
     )
     from kiro_crew.executors import (  # noqa: F401

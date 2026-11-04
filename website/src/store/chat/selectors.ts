@@ -8,9 +8,11 @@ import { slotIsRemoteBound } from '../dashboardSlice'
 import { isSystemNoticeKind } from '../../lib/systemNotice'
 import { isStopEvent } from '../../lib/stopEvent'
 import type { InjectKind } from '../../pages/chat/RecoveryCard'
-import type { SlotState } from './state'
+import type { SendAttempt, SlotState } from './state'
 import { safeKey } from './wire'
+import { isPendingCoordinatorApproval } from './coordinatorApprovals'
 import { selectSlotSubagentsActive } from './subagents'
+import { slotRowByKey } from '../slotIndex'
 
 /** Path B selectors: read a slot's messages / stream-state, falling back to the
  *  global active mirror when the slot IS the currently-active one. */
@@ -25,17 +27,24 @@ export const selectSlotMessages = (state: RootState, slot: string): ChatMessage[
  *  not its reply to the person reading. A structured monitor's wake runs before
  *  its row is written; until then the slot frame says so (`wake_starting`). */
 export const selectSlotTurnFromWake = (state: RootState, slot: string): boolean => {
-  if (state.dashboard.slots.find((sl) => sl.key === slot)?.wake_starting) return true
+  if (slotRowByKey(state.dashboard.slots, slot)?.wake_starting) return true
   const msgs = selectSlotMessages(state, slot)
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i]
     if (!m.content) continue
+    // A wake STEERED into a running turn (`meta.steer`) opened nothing: the
+    // turn is still whoever's row is above it.
+    if (m.role === 'nudge' && m.meta?.steer) continue
     if (m.role === 'nudge' || m.role === 'subagent') return true
     if (m.role === 'user') return false
     if (m.role === 'inject' && TURN_INJECT_KINDS.has((m.meta as { injectKind?: unknown } | undefined)?.injectKind)) return false
   }
   return false
 }
+const EMPTY_SEND_ATTEMPTS: SendAttempt[] = []
+/** The prompts this tab submitted in `slot`, oldest first (see `ChatState.sendAttempts`). */
+export const selectSendAttempts = (state: RootState, slot: string | null | undefined): SendAttempt[] =>
+  (slot ? state.chat.sendAttempts?.[safeKey(slot)] : undefined) ?? EMPTY_SEND_ATTEMPTS
 /** Only a server-confirmed row for THIS send proves delivery, even if the POST
  *  subsequently fails. An optimistic bubble or identical text proves nothing. */
 export const selectSendConfirmed = (state: RootState, slot: string, sendId: string): boolean =>
@@ -58,16 +67,20 @@ export const selectSlotToolLog = (state: RootState, slot: string | null): ToolAc
 
 /** Per-slot pending tool-approval (unresolved permission after the slot's last
  *  user message) — slot-aware version of ChatInput's old selectPendingApproval,
- *  so each grid pane's approval bar reflects ITS slot, not the global active one. */
+ *  so each grid pane's approval bar reflects ITS slot, not the global active one.
+ *  A coordinator-registry card counts wherever it sits: it waits on the
+ *  registry, not on the chat's turn, so a later send does not end it. */
 export const selectSlotPendingApproval = (state: RootState, slot: string | null): ChatMessage | null => {
   const msgs = slot ? selectSlotMessages(state, slot) : state.chat.messages
   // Find the last NON-steer user message — steered messages don't start a new
   // turn, so they must not hide a pending approval bar (#1667).
   let lastUserIdx = -1
   for (let i = msgs.length - 1; i >= 0; i--) { if (msgs[i].role === 'user' && !msgs[i].meta?.steer && !msgs[i].meta?.responsiveSend) { lastUserIdx = i; break } }
-  for (let i = msgs.length - 1; i > lastUserIdx; i--) {
+  for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i]
-    if (m.role === 'permission' && !m.meta?.resolved && m.meta?.approval_id) return m
+    if (i > lastUserIdx
+      ? m.role === 'permission' && !m.meta?.resolved && m.meta?.approval_id
+      : isPendingCoordinatorApproval(m)) return m
   }
   return null
 }
@@ -89,7 +102,7 @@ export const selectComposerBusy = (state: RootState, slot: string | null): boole
   if (selectSlotStreamState(state, slot) !== 'idle') return true
   if (slot === state.chat.activeSlot && state.chat.slotRunning) return true
   if (selectSlotSubagentsActive(state, slot)) return true
-  const dashSlot = state.dashboard.slots.find((sl) => sl.key === slot)
+  const dashSlot = slotRowByKey(state.dashboard.slots, slot)
   return !!dashSlot?.subagents_running
 }
 
@@ -101,7 +114,7 @@ export const selectComposerBusy = (state: RootState, slot: string | null): boole
 export const selectProjectChipLocked = (state: RootState, slot: string | null): boolean => {
   if (!slot) return false
   if (selectSlotSubagentsActive(state, slot)) return true
-  const dashSlot = state.dashboard.slots.find((sl) => sl.key === slot)
+  const dashSlot = slotRowByKey(state.dashboard.slots, slot)
   return !!dashSlot?.subagents_running
 }
 
@@ -140,7 +153,7 @@ const CONTINUE_SCAN_SKIP = new Set(['queued', 'tool_call', 'tool_result', 'injec
 export const selectActiveSlotProject = (state: RootState): string | undefined => {
   const key = state.chat.activeSlot
   if (!key) return undefined
-  return state.dashboard.slots.find((sl) => sl.key === key)?.project || undefined
+  return slotRowByKey(state.dashboard.slots, key)?.project || undefined
 }
 
 /**
@@ -182,7 +195,7 @@ export const selectContinuable = (state: RootState, slot?: string | null): boole
   const c = state.chat
   const key = slot ?? c.activeSlot
   const other = key && key !== c.activeSlot ? key : null
-  const dashSlot = state.dashboard.slots.find((sl) => sl.key === key)
+  const dashSlot = slotRowByKey(state.dashboard.slots, key)
   if (other) {
     if (selectSlotStreamState(state, other) !== 'idle' || c.pendingTurnSlot === other || dashSlot?.running || dashSlot?.stopping) return false
   } else if (c.slotRunning || c.slotStopping || c.pendingTurnSlot) return false

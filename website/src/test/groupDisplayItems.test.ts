@@ -14,7 +14,7 @@ import type { DisplayItem } from '../pages/chat/types'
 const msg = (role: string, content = ''): ChatMessage =>
   ({ role, content, cls: '' } as ChatMessage)
 
-/** A turn long enough to collapse: needs a working step and > 2 items. */
+/** A turn that collapses: it holds a tool call (any length wraps, #23017). */
 const workingTurn = () => [msg('assistant', 'a'), msg('tool', 't'), msg('assistant', 'b')]
 
 /** A sub-agent completion event SubagentCompletionCard can parse. */
@@ -31,6 +31,12 @@ const COMPLETION = [
 const synthesisRow = (): ChatMessage =>
   ({ role: 'inject', content: '[SYSTEM] Sub-agent synthesis: …', cls: '',
      meta: { injectKind: 'synthesis' } } as unknown as ChatMessage)
+
+/** A workflow result another writer appends into the window while a turn runs:
+ *  an assistant row the runner never records as its reply. */
+const envelope = (): ChatMessage =>
+  ({ role: 'assistant', content: 'ENVELOPE: workflow result', cls: '',
+     meta: { kind: 'workflow_result' } } as unknown as ChatMessage)
 
 const isTurn = (d: DisplayItem): d is { kind: 'turn'; items: never[]; complete: boolean; interim?: boolean } =>
   d.kind === 'turn'
@@ -221,6 +227,111 @@ describe('groupDisplayItems', () => {
     expect(folded).not.toContain('ANSWER TWO')
   })
 
+  it('keeps a synthesis answer an error cut short and a recovery resumed out of the next fold', () => {
+    // The runner stamps turn stats on every turn end, an error end included, so
+    // the cut-short first half of the answer carries them. The recovery inject
+    // resumes the SAME turn, so the recovered half is still the answer.
+    const answer = (content: string): ChatMessage =>
+      ({ role: 'assistant', content, cls: '',
+         meta: { turn_stats: { elapsed_ms: 600 } } } as unknown as ChatMessage)
+    const recovery = ({ role: 'inject', content: '[continue]', cls: '',
+                        meta: { injectKind: 'recovery' } } as unknown as ChatMessage)
+    const { turns } = groupDisplayItems([
+      msg('user', 'judge both stacks'),
+      msg('assistant', 'spawning wave 1'),
+      synthesisRow(),
+      answer('ANSWER ONE, first half'),
+      // A sub-agent completion delivered as an assistant row: an envelope too.
+      msg('assistant', COMPLETION),
+      msg('error', 'retrying'),
+      recovery,
+      answer('ANSWER ONE, second half'),
+      msg('assistant', 'spawning wave 2'),
+      msg('assistant', 'wave 2 per-completion prose'),
+      synthesisRow(),
+      answer('ANSWER TWO'),
+    ])
+    const folded = turns
+      .filter(t => isTurn(t) && t.interim)
+      .flatMap(t => (t as unknown as { items: { msg: ChatMessage }[] }).items.map(i => i.msg.content))
+    expect(folded).toContain('wave 2 per-completion prose')
+    expect(folded).not.toContain('ANSWER ONE, first half')
+    expect(folded).not.toContain('ANSWER ONE, second half')
+  })
+
+  it('keeps the error card under a synthesis answer cut short out of the next fold', () => {
+    // No recovery follows: the card is the end of the answer it cut short, not
+    // interim work of the wave a later completion starts.
+    const answer = (content: string): ChatMessage =>
+      ({ role: 'assistant', content, cls: '',
+         meta: { turn_stats: { elapsed_ms: 600 } } } as unknown as ChatMessage)
+    const completion = ({ ...msg('subagent', COMPLETION), meta: { subagentCompletion: {} } } as ChatMessage)
+    const { turns } = groupDisplayItems([
+      msg('user', 'u'),
+      msg('assistant', 'spawning wave 1'),
+      synthesisRow(),
+      answer('ANSWER ONE, cut'),
+      msg('error', 'CARD: the model is at capacity'),
+      completion,
+      answer('wave 2 per-completion prose'),
+      synthesisRow(),
+      answer('ANSWER TWO'),
+    ])
+    const folded = turns
+      .filter(t => isTurn(t) && t.interim)
+      .flatMap(t => (t as unknown as { items: { msg: ChatMessage }[] }).items.map(i => i.msg.content))
+    expect(folded).toContain('wave 2 per-completion prose')
+    expect(folded).not.toContain('ANSWER ONE, cut')
+    expect(folded).not.toContain('CARD: the model is at capacity')
+  })
+
+  it('keeps the tail of a cut-short synthesis turn with its answer', () => {
+    // The answer's text was saved at a tool call, then the turn died: its tool
+    // row, a failed compaction's notice and the error card all report on the
+    // turn that wrote the answer, not on the wave a later completion starts.
+    const answer = (content: string): ChatMessage =>
+      ({ role: 'assistant', content, cls: '',
+         meta: { turn_stats: { elapsed_ms: 600 } } } as unknown as ChatMessage)
+    const notice = ({ role: 'assistant', content: 'NOTICE: compaction failed', cls: '',
+                      meta: { kind: 'compaction' } } as unknown as ChatMessage)
+    const completion = ({ ...msg('subagent', COMPLETION), meta: { subagentCompletion: {} } } as ChatMessage)
+    const { turns } = groupDisplayItems([
+      msg('user', 'u'),
+      msg('assistant', 'spawning wave 1'),
+      synthesisRow(),
+      answer('ANSWER ONE, cut'),
+      msg('tool', 'TOOL: read the plan'),
+      envelope(),
+      notice,
+      msg('error', 'CARD: compaction failed'),
+      completion,
+      answer('wave 2 per-completion prose'),
+      synthesisRow(),
+      answer('ANSWER TWO'),
+    ])
+    const folded = turns
+      .filter(t => isTurn(t) && t.interim)
+      .flatMap(t => (t as unknown as { items: { msg: ChatMessage }[] }).items.map(i => i.msg.content))
+    expect(folded).toContain('wave 2 per-completion prose')
+    for (const tail of ['ANSWER ONE, cut', 'TOOL: read the plan', 'ENVELOPE: workflow result', 'NOTICE: compaction failed', 'CARD: compaction failed']) {
+      expect(folded).not.toContain(tail)
+    }
+  })
+
+  it('wraps a reply an error cut short and the rows after it in one turn', () => {
+    // The cut reply carries turn stats, which end a loose region in the app
+    // promotion pass (transcriptRows); that is safe only because the grouper
+    // has already made a turn of the batch once anything follows the cut.
+    const cut = ({ role: 'assistant', content: 'CUT', cls: '',
+                   meta: { turn_stats: { elapsed_ms: 600 } } } as unknown as ChatMessage)
+    const recovery = ({ role: 'inject', content: '[continue]', cls: '',
+                        meta: { injectKind: 'recovery' } } as unknown as ChatMessage)
+    for (const after of [[msg('error', 'retrying')], [recovery]]) {
+      const { turns } = groupDisplayItems([msg('user', 'go'), msg('tool', 'app'), cut, ...after])
+      expect(turns.map(t => t.kind)).toEqual(['single', 'turn'])
+    }
+  })
+
   it('folds a second wave reached through a queue-drained completion opener', () => {
     // A completion delivered while the slot is busy drains from the queue as a
     // `subagent` row, which opens a turn and flushes the open batch WITHOUT
@@ -405,8 +516,8 @@ describe('groupDisplayItems', () => {
   })
 
   it('reports trailingTurnIdx = -1 when the trailing group does not collapse', () => {
-    // Two items only — below the > 2 threshold, so flushTurn spreads them as
-    // loose items and there is no `complete` flag for the running state to touch.
+    // A lone answer, no tool call: flushTurn spreads it as a loose item and
+    // there is no `complete` flag for the running state to touch.
     const { turns, trailingTurnIdx } = groupDisplayItems([msg('user', 'u'), msg('assistant', 'a')])
     expect(trailingTurnIdx).toBe(-1)
     expect(turns.every(t => !isTurn(t))).toBe(true)
@@ -414,6 +525,40 @@ describe('groupDisplayItems', () => {
 
   it('reports trailingTurnIdx = -1 for an empty list', () => {
     expect(groupDisplayItems([])).toEqual({ turns: [], trailingTurnIdx: -1 })
+  })
+
+  // #23017: a one-tool turn must wrap like a two-tool turn, so it gets the
+  // "1 tool call" fold. The old `items.length > 2` rule spread it loose.
+  it('wraps a one-tool turn (tool call + answer) into a turn', () => {
+    const { turns, trailingTurnIdx } = groupDisplayItems([
+      msg('user', 'what is in README.md'), msg('tool', '🔧 Running: read'), msg('assistant', 'It lists the setup steps.'),
+    ])
+    const wrapped = turns.filter(isTurn)
+    expect(wrapped).toHaveLength(1)
+    expect(wrapped[0].items).toHaveLength(2)
+    expect(trailingTurnIdx).toBe(turns.indexOf(wrapped[0]))
+  })
+
+  it('wraps a lone tool call with no answer into a turn', () => {
+    const { turns } = groupDisplayItems([msg('user', 'u'), msg('tool', '🔧 Running: git status')])
+    expect(turns.filter(isTurn)).toHaveLength(1)
+  })
+
+  it('wraps a one-tool turn that is not the trailing one', () => {
+    const { turns } = groupDisplayItems([
+      msg('user', 'u1'), msg('tool', '🔧 Running: read'), msg('assistant', 'a'), msg('user', 'u2'),
+    ])
+    expect(turns.filter(isTurn)).toHaveLength(1)
+  })
+
+  it('leaves a lone answer with no tool call loose', () => {
+    const { turns } = groupDisplayItems([msg('user', 'u1'), msg('assistant', 'hi'), msg('user', 'u2')])
+    expect(turns.filter(isTurn)).toHaveLength(0)
+  })
+
+  it('leaves two answers with no tool call loose', () => {
+    const { turns } = groupDisplayItems([msg('user', 'u'), msg('assistant', 'a'), msg('assistant', 'b')])
+    expect(turns.filter(isTurn)).toHaveLength(0)
   })
 
   it('does not collapse a turn with no working steps', () => {

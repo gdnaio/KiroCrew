@@ -31,6 +31,7 @@ from kiro_crew.taskq.dependency import (
 )
 from kiro_crew.taskq.store import TaskStore, TaskStoreUnavailable
 from kiro_crew.taskq.waits import WaitRecord
+from kiro_crew.testing.wait import await_until
 
 T0 = 1_000_000.0
 GH = "github:api"
@@ -1022,10 +1023,10 @@ def test_a_wake_the_store_could_not_take_keeps_the_waiter_on_its_scope(
     def _down(task_id: str, **kw: object) -> int | None:
         raise TaskStoreUnavailable("the store could not be reached")
 
-    monkeypatch.setattr(store, "wake_wait", _down)
-    clock.advance(2.0)
-    assert coord.tick() == [], "an unwritten wake was reported as a wake"
-    monkeypatch.undo()
+    with monkeypatch.context() as mp:
+        mp.setattr(store, "wake_wait", _down)
+        clock.advance(2.0)
+        assert coord.tick() == [], "an unwritten wake was reported as a wake"
 
     assert _events(store, "sa-1", EVENT_WAKE) == []
     kinds = [e.kind for e in store.events("sa-1")]
@@ -1081,10 +1082,10 @@ def test_a_wait_that_did_not_persist_is_not_reported_as_a_wait(
     def _down(*_a: object, **_kw: object) -> object:
         raise TaskStoreUnavailable("the store could not be reached")
 
-    monkeypatch.setattr(store, "enter_wait", _down)
-    monkeypatch.setattr(store, "transition", _down)
-    verdict = coord.report("sa-3", _signal(), generation=generation, from_state=model.RUNNING)
-    monkeypatch.undo()
+    with monkeypatch.context() as mp:
+        mp.setattr(store, "enter_wait", _down)
+        mp.setattr(store, "transition", _down)
+        verdict = coord.report("sa-3", _signal(), generation=generation, from_state=model.RUNNING)
 
     assert verdict.outcome == "unpersisted"
     assert verdict.state == model.RUNNING, "the row is still where the caller reported from"
@@ -1162,15 +1163,15 @@ def test_the_schedule_lock_is_never_held_across_a_store_write(
 
         return _wrapper
 
-    for method in ("append_event", "enter_wait", "transition", "wake_wait", "finish"):
-        monkeypatch.setattr(store, method, _probing(method, getattr(store, method)))
+    with monkeypatch.context() as mp:
+        for method in ("append_event", "enter_wait", "transition", "wake_wait", "finish"):
+            mp.setattr(store, method, _probing(method, getattr(store, method)))
 
-    for tid, gen in gens.items():
-        coord.report(tid, _signal(), generation=gen)  # the wait writes
-    clock.advance(2.0)
-    assert coord.tick() == ["t0"]  # the wake write
-    coord.report("t0", _signal(), generation=store.get("t0").generation)  # type: ignore[union-attr]
-    monkeypatch.undo()
+        for tid, gen in gens.items():
+            coord.report(tid, _signal(), generation=gen)  # the wait writes
+        clock.advance(2.0)
+        assert coord.tick() == ["t0"]  # the wake write
+        coord.report("t0", _signal(), generation=store.get("t0").generation)  # type: ignore[union-attr]
 
     assert store.state_of("t1") == model.FAILED  # the give-up writes really ran
     assert {name for name, _free in seen} >= {"append_event", "enter_wait", "wake_wait", "finish"}
@@ -1213,7 +1214,7 @@ async def test_a_report_driven_give_up_releases_a_parked_run_on_the_loop(
     assert sorted(coord.waiters(GH)) == ["reporter", "victim"]
 
     clock.advance(31.0)  # past the scope's wall-clock deadline
-    parked = asyncio.create_task(asyncio.wait_for(released.wait(), timeout=10.0))
+    parked = asyncio.create_task(await_until(released, what="the give-up hooks' release"))
     verdict = await store.run(coord.report, "reporter", _signal(), generation=reporter)
     # Handed to the loop DURING the call, so it is queued ahead of this
     # coroutine's own resumption: the awaiting caller never sees a give-up whose

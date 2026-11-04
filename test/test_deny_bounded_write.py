@@ -1583,6 +1583,26 @@ class TestEveryBackendIdLogSiteIsSanitized:
         "src/kiro_crew/acp/runtime_session_setup.py": [],
         "src/kiro_crew/acp/runtime_session_create.py": [],
         "src/kiro_crew/acp/runtime_session_load.py": [],
+        "src/kiro_crew/acp/runtime_session_registry.py": [],
+        "src/kiro_crew/acp/runtime_mode_activation.py": [],
+        "src/kiro_crew/acp/runtime_wire.py": [
+            "send_notification method=%s: %s; activity clock not refreshed",
+            "response to req=%s; marking runtime dead",
+            "while sending request method=%s req=%s;",
+        ],
+        "src/kiro_crew/acp/runtime_liveness.py": [],
+        "src/kiro_crew/acp/runtime_host_requests.py": [
+            "Ownerless server request answered -32601 — method=%s id=%s",
+            "answer-task cap (%d) reached at %s request id=%s%s and no ",
+            "auto-rejected permission request id=%s for session %s ",
+            "answer for permission request id=%s could not be written in ",
+            "failed to answer unroutable permission request id=%s",
+        ],
+        "src/kiro_crew/acp/runtime_frame_accounting.py": [
+            "Dropped %d unroutable frame(s) for session %s (method=%s)",
+        ],
+        "src/kiro_crew/acp/runtime_reader_loop.py": [],
+        "src/kiro_crew/acp/runtime_class.py": [],
         "src/kiro_crew/acp/client_turn.py": [
             "ACP event: method=%s id=%s action=%s",
         ],
@@ -1619,6 +1639,7 @@ class TestEveryBackendIdLogSiteIsSanitized:
         "src/kiro_crew/acp/session_handle_compaction.py": [],
         "src/kiro_crew/acp/session_handle_turn.py": [
             "rejected permission request id=%s stranded in the ",
+            "cancelled elicitation request id=%s stranded in the ",
         ],
         "src/kiro_crew/acp/session_handle_dispatch.py": [
             "Dropping stray response frame id=%s (no waiter)",
@@ -1635,17 +1656,7 @@ class TestEveryBackendIdLogSiteIsSanitized:
         ],
         "src/kiro_crew/acp/session_handle_updates.py": [],
         "src/kiro_crew/acp/session_handle_class.py": [],
-        "src/kiro_crew/acp/runtime.py": [
-            "send_notification method=%s: %s; activity clock not refreshed",
-            "Dropped %d unroutable frame(s) for session %s (method=%s)",
-            "response to req=%s; marking runtime dead",
-            "while sending request method=%s req=%s;",
-            "Ownerless server request answered -32601 — method=%s id=%s",
-            "answer-task cap (%d) reached at %s request id=%s%s and no ",
-            "auto-rejected permission request id=%s for session %s ",
-            "answer for permission request id=%s could not be written in ",
-            "failed to answer unroutable permission request id=%s",
-        ],
+        "src/kiro_crew/acp/runtime.py": [],
         "src/kiro_crew/acp/_dispatch.py": [],
         "src/kiro_crew/acp/_dispatch_parts/tool_call_identity.py": [],
         "src/kiro_crew/acp/_dispatch_parts/surfaced_text.py": [],

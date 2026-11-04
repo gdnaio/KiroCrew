@@ -16,7 +16,10 @@ from pathlib import Path
 import pytest
 
 SRC = Path(__file__).parent.parent / "src" / "kiro_crew"
-HANDLERS = (SRC / "deploy" / "handlers.py").read_text(encoding="utf-8")
+HANDLERS = "".join(
+    (SRC / "deploy" / name).read_text(encoding="utf-8")
+    for name in ("handlers_guards.py", "handlers_content.py", "handlers_sites.py", "handlers.py")
+)
 VALIDATION = (SRC / "validation.py").read_text(encoding="utf-8")
 MCP_CORE = "\n".join(
     path.read_text(encoding="utf-8")
@@ -128,7 +131,7 @@ class TestDeploySkillsCopyNotSymlink:
             skill_root.mkdir()
             skill_dir = skill_root / "artifact-deploy"
             skill_dir.mkdir()
-            (skill_dir / "SKILL.md").write_text("# Artifact Deploy Skill\n")
+            (skill_dir / "SKILL.md").write_text("# Artifact Deploy Skill\n", encoding="utf-8")
 
             results = _iter_skill_files(skill_root)
             assert len(results) == 1

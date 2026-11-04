@@ -40,7 +40,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,6 +52,7 @@ import pytest
 from kiro_crew.loopback_http import build_loopback_opener
 from kiro_crew.platform_compat import IS_WINDOWS
 from kiro_crew.pod import provision as prov
+from kiro_crew.testing.wait import wait_until
 
 # The pod plane these scenarios run on is hermetic: its own roots, its own unit
 # prefix and its own port band, so a run can never collide with (or reclaim) a
@@ -473,19 +473,30 @@ def _resolve_backend(scratch: Path) -> Path | None:
 def _wait_for(deadline_secs: float, probe, want) -> Any:
     """Poll ``probe`` until it returns a value ``want`` accepts, or the deadline.
 
-    Probe first, test the deadline after -- a do-while. A pre-test loop reads a
-    clock that may already have passed a deadline computed a fork earlier and
-    skips its only body, reporting a timeout on a question nobody asked.
+    Returns the LAST value probed either way: ``wait_until`` reads the probe once
+    before its first deadline check, so a deadline computed a fork earlier still
+    gets one real answer, and the caller reports that answer when it is not the
+    wanted one.
     """
-    deadline = time.monotonic() + deadline_secs
     last: Any = None
-    while True:
+    probed = False
+
+    def _accepted() -> bool:
+        nonlocal last, probed
+        probed = False
         last = probe()
-        if want(last):
-            return last
-        if time.monotonic() >= deadline:
-            return last
-        time.sleep(POLL_INTERVAL)
+        probed = True
+        return bool(want(last))
+
+    try:
+        wait_until(_accepted, timeout=deadline_secs, interval=POLL_INTERVAL)
+    except AssertionError:
+        # Only the deadline is swallowed: the caller owns that failure, reading
+        # ``last`` and failing with the pod's own logs. An assertion the probe
+        # itself raised leaves ``probed`` False and propagates with its message.
+        if not probed:
+            raise
+    return last
 
 
 @pytest.fixture(scope="session")
@@ -787,10 +798,11 @@ def _remove_plane_unit_template() -> None:
 def restart_pod_gateway(pod: PodClient):
     """Restart the pod's gateway in place and wait, bounded, for it to serve again.
 
-    ``pod`` has no restart VERB. Its own remediation table maps "restart" to
-    ``pod down && pod up``, and ``down`` deletes the isolated home -- which
-    destroys the very state a persistence scenario is asserting on, so it cannot
-    be the restart under test. The gateway's own ``POST /api/restart`` is the
+    ``pod restart`` keeps the home but replaces the unit's process, and on
+    Windows the only restart is ``pod down && pod up``, whose ``down`` deletes
+    the isolated home -- the very state a persistence scenario is asserting on.
+    Neither is the in-process restart under test. The gateway's own
+    ``POST /api/restart`` is the
     in-place path: it ``os.execv``s, so the unit stays active and its MainPID is
     unchanged, and it is the same route the dashboard's restart control drives.
     Reached here through ``pod api``, so no test-only transport is introduced.

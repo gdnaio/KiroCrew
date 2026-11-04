@@ -142,6 +142,11 @@ class TestTheRoutesRequireTheInternalSecret:
         """A SessionControlError from create must come back as its own refusal."""
         req = self._request(tmp_path, internal=True, path="/api/session-control/create")
 
+        async def _json():
+            return {"title": "worker"}
+
+        req.json = _json
+
         async def _boom(*_a, **_kw):
             raise sc.SessionControlError("nope", status=429, code="slot_cap_reached")
 
@@ -288,6 +293,29 @@ class TestTheRoutesRequireTheInternalSecret:
         payload = self._body(resp)
         assert payload["ok"] is True
         assert payload["target"] == "chat-2"
+
+    def test_send_hands_its_admission_fence_to_the_own_worker_revive(self, tmp_path, monkeypatch):
+        """The send route's implicit revive must carry the fence admission settled,
+        as every other route does; without it the revive re-derives the fence from
+        config that may have moved while the body read suspended."""
+        req = self._request(tmp_path, internal=True, path="/api/session-control/send")
+        seen: dict = {}
+
+        async def _revive(_state, _caller, target, *, caller_fenced=None):
+            seen["caller_fenced"] = caller_fenced
+            return target
+
+        async def _send(_state, **_kw):
+            return {"ok": True, "target": "chat-2"}
+
+        monkeypatch.setattr(handlers_sc, "_carried_fence", lambda _request: True)
+        monkeypatch.setattr(sc, "revive_own_archived_worker", _revive)
+        monkeypatch.setattr(sc, "send_to_target", _send)
+
+        resp = asyncio.run(handlers_sc.api_session_control_send(req))
+
+        assert resp.status == 200, self._body(resp)
+        assert seen == {"caller_fenced": True}
 
     def test_send_requires_a_non_empty_message(self, tmp_path):
         """The message check lives in the ROUTE, not the business layer, so a

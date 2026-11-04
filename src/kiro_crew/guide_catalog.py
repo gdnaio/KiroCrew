@@ -88,7 +88,7 @@ STEP_UI = "ui"
 STEP_COMMIT = "commit"
 
 #: Caps on a guide's pre-filled name and goal: a proposal short enough to read
-#: at a glance in the New crewmate card's Name and "What it looks after"
+#: at a glance in the New crewmate card's Name and "Goal"
 #: fields, which accept at least this much (they set no shorter limit).
 _GOAL_MAX_CHARS = 200
 _NAME_MAX_CHARS = 24
@@ -382,12 +382,12 @@ ACTIONS: dict[str, ActionDef] = {
     ),
     ACTION_CREWMATE_CREATE: ActionDef(
         id=ACTION_CREWMATE_CREATE,
-        title="Create a crewmate",
+        title="Create a mate",
         description=(
-            "Open the New crewmate card with an optional name and goal "
+            "Open the New mate card with an optional name and goal "
             "pre-filled, then point at its Create button. Nothing is created "
             "until the user clicks Create; completion reports the new "
-            "crewmate's id."
+            "mate's id."
         ),
         steps=(StepDef("create", STEP_COMMIT),),
         params_schema={

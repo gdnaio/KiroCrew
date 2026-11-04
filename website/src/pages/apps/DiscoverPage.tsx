@@ -41,6 +41,7 @@ import { useAppActions } from './useAppActions'
 import { useAppUpdates } from './useAppUpdates'
 import UpdatesList from './UpdatesList'
 import { cardDataKey } from './cardDataKey'
+import { registryRefreshFailureMessage } from '../../components/appstore/registryRefreshMessage'
 
 /**
  * Which app in a featured card has an action in flight, or null.
@@ -255,16 +256,10 @@ function DiscoverPageBody() {
         reportRefreshOutcome(rejection.reason instanceof Error && rejection.reason.message
           ? rejection.reason.message
           : i18nT('components.registryManager.failed_to_refresh_registries'))
-      } else if (
-        registriesResult.status === 'fulfilled'
-        && registriesResult.value.ok === false
-        && registriesResult.value.failed && registriesResult.value.failed.length > 0
-      ) {
-        reportRefreshOutcome(
-          i18nT('components.registryManager.could_not_refresh_still_showing_last_synced',
-            { names: registriesResult.value.failed.join(', ') }))
       } else {
-        reportRefreshOutcome('')
+        reportRefreshOutcome(registriesResult.status === 'fulfilled'
+          ? registryRefreshFailureMessage(registriesResult.value)
+          : '')
       }
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['registry'] }),
@@ -375,8 +370,10 @@ function DiscoverPageBody() {
               worklist, whose update map derives from the same registry rows. */}
           <IconButton
             {...uiLocation('apps.refresh-store')}
-            aria-label={i18nT('pages.appsPage.refresh_store')}
-            title={i18nT('pages.appsPage.refresh_store')}
+            // Disabled while a refresh runs, so the name carries the reason: a
+            // disabled "Refresh the store" reads as unavailable, not busy.
+            aria-label={refreshing ? i18nT('pages.appsPage.refreshing_store') : i18nT('pages.appsPage.refresh_store')}
+            title={refreshing ? i18nT('pages.appsPage.refreshing_store') : i18nT('pages.appsPage.refresh_store')}
             onClick={handleRefresh}
             disabled={refreshing}
           >

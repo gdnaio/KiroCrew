@@ -65,6 +65,19 @@ inside the manifest are rewritten to blob-proxy URLs, so nothing has to be
 mirrored into the Kiro Crew repo. Push a new version and the store picks it up on
 the next refresh.
 
+### Bumping a version reaches your users
+
+Once the store sees a version newer than the one installed, Kiro Crew tells the
+user itself: a bell notification naming your app and the new version, once per
+version, plus the pending-updates count on Discover. Your app can also read the
+same answer and show its own banner through `useAppInfo().update` (see
+[Getting started](getting-started.md#telling-the-user-a-new-version-is-out)).
+
+Two things follow for you. A version bump is user-visible even when nobody opens
+the store, so a release published by accident is noticed; and only `version`
+decides it, so re-pushing the same version with different content tells nobody
+anything.
+
 ## 3. Categories come from your tags
 
 Discover groups apps into a fixed set of categories by scanning `tags` in
@@ -155,8 +168,8 @@ and update paths are not masked and check out LFS content as usual.
 |------|--------------|---------|
 | `onInstall` | After a **registry** install has cloned and built the source, before the files are copied into the data home | 300s |
 | `onUninstall` | Before app files are removed, and only after cron cleanup has succeeded | 120s |
-| `onEnable` | After resources are registered, the backend is started, and dependencies are resolved | 30s, or `onEnableTimeout` |
-| `onDisable` | First step of disable, before hooks, backend stop, and deregistration | 30s, or `onDisableTimeout` |
+| `onEnable` | After resources are registered, the backend is started, and dependencies are resolved | 30s, or `onEnableTimeout` (1-300) |
+| `onDisable` | First step of disable, before hooks, backend stop, and deregistration | 30s, or `onDisableTimeout` (1-300) |
 
 Execution model:
 
@@ -283,6 +296,12 @@ kirocrew app install /absolute/path/to/my-app
 kirocrew app enable my-app
 ```
 
+`enable` refuses an app that is not built in until it is trusted. Enabling it
+from the App Store asks you to trust that app alone (`agent.apps_trusted`);
+Settings → Security → Third-party apps lists and revokes those grants, and holds
+the switch that trusts every third-party app (`agent.apps_allow_third_party`). See
+[Third-party executable code is off by default](#third-party-executable-code-is-off-by-default).
+
 The REST routes require dashboard or app authentication; a bare `curl` request
 is not an equivalent local-install command.
 
@@ -370,6 +389,17 @@ MyAppRepo/
 
 ## 10. Add a registry entry
 
+**Where your app's code lives.** Every app reaches people through a registry,
+never by being added to the Kiro Crew package: Kiro Crew accepts no new built-in
+app. Every app, first-party included, lives in a dedicated GitHub repository
+listed in the official registry
+([kirodotdev/KiroCrewApps](https://github.com/kirodotdev/KiroCrewApps)), and the
+official catalog row below is what lists it; the catalog repository holds listing
+data, never app code. The built-in apps that still ship inside the package are
+being moved out the same way, so do not copy one of them as a pattern for where a
+new app goes
+([decision](../decisions/2026-11-01-kiro-crew-accepts-no-new-built-in-apps.md)).
+
 There are two listing surfaces, and they take different paths:
 
 **The official App Store catalog** is the store's inventory, and it is
@@ -426,7 +456,7 @@ The seed (and any federated registry index) uses this row shape:
 | `subdirectory` | | Path within the repo holding `app.json`, for a monorepo layout. Treated as untrusted: it is joined with symlink-resolving containment and rejected if it escapes the clone root. The store also joins it into every art path the manifest declares (`iconPath`, `heroImage*`, `screenshots*`) when it builds blob-proxy URLs, so those paths stay relative to the app directory. |
 | `resources` | | `"gateway"` (default) or `"app"`: who registers agents, skills, MCP servers, and crons. |
 | `lifecycle` | | `"gateway"` (default), `"app"`, or `"locked"`: who owns updates and uninstall. |
-| `detectInstalled` | | Shell command that exits 0 when the app is already present on the machine (for self-managed apps). It runs in the strict sandbox with a 5s timeout and a credential-free environment: only location hints (`HOME`, `PATH`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `TMPDIR`, locale, and their Windows equivalents) plus git prompt and config suppression. Toolchain variables and git/SSH identity are absent, and stderr is discarded. |
+| `detectInstalled` | | Shell command that exits 0 when the app is already present on the machine (for self-managed apps). It runs in the strict sandbox with a 5s timeout and a credential-free environment: only location hints (`HOME`, `PATH`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `TMPDIR`, locale, and their Windows equivalents) plus git prompt and config suppression. Toolchain variables and git/SSH identity are absent, and stderr is discarded. It runs through `/bin/sh`, so on native Windows it is not run: the app reads not installed and the gateway logs a warning naming the platform. |
 | `featured` | | Curator flag for the Discover editorial layer. `true` marks the app featured; a number both marks it and orders the slots (lower first). It lives on the registry entry, not in `app.json`, and is honored only for core-registry entries: a `featured` flag from an external registry is ignored, so adding a registry cannot seize the spotlight. With nothing flagged, the store falls back to a deterministic pick (apps with hero art first, then verified publishers, then name). |
 
 ## 11. Federated external registries
@@ -603,7 +633,8 @@ installed one.
   deregisters the app's resources, then re-clones, rebuilds, and re-runs
   `onInstall`. If that install fails, the old version is restored: an enabled app
   is re-registered and restarted, while a disabled app stays stopped and
-  unregistered.
+  unregistered. `kirocrew app update <name>` runs the same request from a
+  terminal through a running gateway.
 
 ## 14. Review checklist
 
@@ -635,7 +666,7 @@ useful to Kiro Crew users.
 | Scaffold | `kirocrew app init my-app` |
 | Build UI | `cd ui && npm run build` |
 | Install locally | `POST /api/apps/install`, or `kirocrew app install <dir>` |
-| Enable | `POST /api/apps/{name}/enable`, or `kirocrew app enable <name>` |
+| Enable | Trust the app first, then `POST /api/apps/{name}/enable`, or `kirocrew app enable <name>` |
 | Live reload | `kirocrew app dev <name>` |
 | Update local copy | `POST /api/apps/{name}/update` |
 | List a registry app | Official catalog: open an [App Store listing request](https://github.com/kirodotdev/KiroCrew/issues/new?template=app-store-listing.yml) issue (maintainer-curated). Bundled seed or a federated registry: add an entry to `app-registry.json`, open a pull request |

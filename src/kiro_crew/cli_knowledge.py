@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 
 from kiro_crew.config import KiroCrewConfig, config_dir
 from kiro_crew.config.loader import build_provider_factory
@@ -23,6 +24,7 @@ from kiro_crew.knowledge import store as knowledge_store
 from kiro_crew.knowledge.dedup import dedup_sweep
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.memory import MemoryStore
+from kiro_crew.messaging.tables import display_width
 from kiro_crew.sel import sel
 from kiro_crew.session import SessionManager
 from kiro_crew.skills import SkillsLoader
@@ -103,11 +105,14 @@ def _knowledge_stats(args) -> None:
     )
     if not stats.per_source:
         return
-    # Width from the data, so a long source name does not wrap the count columns.
-    name_width = max(len(s.name) for s in stats.per_source)
-    print(f"\n  {'SOURCE'.ljust(name_width)}  {'DOCS':>6}  {'ITEMS':>6}")
+    # Width from the data, so a long source name does not wrap the count columns,
+    # measured in display columns so a CJK or accented name keeps them aligned.
+    name_width = max(display_width("SOURCE"), *(display_width(s.name) for s in stats.per_source))
+    header_pad = " " * (name_width - display_width("SOURCE"))
+    print(f"\n  SOURCE{header_pad}  {'DOCS':>6}  {'ITEMS':>6}")
     for s in stats.per_source:
-        print(f"  {s.name.ljust(name_width)}  {s.documents:>6}  {s.items:>6}")
+        name_pad = " " * (name_width - display_width(s.name))
+        print(f"  {s.name}{name_pad}  {s.documents:>6}  {s.items:>6}")
 
 
 def _knowledge(args) -> None:
@@ -201,6 +206,18 @@ def _consolidate_cmd(args) -> None:
     mem = MemoryStore()
     mem.init()
     skills = SkillsLoader()
+    # A stored Kiro CLI pick runs on KAS where kiro-cli offers v3; this process
+    # never ran the gateway's KAS floor, so establish that evidence (probes only
+    # for a Kiro CLI pick) and reload, so the factory reads the pick as KAS. Only
+    # on the consolidation path, so the list-only branch above spends no spawn.
+    from kiro_crew.agent_sdk.backends import ensure_kiro_cli_kas_verdict
+
+    # Local, like the import above: the one helper consolidate_now's own
+    # sensitive-session skip uses, kept off the cli facade's served names.
+    from kiro_crew.history import _session_touched_sensitive
+
+    ensure_kiro_cli_kas_verdict()
+    cfg = KiroCrewConfig.load()
     sessions = SessionManager(cfg, provider_factory=build_provider_factory(cfg))
 
     # vector_store omitted: skill dedup uses SkillsLoader.find_similar() (Jaccard),
@@ -222,7 +239,11 @@ def _consolidate_cmd(args) -> None:
         judge_model=cfg.skills.judge_model,
     )
 
-    async def _run(keys: list[str]) -> None:
+    async def _run(keys: list[str]) -> int:
+        # Keys that did not finish. Each one gets a single stderr line naming
+        # the key and the outcome (an exception's type, never its message, which
+        # can carry transcript text), and any one of them makes the command exit 1.
+        unfinished = 0
         for key in keys:
             try:
                 sel().log_api_access(
@@ -236,9 +257,11 @@ def _consolidate_cmd(args) -> None:
                 if count < 1:
                     print(f"  {key}: no unconsolidated messages, skipping")
                     continue
-                print(f"  {key}: consolidating {count} messages...")
+                # Flushed so a stderr outcome line lands after it in a combined log.
+                print(f"  {key}: consolidating {count} messages...", flush=True)
                 if not await consolidator.consolidate_now(key):
-                    print(f"  {key}: no completed pass recorded")
+                    print(f"  {key}: no completed pass recorded", file=sys.stderr)
+                    unfinished += 1
                     continue
                 # consolidate_now drains the tail over as many bounded passes as
                 # it takes, but it can stop short — a backoff armed part-way
@@ -248,12 +271,25 @@ def _consolidate_cmd(args) -> None:
                 # remainder, so a bare "done" would be the last word on messages
                 # nothing has read.
                 left = conv_log.unconsolidated_count(key)
-                if left:
-                    print(f"  {key}: partially consolidated, {left} message(s) remain")
+                if left and _session_touched_sensitive(conv_log._read_messages(key)):
+                    # consolidate_now skips a sensitive session on purpose (before
+                    # the first pass, or once it turns sensitive mid-drain) and
+                    # returns True. That is a skip, not a stalled drain: rerunning
+                    # never changes it, so it must not fail the command.
+                    print(f"  {key}: sensitive session, skipping ({left} message(s) left)")
+                elif left:
+                    print(
+                        f"  {key}: partially consolidated, {left} message(s) remain",
+                        file=sys.stderr,
+                    )
+                    unfinished += 1
                 else:
                     print(f"  {key}: done ✓")
-            except Exception:
+            except Exception as exc:
                 logger.debug("consolidate (or SEL) failed for %s", key, exc_info=True)
+                print(f"  {key}: failed ({type(exc).__name__})", file=sys.stderr)
+                unfinished += 1
+        return unfinished
 
     if consolidate_all:
         keys = [
@@ -265,9 +301,12 @@ def _consolidate_cmd(args) -> None:
             print("No sessions with unconsolidated messages.")
             return
         print(f"Consolidating {len(keys)} session(s)...")
-        asyncio.run(_run(keys))
+        unfinished = asyncio.run(_run(keys))
     else:
         print(f"Consolidating session: {session_key}")
-        asyncio.run(_run([session_key]))
+        unfinished = asyncio.run(_run([session_key]))
 
+    if unfinished:
+        print(f"\n{unfinished} session(s) did not finish consolidating.", file=sys.stderr)
+        sys.exit(1)
     print("\nDone. Check ~/.kiro/crew/skills/auto/ for new skills.")

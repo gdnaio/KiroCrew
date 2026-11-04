@@ -219,6 +219,37 @@ def test_a_resolved_prefix_holding_glob_characters_matches_only_itself(tmp_path,
     )
 
 
+@needs_posix_symlinks
+def test_a_canonical_cache_resolves_a_repeated_glob_once_and_agrees(
+    tmp_path, monkeypatch, symlinked_home
+):
+    """A shared cache resolves each distinct glob once and returns the uncached answer."""
+    import kiro_crew.skills as skills_module
+
+    link_home, real_home = symlinked_home
+    _write_skill(link_home / "skills", "demo")
+    glob = str(link_home / "skills" / "*" / "SKILL.md")
+    seen: list[str] = []
+    real_validate = skills_module.validate_file_path
+
+    def recording_validate(raw: str) -> str | None:
+        seen.append(raw)
+        return real_validate(raw)
+
+    monkeypatch.setattr(skills_module, "validate_file_path", recording_validate)
+
+    uncached = skills_module._with_canonical_globs([glob])
+    seen.clear()
+    cache: dict = {}
+    first = skills_module._with_canonical_globs([glob], None, cache)
+    second = skills_module._with_canonical_globs([glob], None, cache)
+
+    assert first == second == uncached
+    assert uncached == [glob, str(real_home / "skills" / "*" / "SKILL.md")]
+    # The linked prefix is validated once across the two cached calls.
+    assert seen.count(str(link_home / "skills")) == 1
+
+
 def test_loader_roots_are_resolved_once_however_many_mappings(tmp_path, monkeypatch, opened):
     import kiro_crew.skills as skills_module
 
@@ -255,3 +286,111 @@ def test_the_dashboard_annotation_agrees_with_the_loader(tmp_path, symlinked_hom
 
     assert _agents_loading_skill(resolved_skill, expanded) == ["a"]
     assert _agent_loads_skill(spec, agent_path, resolved_skill) is True
+
+
+@needs_posix_symlinks
+def test_a_resolved_home_mapping_matches_a_row_listed_through_the_link(tmp_path, symlinked_home):
+    """The glob is already resolved; the row is spelled through ``$HOME``."""
+    from kiro_crew.dashboard.handlers._shared import (
+        _agent_loads_skill,
+        _agents_loading_skill,
+        _expand_agent_globs,
+    )
+
+    link_home, real_home = symlinked_home
+    _write_skill(link_home / "my-skills", "demo")
+    listed_row = link_home / "my-skills" / "demo" / "SKILL.md"
+    agent_path = tmp_path / "a.json"
+    specs = {
+        "exact": {"resources": [f"skill://{real_home}/my-skills/demo/SKILL.md"]},
+        "glob": {"resources": [f"skill://{real_home}/my-skills/*/SKILL.md"]},
+    }
+
+    expanded = _expand_agent_globs([(n, s, agent_path) for n, s in specs.items()])
+
+    assert _agents_loading_skill(listed_row, expanded) == ["exact", "glob"]
+    for spec in specs.values():
+        assert _agent_loads_skill(spec, agent_path, listed_row) is True
+
+
+@needs_posix_symlinks
+@pytest.mark.asyncio
+async def test_agent_scoped_listing_names_what_the_runtime_scope_selects(
+    tmp_path, monkeypatch, opened
+):
+    """End to end: ``GET /api/skills?agent=`` agrees with ``scoped_skills``."""
+    import json
+    from unittest.mock import MagicMock
+
+    from aiohttp.test_utils import TestClient, TestServer
+    from skill_browser_helpers import _make_app
+
+    from kiro_crew.agent_discovery import agent_skill_globs
+    from kiro_crew.testing.wait import async_wait_until
+
+    real = tmp_path / "data" / "home" / "alice"
+    real.mkdir(parents=True)
+    spelled = tmp_path / "home-alice"
+    spelled.symlink_to(real, target_is_directory=True)
+    resolved = Path(os.path.realpath(spelled))
+    monkeypatch.setenv("HOME", str(spelled))
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)
+    monkeypatch.setattr("kiro_crew.agent_discovery._KIRO_AGENTS_DIR", spelled / ".kiro" / "agents")
+    _write_skill(spelled / ".kiro" / "crew" / "skills", "demo")
+    agents = spelled / ".kiro" / "agents"
+    agents.mkdir(parents=True)
+    specs = {
+        "tilde": "skill://~/.kiro/crew/skills/demo/SKILL.md",
+        "resolved": f"skill://{resolved}/.kiro/crew/skills/demo/SKILL.md",
+        "resolved-glob": f"skill://{resolved}/.kiro/crew/skills/*/SKILL.md",
+    }
+    for name, uri in specs.items():
+        (agents / f"{name}.json").write_text(json.dumps({"name": name, "resources": [uri]}))
+    loader = opened(SkillsLoader(install_builtins=False))
+    state = MagicMock(_slots={}, context_builder=None)
+    state._standalone_skills = loader
+
+    async with TestClient(TestServer(_make_app(state))) as client:
+
+        async def demo_is_listed() -> bool:
+            rows = await (await client.get("/api/skills")).json()
+            return any(r["name"] == "demo" for r in rows)
+
+        # The loader publishes its first walk from a worker thread.
+        await async_wait_until(demo_is_listed, describe=lambda: "demo never listed")
+        listed = {}
+        for agent in specs:
+            payload = await (await client.get("/api/skills", params={"agent": agent})).json()
+            listed[agent] = [s["name"] for s in payload["skills"]]
+
+    runtime = {
+        a: [r["name"] for r in loader.scoped_skills(only=agent_skill_globs(a))] for a in specs
+    }
+    assert runtime == {a: ["demo"] for a in specs}
+    assert listed == runtime
+
+
+@needs_posix_symlinks
+def test_the_indexed_matcher_agrees_under_a_symlinked_home(tmp_path, symlinked_home):
+    """A ``~`` mapping matches the resolved row through both index buckets.
+
+    A ``~`` wildcard mapping canonicalises to a glob whose literal prefix is the
+    resolved home, so it lands in the wildcard bucket; an exact ``~`` mapping
+    canonicalises to the resolved file path and lands in the exact set.
+    """
+    from kiro_crew.dashboard.handlers._shared import (
+        _agents_loading_skill_indexed,
+        _build_agent_match_index,
+        _expand_agent_globs,
+    )
+
+    link_home, real_home = symlinked_home
+    _write_skill(link_home / "my-skills", "demo")
+    resolved_skill = real_home / "my-skills" / "demo" / "SKILL.md"
+    parsed = [
+        ("wild", {"resources": ["skill://~/my-skills/*/SKILL.md"]}, tmp_path / "w.json"),
+        ("exact", {"resources": ["skill://~/my-skills/demo/SKILL.md"]}, tmp_path / "e.json"),
+    ]
+    index = _build_agent_match_index(_expand_agent_globs(parsed))
+
+    assert _agents_loading_skill_indexed(resolved_skill, index) == ["wild", "exact"]

@@ -75,7 +75,7 @@ CHILD_PERMISSION_ROUTED = "kirocrew.acp.child_permission.routed"
 DROPPED_FRAMES = "kirocrew.acp.dropped_frames"
 
 #: One point per ``session/set_mode`` that did not land on the freshly prepared
-#: skill-view alias on the first try (``acp/runtime.py::_activate_mode_bracketed``).
+#: skill-view alias on the first try (``acp/runtime_mode_activation.py::_activate_mode_bracketed``).
 #: ``outcome`` is the closed enum ``loaded_after_retry`` (the host loaded it after a
 #: forced reload) / ``refused_unloaded`` (it never did; the session start failed) /
 #: ``refused_unprepared`` (no view could be prepared; the start failed) /
@@ -94,6 +94,9 @@ TURN_TIMEOUT_CAUSE = "kirocrew.turn.timeout.cause"
 #: Idle-sweep expiries — ``turn_active=True`` means the sweep killed a
 #: runtime mid-turn, the teardown signature of the original incidents.
 SESSION_IDLE_EXPIRED = "kirocrew.session.idle_expired"
+
+#: One runtime-reconcile pass: its reading's counts, emitted every pass.
+SESSION_RUNTIME_RECONCILE = "kirocrew.session.runtime_reconcile"
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +148,51 @@ def subagent_outcome(raw: object) -> str:
     if isinstance(raw, str) and raw in SUBAGENT_OUTCOMES:
         return raw
     return SUBAGENT_OUTCOME_UNKNOWN
+
+
+#: Every value ``result`` can carry on :data:`SUBAGENT_COMPLETED`: ``text`` for a
+#: completed run that returned a non-empty result, ``empty`` for a completed run
+#: whose result is empty (the "finished with no answer" failure mode), and
+#: ``none`` for a run that did not complete (failed, stopped or unknown). Only the
+#: emptiness of the result is published, never the result itself.
+SUBAGENT_RESULT_VALUES: tuple[str, ...] = ("text", "empty", "none")
+
+
+#: The placeholder the sub-agent runner stores as ``result`` when a run returned
+#: no reply (``subagent_manager/run_turn.py``). A notice may follow it.
+SUBAGENT_NO_REPLY_RESULT = "_No response._"
+
+
+def subagent_result_kind(
+    outcome: str,
+    result: object,
+    truncated: object = False,
+    *,
+    returned_reply: object = None,
+) -> str:
+    """Fold a terminal run's result onto :data:`SUBAGENT_RESULT_VALUES`; never raises.
+
+    *returned_reply* is the record's ``returned_reply``: whether the run's own
+    reply was non-empty before any notice (a model fallback, a no-reply notice)
+    was added to ``result``. When the runner set it, it decides. Otherwise the
+    stored result is read: a completed run is ``empty`` when its result is blank
+    or is the runner's
+    no-reply placeholder (with or without the notice appended to it), and
+    ``text`` otherwise. *truncated* is the record's ``result_truncated``: a result
+    too long for the completion event had a reply, so it counts as ``text``. The
+    result path is not consulted, because the runner assigns it to every run.
+    """
+    if outcome != "completed":
+        return "none"
+    if isinstance(returned_reply, bool):
+        return "text" if returned_reply else "empty"
+    if truncated is True:
+        return "text"
+    if isinstance(result, str):
+        text = result.strip()
+        if text and not text.startswith(SUBAGENT_NO_REPLY_RESULT):
+            return "text"
+    return "empty"
 
 
 #: One per inbound webhook REQUEST the endpoint decides, which is WIDER than the

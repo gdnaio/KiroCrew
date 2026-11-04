@@ -508,6 +508,20 @@ def fchmod_safe(fd: int, mode: int) -> None:
             logger.warning("Cannot set permissions on fd %d", fd)
 
 
+def dup_fd_at_or_above(fd: int, floor: int) -> int:
+    """A new fd for *fd*'s file: the lowest free one at or above *floor* (``F_DUPFD``).
+
+    *fd* stays open; the duplicate is not inheritable. POSIX only: raises
+    :class:`OSError` (``ENOTSUP``) on Windows, which has no descriptor numbering to
+    place.
+    """
+    if not IS_POSIX:
+        raise OSError(errno.ENOTSUP, "F_DUPFD is POSIX only")
+    import fcntl
+
+    return fcntl.fcntl(fd, fcntl.F_DUPFD, floor)
+
+
 def chmod_safe(path: str | os.PathLike, mode: int) -> None:
     """Apply ``mode`` to ``path``. Logs warning on failure.
     No-op on Windows.
@@ -818,3 +832,15 @@ def ensure_owner_rwx_dirs(root: str | os.PathLike) -> None:
                 dirnames.remove(dname)
                 continue
             _add_owner_rwx(entry)
+
+
+def claude_code_managed_settings_dir() -> Path:
+    """The directory Claude Code reads managed (organisation policy) settings from on this OS.
+
+    It holds ``managed-settings.json`` and the ``managed-settings.d/`` drop-in directory.
+    """
+    if IS_MACOS:
+        return Path("/Library/Application Support/ClaudeCode")
+    if IS_WINDOWS:
+        return Path("C:\\Program Files\\ClaudeCode")
+    return Path("/etc/claude-code")

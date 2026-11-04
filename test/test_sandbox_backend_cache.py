@@ -23,11 +23,13 @@ import errno
 import os
 import shlex
 import threading
+import time
 import types
 
 import pytest
 
 import kiro_crew.sandbox as sb
+from kiro_crew.testing.clock import ManualClock
 
 # This file replaces ctypes.CDLL, find_library or a cached libc handle for a test,
 # so the shared macOS handle caches are put back after each one (see conftest.py).
@@ -38,6 +40,33 @@ _EAGAIN_REASON = "fork failed with errno 11 (EAGAIN)"
 # step, so a permanent denial reads as the NEWNS call rather than a combined
 # unshare — this is the exact string an Ubuntu >= 23.10 host produces.
 _EPERM_REASON = "unshare(CLONE_NEWNS) failed with errno 1 (EPERM)"
+
+
+def _sandbox_child_env(monkeypatch, env=None):
+    """Return the env from the real sandboxed-spawn chokepoint without OS setup."""
+    monkeypatch.setattr(sb, "wrap_argv", lambda argv, **_kwargs: (list(argv), None))
+    monkeypatch.setattr(sb, "cgroup_scope_bus_env", lambda child_env: (child_env, ()))
+    monkeypatch.setattr(sb, "cgroup_scope_argv", lambda argv: argv)
+
+    _argv, child_env, _cleanup = sb.sandboxed_spawn_argv(["tool"], env=env or {})
+
+    return child_env
+
+
+def _become_child(monkeypatch, child_env):
+    """Install *child_env* as this process's env and seed state as import does."""
+    for name in (
+        sb._INHERITED_USERNS_FAILURE_ENV,
+        sb.KIROCREW_SPAWNED_ENV,
+        sb.KIROCREW_SANDBOX_TOOL_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in child_env.items():
+        monkeypatch.setenv(name, value)
+    inherited = sb._read_inherited_userns_failure()
+    monkeypatch.setattr(sb, "_inherited_unshare_failure", inherited)
+    sb.reset_backend()
+    sb._last_unshare_failure = inherited
 
 
 @pytest.fixture(autouse=True)
@@ -55,6 +84,7 @@ def clean_backend(monkeypatch):
     passthrough from short-circuiting tests on sandboxed hosts.
     """
     monkeypatch.delenv("KIROCREW_SANDBOX_ACTIVE", raising=False)
+    monkeypatch.delenv(sb._INHERITED_USERNS_FAILURE_ENV, raising=False)
     monkeypatch.setattr(
         sb, "_KIRO_INTERNAL_SETTINGS_PATH", "/nonexistent/kirocrew-test/amazon-internal.json"
     )
@@ -136,6 +166,69 @@ def test_probe_permanent_failure_does_not_retry(monkeypatch):
     assert sb._probe_unshare() is False
     assert len(calls) == 1
     assert sb._last_unshare_failure == (False, _EPERM_REASON, "")
+
+
+def test_inherited_permanent_failure_skips_probe_and_warning(monkeypatch, caplog):
+    monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="linux"))
+    sb._last_unshare_failure = (False, _EPERM_REASON, "apparmor_userns")
+    # The no-backend path sets no launcher marker, and a caller value is replaced.
+    child_env = _sandbox_child_env(
+        monkeypatch, {sb._INHERITED_USERNS_FAILURE_ENV: '["forged","forged"]'}
+    )
+    assert "KIROCREW_SANDBOX_ACTIVE" not in child_env
+
+    _become_child(monkeypatch, child_env)
+    monkeypatch.setattr(
+        sb,
+        "_probe_unshare_once",
+        lambda: pytest.fail("child repeated the inherited permanent probe"),
+    )
+
+    assert sb.detect_backend() == "none"
+    sb.reset_backend()
+    sb._last_unshare_failure = sb._inherited_unshare_failure
+    sb._background_warm()
+    assert sb._backend == "none"
+    assert sb._last_unshare_failure == (False, _EPERM_REASON, "apparmor_userns")
+    assert not [record for record in caplog.records if "probe" in record.message]
+
+
+def test_child_without_inherited_failure_probes_and_logs(monkeypatch, caplog):
+    monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="linux"))
+    _become_child(monkeypatch, _sandbox_child_env(monkeypatch))
+    calls: list[int] = []
+
+    def fake_once():
+        calls.append(1)
+        return (False, False, _EPERM_REASON, "apparmor_userns")
+
+    monkeypatch.setattr(sb, "_probe_unshare_once", fake_once)
+
+    assert sb._inherited_unshare_failure is None
+    assert sb._probe_unshare() is False
+    assert calls == [1]
+    assert [
+        record.message for record in caplog.records if "userns probe failed" in record.message
+    ] == [f"userns probe failed (permanent): {_EPERM_REASON}"]
+
+
+def test_hint_outside_a_chokepoint_tree_is_ignored(monkeypatch):
+    monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="linux"))
+    _become_child(monkeypatch, {sb._INHERITED_USERNS_FAILURE_ENV: '["forged","forged"]'})
+
+    assert sb._inherited_unshare_failure is None
+
+
+def test_transient_failure_is_not_inherited_by_child(monkeypatch):
+    monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="linux"))
+    sb._last_unshare_failure = (True, _EAGAIN_REASON, "")
+
+    child_env = _sandbox_child_env(
+        monkeypatch,
+        {sb._INHERITED_USERNS_FAILURE_ENV: '["stale","stale"]'},
+    )
+
+    assert sb._INHERITED_USERNS_FAILURE_ENV not in child_env
 
 
 def test_probe_transient_then_success_recovers(monkeypatch):
@@ -258,12 +351,61 @@ def test_fail_closed_permanent_message_includes_optout_and_detail(monkeypatch):
 # ── Finding 2: signal-killed probe child classified transient ──
 
 
+class _FakePoll:
+    """Stand-in for ``select.poll`` where the platform has none (Windows).
+
+    Always reports the fd readable, so the probe's own ``os.read`` decides: the
+    parent closed the pipe's write end, so that read returns EOF at once.
+    """
+
+    def register(self, fd, mask):
+        pass
+
+    def unregister(self, fd):
+        pass
+
+    def poll(self, timeout=None):
+        return [(0, 1)]
+
+
+def _provide_posix_probe_apis(monkeypatch):
+    """Supply the POSIX names the fork probe touches, only where they are missing.
+
+    On Linux and macOS every name already exists and nothing is replaced. On
+    Windows ``os.fork``, ``os.getuid``/``getgid``, ``os.WNOHANG``, the wait-status
+    macros and ``select.poll`` are absent, so stand-ins with POSIX semantics are
+    added for this test only (``raising=False`` lets monkeypatch add a name).
+    """
+    import select
+
+    def _missing(mod, name, value):
+        if not hasattr(mod, name):
+            monkeypatch.setattr(mod, name, value, raising=False)
+
+    _missing(os, "getuid", lambda: 1000)
+    _missing(os, "getgid", lambda: 1000)
+    _missing(os, "WNOHANG", 1)
+    # POSIX wait-status layout: low 7 bits are the terminating signal (0 = exited,
+    # 0x7f = stopped), the next byte is the exit status.
+    _missing(os, "WIFSIGNALED", lambda s: (s & 0x7F) not in (0, 0x7F))
+    _missing(os, "WTERMSIG", lambda s: s & 0x7F)
+    _missing(os, "WIFEXITED", lambda s: (s & 0x7F) == 0)
+    _missing(os, "WEXITSTATUS", lambda s: (s >> 8) & 0xFF)
+    _missing(select, "POLLIN", 1)
+    _missing(select, "poll", _FakePoll)
+
+
 def test_probe_child_killed_by_signal_is_transient(monkeypatch):
-    """A probe child killed by a signal (WIFEXITED=False) must be transient."""
+    """A probe child killed by a signal (WIFEXITED=False) must be transient.
+
+    Runs on every platform: fork, waitpid and libc are faked, and the POSIX names
+    Windows lacks are supplied, so the parent's verdict logic is what is tested.
+    """
+    _provide_posix_probe_apis(monkeypatch)
     # Simulate fork -> child killed by SIGKILL (signal 9).
     # Status word for signal-killed: signal number in low 7 bits, no exit.
     signal_status = 9  # WIFSIGNALED(9)=True, WTERMSIG(9)=9, WIFEXITED(9)=False
-    monkeypatch.setattr(os, "fork", lambda: 12345)
+    monkeypatch.setattr(os, "fork", lambda: 12345, raising=False)
     monkeypatch.setattr(os, "waitpid", lambda pid, flags: (pid, signal_status))
     # Stub out the libc loading so we don't actually fork
     import ctypes as _ct
@@ -346,7 +488,6 @@ def test_on_loop_kicks_background_warm_that_populates_cache(monkeypatch):
     # Probe ran on background thread, not on event loop
     assert len(probe_thread_names) >= 1
     assert all("sandbox-probe-warm" in n for n in probe_thread_names)
-    # Cache is now populated
     assert sb._backend == "namespace"
 
 
@@ -360,7 +501,6 @@ def test_warm_dedupe_two_rapid_calls_start_at_most_one_thread(monkeypatch):
 
     monkeypatch.setattr(sb, "_probe_unshare_once", slow_probe)
 
-    # Patch Thread to track starts
     real_thread = threading.Thread
     thread_starts: list[int] = []
 
@@ -377,7 +517,6 @@ def test_warm_dedupe_two_rapid_calls_start_at_most_one_thread(monkeypatch):
 
     try:
         asyncio.run(_run())
-        # At most 1 thread started despite 2 calls
         assert len(thread_starts) <= 1
     finally:
         gate.set()  # unblock so thread can finish
@@ -391,7 +530,6 @@ def test_prewarm_backend_populates_cache(monkeypatch):
     monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="linux"))
 
     sb.prewarm_backend()
-    # Wait for thread
     if sb._warm_thread is not None:
         sb._warm_thread.join(timeout=5.0)
     assert sb._backend == "namespace"
@@ -514,15 +652,49 @@ def test_warm_backend_is_a_noop_off_linux(monkeypatch):
 # ── Off-loop behaviour preserved ──
 
 
+def _pin_clock(monkeypatch) -> ManualClock:
+    """A clock only the sandbox modules read, recording their retry sleeps.
+
+    Installed through the facade's own ``time`` binding, which the mirror passes
+    to every sandbox owner. That binding IS the stdlib module, so recording by
+    patching ``sb.time.sleep`` would also record every other thread's sleep.
+    """
+    clock = ManualClock(monotonic_start=0.0)
+    clock.install(monkeypatch, sb)
+    return clock
+
+
+def test_another_thread_does_not_reach_the_retry_clock(monkeypatch):
+    """A neighbour thread's sleep and clock read stay off the test's clock.
+
+    ``clean_backend`` already swaps the stdlib sleep for a no-op, so this checks
+    what a recorder depends on: the neighbour's sleep is not recorded and its
+    monotonic reading is not the clock's.
+    """
+    clock = _pin_clock(monkeypatch)
+    clock.advance(10_000_000.0)
+    seen: dict[str, float] = {}
+
+    def _neighbour() -> None:
+        time.sleep(0)
+        seen["monotonic"] = time.monotonic()
+
+    thread = threading.Thread(target=_neighbour, daemon=True)
+    thread.start()
+    thread.join(30.0)
+    assert not thread.is_alive()
+    assert clock.sleeps == (), "another thread's sleep reached the test's clock"
+    assert seen["monotonic"] != clock.monotonic(), "another thread read the test's clock"
+    assert sb.time.monotonic() == clock.monotonic()
+
+
 def test_off_loop_transient_retry_sleeps(monkeypatch):
     """When no event loop is running, time.sleep IS called for the retry."""
     monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="linux"))  # hermetic: gate precedes the mocked probe
-    sleep_calls: list[float] = []
-    monkeypatch.setattr(sb.time, "sleep", lambda s: sleep_calls.append(s))
+    clock = _pin_clock(monkeypatch)
     monkeypatch.setattr(sb, "_probe_unshare_once", lambda: (False, True, "EAGAIN", ""))
     sb._probe_unshare()
-    assert len(sleep_calls) == 1
-    assert sleep_calls[0] == sb._PROBE_TRANSIENT_RETRY_DELAY_SECS
+    assert clock.sleeps == (sb._PROBE_TRANSIENT_RETRY_DELAY_SECS,)
 
 
 def test_off_loop_does_not_kick_background_warm(monkeypatch):
@@ -540,9 +712,8 @@ def test_probe_unshare_fast_path_on_loop_when_backend_set(monkeypatch):
     """When _backend == 'namespace', _probe_unshare() returns True immediately
     without calling _probe_unshare_once — even on a running event loop.
 
-    Regression test for review-bot finding post 36: userns_available() was
-    bypassing the warm cache and deferring on-loop, returning False even
-    though the host is known-good.
+    Bypassing the warm cache and deferring on-loop would make
+    userns_available() return False even though the host is known-good.
     """
     monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="linux"))  # hermetic: gate precedes the mocked probe
     import asyncio

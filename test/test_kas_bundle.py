@@ -356,6 +356,32 @@ class TestInstall:
         assert kas_bundle.installed_bundle(root=root, version="0.66.33") is not None
         assert [p.name for p in root.iterdir() if p.name.startswith(".staging-")] == []
 
+    def test_a_forced_install_over_an_engine_in_use_is_a_named_refusal(
+        self, source_dir, tmp_path, monkeypatch
+    ):
+        """Windows refuses to move aside a directory a running node.exe holds open;
+        --force over it is an install error naming the cause, and the installed
+        engine and its record stay as they were."""
+        root = tmp_path / "root"
+        installed = _install(source_dir, root)
+        marker = installed.root / "in-use"
+        marker.write_text("held")
+        real_rename = os.rename
+
+        def rename_refusing_the_live_engine(src, dst):
+            if Path(src) == installed.root:
+                raise PermissionError(13, "Access is denied", str(src))
+            return real_rename(src, dst)
+
+        monkeypatch.setattr(kas_bundle.os, "rename", rename_refusing_the_live_engine)
+        with pytest.raises(
+            kas_bundle.KasBundleError, match="could not be replaced.*Access is denied.*retry"
+        ):
+            _install(source_dir, root, force=True)
+        assert marker.read_text() == "held"
+        assert kas_bundle.installed_bundle(root=root, version="0.66.33") is not None
+        assert [p.name for p in root.iterdir() if p.name.startswith(".staging-")] == []
+
     def test_a_zstd_engine_archive_installs_like_the_published_one(
         self, source_dir, tmp_path, monkeypatch
     ):
@@ -579,16 +605,48 @@ class TestSpawnRoute:
         assert plan.stderr_label == KAS_BUNDLE_SPAWN_LABEL
 
     @pytest.mark.asyncio
-    async def test_bundle_on_with_nothing_installed_refuses_and_names_the_install(self, tmp_path):
-        """A refusal, not a fallback to the relay: the operator chose the route, and a
-        silent relay spawn would make a kiro-cli problem look like a bundle one."""
+    async def test_bundle_on_with_nothing_installed_installs_the_pin_then_spawns_it(
+        self, source_dir, tmp_path
+    ):
+        """A missing engine is installed by the spawn itself, in the gateway, and the
+        spawn then runs what was laid down. Never a fallback to the relay."""
+        installed = _install(source_dir, tmp_path / "root")
+        calls = []
+
+        def fake_install_pinned(base_url, *, on_progress=None, root=None):
+            calls.append(base_url)
+            return installed
+
         with (
             patch("kiro_crew.acp.harness.kas._bundle_route_selected", return_value=True),
             patch.object(kas_bundle, "installed_bundle", return_value=None),
-            patch.object(kas_bundle, "kas_engines_root", return_value=tmp_path),
+            patch.object(kas_bundle, "install_pinned", side_effect=fake_install_pinned),
         ):
-            with pytest.raises(AcpRuntimeError, match="kirocrew kas install"):
+            plan = await KasHarness().resolve_spawn(_ctx(tmp_path))
+        assert len(calls) == 1
+        assert plan.argv == build_kas_bundle_argv(
+            str(installed.node_bin), str(installed.acp_server)
+        )
+        assert plan.host_auth is True
+
+    @pytest.mark.asyncio
+    async def test_a_failed_install_refuses_with_the_cause_and_the_retry_command(self, tmp_path):
+        """Offline: the refusal names the route, the cause and how to retry."""
+
+        def offline(*a, **k):
+            raise kas_bundle.KasBundleError("could not fetch https://h.test/kas: no route to host")
+
+        with (
+            patch("kiro_crew.acp.harness.kas._bundle_route_selected", return_value=True),
+            patch.object(kas_bundle, "installed_bundle", return_value=None),
+            patch.object(kas_bundle, "install_pinned", side_effect=offline),
+        ):
+            with pytest.raises(AcpRuntimeError) as caught:
                 await KasHarness().resolve_spawn(_ctx(tmp_path))
+        text = str(caught.value)
+        assert "Kiro Crew's own engine" in text
+        assert "no route to host" in text
+        assert "`kirocrew kas install`" in text
 
     @pytest.mark.asyncio
     async def test_bundle_off_keeps_the_relay(self, tmp_path):
@@ -639,7 +697,7 @@ class TestTheLeafIsSealed:
     def test_engines_is_read_only_in_the_sandbox_and_fenced_at_the_tool_gate(self):
         """A sandboxed KAS process must read and execute the engine; nothing in a
         sandbox may rewrite the code the next session runs. Same disposition as
-        ``playwright-cli``, and the same precreate + no-follow pins so an absent
+        ``browser-harness``, and the same precreate + no-follow pins so an absent
         directory on a fresh install is not a name the agent gets to create."""
         from kiro_crew import sandbox, security
 
@@ -832,4 +890,170 @@ class TestOldGlibcRefusal:
         # The refusal is Linux-only; a non-Linux host never reads glibc.
         with _patch_glibc((2, 26)) as reader:
             kas_bundle._require_loadable_glibc("Darwin", "arm64")
-        reader.assert_not_called()
+            reader.assert_not_called()
+            # The same old glibc on Linux is refused, so the Darwin pass is the OS gate.
+            with pytest.raises(kas_bundle.KasBundleError, match="2.26"):
+                kas_bundle._require_loadable_glibc("Linux", "x86_64")
+
+
+# ── the copy an app ships: one universal Node, trimmed to what runs ─────────────
+
+
+def _node_script_tar(dist: str, extra: dict[str, bytes] | None = None) -> bytes:
+    script = f"#!/bin/sh\necho v{_NODE_VERSION}\n".encode()
+    members = {f"{dist}/bin/node": script, **{f"{dist}/{k}": v for k, v in (extra or {}).items()}}
+    return _tar_bytes(members, mode=0o755)
+
+
+def _darwin_source(tmp_path: Path, *, engine: bytes | None = None, node_extra=None) -> Path:
+    """A publishing-host directory for the Mac matrix: one universal engine, two Nodes."""
+    src = tmp_path / "darwin-src"
+    src.mkdir()
+    engine = engine if engine is not None else _engine_tar()
+    builds = {}
+    for key in ("darwin-arm64", "darwin-x64"):
+        name = f"node-v{_NODE_VERSION}-{key}.tar.xz"
+        data = _node_script_tar(f"node-v{_NODE_VERSION}-{key}", node_extra)
+        (src / name).write_bytes(data)
+        builds[key] = _ref(name, data)
+    (src / "kas-darwin-universal.tar.xz").write_bytes(engine)
+    manifest = {
+        "version": "0.66.33",
+        "package": "@kiro/agent",
+        "platforms": {"darwin-universal": _ref("kas-darwin-universal.tar.xz", engine)},
+        "node": {"version": _NODE_VERSION, "builds": builds},
+    }
+    (src / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return src
+
+
+def _darwin_install(src: Path, root: Path) -> kas_bundle.InstalledKasBundle:
+    return kas_bundle.install_bundle(
+        _manifest(src), source=str(src), root=root, system="Darwin", machine="arm64"
+    )
+
+
+def _tool(path: Path, body: str) -> str:
+    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    path.chmod(0o755)
+    return str(path)
+
+
+def _fake_lipo(tmp_path: Path, archs: str = "x86_64 arm64") -> str:
+    # `-create -output OUT A B` concatenates nothing: it copies A, enough for the
+    # stand-in script; `-archs` reports the slices a real lipo would.
+    return _tool(
+        tmp_path / "lipo",
+        'if [ "$1" = "-create" ]; then out="$3"; cp "$4" "$out"; exit 0; fi\n'
+        f'if [ "$1" = "-archs" ]; then echo "{archs}"; exit 0; fi\n'
+        "exit 2\n",
+    )
+
+
+def _fake_arch(tmp_path: Path, log: Path) -> str:
+    return _tool(tmp_path / "arch", f'echo "$1" >> "{log}"\nshift\nexec "$@"\n')
+
+
+class TestUniversalNode:
+    def test_one_root_serves_both_architectures(self, tmp_path):
+        src = _darwin_source(tmp_path)
+        root = tmp_path / "kas"
+        installed = _darwin_install(src, root)
+        log = tmp_path / "arch.log"
+        merged = kas_bundle.make_universal_node(
+            _manifest(src),
+            installed,
+            source=str(src),
+            lipo=_fake_lipo(tmp_path),
+            arch=_fake_arch(tmp_path, log),
+        )
+        # The record names the same binary, so every reader of node_bin is unchanged.
+        assert merged.node_bin == installed.node_bin
+        assert merged.acp_server == installed.acp_server
+        assert kas_bundle.installed_bundle(root=root, version="0.66.33") == merged
+        # The record is left as install_bundle wrote it.
+        record = json.loads((merged.root / "install.json").read_text())
+        assert record["node_key"] == "darwin-arm64"
+        assert isinstance(record["node_sha256"], str)
+        # Each slice was run once through arch(1).
+        assert sorted(log.read_text().split()) == ["-arm64", "-x86_64"]
+        # Nothing of the work tree or the merged temp file is left behind.
+        assert [p.name for p in root.iterdir()] == ["0.66.33"]
+        assert [p.name for p in merged.node_bin.parent.iterdir() if p.name.startswith(".")] == []
+
+    def test_a_missing_slice_leaves_the_install_as_it_was(self, tmp_path):
+        src = _darwin_source(tmp_path)
+        root = tmp_path / "kas"
+        installed = _darwin_install(src, root)
+        before = (installed.root / "install.json").read_text()
+        with pytest.raises(kas_bundle.KasBundleError, match="slices"):
+            kas_bundle.make_universal_node(
+                _manifest(src),
+                installed,
+                source=str(src),
+                lipo=_fake_lipo(tmp_path, archs="arm64"),
+                arch=_fake_arch(tmp_path, tmp_path / "arch.log"),
+            )
+        assert (installed.root / "install.json").read_text() == before
+        assert [p.name for p in root.iterdir()] == ["0.66.33"]
+        assert [p.name for p in installed.node_bin.parent.iterdir()] == ["node"]
+
+    def test_a_non_mac_install_is_refused(self, source_dir, tmp_path):
+        installed = _install(source_dir, tmp_path / "kas")
+        with pytest.raises(kas_bundle.KasBundleError, match="linux-x64"):
+            kas_bundle.make_universal_node(
+                _manifest(source_dir), installed, source=str(source_dir), lipo="lipo"
+            )
+
+
+class TestTrimForShipping:
+    def test_keeps_what_runs_and_drops_the_rest(self, tmp_path):
+        pkg = "node_modules/@kiro/agent"
+        engine = _tar_bytes(
+            {
+                f"{pkg}/package.json": json.dumps(
+                    {"name": "@kiro/agent", "bin": {"kiro-agent": "dist/server/acp-server.js"}}
+                ).encode(),
+                f"{pkg}/dist/server/acp-server.js": b"// engine\n",
+                f"{pkg}/dist/server/acp-server.js.map": b"{}",
+                "node_modules/@kiro/tree-sitter-powershell/src/parser.c": b"int x;\n",
+                "node_modules/@kiro/tree-sitter-powershell/src/grammar.json": b"{}",
+                "node_modules/@kiro/tree-sitter-powershell/tree-sitter-powershell.wasm": b"\0asm",
+                "node_modules/sharp/src/sharp.cc": b"//\n",
+                "node_modules/sharp/src/common.h": b"//\n",
+                "node_modules/web-tree-sitter/web-tree-sitter.wasm": b"\0asm",
+                "node_modules/web-tree-sitter/debug/web-tree-sitter.wasm": b"\0asm",
+            }
+        )
+        src = _darwin_source(
+            tmp_path,
+            engine=engine,
+            node_extra={
+                "LICENSE": b"MIT\n",
+                "CHANGELOG.md": b"# log\n",
+                "include/node/node.h": b"//\n",
+                "lib/node_modules/npm/index.js": b"//\n",
+                "share/man/man1/node.1": b".TH\n",
+            },
+        )
+        root = tmp_path / "kas"
+        installed = _darwin_install(src, root)
+        freed = kas_bundle.trim_for_shipping(installed)
+        assert freed > 0
+
+        node_root = installed.root / "node" / f"node-v{_NODE_VERSION}-darwin-arm64"
+        kept = sorted(p.relative_to(node_root).as_posix() for p in node_root.rglob("*"))
+        assert kept == ["LICENSE", "bin", "bin/node"]
+
+        modules = installed.root / "bundle" / "node_modules"
+        left = {p.relative_to(modules).as_posix() for p in modules.rglob("*") if p.is_file()}
+        assert left == {
+            "@kiro/agent/package.json",
+            "@kiro/agent/dist/server/acp-server.js",
+            "@kiro/tree-sitter-powershell/src/grammar.json",
+            "@kiro/tree-sitter-powershell/tree-sitter-powershell.wasm",
+            "web-tree-sitter/web-tree-sitter.wasm",
+        }
+        assert not (modules / "web-tree-sitter" / "debug").exists()
+        # The record is untouched and the reader still resolves the trimmed tree.
+        assert kas_bundle.installed_bundle(root=root, version="0.66.33") == installed

@@ -32,6 +32,7 @@ import json
 import logging
 import re
 import stat
+import sys
 from pathlib import Path
 
 import acp_pi_backend_helpers
@@ -76,6 +77,7 @@ from kiro_crew.acp.client import (
     pi_gate_extension_path,
 )
 from kiro_crew.acp.harness import pi as pi_mod
+from kiro_crew.acp.transport_errors import AcpError
 from kiro_crew.acp.types import JsonRpcMessage
 from kiro_crew.acp_backends import (
     ACP_BACKEND_OPENCODE,
@@ -365,6 +367,58 @@ class TestGateLauncher:
         other = _ensure_pi_gate_launcher(str(tmp_path / "pi2"), str(tmp_path / "gate.ts"))
         assert other != first
 
+    @staticmethod
+    def _as_windows(monkeypatch, tmp_path, code_page):
+        """Select the ``.cmd`` form with a concrete OEM page standing in for ``oem``.
+
+        ``cmd.exe`` and the ``oem`` codec exist only on Windows. ``raising=False``
+        so the stand-in is a no-op on a build without the encoding seam.
+        """
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        monkeypatch.setattr(acp_client.platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(pi_mod, "_pi_gate_launcher_encoding", lambda: code_page, raising=False)
+        monkeypatch.setattr(pi_mod, "_pi_gate_artifact_dir", lambda: str(run_dir))
+        monkeypatch.setattr(pi_mod, "_pi_gate_launcher_cache", {})
+        return run_dir
+
+    def test_the_windows_launcher_is_written_in_the_console_code_page(self, monkeypatch, tmp_path):
+        """``cmd.exe`` reads a ``.cmd`` in the OEM page, so a UTF-8 ``é`` (two bytes)
+        reads back as two other characters and the launcher cannot find pi."""
+        self._as_windows(monkeypatch, tmp_path, "cp437")
+        pi_bin = str(tmp_path / "José" / "pi.cmd")
+        gate = str(tmp_path / "José" / "gate.ts")
+        launcher = _ensure_pi_gate_launcher(pi_bin, gate)
+        assert launcher.endswith(".cmd")
+        data = Path(launcher).read_bytes()
+        assert data == _pi_gate_launcher_body(pi_bin, gate).encode("cp437")
+        assert "José".encode("cp437") in data
+        assert "José".encode("utf-8") not in data
+        assert data.count(b"\r\n") == 2, "line endings must be written exactly"
+
+    def test_the_windows_launcher_refuses_a_path_the_code_page_cannot_spell(
+        self, monkeypatch, tmp_path
+    ):
+        """A launcher naming a misread path would start no pi at all."""
+        run_dir = self._as_windows(monkeypatch, tmp_path, "cp437")
+        with pytest.raises(AcpError, match="cp437") as caught:
+            _ensure_pi_gate_launcher(str(tmp_path / "日本" / "pi.cmd"), str(tmp_path / "gate.ts"))
+        assert "KIROCREW_HOME" in str(caught.value)
+        assert list(run_dir.iterdir()) == [], "no launcher may be left behind"
+        assert pi_mod._pi_gate_launcher_cache == {}
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="the oem codec exists only on Windows")
+    def test_the_windows_launcher_uses_the_oem_codec(self, monkeypatch, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        monkeypatch.setattr(pi_mod, "_pi_gate_artifact_dir", lambda: str(run_dir))
+        monkeypatch.setattr(pi_mod, "_pi_gate_launcher_cache", {})
+        # Fixed ASCII stand-ins: the function only writes them into the body, and a
+        # runner temp path the OEM page cannot spell must not fail this test.
+        pi_bin, gate = r"C:\pi\pi.cmd", r"C:\pi\gate.ts"
+        launcher = _ensure_pi_gate_launcher(pi_bin, gate)
+        assert Path(launcher).read_bytes() == _pi_gate_launcher_body(pi_bin, gate).encode("oem")
+
     def test_nothing_is_written_into_the_work_dir_or_the_pi_directory(self, monkeypatch, tmp_path):
         run_dir = tmp_path / "run"
         run_dir.mkdir()
@@ -584,9 +638,9 @@ class TestAdapterVersionIsNamedAtHandshake:
     def test_a_release_is_named_once_per_process(self, tmp_path, caplog):
         """A gateway on a newer adapter is told once, not on every session."""
         with caplog.at_level(logging.WARNING, logger="kiro_crew.acp.client"):
-            self._client(tmp_path, "0.0.34")._note_pi_adapter_version()
-            self._client(tmp_path, "0.0.34")._note_pi_adapter_version()
             self._client(tmp_path, "0.0.35")._note_pi_adapter_version()
+            self._client(tmp_path, "0.0.35")._note_pi_adapter_version()
+            self._client(tmp_path, "0.0.36")._note_pi_adapter_version()
         hits = [r for r in caplog.records if "gate extension contract" in r.getMessage()]
         assert len(hits) == 2
 
@@ -595,7 +649,7 @@ class TestAdapterVersionIsNamedAtHandshake:
             self._client(tmp_path, acp_client.PI_ACP_VERIFIED_VERSION)._note_pi_adapter_version()
         assert not [r for r in caplog.records if "gate extension contract" in r.getMessage()]
 
-    @pytest.mark.parametrize("version", ["0.0.34", ""])
+    @pytest.mark.parametrize("version", ["0.0.35", ""])
     def test_another_or_unknown_release_is_logged_with_both_versions(
         self, tmp_path, caplog, version
     ):
@@ -623,6 +677,12 @@ class TestAdapterVersionIsNamedAtHandshake:
             encoding="utf-8"
         )
         assert acp_client.PI_ACP_VERIFIED_VERSION in readme
+
+    def test_the_verified_version_is_the_lane_pin(self):
+        """The corpus is captured at the lane's pin, so the constant tracks it."""
+        from real_adapter_gate import MEASURED_PI_ACP_VERSION
+
+        assert acp_client.PI_ACP_VERIFIED_VERSION == MEASURED_PI_ACP_VERSION
 
 
 class TestGateTripwire:

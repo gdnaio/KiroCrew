@@ -28,6 +28,7 @@ from test_cron_acp_retry import gw_and_cb  # noqa: F401  (fixture)
 from kiro_crew.acp.client import AcpError
 from kiro_crew.llm_helpers import SESSION_NOT_FOUND_GIVE_UP_TEXT, SESSION_NOT_FOUND_RETRY_NOTICE
 from kiro_crew.providers.base import EVENT_TOOL_CALL, LLMEvent
+from kiro_crew.testing.wait import async_wait_until
 
 
 def _lost() -> AcpError:
@@ -113,6 +114,28 @@ async def test_slack_lost_session_resets_and_replays_once():
     assert any(SESSION_NOT_FOUND_RETRY_NOTICE in t for t in texts), texts
     assert any("The answer is 42" in t for t in texts), texts
     assert sessions.replay_gaps == [("open", "thread1"), ("close", "thread1")]
+
+
+@pytest.mark.asyncio
+async def test_slack_lost_session_ends_the_lost_attempt_before_its_reset():
+    """The lost turn never landed, so its attempt ends before the reset and what
+    it received inline is revoked before the replay runs."""
+    from test_slack_handler import FakeSessionManager, MockSlackClient
+
+    from kiro_crew.slack.handler import handle_message
+
+    class _Settling(FakeSessionManager):
+        def settle_turn(self, key):
+            self.removed.append(f"settle:{key}")
+
+    provider = _ScriptedSlackProvider([[_lost()], _answer()])
+    sessions = _Settling(provider)
+
+    await handle_message(MockSlackClient(), sessions, "C1", "hello", "thread1", "msg1", "U1")
+
+    assert provider.turns == 2
+    assert sessions.removed.count("settle:thread1") == 1
+    assert sessions.removed.index("settle:thread1") < sessions.removed.index("reset:thread1")
 
 
 @pytest.mark.asyncio
@@ -436,22 +459,59 @@ def test_cron_sequence_step_defers_reset_when_subagents_pending(gw_and_cb):  # n
     assert reset_keys.count("cron:seqdef:a") == 0
 
 
+def test_cron_sequence_step_loss_does_not_reset_a_key_another_turn_holds(gw_and_cb):  # noqa: F811
+    """A lost step whose key another turn took after the release (the job's
+    dashboard tab shares it) leaves that turn running: neither reset tears
+    it down, and the step is given up rather than re-run on the stale
+    binding."""
+    gw, get_cb, capture_cron = gw_and_cb
+    gw.cron_svc = None
+    held = {"cron:seqbusy:a"}
+
+    async def reset(key, *, skip_if_busy=False):
+        return not (skip_if_busy and key in held)
+
+    gw.sessions.reset = AsyncMock(side_effect=reset)
+    gw.sessions.is_busy = MagicMock(side_effect=lambda key: key in held)
+    calls = 0
+
+    async def resume(_c, _m, **_k):
+        nonlocal calls
+        calls += 1
+        raise _lost()
+
+    with pytest.raises(AcpError, match=SESSION_NOT_FOUND_GIVE_UP_TEXT):
+        _run_cron(
+            gw, get_cb, capture_cron, _job(agent_sequence=["a", "b"], id="seqbusy"), resume=resume
+        )
+    assert calls == 1
+    resets = gw.sessions.reset.await_args_list
+    assert [c.args[0] for c in resets] == ["cron:seqbusy:a", "cron:seqbusy:a"]
+    assert all(c.kwargs == {"skip_if_busy": True} for c in resets)
+
+
 # ── subagent run ────────────────────────────────────────────────────────────
 
 
-async def _settle(mgr, info, rounds: int = 400) -> None:
+async def _settle(mgr, info) -> None:
     """Wait for *info* to end, following any respawned task."""
-    for _ in range(rounds):
-        task = mgr._tasks.get(info.id)
-        if task is not None and not task.done():
+
+    def _live_task():
+        for key in (info.id, f"{info.id}:recovery"):
+            task = mgr._tasks.get(key)
+            if task is not None and not task.done():
+                return task
+        return None
+
+    while not info.done:
+        # Between one task ending and its respawn registering there is no task to
+        # await, so wait on the state: the end itself, or a live task to follow.
+        await async_wait_until(
+            lambda: info.done or _live_task() is not None, describe=lambda: dict(mgr._tasks)
+        )
+        task = _live_task()
+        if task is not None:
             await task
-        recovery = mgr._tasks.get(f"{info.id}:recovery")
-        if recovery is not None and not recovery.done():
-            await recovery
-            continue
-        if info.done:
-            return
-        await asyncio.sleep(0.01)
 
 
 @pytest.mark.asyncio

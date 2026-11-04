@@ -155,9 +155,10 @@ kirocrew app install /absolute/path/to/my-dashboard
 
 Before you enable it, trust the app. Enable refuses every app that is not
 built in, even one that ships only an agent and a skill, until the operator
-trusts it in Settings → Security → Third-party apps. That setting grants this app
-(`agent.apps_trusted`) or all third-party apps (`agent.apps_allow_third_party`
-set to `true`). See
+trusts it. Enabling it from the App Store asks you to trust this app alone
+(`agent.apps_trusted`). Settings → Security → Third-party apps lists and revokes
+those grants, and holds the switch that trusts all third-party apps
+(`agent.apps_allow_third_party` set to `true`). See
 [Publishing Guide](publishing-guide.md#third-party-executable-code-is-off-by-default).
 
 ```bash
@@ -191,7 +192,7 @@ Available in `@kirocrew/app-sdk`:
 | `useAppApi()` | Permission-scoped JSON-response HTTP client (`request`, GET/POST/PUT/PATCH/DELETE); request options and errors: [API reference](api-reference.md#app-sdk-hooks-dashboard-ui) |
 | `useAppEvents(event, cb)` | Subscribe to real-time WebSocket events |
 | `useTheme()` | Reactive theme (mode, accent, colorTheme) |
-| `useAppInfo()` | App metadata (name, version, permissions, `active`) |
+| `useAppInfo()` | App metadata (name, version, permissions, `active`, `update`) |
 | `useNavigate()` | Navigate to Kiro Crew routes |
 | `useNotify()` | Show toast notifications |
 | `useNavBadge()` | Update sidebar badge count |
@@ -216,6 +217,68 @@ useEffect(() => {
 Treat `undefined` as `true`: the field is optional, so an app running on a host that
 predates it must still render rather than assume it is hidden.
 
+### Telling the user a new version is out
+
+`useAppInfo().update` is how your app finds out that a newer version of itself has
+been published, so you can show your own "update available" row instead of waiting
+for the user to visit the store.
+
+```tsx
+const { version, update } = useAppInfo()
+
+if (!update) return null                 // nothing checked yet — say nothing
+if (!update.available) return null       // checked, you are current
+
+return <Banner>Version {update.latestVersion} is out (you have {version}).</Banner>
+```
+
+The three states are deliberately distinct, and the first two are easy to confuse:
+
+| `update` | Means |
+|---|---|
+| absent | The host has not consulted anything. You do **not** know you are current. |
+| `available: false` | The host checked and nothing newer is published. |
+| `available: true` | `latestVersion` is newer than your installed `version`. |
+
+Render an absent `update` as "nothing to say", never as "up to date" — the second
+claims something no one has verified.
+
+`checkedAt` is when the host's cache was written, as an ISO-8601 instant, or `null`
+if it could not be read. The host answers from caches it already keeps and never
+fetches on your behalf, so the answer can be hours old; show `checkedAt` if the age
+matters to your user. A fresh answer arrives when the store's listing refreshes.
+
+The field reads the same on every surface your app mounts on — a routed `ui.pages`
+page and a `contributes.panelTabs` side-panel tab both get it — so you write the
+banner once.
+
+The field is advisory. It tells you what to display, not what to do: your app cannot
+update itself from it, and the gateway re-resolves the app's source when an update is
+actually applied.
+
+### Running something once after you are upgraded
+
+There is no "you were just updated" event, on purpose. An update is applied from
+Discover or the app's detail page, where your app is usually not mounted, so a
+live signal would reach the code that needs it least. Compare instead, on mount:
+remember the last version your app ran, and act when `useAppInfo().version`
+differs from it.
+
+```tsx
+const { version } = useAppInfo()
+useEffect(() => {
+  const last = localStorage.getItem('my-app:last-version')
+  if (last !== version) {
+    migrateIfNeeded(last, version)   // last is null on a first run
+    localStorage.setItem('my-app:last-version', version)
+  }
+}, [version])
+```
+
+This runs in the NEW bundle, whenever it first mounts, however long after the
+update that is. Keep the stored version wherever the rest of your app's state
+lives — a backend can do the same comparison on start against its own data.
+
 ## Chat Marker Protocol
 
 Also in `@kirocrew/app-sdk`, for an app that renders agent messages itself. An agent puts follow-up
@@ -239,13 +302,13 @@ Available in `@kirocrew/app-sdk/ui`:
 `SourceBadge`, `StatCard`, `Skeleton`, `ContentSkeleton`, `EmptyState`,
 `PageHeader`, `Toggle`, `InfoTip`, `SegmentedControl`, `MarkdownRenderer`,
 `Clickable`, `Modal`, `ErrorNotice`, `SettingsSection`, `SettingsCard`,
-`SettingsInput`, `SettingsToggle`, `SettingsSelect`
+`SettingsInput`, `SettingsToggle`, `SettingsSelect`, `Select`, `guideCaution`
 
 ## Shared interaction and locale helpers
 
 The main SDK exports `useImeGuard` so app-owned inputs reuse the host's IME
-Enter protection. It also exports `activeLocale`, `fmtNumber`, `fmtDate`,
-`fmtTime`, `fmtDateTime`, `fmtRelative`, `compareText` and
+Enter protection. It also exports `activeLocale`, `fmtNumber`, `fmtCurrency`,
+`fmtDate`, `fmtTime`, `fmtDateTime`, `fmtRelative`, `compareText` and
 `useLanguageGeneration`. Subscribe with the hook when a memoized component
 needs to repaint on language changes. Apps own their translation catalogs;
 these helpers share locale selection and formatting, not permission to modify
@@ -257,6 +320,15 @@ launch appends to that session's unsent text. Omit
 `autoSend` to send automatically; without `slotKey` this starts a new session.
 `agent` applies only to new sessions. A target must activate successfully before
 its message is used; the SDK does not select another session on failure.
+`memoryMode` (`'persistent'`, `'incognito'` or `'temporary'`) and
+`sessionFolder: false` shape a new session and are ignored with `slotKey`.
+Either one opens a new draft session, like `autoSend: false`, so the message is
+staged for the user to send.
+
+To tell an older host from one with these seams, read `APP_SDK_LEVEL` through a
+namespace import (`import * as sdk from '@kirocrew/app-sdk'`; an older host has
+no such export, so `sdk.APP_SDK_LEVEL` is `undefined` there). A named import of a
+name the host lacks fails the whole bundle at load time.
 
 For Python app hooks with an existing cron grant, use
 `await ctx.cron.set_enabled_async(job_id, False)` to pause an owned job, or
@@ -338,6 +410,9 @@ method table are in [API Reference](api-reference.md#python-client).
 ## Publishing Your App
 
 Once your app works locally, publish it to the App Store registry so other
-Kiro Crew users can install it with one click.
+Kiro Crew users can install it with one click. Your app's code stays in a
+dedicated GitHub repository listed in the official registry
+(`kirodotdev/KiroCrewApps`); Kiro Crew accepts no new built-in app, so an app is
+never added to the Kiro Crew package itself.
 
 See [Publishing Guide](publishing-guide.md) for the full workflow.

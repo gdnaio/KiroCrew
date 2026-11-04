@@ -37,6 +37,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from test_card_handshake_fields import live_init
 
 from kiro_crew.acp.client import (
     CLIENT_NAME,
@@ -717,9 +718,11 @@ class TestSpawn:
 
         with patch.object(
             client_mod, "_resolve_codex_acp_bin", return_value=(["/n/node", "/p/index.js"], "/s")
-        ):
+        ) as resolver:
             plan = await adapter.resolve_spawn(_ctx())
         assert plan.argv == ["/n/node", "/p/index.js"]
+        # One resolution order, so "why did it pick that one?" has one answer.
+        assert resolver.call_count == 1
 
     @pytest.mark.asyncio
     async def test_no_agent_and_no_model_flag_is_appended(self, adapter, mask_resolved):
@@ -759,17 +762,6 @@ class TestSpawn:
         assert "@agentclientprotocol/codex-acp" in message
         assert "CODEX_ACP_BIN" in message
         assert "/one" in message and "/two" in message
-
-    @pytest.mark.asyncio
-    async def test_the_resolver_is_delegated_not_duplicated(self, adapter, mask_resolved):
-        """One resolution order, so "why did it pick that one?" has one answer."""
-        from kiro_crew.acp import client as client_mod
-
-        with patch.object(
-            client_mod, "_resolve_codex_acp_bin", return_value=(["/n/node", "/p/i.js"], "/s")
-        ) as resolver:
-            await adapter.resolve_spawn(_ctx())
-        assert resolver.call_count == 1
 
     def test_the_kiro_api_key_is_taken_out_of_the_child_environment(self, adapter):
         """A foreign adapter must never receive it. Same as the AcpClient path does."""
@@ -1142,6 +1134,8 @@ class TestTheEffortChannelIsReadFromItsOwnTable:
         """
         provider = _effort_provider(ACP_BACKEND_KIRO, "claude-fable-5")
         provider._effort_per_model = {"claude-fable-5": "high"}
+        # A level resolves, so the missing push is the channel set's doing.
+        assert provider._resolve_effort() == "high"
         await provider._apply_initial_effort()
         provider._client.set_config_option.assert_not_awaited()
 
@@ -1152,9 +1146,10 @@ class TestTheEffortChannelIsReadFromItsOwnTable:
 
 
 def _handle_on(backend: str) -> AcpSessionHandle:
-    """A handle whose runtime names *backend* -- the only thing these answers read."""
+    """A handle whose runtime names *backend*, on codex-acp 2.2.2's live handshake."""
     rt = MagicMock()
     rt.acp_backend = backend
+    rt.initialize_result = live_init("codex/steering-live.jsonl")
     return AcpSessionHandle("s1", asyncio.Queue(), rt)
 
 
@@ -1484,6 +1479,40 @@ class TestTheRuntimeSendsCodexNoAgentMode:
             await rt.create_session(cwd="/w", agent="kirocrew")
 
         assert METHOD_SET_MODE in plane.methods
+
+
+class TestTheRuntimePersistsTheAdvertisedModelCacheForCodex:
+    @pytest.mark.asyncio
+    async def test_create_session_feeds_and_persists_once(self, monkeypatch, tmp_path):
+        """codex is in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION, so the shared runtime
+        feeds the advertised-model cache and then offloads its persist after
+        session/new; the kiro side of the same gate is pinned in
+        test_acp_runtime_load_session.py."""
+        from kiro_crew import model_registry
+
+        monkeypatch.setattr(model_registry, "_ADVERTISED_MODELS", {})
+        monkeypatch.setattr(model_registry, "_ADVERTISED_META", {})
+        sidecar = tmp_path / "provider_models.json"
+        monkeypatch.setattr(model_registry, "_advertised_models_cache_path", lambda: sidecar)
+        ids = ["test-model-a", "test-model-b"]
+        response = _codex_session_new_response()
+        response["configOptions"].append(
+            {
+                "id": "model",
+                "type": "select",
+                "currentValue": ids[0],
+                "options": [{"value": m, "name": m} for m in ids],
+            }
+        )
+        rt = _codex_runtime()
+        plane = _ControlPlane(response)
+
+        with ExitStack() as stack:
+            plane.install(rt, stack)
+            await rt.create_session(cwd="/w", agent="kirocrew")
+
+        assert model_registry.advertised_models("codex") == ids
+        assert json.loads(sidecar.read_text(encoding="utf-8"))["codex"] == ids
 
 
 class TestTheRuntimeArmsCodexPermissionRouting:

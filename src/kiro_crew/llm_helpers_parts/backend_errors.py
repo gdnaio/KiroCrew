@@ -19,6 +19,7 @@ from typing import Any
 from kiro_crew.agent_sdk.drivers.acp import provider_error_client
 from kiro_crew.agent_sdk.drivers.acp_turn_vocab import AcpError, AcpPromptBusy
 from kiro_crew.credential_errors import is_credential_propagation_delay
+from kiro_crew.platform.context import redact_via_context
 
 _PROMPT_BUSY_RETRIES = 2
 _PROMPT_BUSY_DELAY = 1.5  # seconds between retries
@@ -194,10 +195,12 @@ def is_prompt_busy(exc: BaseException) -> bool:
 
 # The provider's refusal of a request larger than the model's window, in the
 # spellings the ACP backends answer with: kiro's typed "context window
-# overflowed", the claude adapter's "Prompt is too long", and the OpenAI-style
+# overflowed", the claude adapter's "Prompt is too long", the model service's
+# "Request exceeds the maximum allowed size" byte cap, and the OpenAI-style
 # "maximum context length" a compatible endpoint returns through it.
 _RE_CONTEXT_OVERFLOW_TEXT = re.compile(
-    r"prompt is too long|context window overflowed|maximum context length",
+    r"prompt is too long|context window overflowed|maximum context length"
+    r"|request exceeds the maximum allowed size",
     re.IGNORECASE,
 )
 
@@ -207,7 +210,7 @@ def is_context_overflow_error(exc: BaseException) -> bool:
 
     Structural first: the raise-time classifier's ``context_overflow`` tag, which
     owns the claude adapter's ``message``-borne refusal through the anchored
-    ``_RE_ADAPTER_INPUT_TOO_LONG`` in ``acp/transport_errors.py``. The text match
+    ``_RE_ADAPTER_INPUT_TOO_LONG`` in ``acp/oversized_request_errors.py``. The text match
     is the fallback for a frame that classifier cannot read (a non-dict error,
     formatted ``Prompt error: <raw>``), for an ``AcpError`` built from text, and for the
     OpenAI-style "maximum context length", which no captured frame places yet, so
@@ -284,17 +287,38 @@ def acp_error_needs_fresh_credentials(exc: BaseException) -> bool:
     return isinstance(exc, AcpError) and getattr(exc, "credential_reload", False) is True
 
 
+#: The frame's structured ``data`` as the ACP formatter appends it to the provider
+#: text (``...try again.: {'errorKind': 'cloud_credential_error'}``). Machine data
+#: that tells the reader nothing, so the give-up line ends on the provider's words.
+#: The match starts at the ``:`` (not at whitespace before it), so a long
+#: whitespace run in provider text cannot make the scan quadratic; the space
+#: before the ``:`` is stripped after the substitution.
+_FRAME_DATA_TAIL_RE = re.compile(
+    r""":\s*\{\s*['"]errorKind['"]\s*:\s*['"][A-Za-z0-9_]*['"]\s*\}\s*$"""
+)
+
+
 def credential_give_up_text(exc: BaseException | str) -> str:
     """The dead end of a credential failure that the fresh process drew too.
 
     The helper itself is broken (an expired SSO login, a revoked role), so no
     restart or new chat can fix it: the provider's own instruction is the only
-    actionable line, and it is carried verbatim. Each surface appends its own
-    next step.
+    actionable line. Each surface appends its own next step.
+
+    The provider text is redacted here, through the egress redaction path, so
+    every surface that shows the line gets it scrubbed: the dashboard row and the
+    channel post do not redact on their own. That path finds link and credential
+    spans on the original text and rewrites it once, so a value one pass would
+    leave once the other had rewritten its surroundings is still removed. The
+    frame's trailing ``data`` repr is dropped.
     """
+    detail, dropped = _FRAME_DATA_TAIL_RE.subn("", str(exc))
+    if dropped:
+        detail = detail.rstrip()
+    detail = redact_via_context(detail)
     return (
         "The agent still could not load its cloud credentials after a restart. "
-        f"Fix them first. The provider said: {exc}"
+        f"Fix them first. The provider said: {detail}"
     )
 
 

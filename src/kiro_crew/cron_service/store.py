@@ -28,14 +28,25 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import platform_compat
-from kiro_crew.cron_service.model import _AUTO_PAUSE_THRESHOLD, CronJob, CronSchedule
+from kiro_crew.cron_service.model import (
+    _ALERT_AFTER_DEFAULT,
+    _AUTO_PAUSE_THRESHOLD,
+    CronJob,
+    CronSchedule,
+)
+from kiro_crew.cron_service.zone_default_migration import (
+    LOCAL_DEFAULT_STORE_VERSION,
+    predates_local_default,
+)
 
 logger = logging.getLogger("kiro_crew.cron")
 
 _CRONS_FILE = "crons.json"
 
 
-_STORE_VERSION = 2
+#: 3: an empty job zone under an empty config zone is the host's zone, not UTC
+#: (``zone_default_migration`` keeps an older store's jobs on UTC).
+_STORE_VERSION = LOCAL_DEFAULT_STORE_VERSION
 
 #: The top-level keys of the store document this build writes itself. Any other
 #: top-level key came from a newer build and is written back unchanged.
@@ -189,6 +200,13 @@ def _record_is_enabled(j: dict[str, Any]) -> bool:
     drift when a future pause-state change lands in only one reader.
     """
     return not _record_user_paused(j) and not j.get("auto_paused", False)
+
+
+def _ack_ids_field(value: Any) -> list[str]:
+    """``acked_item_ids`` as stored: a list of strings, else no ids at all."""
+    if isinstance(value, list) and all(isinstance(i, str) for i in value):
+        return value
+    return []
 
 
 def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> CronJob:
@@ -385,6 +403,10 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
         execution_context=j.get("execution_context"),
         approval_mode=_guard_str("approval_mode"),
         acked_items=j.get("acked_items", []),
+        # Anything but a list of strings (null from an imported archive, a hand
+        # edit) loads as no ids, so the job still saves and no id names an entry.
+        acked_item_ids=_ack_ids_field(j.get("acked_item_ids")),
+        acked_item_ids_digest=_guard_str("acked_item_ids_digest"),
         created_by=_guard_str("created_by"),
         source_preset=_guard_str("source_preset"),
         source_template_prompt=_guard_str("source_template_prompt"),
@@ -409,6 +431,7 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
         last_retry_count=_guard_num("last_retry_count", 0),
         last_retry_run_ts=_guard_num("last_retry_run_ts", 0.0),
         run_generation=_guard_num("run_generation", 0),
+        user_pause_generation=_guard_num("user_pause_generation", 0),
         agent_sequence=_str_list("agent_sequence"),
         env=j.get("env", {}),
         timeout_secs=_guard_num("timeout_secs", seams._JOB_TIMEOUT_SECS),
@@ -416,6 +439,7 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
         # keep the default limit. A malformed value is left for
         # CronJob.auto_pause_limit() to read back as the default.
         auto_pause_after_failures=_guard_num("auto_pause_after_failures", _AUTO_PAUSE_THRESHOLD),
+        alert_after_failures=_guard_num("alert_after_failures", _ALERT_AFTER_DEFAULT),
         strict_schedule=j.get("strict_schedule", False),
         script=_selector_str("script"),
         command=_selector_str("command"),
@@ -610,6 +634,7 @@ def job_record(j: CronJob) -> dict[str, Any]:
         "env": j.env,
         "timeout_secs": j.timeout_secs,
         "auto_pause_after_failures": j.auto_pause_after_failures,
+        "alert_after_failures": j.alert_after_failures,
         "strict_schedule": j.strict_schedule,
         "script": j.script,
         "command": j.command,
@@ -625,22 +650,33 @@ def job_record(j: CronJob) -> dict[str, Any]:
     # an older build reading it back sees nothing new.
     if j.auto_pause_after_failures == _AUTO_PAUSE_THRESHOLD:
         del record["auto_pause_after_failures"]
-    # Written only when set, and last: a store with no installer-managed job
-    # and no app-registered job stays byte-identical to the one an older build
-    # writes (pinned by test_cron_refactor_contract's store-bytes fixtures). An
-    # older build reads a newer store's extra key and, from this build on,
-    # writes it back (decode_store / encode_store).
+    if j.alert_after_failures == _ALERT_AFTER_DEFAULT:
+        del record["alert_after_failures"]
+    # Written only when set, and last: a store with no ordered user pause,
+    # installer-managed job, or app-registered job stays byte-identical to one
+    # an older build writes.
+    if j.user_pause_generation:
+        record["user_pause_generation"] = j.user_pause_generation
+    # The optional ownership keys follow the same compatibility rule. An older
+    # build reads a newer store's extra key and writes it back.
     if j.managed_by:
         record["managed_by"] = j.managed_by
     if j.app_manifest_digest:
         record["app_manifest_digest"] = j.app_manifest_digest
+    # The per-entry ack ids follow the same rule: a job whose acks carry no id
+    # (every ack before this key, and every Slack ack) writes nothing new.
+    if any(j.acked_item_ids):
+        record["acked_item_ids"] = j.acked_item_ids
+        record["acked_item_ids_digest"] = j.acked_item_ids_digest
     return record
 
 
 #: Every key :func:`job_record` can write, read off the encoder itself so the two
-#: cannot drift: a job that sets each conditionally written key (``managed_by``,
-#: ``app_manifest_digest``, and a non-default ``auto_pause_after_failures``, which
-#: is omitted at the default). A record key outside this set came from a newer
+#: cannot drift: a job that sets each conditionally written key
+#: (``user_pause_generation``, ``managed_by``, ``app_manifest_digest``,
+#: ``acked_item_ids`` with ``acked_item_ids_digest``, and a
+#: non-default ``auto_pause_after_failures`` and ``alert_after_failures``, which
+#: are omitted at the default). A record key outside this set came from a newer
 #: build. A key inside it is this build's to write or to omit, so a value this
 #: build cleared stays cleared.
 _KNOWN_JOB_KEYS = frozenset(
@@ -650,9 +686,13 @@ _KNOWN_JOB_KEYS = frozenset(
             name="",
             message="",
             schedule=CronSchedule(kind="cron"),
+            user_pause_generation=1,
             managed_by="-",
             app_manifest_digest="-",
             auto_pause_after_failures=0,
+            alert_after_failures=2,
+            acked_item_ids=["-"],
+            acked_item_ids_digest="-",
         )
     )
 )
@@ -708,7 +748,8 @@ def encode_store(
     written back fill-only, the rule ``KiroCrewConfig.to_dict`` applies to unknown
     config keys: a key this build writes itself is never overwritten, and only a job
     still in ``jobs`` gets its unknown keys back, so a job this build deleted is gone
-    with them. The version is never written lower than the one read. A store with no
+    with them. ``version`` is written as given: the decoder's, never lower than the
+    one read, or the older version a store whose upgrade had to wait keeps. A store with no
     unknown keys encodes exactly as it did before.
     """
     fields_by_job = unknown_fields or {}
@@ -723,7 +764,7 @@ def encode_store(
                 record.setdefault(key, value)
         records.append(record)
     data: dict[str, Any] = {
-        "version": max(_STORE_VERSION, version),
+        "version": version,
         "jobs": records,
     }
     for key, value in (extra or {}).items():
@@ -752,6 +793,8 @@ class StoreDocument:
     version: int
     extra: Mapping[str, Any]
     unknown_fields: Mapping[str, UnknownFields]
+    #: Written before an unset zone followed the host; see ``zone_default_migration``.
+    predates_local_default: bool = False
 
 
 def _unknown_fields_of(record: dict[str, Any]) -> tuple[UnknownFields, int] | None:
@@ -852,7 +895,13 @@ def decode_store(raw: bytes) -> StoreDocument | None:
             past_total,
             MAX_UNKNOWN_FIELDS_STORE_BYTES,
         )
-    return StoreDocument(jobs=jobs, version=version, extra=extra, unknown_fields=unknown_fields)
+    return StoreDocument(
+        jobs=jobs,
+        version=version,
+        extra=extra,
+        unknown_fields=unknown_fields,
+        predates_local_default=predates_local_default(read_version),
+    )
 
 
 #: Infix between the store's file name and the UTC stamp of a quarantine copy:

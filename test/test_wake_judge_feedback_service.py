@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import contextlib
 import json
 from pathlib import Path
 
@@ -29,6 +28,20 @@ from kiro_crew.autonudge import (
 )
 from kiro_crew.decisions import log as decisions_log
 from kiro_crew.monitoring.models import MonitorState
+from kiro_crew.testing.wait import async_wait_until
+
+
+async def _drain_inflight_adds(service: AutoNudgeService) -> None:
+    """Wait until every task the service supervises has finished.
+
+    The hook, the tick and the fire path hand their writes to supervised tasks that
+    stay in ``_inflight_adds`` until they complete, so an empty set is the state in
+    which nothing is left pending when the loop closes.
+    """
+    await async_wait_until(
+        lambda: not service._inflight_adds,
+        describe=lambda: f"still in flight: {service._inflight_adds!r}",
+    )
 
 
 class TestTheStoredPullRequestBaselineIsBoundOnLoad:
@@ -274,10 +287,13 @@ class TestTurnCompleteLabelling:
         gate = facts["nudge_turn"]
         assert isinstance(gate, ast.BoolOp)
         assert isinstance(gate.op, ast.And)
-        assert [part.id for part in gate.values if isinstance(part, ast.Name)] == [
-            "_directive_self_wake",
-            "_turn_landed",
-        ]
+        # A flag a phase sets is read through the turn (``turn._turn_landed``).
+        assert [
+            part.id if isinstance(part, ast.Name) else part.attr
+            for part in gate.values
+            if isinstance(part, ast.Name)
+            or (isinstance(part, ast.Attribute) and getattr(part.value, "id", None) == "turn")
+        ] == ["_directive_self_wake", "_turn_landed"]
         assert isinstance(facts["reply_flushed"], ast.Name)
         assert facts["reply_flushed"].id == "_turn_flushed_visible_text"
         calls = [
@@ -325,15 +341,7 @@ class TestTurnCompleteLabelling:
             service.notify_turn_complete("chat-1", **kwargs)
             # Drain the label task and every persist or append task it creates, so
             # nothing is left pending when the loop closes.
-            # flake-ok: a zero-length yield so the hook's label task starts before the drain loop reads it; moved verbatim
-            await asyncio.sleep(0)
-            while service._inflight_adds:
-                for task in list(service._inflight_adds):
-                    with contextlib.suppress(Exception):
-                        # flake-ok: awaits each in-flight add the hook created; each ends on its own persist or append; moved verbatim
-                        await task
-                # flake-ok: a zero-length yield so the tasks the drained ones scheduled take a turn before the loop re-reads the set; moved verbatim
-                await asyncio.sleep(0)
+            await _drain_inflight_adds(service)
 
         asyncio.run(drive())
 
@@ -769,8 +777,8 @@ class TestProbeFloorFiresAJudgedTick:
             service._confirm_judge_delivery(loop)
             history, _ = judge.label_latest_delivery(loop.judge_recent_verdicts, acted=True)
             loop.judge_recent_verdicts = history
-            # flake-ok: a zero-length yield so the tasks this drive scheduled start before the loop closes; moved verbatim
-            await asyncio.sleep(0)
+            # The tick's writes finish before the loop closes.
+            await _drain_inflight_adds(service)
 
         try:
             asyncio.run(drive())
@@ -838,8 +846,8 @@ class TestProbeFloorFiresAJudgedTick:
             service._confirm_judge_delivery(loop)
             history, _ = judge.label_latest_delivery(loop.judge_recent_verdicts, acted=True)
             loop.judge_recent_verdicts = history
-            # flake-ok: a zero-length yield so the tasks this drive scheduled start before the loop closes; moved verbatim
-            await asyncio.sleep(0)
+            # The tick's writes finish before the loop closes.
+            await _drain_inflight_adds(service)
 
         try:
             asyncio.run(drive())

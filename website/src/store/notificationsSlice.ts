@@ -1,6 +1,7 @@
-import { createSlice, createAsyncThunk, type PayloadAction } from '@reduxjs/toolkit'
+import { createSlice, createAsyncThunk, original, type PayloadAction } from '@reduxjs/toolkit'
 import { api } from '../api/client'
 import type { Notification } from '../types'
+import { jsonEqual } from '../utils/structuralEqual'
 
 interface NotificationsState {
   items: Notification[]
@@ -46,8 +47,8 @@ const capped = (items: Notification[]): Notification[] =>
  *  `kiro_crew/notifications/settings.py`: muting a channel keeps the note in
  *  history but sets `silenced: true` and forces `priority: "passive"`, "so every
  *  attention surface (badge count, sound, native banner, feed styling) skips
- *  it". `notification_coordinator.deliver()` holds its own `_unread_count` to
- *  the priority half of that rule.
+ *  it". `notification_coordinator.unread_count()` applies both halves to the
+ *  `unread` number `GET /api/notifications` returns.
  *
  *  Both halves are checked, not just `silenced`: a channel default or a
  *  producer-requested `passive` (a subagent completion, say) is never muted and
@@ -303,12 +304,21 @@ const notificationsSlice = createSlice({
         // server, so this narrows to ack state only.
         const requestAckSeq = action.payload.ackSeq ?? 0
         const stamps = state.ackSeqByTs ?? {}
-        state.items = capped(action.payload.items).map(item => {
+        const prev = original(state.items) ?? []
+        const prevByTs = new Map<string, Notification>()
+        for (const n of prev) if (!prevByTs.has(n.ts)) prevByTs.set(n.ts, n)
+        const next = capped(action.payload.items).map(item => {
           const stamped = stamps[item.ts]
-          if (stamped === undefined || stamped <= requestAckSeq) return item
-          const local = state.items.find(n => n.ts === item.ts)
-          return local ? { ...item, acked: local.acked } : item
+          const local = prevByTs.get(item.ts)
+          const merged = stamped === undefined || stamped <= requestAckSeq || !local
+            ? item
+            : { ...item, acked: local.acked }
+          // A reconnect refetch mostly repeats what the socket already
+          // delivered. Keeping the held object for an equal item keeps every
+          // row keyed on it, and every memo over the list, from re-rendering.
+          return local && jsonEqual(local, merged) ? local : merged
         })
+        if (next.length !== prev.length || next.some((n, i) => n !== prev[i])) state.items = next
         pruneAckStamps(state)
       })
       .addCase(clearNotifications.fulfilled, (state, action) => {

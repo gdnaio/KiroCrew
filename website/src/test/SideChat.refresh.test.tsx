@@ -3,13 +3,14 @@ import { configureStore } from '@reduxjs/toolkit'
 import dashboardReducer from '../store/dashboardSlice'
 import { Provider } from 'react-redux'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import chatReducer from '../store/chatSlice'
 import SideChat from '../pages/chat/SideChat'
 import { ApiError } from '../api/apiError'
 
 vi.mock('../api/client', () => ({
   api: {
+    sideState: vi.fn().mockResolvedValue({ open: false }),
     sideOpen: vi.fn().mockResolvedValue({ ok: true, open: true, messages: 0, last_run_id: '', created_at: new Date().toISOString() }),
     sideTurn: vi.fn().mockResolvedValue({ ok: true, run_id: 'r1', messages: 1 }),
     sideClose: vi.fn().mockResolvedValue({ ok: true, was_open: true }),
@@ -76,7 +77,7 @@ describe('SideChat stale-context banner', () => {
     vi.clearAllMocks()
   })
 
-  it('banner shows correct turn count when parent has advanced', () => {
+  it('banner shows correct turn count when parent has advanced', async () => {
     const store = makeStore(
       [
         { role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' },
@@ -90,10 +91,36 @@ describe('SideChat stale-context banner', () => {
       }
     )
     const { container } = renderWithStore(store)
+    // The panel reads the gateway's side conversation on mount: let it land inside act().
+    await waitFor(() => expect(store.getState().chat.slotSideRestored?.['slot-1']).toBe(true))
     const banner = container.querySelector('span.italic')
     expect(banner).not.toBeNull()
     const text = (banner?.textContent ?? '').replace(/\s+/g, ' ').trim()
     expect(text.toLowerCase()).toContain('context from 4 turns ago')
+  })
+
+  it('shows the enabled Refresh context hint in the banner InfoTip', async () => {
+    const store = makeStore(
+      [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'hello' }],
+      {
+        messages: [{ role: 'user', content: 'side q', ts: '2026-10-26T12:00:00.000Z', run_id: 'r1' }],
+        openedAtTurnCount: 2,
+        createdAt: '2026-10-26T12:00:00.000Z',
+      }
+    )
+    renderWithStore(store)
+    await waitFor(() => expect(store.getState().chat.slotSideRestored?.['slot-1']).toBe(true))
+    const refresh = screen.getByRole('button', { name: 'Refresh context' })
+    expect(refresh).toBeEnabled()
+    expect(refresh).not.toHaveAttribute('title')
+
+    const banner = screen.getByText(/Context from/).closest('div')
+    expect(banner).not.toBeNull()
+    const infoTip = within(banner!).getByRole('button', { name: 'More information' })
+    const hint = 'Clears this side chat in every open tab and starts over with the current context'
+    expect(infoTip).toHaveAttribute('title', hint)
+    fireEvent.click(infoTip)
+    expect(screen.getByRole('tooltip')).toHaveTextContent(hint)
   })
 
   it('clicking Refresh context calls api.sideClose AND drops slotSide', async () => {

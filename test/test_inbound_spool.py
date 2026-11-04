@@ -52,6 +52,7 @@ from kiro_crew.messaging.inbound_spool import (
 )
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.session_allocation import SessionClosingError
+from kiro_crew.testing.wait import async_wait_until
 
 # ── Pipeline stand-ins, mirroring test_messaging_dispatch.py ──────────────────
 
@@ -1074,9 +1075,9 @@ def test_an_unreadable_spool_is_left_untouched(spool_home: Path, monkeypatch) ->
             raise PermissionError(13, "transient")
         return real_open(path)
 
-    monkeypatch.setattr(S, "_open_own_file", _flaky_open)
-    assert peek_next(path=spool_home) is None
-    monkeypatch.undo()
+    with monkeypatch.context() as mp:
+        mp.setattr(S, "_open_own_file", _flaky_open)
+        assert peek_next(path=spool_home) is None
 
     assert spool_home.exists(), "the spool was deleted after a read failure"
     assert _texts(spool_home) == ["keep me"]
@@ -1093,12 +1094,12 @@ def test_an_unreadable_spool_refuses_a_write_rather_than_overwriting(
             raise PermissionError(13, "transient")
         return real_open(path)
 
-    monkeypatch.setattr(S, "_open_own_file", _flaky_open)
-    wrote = record_refusal_sync(
-        SpooledInbound(channel_type="telegram", conversation_id="1", text="new"),
-        path=spool_home,
-    )
-    monkeypatch.undo()
+    with monkeypatch.context() as mp:
+        mp.setattr(S, "_open_own_file", _flaky_open)
+        wrote = record_refusal_sync(
+            SpooledInbound(channel_type="telegram", conversation_id="1", text="new"),
+            path=spool_home,
+        )
 
     assert wrote is False
     assert _texts(spool_home) == ["keep me"]
@@ -1211,10 +1212,10 @@ def test_a_cancelled_refusal_handler_still_lands_the_write(spool_home: Path) -> 
             assert not spool_home.exists(), "the write had not been released yet"
             release.set()
             # Let the shielded inner task finish before the loop closes.
-            for _ in range(50):
-                if spool_home.exists() and S.pending_refusal_write_count() == 0:
-                    break
-                await asyncio.sleep(0.02)
+            await async_wait_until(
+                lambda: spool_home.exists() and S.pending_refusal_write_count() == 0,
+                describe=lambda: f"{S.pending_refusal_write_count()} write(s) still pending",
+            )
             assert S.pending_refusal_write_count() == 0
         finally:
             S.record_refusal_sync = real_sync  # type: ignore[assignment]

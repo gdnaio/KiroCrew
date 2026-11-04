@@ -56,7 +56,7 @@ BASE_SURFACE: dict[str, str] = {
     "GUEST_AGENT_PROMPT": "value str 9f07b9e7c179fff5",
     "KIRO_AGENTS_DIR": "value host",
     "MCP_PATH_HINT": "value str 2c0b855124e13185",
-    "OWNED_KIRO_AGENT_FILES": "value tuple b6cbb50d931ce6c1",
+    "OWNED_KIRO_AGENT_FILES": "value tuple dd392f80c6781ad5",
     "Path": "class Path",
     "REQUIRED_KIRO_AGENT_FILES": "value tuple d3a5d201c05d5c9b",
     "SecurityEvent": "class SecurityEvent",
@@ -65,8 +65,8 @@ BASE_SURFACE: dict[str, str] = {
     "_CC_MCP_JSON": "value host",
     "_CONDUCTOR_AGENT_FILENAME": "value str 923f5ca0627d569f",
     "_CONDUCTOR_CORE_GRANTS": "value tuple 7152a6eb169c7c40",
-    "_CONDUCTOR_DASHBOARD_GRANTS": "value tuple 0b859d2b54e84503",
-    "_CONDUCTOR_SYSTEM_PROMPT": "value str 1209a2f6c77c3e84",
+    "_CONDUCTOR_DASHBOARD_GRANTS": "value tuple 41cf09029e05ee1b",
+    "_CONDUCTOR_SYSTEM_PROMPT": "value str e43c6788708a4969",
     "_CREW_ONLY_HOOK_EVENTS": "value frozenset 9d900cfb866f983a",
     "_DEFAULT_KIRO_HOOKS_DIR": "value host",
     "_DEFAULT_SPEC_OBSERVATION_ATTEMPTS": "value int 4e07408562bedb8b",
@@ -101,7 +101,7 @@ BASE_SURFACE: dict[str, str] = {
     "_MANAGED_MCP_ENTRY_ITEM_TYPES": "value dict b743f9c4b68215c4",
     "_MANAGED_MCP_ENTRY_KEYS": "value frozenset 5b8554ac36b42722",
     "_MANAGED_MCP_ENTRY_VALUE_TYPES": "value dict adfab10cc996c8fe",
-    "_MANAGED_MCP_SERVERS": 'value dict {"gates": {"kirocrew-computer": "_computer_use_spec_gate", "kirocrew-core": null, "kirocrew-crew-log": null, "kirocrew-cron": null, "kirocrew-dashboard": null, "kirocrew-debug": null, "kirocrew-guide": null, "kirocrew-mate": null, "kirocrew-panel": null, "kirocrew-work": null}, "opt_in": {"kirocrew-computer": false, "kirocrew-core": false, "kirocrew-crew-log": true, "kirocrew-cron": false, "kirocrew-dashboard": true, "kirocrew-debug": true, "kirocrew-guide": false, "kirocrew-mate": false, "kirocrew-panel": true, "kirocrew-work": true}, "shape": {"kirocrew-computer": ["invocation_fn", "spec_gate"], "kirocrew-core": ["invocation_fn"], "kirocrew-crew-log": ["invocation_fn", "opt_in"], "kirocrew-cron": ["invocation_fn"], "kirocrew-dashboard": ["invocation_fn", "opt_in"], "kirocrew-debug": ["invocation_fn", "opt_in"], "kirocrew-guide": ["invocation_fn"], "kirocrew-mate": ["invocation_fn"], "kirocrew-panel": ["invocation_fn", "opt_in"], "kirocrew-work": ["invocation_fn", "opt_in"]}}',
+    "_MANAGED_MCP_SERVERS": 'value dict {"gates": {"kirocrew-computer": "_computer_use_spec_gate", "kirocrew-core": null, "kirocrew-crew-log": null, "kirocrew-cron": null, "kirocrew-dashboard": null, "kirocrew-debug": null, "kirocrew-guide": null, "kirocrew-mate": null, "kirocrew-panel": null, "kirocrew-secrets": null, "kirocrew-work": null}, "opt_in": {"kirocrew-computer": false, "kirocrew-core": false, "kirocrew-crew-log": true, "kirocrew-cron": false, "kirocrew-dashboard": true, "kirocrew-debug": true, "kirocrew-guide": false, "kirocrew-mate": false, "kirocrew-panel": true, "kirocrew-secrets": true, "kirocrew-work": true}, "shape": {"kirocrew-computer": ["invocation_fn", "spec_gate"], "kirocrew-core": ["invocation_fn"], "kirocrew-crew-log": ["invocation_fn", "opt_in"], "kirocrew-cron": ["invocation_fn"], "kirocrew-dashboard": ["invocation_fn", "opt_in"], "kirocrew-debug": ["invocation_fn", "opt_in"], "kirocrew-guide": ["invocation_fn"], "kirocrew-mate": ["invocation_fn"], "kirocrew-panel": ["invocation_fn", "opt_in"], "kirocrew-secrets": ["invocation_fn", "opt_in"], "kirocrew-work": ["invocation_fn", "opt_in"]}}',
     "_MAX_HOOK_DESCRIPTION_LEN": "value int 40510175845988f1",
     "_MAX_HOOK_NAME_LEN": "value int 27badc983df1780b",
     "_MAX_HOOK_PAYLOAD_LEN": "value int 8b926d75599a618e",
@@ -110,17 +110,17 @@ BASE_SURFACE: dict[str, str] = {
     "_MAX_TOTAL_USER_HOOKS": "value int f5ca38f748a1d6ea",
     "_MAX_USER_HOOKS_PER_EVENT": "value int 4a44dc15364204a8",
     "_MCP_REGISTRY_TYPE": "value str 06c63899e16a32c5",
-    "_MEMBER_DASHBOARD_GRANTS": "value tuple 217848c3e96f9a58",
+    "_MEMBER_DASHBOARD_GRANTS": "value tuple efcd95e405400991",
     # Moved for ``@kirocrew-panel/dashboard_types``, the dynamic dashboard's data-type
     # catalog. The readable pin for this tuple is
-    # ``test_the_member_grants_extend_the_conductor_grants``, which spells the whole set
-    # out; this digest is the byte-level half and moves with it.
-    "_MEMBER_PANEL_GRANTS": "value tuple fe49f85f5f3b65f6",
+    # ``test_the_member_grants_extend_the_conductor_grants_in_order``, which spells the
+    # whole set out; this digest is the byte-level half and moves with it.
+    "_MEMBER_PANEL_GRANTS": "value tuple 5d490a048710e572",
     "_NATIVE_PROMPT_STUB": "value str cf6d81ff1d0b3797",
     "_PIPELINE_CONDUCTOR_AGENT_FILENAME": "value str 3b5e111de6d1d305",
     "_PIPELINE_CONDUCTOR_CORE_GRANTS": "value tuple 1ad9ce711e266082",
-    "_PIPELINE_CONDUCTOR_DASHBOARD_GRANTS": "value tuple 3f7fb6d17a7f0ebc",
-    "_PIPELINE_CONDUCTOR_SYSTEM_PROMPT": "value str d7010e266b564182",
+    "_PIPELINE_CONDUCTOR_DASHBOARD_GRANTS": "value tuple 41cf09029e05ee1b",
+    "_PIPELINE_CONDUCTOR_SYSTEM_PROMPT": "value str 7cedf60bfaff5e2d",
     "_PROVENANCE_SPEC_CAP_BYTES": "value int 54faea9b3eeffce2",
     "_PROVENANCE_TOTAL_BUDGET_BYTES": "value int 107f41ed92e01eb5",
     "_RESEARCH_AGENT_FILENAME": "value str 5cec351bc572af00",
@@ -128,10 +128,10 @@ BASE_SURFACE: dict[str, str] = {
     "_SAFE_MATCHER_RE": "value Pattern ac8a0d6bfee13169",
     "_SAFE_PATH_RE": "value platform",
     "_SECURITY_CONDUCTOR_AGENT_FILENAME": "value str ea0f45466289114a",
-    "_SECURITY_CONDUCTOR_DASHBOARD_GRANTS": "value tuple 4f02f1db82a878ee",
-    "_SECURITY_CONDUCTOR_SYSTEM_PROMPT": "value str 667c3be2c962f11a",
+    "_SECURITY_CONDUCTOR_DASHBOARD_GRANTS": "value tuple 41cf09029e05ee1b",
+    "_SECURITY_CONDUCTOR_SYSTEM_PROMPT": "value str 05c42bdf80ec1b4f",
     "_TEAM_LEAD_AGENT_FILENAME": "value str ef870cb7d4ed6640",
-    "_TEAM_LEAD_SYSTEM_PROMPT": "value str 24dc989a61cd8e56",
+    "_TEAM_LEAD_SYSTEM_PROMPT": "value str 13655a722e56ea1c",
     "_SOURCE_OWNED_MCP_KEYS": "value tuple b13c0a56645cc511",
     "_VALID_HOOK_EVENTS": "value frozenset 2b7aa96bff704c33",
     "_WORKER_AGENT_FILENAME": "value str e6d5cee102d8cbdf",
@@ -146,7 +146,7 @@ BASE_SURFACE: dict[str, str] = {
     "_alias_family_base": "callable _alias_family_base(key: 'str') -> 'str'",
     "_all_skill_paths": "callable _all_skill_paths() -> 'list[str]'",
     "_app_owned_mcp_keys": "callable _app_owned_mcp_keys() -> 'dict[str, bool]'",
-    "_apply_allowed_tools_ceiling": "callable _apply_allowed_tools_ceiling(config: 'dict', *, source: 'str') -> 'None'",
+    "_apply_allowed_tools_ceiling": "callable _apply_allowed_tools_ceiling(config: 'dict', *, source: 'str', audit: 'bool' = True) -> 'None'",
     "_apply_connection_tool_aliases": "callable _apply_connection_tool_aliases(config: 'dict', claimed: 'frozenset[tuple[str, str, str]]' = frozenset()) -> 'tuple[str, frozenset[tuple[str, str, str]]] | None'",
     "_apply_operator_oauth_client": "callable _apply_operator_oauth_client(name: 'str', entry: 'dict', *, managed: 'bool') -> 'dict'",
     "_apply_user_kiro_hooks": "callable _apply_user_kiro_hooks(config: 'dict', mc_cfg: 'dict') -> 'None'",
@@ -207,6 +207,8 @@ BASE_SURFACE: dict[str, str] = {
     "_install_ledger_conductor_agent": "callable _install_ledger_conductor_agent(*, clean: 'bool' = False) -> 'bool'",
     "_install_lite_agent_fallback": "callable _install_lite_agent_fallback() -> 'None'",
     "_install_pipeline_conductor_agent": "callable _install_pipeline_conductor_agent(*, clean: 'bool' = False) -> 'bool'",
+    "_install_mate_conductor_agent": "callable _install_mate_conductor_agent() -> 'None'",
+    "_install_mate_worker_agent": "callable _install_mate_worker_agent() -> 'None'",
     "_install_research_agent": "callable _install_research_agent() -> 'None'",
     "_install_security_conductor_agent": "callable _install_security_conductor_agent(*, clean: 'bool' = False) -> 'bool'",
     "_install_team_lead_agent": "callable _install_team_lead_agent() -> 'None'",
@@ -242,7 +244,7 @@ BASE_SURFACE: dict[str, str] = {
     "_project_shadow_of": "callable _project_shadow_of(agent: 'str', work_dir: 'str | Path | None', *, markdown_specs: 'bool' = True, dispatchable_only: 'bool' = False) -> 'Path | None'",
     "_projected_ceiling_generation": "value state",
     "_prompt_path": "callable _prompt_path() -> 'Path'",
-    "_read_agent_spec": "callable _read_agent_spec(path: 'Path', *, operation: 'str' = 'list_agents', source: 'str' = 'list_agents') -> 'dict[str, Any] | None'",
+    "_read_agent_spec": "callable _read_agent_spec(path: 'Path', *, operation: 'str' = 'list_agents', source: 'str' = 'list_agents', fence: 'Callable[[Path], bool] | None' = None) -> 'dict[str, Any] | None'",
     "_read_spec_capped": "callable _read_spec_capped(path: 'Path') -> 'dict | None'",
     "_reconcile_tool_aliases_from_disk": "callable _reconcile_tool_aliases_from_disk(path: 'Path', config: 'dict') -> 'bool'",
     "_refresh_dynamic_fields": "callable _refresh_dynamic_fields(config: 'dict', *, gated_off: \"'frozenset[str] | None'\" = None, fork: 'bool' = False) -> 'None'",
@@ -265,7 +267,7 @@ BASE_SURFACE: dict[str, str] = {
     "_stem_claimant_fork": "callable _stem_claimant_fork(agent: 'str') -> 'str | None'",
     "_strip_excluded_auto_approve": "callable _strip_excluded_auto_approve(servers: 'dict[str, Any]') -> 'tuple[dict[str, Any], list[str]]'",
     "_strip_legacy_denied_commands": "callable _strip_legacy_denied_commands(config: 'dict') -> 'None'",
-    "_strip_ungoverned_auto_approve": "callable _strip_ungoverned_auto_approve(servers: 'dict[str, Any]') -> 'dict[str, Any]'",
+    "_strip_ungoverned_auto_approve": "callable _strip_ungoverned_auto_approve(servers: 'dict[str, Any]', *, audit: 'bool' = True) -> 'dict[str, Any]'",
     "_under_system_tmp": "callable _under_system_tmp(path: 'Path') -> 'bool'",
     "_user_dir": "callable _user_dir() -> 'Path'",
     "_user_overrides_path": "callable _user_overrides_path() -> 'Path'",
@@ -342,7 +344,7 @@ BASE_SURFACE: dict[str, str] = {
     "redact_log": "callable redact_log_via_context(text: 'str') -> 'str'",
     "rederive_worker_agent": "callable rederive_worker_agent(reason: 'str') -> 'bool'",
     "repair_agent_configs": "callable repair_agent_configs() -> 'None'",
-    "replace_with_retry": "callable replace_with_retry(src: 'Path | str', dst: 'Path | str') -> 'None'",
+    "replace_with_retry": "callable replace_with_retry(src: 'Path | str', dst: 'Path | str', *, budget_s: 'float | None' = None) -> 'None'",
     "reproject_for_ceiling_change": "callable reproject_for_ceiling_change() -> 'None'",
     "require_fork_governance": "callable require_fork_governance(agent: 'str | None', project_dir: 'str | Path | None' = None) -> 'None'",
     "require_fresh_derived_spec": "callable require_fresh_derived_spec(agent: 'str | None', work_dir: 'str | Path | None') -> \"'DerivedSpecSnapshot | None'\"",
@@ -511,11 +513,12 @@ _RUNTIME_STATE = frozenset(
 )
 
 #: Values compiled per platform at import, pinned for each platform they are built on:
-#: the hook path allowlist admits ``\`` and ``:`` on Windows only.
+#: the hook path allowlist admits ``\``, ``:`` and Unicode letters and digits on
+#: Windows only.
 _PER_PLATFORM: dict[str, dict[str, str]] = {
     "_SAFE_PATH_RE": {
         "posix": "value Pattern 0d1f4584e517d253",
-        "windows": "value Pattern 92e93b93e927a8a7",
+        "windows": "value Pattern 87efde2f8558ca88",
     },
 }
 
@@ -906,9 +909,6 @@ def test_every_conductor_prompt_carries_the_patrol_receipt_rule(prompt: str) -> 
 
 def test_the_member_grants_extend_the_conductor_grants_in_order() -> None:
     assert agent._CONDUCTOR_DASHBOARD_GRANTS == (
-        "@kirocrew-dashboard/chat_folder_tree",
-        "@kirocrew-dashboard/chat_folder_create",
-        "@kirocrew-dashboard/chat_folder_file_self",
         "@kirocrew-dashboard/session_create",
         "@kirocrew-dashboard/session_read_message",
         "@kirocrew-dashboard/session_status",
@@ -918,6 +918,7 @@ def test_the_member_grants_extend_the_conductor_grants_in_order() -> None:
         "@kirocrew-dashboard/session_broadcast",
         "@kirocrew-dashboard/session_stop",
         "@kirocrew-dashboard/session_retry",
+        "@kirocrew-dashboard/session_close",
     )
     assert agent._MEMBER_PANEL_GRANTS == (
         "@kirocrew-panel/panel_templates",
@@ -930,20 +931,48 @@ def test_the_member_grants_extend_the_conductor_grants_in_order() -> None:
         "@kirocrew-panel/dashboard_preview",
         "@kirocrew-panel/dashboard_apply",
         "@kirocrew-panel/dashboard_rollback",
+        "@kirocrew-panel/dashboard_snapshot",
     )
 
 
 def test_the_security_grants_extend_the_pipeline_grants() -> None:
     assert agent._PIPELINE_CONDUCTOR_DASHBOARD_GRANTS == (
-        "@kirocrew-dashboard/chat_folder_tree",
-        "@kirocrew-dashboard/chat_folder_create",
         "@kirocrew-dashboard/session_create",
         "@kirocrew-dashboard/session_read_message",
         "@kirocrew-dashboard/session_status",
     )
-    assert agent._SECURITY_CONDUCTOR_DASHBOARD_GRANTS == (
-        agent._PIPELINE_CONDUCTOR_DASHBOARD_GRANTS + ("@kirocrew-dashboard/chat_folder_file_self",)
-    )
+    assert agent._SECURITY_CONDUCTOR_DASHBOARD_GRANTS == agent._PIPELINE_CONDUCTOR_DASHBOARD_GRANTS
+
+
+def test_no_dispatcher_grant_names_a_folder_verb() -> None:
+    """Dispatchers stop managing folders (rfc-crewmate-workers-under-the-crewmate.md,
+    Design 6): no conductor or member grant tuple auto-approves a ``chat_folder_*``
+    verb."""
+    for grants in (
+        agent._CONDUCTOR_DASHBOARD_GRANTS,
+        agent._MEMBER_DASHBOARD_GRANTS,
+        agent._PIPELINE_CONDUCTOR_DASHBOARD_GRANTS,
+        agent._SECURITY_CONDUCTOR_DASHBOARD_GRANTS,
+    ):
+        assert not [g for g in grants if "chat_folder_" in g], grants
+
+
+def test_ordinary_agents_keep_the_folder_tools() -> None:
+    """The folder verbs stay on ``kirocrew-dashboard`` for any agent that mounts it,
+    behind an approval; only ``chat_folder_file_self``, which no one but a conductor
+    used, is gone."""
+    from kiro_crew import mcp_dashboard
+
+    names = {t["name"] for t in mcp_dashboard._tool_definitions()}
+    assert {
+        "chat_folder_tree",
+        "chat_folder_create",
+        "chat_folder_move",
+        "chat_folder_update",
+        "chat_folder_move_session",
+        "chat_folder_delete",
+    } <= names
+    assert "chat_folder_file_self" not in names
 
 
 def test_no_conductor_is_granted_a_fleet_write_or_a_model_switch() -> None:

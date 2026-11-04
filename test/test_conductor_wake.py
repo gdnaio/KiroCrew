@@ -40,6 +40,7 @@ from conductor_wake_helpers import (
 )
 
 from kiro_crew import conductor_wake, work_ledger
+from kiro_crew.testing.wait import async_wait_until, default_timeout
 
 # ── the shared lookup ────────────────────────────────────────────────────────
 
@@ -436,11 +437,11 @@ def test_a_work_fold_event_is_handed_to_the_service_loop(monkeypatch):
     try:
         first = conductor_wake._observe_event(_event(CONDUCTOR, [("it_a", "t1")]))
         assert first is not None
-        first.result(timeout=5)
+        first.result(timeout=default_timeout())
         assert set(conductor_wake._registry.boards[CONDUCTOR]) == {"it_a"}
         moved = conductor_wake._observe_event(_event(CONDUCTOR, [("it_a", "t2")]))
         assert moved is not None
-        moved.result(timeout=5)
+        moved.result(timeout=default_timeout())
         assert fired == [(CONDUCTOR, "it_a")], "the report reached the loop and fired"
     finally:
         loop.call_soon_threadsafe(loop.stop)
@@ -522,9 +523,13 @@ def _board(unit: str, board: str, worker: str) -> None:
     _write(unit, **base, action="bind", item_id="it_p", worker_session_key=worker)
 
 
+#: Each board's own unit, where the report route writes the board's copy of a report.
+_BOARD_UNITS = {CONDUCTOR: "acp-c", OTHER: "acp-o"}
+
+
 def _report(unit: str, board: str, worker: str, stamp: str, *, status: str = "done") -> None:
-    _write(
-        unit,
+    """A worker's report as the route records it: the worker's copy, then the board's."""
+    fields = dict(
         slot=board,
         actor="worker",
         by=worker,
@@ -534,14 +539,14 @@ def _report(unit: str, board: str, worker: str, stamp: str, *, status: str = "do
         summary="s",
         last_report_at=stamp,
     )
+    _write(unit, **fields)
+    if _BOARD_UNITS[board] != unit:
+        _write(_BOARD_UNITS[board], **fields)
 
 
-async def _until(predicate, timeout: float = 5.0) -> bool:
-    deadline = asyncio.get_running_loop().time() + timeout
-    while not predicate():
-        if asyncio.get_running_loop().time() > deadline:
-            return False
-        await asyncio.sleep(0.01)
+async def _until(predicate, timeout: float | None = None) -> bool:
+    """True once ``predicate()`` holds; a wait that never does fails by name."""
+    await async_wait_until(predicate, timeout=timeout)
     return True
 
 
@@ -549,6 +554,15 @@ async def _sync_and_join(svc) -> None:
     """Sync the subscriptions, then wait for every join it started to land."""
     conductor_wake.sync_subscriptions(svc)
     await asyncio.gather(*list(conductor_wake._subscriptions.joining.values()))
+    # A board with no warm cell gets no baseline on the join: one background prime folds
+    # it and its first push is the board's first sight. Wait for that prime, then for the
+    # observations it scheduled on this loop, so every case starts from the board's
+    # first sight already recorded.
+    from kiro_crew.crew_log import slot_prime
+
+    assert await asyncio.to_thread(slot_prime.drain, 30.0), "a background prime never finished"
+    live = set(conductor_wake._subscriptions.live)
+    await _until(lambda: live <= set(conductor_wake._registry.boards))
 
 
 def _on_this_loop(monkeypatch, svc) -> None:
@@ -1055,11 +1069,14 @@ def _record_close(monkeypatch, *, save_fails: bool) -> list[str]:
     events: list[str] = []
     monkeypatch.setattr(autonudge, "_INSTANCE", None)
 
-    async def _save(_state, _slot, *_a, **kw) -> None:
+    async def _save(_state, _slot, *_a, **kw) -> bool:
         if kw.get("closed"):
             events.append("save")
             if save_fails:
                 raise OSError("disk full")
+        # True: this double models the durable write itself; a bare None reads
+        # as the save's own refusal, which the close answers rather than ignores.
+        return True
 
     async def _wake(_svc, board: str, item_id: str = "") -> str:
         events.append(f"wake:{board}:{item_id}")

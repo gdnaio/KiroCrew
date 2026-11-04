@@ -18,15 +18,16 @@ import json
 import logging
 import math
 import time as _time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from kiro_crew.atomic_write import atomic_write
 from kiro_crew.history_consolidation import (
     _CONSOLIDATION_META_KEYS,
     _CONSOLIDATION_SUBOFFSET_META_KEYS,
     AttemptedSpan,
 )
-from kiro_crew.history_files import _restore_mtime, _safe_mtime, transcript_lock_stems
+from kiro_crew.history_files import transcript_lock_stems
+from kiro_crew.history_rewrite import rewrite_metadata_line
 from kiro_crew.history_schema import metadata_now_iso
 
 if TYPE_CHECKING:
@@ -113,10 +114,23 @@ def snapshot_for_consolidation(
             self._withhold_if_restricted(key)
         messages = self._read_messages(key)
         meta = self._read_metadata(key)
-        offset = meta.get("last_consolidated", 0)
         generation = int(meta.get("rotation_generation", 0) or 0)
-        sub_offset = self._sub_offset_for_generation(meta, generation)
+        offset, sub_offset = _live_position(meta, generation)
         return list(messages[offset:]), len(messages), generation, sub_offset
+
+
+def _live_position(meta: dict, generation: int) -> tuple[int, int]:
+    """``(row marker, sub-offset)`` as the consolidator reads them, for *generation*.
+
+    The one reading of the pair: the snapshot slices by it, and the retry-span
+    check compares a charged attempt against it, so the two cannot disagree. A
+    sub-offset is a character position in the row at the stored marker, so a
+    marker that had to be repaired (unreadable or negative) pairs with 0.
+    """
+    offset, repaired = _read_consolidated_offset(meta)
+    if repaired:
+        return 0, 0
+    return offset, _sub_offset_for_generation(meta, generation)
 
 
 def _sub_offset_for_generation(meta: dict, generation: int) -> int:
@@ -186,17 +200,17 @@ def mark_consolidated(
     them from memory/history extraction). When neither trips, the offset is
     applied as-is.
     """
-    # Serialize behind the cross-process lock and resolve/re-read under it so
-    # a concurrent append or restore cannot redirect this key after its path
-    # was chosen.
-    with self._locked(key):
-        path = self._path(key)
-        if not path.exists():
-            return
-        prev_mtime = _safe_mtime(path)
-        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+
+    # rewrite_metadata_line runs this on an unlocked read, then renames under
+    # the cross-process lock only if the file (and the path for this key) is
+    # still exactly what it read; otherwise it runs it again under the lock, so
+    # a concurrent append or restore cannot be lost or redirect the write.
+    def build(path: Path, text: str | None) -> bytes | None:
+        if text is None:
+            return None
+        lines = text.splitlines(keepends=True)
         if not lines:
-            return
+            return None
         meta = json.loads(lines[0])
         # Reconcile the caller's absolute *offset* against the messages
         # actually present now. Line 0 is the metadata line; every other
@@ -281,24 +295,18 @@ def mark_consolidated(
         for _sub_key in _CONSOLIDATION_SUBOFFSET_META_KEYS:
             meta.pop(_sub_key, None)
         lines[0] = json.dumps(meta) + "\n"
-        # Reduce lock hold for this one-line metadata rewrite: skip the
-        # fsync (fsync=False). ``last_consolidated`` is recoverable
-        # bookkeeping — if a crash loses it we simply re-consolidate a few
-        # messages — so paying a disk flush while holding the cross-process
-        # lock (blocking every other writer of this session) isn't worth it.
-        atomic_write(path, "".join(lines), fsync=False)
-        # Housekeeping bookkeeping — must not advance the session's mtime
-        # (see _restore_mtime). Otherwise consolidation floats stale sessions
-        # to the top of list_sessions on every gateway restart.
-        _restore_mtime(path, prev_mtime)
-        # Invalidate while still holding the lock. Outside it there is a
-        # window where the file is already rewritten but the generation has
-        # not moved, so a concurrent fold / snippet / metadata read could
-        # publish before the local invalidation. Every other preserved-mtime
-        # writer already invalidates inside its locked section;
-        # _invalidate_cache is pure in-memory work, so this adds no I/O
-        # under the cross-process flock.
-        self._invalidate_cache(key)
+        # Synced, although only line 0 changed: the replacement carries every
+        # row of the conversation, and an unsynced file renamed over the old
+        # one can come back empty after a power loss. The helper syncs it
+        # before taking the lock, keeps the session's mtime (consolidation is
+        # housekeeping and must not float stale sessions to the top of
+        # list_sessions), and invalidates the cache while still holding the
+        # lock, so no concurrent read publishes the old line under the new
+        # generation. Bytes, so no newline translation turns the LF ends into CRLF on
+        # Windows.
+        return "".join(lines).encode("utf-8")
+
+    rewrite_metadata_line(self, key, build)
 
 
 def advance_consolidation_sub_offset(
@@ -314,8 +322,9 @@ def advance_consolidation_sub_offset(
     past the whole message only once its last slice succeeds, through
     :meth:`mark_consolidated`.
 
-    Three guards, all under the one lock, keep the sub-offset from ever
-    resuming into content it does not describe:
+    Three guards, each judged on the exact bytes the locked rename replaces
+    (see :func:`~kiro_crew.history_rewrite.rewrite_metadata_line`), keep the
+    sub-offset from ever resuming into content it does not describe:
 
     * The session must still exist (``_update_metadata_locked`` upserts, so
       writing a deleted session would resurrect it as metadata-only).
@@ -332,14 +341,13 @@ def advance_consolidation_sub_offset(
     slice reached; it is stamped with *generation* so a later rotation
     invalidates it the same way the attempt stamps are invalidated.
     """
-    with self._locked(key):
-        path = self._path(key)
-        if not path.exists():
-            return
-        prev_mtime = _safe_mtime(path)
-        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+
+    def build(path: Path, text: str | None) -> bytes | None:
+        if text is None:
+            return None
+        lines = text.splitlines(keepends=True)
         if not lines:
-            return
+            return None
         meta = json.loads(lines[0])
         current_generation = int(meta.get("rotation_generation", 0) or 0)
         if current_generation != generation:
@@ -351,11 +359,8 @@ def advance_consolidation_sub_offset(
                 current_generation,
                 key,
             )
-            return
-        try:
-            current_offset = int(meta.get("last_consolidated", 0) or 0)
-        except (TypeError, ValueError, OverflowError):
-            current_offset = 0
+            return None
+        current_offset, repaired = _read_consolidated_offset(meta)
         if current_offset != offset:
             logger.info(
                 "advance_consolidation_sub_offset: marker moved %d->%d for "
@@ -365,7 +370,12 @@ def advance_consolidation_sub_offset(
                 current_offset,
                 key,
             )
-            return
+            return None
+        if repaired:
+            # Saved with the sub-offset it pairs with: a snapshot reads a marker
+            # it had to repair as 0 with no sub-offset, so leaving the stored
+            # value in place would restart this head's first slice every pass.
+            meta["last_consolidated"] = 0
         meta["consolidation_sub_offset"] = max(0, int(sub_offset))
         meta["consolidation_sub_offset_generation"] = generation
         # A slice that reached its durable sub-offset is a span that ended —
@@ -381,12 +391,13 @@ def advance_consolidation_sub_offset(
             meta.pop(_acct_key, None)
         meta["updated_at"] = metadata_now_iso()
         lines[0] = json.dumps(meta) + "\n"
-        # Same cheap, mtime-preserving, no-fsync write as mark_consolidated:
-        # a lost sub-offset only re-slices the head from its start, which is
-        # correct behaviour, so it is not worth a disk flush under the lock.
-        atomic_write(path, "".join(lines), fsync=False)
-        _restore_mtime(path, prev_mtime)
-        self._invalidate_cache(key)
+        # Same mtime-preserving, synced whole-file write as mark_consolidated,
+        # synced before the lock is taken: a lost sub-offset would only
+        # re-slice the head, but the replacement carries every row. Bytes, as in
+        # mark_consolidated.
+        return "".join(lines).encode("utf-8")
+
+    rewrite_metadata_line(self, key, build)
 
 
 def unconsolidated_count(self: ConversationLog, key: str) -> int:
@@ -396,8 +407,7 @@ def unconsolidated_count(self: ConversationLog, key: str) -> int:
     the startup idle-seed scan calls this for every recent transcript.
     """
     total = self._count_messages(key)
-    offset = self._read_metadata(key).get("last_consolidated", 0)
-    return max(0, total - offset)
+    return max(0, total - self.consolidated_offset(key))
 
 
 def consolidation_counts(self: ConversationLog, key: str) -> tuple[int, int]:
@@ -420,11 +430,29 @@ def consolidation_counts(self: ConversationLog, key: str) -> tuple[int, int]:
 
 def consolidated_offset(self: ConversationLog, key: str) -> int:
     """Rows already consolidated, from the metadata line; 0 when unreadable."""
-    offset = self._read_metadata(key).get("last_consolidated", 0)
+    return _consolidated_offset_of(self._read_metadata(key))
+
+
+def _consolidated_offset_of(meta: dict) -> int:
+    """``last_consolidated`` as a row count: 0 when unreadable or negative."""
+    return _read_consolidated_offset(meta)[0]
+
+
+def _read_consolidated_offset(meta: dict) -> tuple[int, bool]:
+    """``(row count, repaired)`` for ``last_consolidated``.
+
+    The value is caller-supplied JSON. A negative one used as a slice start would
+    count from the END of the transcript and skip the rows before it, and a
+    non-integer one would raise in the slice or the subtraction, so both read as
+    0 with ``repaired`` true.
+    """
     try:
-        return int(offset or 0)
+        value = int(meta.get("last_consolidated", 0) or 0)
     except (TypeError, ValueError, OverflowError):
-        return 0
+        return 0, True
+    if value < 0:
+        return 0, True
+    return value, False
 
 
 def consolidation_retry_state(
@@ -559,14 +587,23 @@ def _attempts_describe_current_span(
     transcript in front of us by construction, and every test here would
     trivially match.
     """
-    for meta_key, span_key in (
-        ("rotation_generation", "consolidation_attempts_generation"),
-        ("last_consolidated", "consolidation_attempts_offset"),
+    # The live marker is read as the snapshot reads it (``_live_position``), so an
+    # attempt charged against a repaired marker matches the 0 it was sliced from.
+    try:
+        live_generation = int(meta.get("rotation_generation", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        live_generation = None
+    live_offset, live_sub_offset = (
+        _live_position(meta, live_generation) if live_generation is not None else (None, None)
+    )
+    for span_key, live in (
+        ("consolidation_attempts_generation", live_generation),
+        ("consolidation_attempts_offset", live_offset),
     ):
-        if span_key not in meta:
+        if span_key not in meta or live is None:
             continue
         try:
-            if int(meta.get(span_key, 0) or 0) != int(meta.get(meta_key, 0) or 0):
+            if int(meta.get(span_key, 0) or 0) != live:
                 return False
         except (TypeError, ValueError, OverflowError):
             # Unreadable stamp — fall back to keeping the cap.
@@ -589,10 +626,8 @@ def _attempts_describe_current_span(
     # the generation-honoured value makes the comparison see the same 0 the
     # slicer used, so a genuinely-advanced earlier slice still resets the cap
     # while a bare rotation does not.
-    if "consolidation_attempts_sub_offset" in meta:
+    if "consolidation_attempts_sub_offset" in meta and live_sub_offset is not None:
         try:
-            current_generation = int(meta.get("rotation_generation", 0) or 0)
-            live_sub_offset = self._sub_offset_for_generation(meta, current_generation)
             if int(meta.get("consolidation_attempts_sub_offset", 0) or 0) != live_sub_offset:
                 return False
         except (TypeError, ValueError, OverflowError):

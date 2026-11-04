@@ -86,8 +86,9 @@ class AppRegistryPolicy(Protocol):
 class AppsLoader(Protocol):
     """Discovery of bundled (builtin) apps + manifest sources.
 
-    Public default = the open-source ``apps/builtins/`` set (``auto_research``,
-    ``file_explorer``).  The companion bundles the internal feature apps.
+    Public default = the open-source ``apps/builtins/`` set, found by scanning that
+    directory, so it declares no names.  The companion bundles the internal feature
+    apps.
     """
 
     def bundled_app_names(self) -> List[str]: ...
@@ -146,6 +147,12 @@ class AppsLoader(Protocol):
         let a hand-edited ``config.json`` inherit that tier while repointing
         ``repo`` somewhere else. An operator can still add registries freely — just
         not silently repoint one the edition pinned.
+
+        A row may also carry ``"allowDefaultInstall": true``. Only then may that
+        registry's index mark apps ``defaultInstall``, which installs and trusts
+        them once on first boot (``apps/default_installs.py``). It is honoured only
+        for a row in force at the ``owner`` tier, and read only from this build
+        row, never from ``config.json``. Absent means ``false``.
 
         The public Default returns ``[]``, so standalone behaviour is byte-identical
         to reading ``config.registries`` alone. v1 method addition (no

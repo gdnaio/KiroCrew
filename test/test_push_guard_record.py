@@ -577,8 +577,8 @@ class TestPushGuardContracts:
             assert re.search(rf"\b{code}\b", row.rsplit("|", 2)[-2]), code
 
     def test_no_line_trips_the_portability_gate(self):
-        """The cross-platform job greps added lines for POSIX-only calls; these scripts pass."""
-        workflow = (REPO_ROOT / ".github" / "workflows" / "cross-platform.yml").read_text(
+        """The Cross-Platform Portability step greps added lines for POSIX-only calls; these scripts pass."""
+        workflow = (REPO_ROOT / ".github" / "workflows" / "pr-policy.yml").read_text(
             encoding="utf-8"
         )
         rule = r"\b(os\.(fork|kill|getuid|geteuid|setsid|getpgid|killpg)|signal\.(SIGKILL|SIGHUP|SIGUSR[12]|SIGCHLD))\b"
@@ -586,7 +586,8 @@ class TestPushGuardContracts:
         # The manual '/' path-assembly rule, as the gate's grep spells it.
         assert "Manual '/' path assembly" in workflow, "the gate's rule moved; re-pin it here"
         joins = r"""\.(split|join|rsplit)\(["']/["']\)|\+\s*["']/["']\s*\+"""
-        for script in ("push_guard.py", "preflight.py"):
+        owners = sorted(path.name for path in PUSH_GUARD_DIR.glob("push_guard_*.py"))
+        for script in ("push_guard.py", "preflight.py", *owners):
             code = [
                 line
                 for line in (PUSH_GUARD_DIR / script).read_text(encoding="utf-8").splitlines()

@@ -14,13 +14,13 @@ Instance fields written: ``_awaiting_permission``, ``_codex_compaction_pending``
 ``_stale_probe``, ``_tool_dispatched``, ``active_agent``, ``last_compaction_transient``.
 
 Instance fields read: ``_awaited_responses``, ``_cancel_grace_secs``, ``_cancel_ts``,
-``_cancelled``, ``_ingress_seq``, ``_kas_compact_turn``, ``_keepalive_parked``,
-``_keepalive_ts``, ``_parked_total``, ``_queue``, ``_runtime``, ``_session_id``,
-``_skill_reads``, ``_stale_eligible``, ``_steers_proven``, ``_tool_call_diff_path``,
-``_tool_call_harness_tool_name``, ``_tool_call_input_redacted``, ``_tool_call_inputs``,
-``_tool_call_is_shell``, ``_tool_call_mcp_server``, ``_tool_call_raw_params``,
-``_tool_call_tool_name``, ``_turn_done``, ``_watchdog``, ``child_fidelity_aware``,
-``last_prompt_stats``.
+``_cancelled``, ``_engine_fallback``, ``_ingress_seq``, ``_kas_compact_turn``,
+``_keepalive_parked``, ``_keepalive_ts``, ``_parked_total``, ``_queue``, ``_runtime``,
+``_session_id``, ``_skill_reads``, ``_stale_eligible``, ``_steers_proven``,
+``_tool_call_diff_path``, ``_tool_call_harness_tool_name``, ``_tool_call_input_redacted``,
+``_tool_call_inputs``, ``_tool_call_is_shell``, ``_tool_call_mcp_server``,
+``_tool_call_raw_params``, ``_tool_call_tool_name``, ``_turn_done``, ``_watchdog``,
+``child_fidelity_aware``, ``last_prompt_stats``.
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ from kiro_crew.acp.client import (
     compaction_failure_is_transient,
     format_command_result,
 )
+from kiro_crew.acp.engine_fallback import normalize_kiro_v2
 from kiro_crew.acp.liveness import (
     EVIDENCE_ESTABLISHED_FLAT,
     EVIDENCE_PLATFORM_LIMITED,
@@ -69,6 +70,7 @@ from kiro_crew.acp.types import (
     EVENT_MCP_SERVER_INITIALIZED,
     EVENT_STEER_CLEARED,
     EVENT_STEER_CONSUMED,
+    EVENT_STEER_DROPPED,
     EVENT_STEER_QUEUED,
     EVENT_STRUCTURED_STATUS,
     EVENT_SUBAGENT_ACTIVITY,
@@ -78,6 +80,7 @@ from kiro_crew.acp.types import (
     EVENT_TOOL_CALL_UPDATE,
     EVENT_TOOL_RESULT,
     JSONRPC_METHOD_NOT_FOUND,
+    STOP_REASON_CANCEL_UNACKED,
     STOP_REASON_CANCELLED,
     STOP_REASON_COMPACTION_FAILED,
     STOP_REASON_END_TURN,
@@ -233,7 +236,7 @@ async def _dispatch_events(
                 )
                 yield AcpEvent(
                     kind=EVENT_COMPLETE,
-                    stop_reason="error: cancel unacked",
+                    stop_reason=STOP_REASON_CANCEL_UNACKED,
                     usage=self.last_prompt_stats.to_turn_usage(),
                 )
                 return
@@ -567,7 +570,13 @@ async def _dispatch_events(
                     if verdict == VERDICT_WORKING:
                         self._log_working_deferral(_stale_idle, evidence, timeout)
                         continue
-                    _flat_wait = evidence.startswith(EVIDENCE_ESTABLISHED_FLAT)
+                    # established_flat (a backend socket held, nothing
+                    # flowing) and platform_limited (macOS: a flat tree with
+                    # no socket evidence to tell a think from a wedge) both
+                    # get the model-silent window.
+                    _flat_wait = evidence.startswith(
+                        (EVIDENCE_ESTABLISHED_FLAT, EVIDENCE_PLATFORM_LIMITED)
+                    )
                     if verdict != VERDICT_DEAD:
                         # UNKNOWN: probe only past the window. An established-
                         # but-flat backend connection is probably a non-streamed
@@ -717,6 +726,7 @@ async def _dispatch_events(
                                 agent_info.get("name", "") if isinstance(agent_info, dict) else ""
                             )
                             if name:
+                                name = self._crew_agent_name(name)
                                 self.active_agent = name
                                 yield AcpEvent(kind=EVENT_AGENT_SWITCHED, text=name)
                 reason, _refusal = self.last_prompt_stats.terminal_refusal(reason)
@@ -850,6 +860,18 @@ async def _dispatch_events(
                 # "waiting for a human" from "the consumer stopped pulling".
                 self._awaiting_permission = True
                 yield _perm_event
+            elif action == "elicitation":
+                # An MCP server's human-in-the-loop ask. The handle answers it
+                # itself (decline) unless this consumer can put it to a person;
+                # the returned event is the ask that consumer must answer. No
+                # trust tier applies: it is the server's requirement, not ours.
+                _elicit_event = await self._handle_elicitation_request(msg)
+                if _elicit_event is None:
+                    continue
+                # Same park marking as a permission: the consumer waits on a
+                # human here too, and an observer must not read that as a stall.
+                self._awaiting_permission = True
+                yield _elicit_event
             elif action == "server_request_unknown":
                 await self._runtime.send_error(msg.id, JSONRPC_METHOD_NOT_FOUND, "Method not found")
             elif action == "update":
@@ -920,6 +942,11 @@ async def _dispatch_events(
                     yield AcpEvent(kind=EVENT_STEER_CONSUMED, text=_text, runtime_global=_ownerless)
                 elif _disc == "steering_cleared":
                     yield AcpEvent(kind=EVENT_STEER_CLEARED, runtime_global=_ownerless)
+                elif _disc == "AgentExecutionUserMessageCleared":
+                    # The steers a ``_session/steer/clear`` dropped unread. Only
+                    # the fact is carried: kiro-cli's message ids name nothing
+                    # Crew keeps, so the caller decides which steers it held.
+                    yield AcpEvent(kind=EVENT_STEER_DROPPED, runtime_global=_ownerless)
             elif action == "metadata":
                 self._track_metadata(msg)
             elif action == "compaction":
@@ -981,10 +1008,11 @@ async def _dispatch_events(
                 saw_agent_switch = True
                 params = msg.params or {}
                 name = params.get("agentName", "")
-                self.active_agent = name if isinstance(name, str) else ""
+                name = self._crew_agent_name(name) if isinstance(name, str) else ""
+                self.active_agent = name
                 yield AcpEvent(
                     kind=EVENT_AGENT_SWITCHED,
-                    text=params.get("agentName", ""),
+                    text=name,
                     runtime_global=msg.fanout_no_owner,
                 )
             elif action == "subagent_list":
@@ -1021,6 +1049,16 @@ async def _dispatch_events(
                         subagents=subs,
                         runtime_global=msg.fanout_no_owner,
                     )
+            elif action == "model_fallback":
+                # The V2 engine's fallback notice for THIS session. A notice
+                # naming another session is not ours to apply: V2 sub-agents
+                # never fall back, so it can only be a co-tenant's.
+                params = msg.params or {}
+                ssid = str(params.get("sessionId") or "")
+                upd = params.get("update")
+                if (not ssid or ssid == self._session_id) and isinstance(upd, dict):
+                    for _fb_event in self._engine_fallback.events(self, normalize_kiro_v2(upd)):
+                        yield _fb_event
             elif action == "subagent_activity":
                 params = msg.params or {}
                 ssid = str(params.get("sessionId") or "")

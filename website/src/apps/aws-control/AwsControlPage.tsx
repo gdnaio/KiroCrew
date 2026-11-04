@@ -787,9 +787,13 @@ function AccountsPane({ accountsQ, selected, onUse, openAddAccounts = false }: {
           // never name two different numbers.
           <span data-testid="accounts-totals">
             {i18nT('apps.awsControl.page.totals_summary', {
+              count: data.accounts.length,
               accounts: fmtNumber(data.accounts.length),
-              keys: fmtNumber(data.totals.profiles),
-              healthy: fmtNumber(data.totals.profilesHealthy),
+              keys: i18nT('apps.awsControl.page.keys_healthy', {
+                count: data.totals.profiles,
+                n: fmtNumber(data.totals.profiles),
+                healthy: fmtNumber(data.totals.profilesHealthy),
+              }),
             })}
           </span>
         ) : undefined}
@@ -1402,7 +1406,7 @@ function DrivePaneGate({ pane, account, drive, driveQ, children }: {
       {/* No bucket yet, so the pane carries the one action that changes that. */}
       {drive && !drive.exists && (
         <div data-testid="capability-drive-setup">
-          <SetupCard account={id} region={setupRegion} />
+          <SetupCard account={id} region={setupRegion} searchedRegion={drive.searched_region} />
         </div>
       )}
     </section>

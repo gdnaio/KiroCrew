@@ -658,6 +658,39 @@ class TestReviewSectionIO(_SageRoutesBase):
         self.assertEqual(review["model"], "opus-4.8")
         self.assertTrue(self._cfg_path().is_file())
 
+    def _save_with_bom(self, cfg: dict) -> None:
+        """Bytes Notepad "UTF-8 with BOM" and PowerShell 5.1 ``Set-Content`` write."""
+        self._cfg_path().write_bytes(b"\xef\xbb\xbf" + json.dumps(cfg).encode("utf-8"))
+
+    def test_load_config_reads_a_utf8_bom_file_like_one_without(self):
+        cfg = json.loads(self._cfg_path().read_text(encoding="utf-8"))
+        cfg["review"] = {"model": "example-model"}
+        self._save_with_bom(cfg)
+        self.assertEqual(store.load_config(), cfg)
+        self.assertEqual(self.mod._load_review_section()["model"], "example-model")
+
+    def test_write_over_a_utf8_bom_file_keeps_settings_and_drops_the_mark(self):
+        cfg = json.loads(self._cfg_path().read_text(encoding="utf-8"))
+        cfg["kept_by_test"] = {"nested": 1}
+        self._save_with_bom(cfg)
+        review = self.mod._write_review_section({"effort": "high"})
+        self.assertEqual(review["effort"], "high")
+        raw = self._cfg_path().read_bytes()
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))
+        self.assertEqual(json.loads(raw.decode("utf-8"))["kept_by_test"], {"nested": 1})
+
+    def test_load_config_names_a_utf16_file(self):
+        cfg = json.loads(self._cfg_path().read_text(encoding="utf-8"))
+        self._cfg_path().write_bytes(json.dumps(cfg).encode("utf-16"))
+        with self.assertRaises(ValueError) as caught:
+            store.load_config()
+        self.assertIn(str(self._cfg_path()), str(caught.exception))
+
+    def test_load_config_still_raises_on_malformed_json(self):
+        self._cfg_path().write_bytes(b"\xef\xbb\xbf{not json")
+        with self.assertRaises(json.JSONDecodeError):
+            store.load_config()
+
     def test_write_replaces_a_non_mapping_review_section(self):
         cfg = json.loads(self._cfg_path().read_text(encoding="utf-8"))
         cfg["review"] = "clobbered"
@@ -1326,10 +1359,14 @@ class TestRegisterRoutes(_SageRoutesBase):
     async def test_startup_hook_reaps_orphan_run_dirs_off_the_loop(self):
         app = web.Application()
         self.mod.register_routes(app)
+        store.ensure_run_layout("orphan-run")
+        self.assertEqual(store.list_run_ids(), ["orphan-run"])
         with unittest.mock.patch.object(
-                self.mod, "_reap_orphan_run_dirs", return_value=2) as reap:
+                self.mod, "_reap_orphan_run_dirs",
+                wraps=self.mod._reap_orphan_run_dirs) as reap:
             await self._startup_hook(app, "_reap_on_startup")(app)
         reap.assert_called_once_with()
+        self.assertEqual(store.list_run_ids(), [], "the orphan run dir is reaped")
 
     async def test_startup_hook_swallows_a_reap_failure(self):
         app = web.Application()
@@ -1341,11 +1378,11 @@ class TestRegisterRoutes(_SageRoutesBase):
     async def test_cleanup_hook_retires_the_review_pool(self):
         app = web.Application()
         self.mod.register_routes(app)
-        shutdown = unittest.mock.AsyncMock()
-        with unittest.mock.patch.object(
-                self.mod.review_pool, "shutdown_pool", shutdown):
+        live_pool = unittest.mock.AsyncMock()
+        with unittest.mock.patch.object(self.mod.review_pool, "_POOL", live_pool):
             await app.on_cleanup[-1](app)
-        shutdown.assert_awaited_once()
+            self.assertIsNone(self.mod.review_pool._POOL, "the singleton pool is retired")
+        live_pool.shutdown.assert_awaited_once()
 
     async def test_cleanup_hook_swallows_a_shutdown_failure(self):
         app = web.Application()

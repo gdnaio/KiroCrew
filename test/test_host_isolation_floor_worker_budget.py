@@ -47,12 +47,11 @@ class TestTheWorkerBudgetIsMemoryBounded:
     #: covered by ``test_xdist_host_budget.py::test_per_worker_reservation_is_platform_aware``.
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- no test in this module undoes the shared monkeypatch
-    def _pin_per_worker_reservation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _pin_per_worker_reservation(self, _floor_monkeypatch: pytest.MonkeyPatch) -> None:
         import xdist_budget as budget
 
-        monkeypatch.setattr(budget, "_gib_per_worker", lambda: budget._GIB_PER_WORKER)
-        monkeypatch.setattr(
+        _floor_monkeypatch.setattr(budget, "_gib_per_worker", lambda: budget._GIB_PER_WORKER)
+        _floor_monkeypatch.setattr(
             budget, "_gib_per_worker_available", lambda: budget._GIB_PER_WORKER_AVAILABLE
         )
 
@@ -70,7 +69,12 @@ class TestTheWorkerBudgetIsMemoryBounded:
         ``test/`` even after a regression put the hook back in the wrong file.
         """
         root_conftest = (_REPO_ROOT / "conftest.py").read_text(encoding="utf-8")
-        suite_conftest = (_REPO_ROOT / "test" / "conftest.py").read_text(encoding="utf-8")
+        # test/conftest.py binds most of its definitions from plain modules beside it.
+        floor = set((_REPO_ROOT / "test").glob("conftest_floor_*.py"))
+        parts = sorted(set((_REPO_ROOT / "test").glob("conftest_*.py")) - floor)
+        suite_conftest = "\n".join(
+            p.read_text(encoding="utf-8") for p in (_REPO_ROOT / "test" / "conftest.py", *parts)
+        )
         hook = "def pytest_xdist_auto_num_workers"
 
         assert hook in root_conftest, (

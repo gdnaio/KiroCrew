@@ -274,10 +274,16 @@ function renderSidebar(opts: RenderOpts = {}) {
       automations: {}, workflowRuns: {}, subagentQueued: {}, slotHistory: [],
     } as unknown as RootState['chat'],
   })
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity }, mutations: { retry: false } } })
   qc.setQueryData(['chat-folders'], folders)
   qc.setQueryData(['tag-columns'], opts.board ? COLUMNS : [])
   qc.setQueryData(['chat-tags'], opts.board ? TAGS : [])
+  // ThemeProvider's own boot reads: seeded (and never stale) so they cannot land a
+  // re-render of the sidebar rows after the test's last barrier.
+  qc.setQueryData(['custom-themes-catalog'], { themes: [], dataMap: new Map() })
+  qc.setQueryData(['theme-boot'], {})
+  qc.setQueryData(['kirocrewConfig'], {})
+  qc.setQueryData(['shared-crew', 'capabilities'], {})
   const view = render(
     <QueryClientProvider client={qc}>
       <Provider store={store}>
@@ -503,6 +509,10 @@ describe('ChatSidebar — drop routing (onDragEnd)', () => {
     })
   })
 
+  /** A folder write is optimistic: its cache write lands a tick after the drop, so
+   *  the drop runs in an async act that takes that re-render with it. */
+  const dragEndAsync = (...args: Parameters<typeof dragEnd>) => act(async () => { dragEnd(...args) })
+
   it('a drop outside every target is a no-op', async () => {
     renderSidebar()
     await waitFor(() => expect(dnd.onDragEnd).toBeTruthy())
@@ -514,7 +524,7 @@ describe('ChatSidebar — drop routing (onDragEnd)', () => {
   it('re-parents a nested folder dropped on a folder zone', async () => {
     renderSidebar()
     await waitFor(() => expect(dnd.onDragEnd).toBeTruthy())
-    dragEnd(
+    await dragEndAsync(
       { id: 'f3', data: { type: 'folder', nested: true } },
       { id: 'folder-drop:f1', data: { type: 'folder-drop', folderId: 'f1' } },
     )
@@ -524,7 +534,7 @@ describe('ChatSidebar — drop routing (onDragEnd)', () => {
   it('moves a nested folder to the top level when dropped on the root lane', async () => {
     renderSidebar()
     await waitFor(() => expect(dnd.onDragEnd).toBeTruthy())
-    dragEnd(
+    await dragEndAsync(
       { id: 'f3', data: { type: 'folder', nested: true } },
       { id: 'root-lane', data: { type: 'folder-drop', folderId: null } },
     )
@@ -541,7 +551,7 @@ describe('ChatSidebar — drop routing (onDragEnd)', () => {
   it('re-parents a root folder dropped on a folder zone', async () => {
     renderSidebar()
     await waitFor(() => expect(dnd.onDragEnd).toBeTruthy())
-    dragEnd(
+    await dragEndAsync(
       { id: 'f1', data: { type: 'folder' } },
       { id: 'folder-drop:f2', data: { type: 'folder-drop', folderId: 'f2' } },
     )
@@ -925,11 +935,27 @@ describe('ChatSidebar — surfaces that exist only during a drag', () => {
     await waitFor(() => expect(screen.getAllByText('Loose work')).toHaveLength(1))
   })
 
-  it('falls back to the session key when the dragged slot has no distinct title', async () => {
+  it('labels a dragged untitled slot "Untitled session", never its key (#22049)', async () => {
     renderSidebar({ slots: [{ key: SLOT_LOOSE, title: SLOT_LOOSE, running: false, messages: 1 }] })
     await waitFor(() => expect(dnd.onDragStart).toBeTruthy())
     dragStart({ type: 'session', key: SLOT_LOOSE }, SLOT_LOOSE)
-    await waitFor(() => expect(screen.getAllByText(SLOT_LOOSE).length).toBeGreaterThan(1))
+    // The row and its drag preview both read the label.
+    await waitFor(() => expect(screen.getAllByText('Untitled session').length).toBeGreaterThan(1))
+    expect(screen.queryByText(SLOT_LOOSE)).toBeNull()
+    // The row keeps the key in its tooltip, where it tells untitled rows apart.
+    const rowTitle = document.querySelector('.sidebar-inner [data-session-title]')
+    expect(rowTitle?.getAttribute('title')).toBe(`Untitled session · ${SLOT_LOOSE}`)
+  })
+
+  it('keeps a titled row\'s name and tooltip unchanged', async () => {
+    renderSidebar({ slots: [SLOTS[1]] })
+    const rowTitle = await waitFor(() => {
+      const el = document.querySelector('.sidebar-inner [data-session-title]')
+      if (!el) throw new Error('row title not rendered')
+      return el
+    })
+    expect(rowTitle.textContent).toContain('Loose work')
+    expect(rowTitle.getAttribute('title')).toBe('Loose work')
   })
 
   it('renders the preview OUTSIDE the sidebar, where the drawer clip cannot hide it', async () => {

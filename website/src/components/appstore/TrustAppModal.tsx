@@ -30,6 +30,7 @@ import { Badge, Btn } from '../ui'
 import SessionApprovalModes from './SessionApprovalModes'
 import { i18nT } from '../../i18n/t'
 import { findReport, isGatewayConnected, subscribeGatewayConnected } from '../../utils/errorReport'
+import { safeHref } from '../../utils/safeHref'
 import { sourceLabel, type RegistryApp } from './types'
 
 /** Machine-readable code the enable and registry-install paths return when trust is missing. */
@@ -303,17 +304,29 @@ export function useTrustGate(retryEnable: (name: string) => Promise<void>) {
     setFailed(false)
     setDetail('')
     setDetailCode('')
+    // In the trust-saved state the button reads "Try again", so this click only
+    // retries the action: it writes no trust. The grant from the earlier click
+    // stands unless it was removed elsewhere (Settings in another window), and
+    // re-writing it here would put back a trust the user just took away under a
+    // label that does not say so (#21459).
+    const grantStood = granted
     // Local, not the `granted` state: state updates are not readable in this same
-    // closure, and the catch below has to know whether the grant actually landed.
-    let grantLanded = false
+    // closure, and the catch below has to know whether a grant stands.
+    let grantLanded = grantStood
     try {
-      await api.trustApp(gate.app.name, gate.app.trustRepository)
-      grantLanded = true
-      setGranted(true)
+      if (!grantStood) {
+        await api.trustApp(gate.app.name, gate.app.trustRepository)
+        grantLanded = true
+        setGranted(true)
+      }
       await gate.retry(gate.app.name)
       refreshTrustViews()
       setGate(null)
     } catch (failure) {
+      // A retry refused for missing trust means the earlier grant no longer
+      // stands. Nothing is left to roll back, and the dialog returns to the
+      // not-saved state, whose button names the trust it writes.
+      if (grantStood && isTrustDeniedError(failure)) grantLanded = false
       // Keep the modal open and report inline: the grant may have landed while
       // the retried action failed for an unrelated reason, and closing here
       // would strand the user back on the raw-error path this modal replaces.
@@ -360,10 +373,11 @@ export function useTrustGate(retryEnable: (name: string) => Promise<void>) {
           }
         }
       }
-      // Either branch changed server-side trust state — the grant landed, or it
-      // landed and was rolled back — so the views have to be refreshed even on
+      // Server-side trust state may differ from what the views show: the grant
+      // landed, it landed and was rolled back, or a grant this dialog held as
+      // standing was found removed elsewhere. So the views are refreshed even on
       // the failure path, which is exactly where a stale list is most confusing.
-      if (grantLanded) refreshTrustViews()
+      if (grantLanded || grantStood) refreshTrustViews()
       // A rolled-back grant means nothing was left behind, which is what the
       // `failed_generic` copy says; `granted` is what selects between the two.
       setGranted(grantLanded && !rolledBack)
@@ -378,7 +392,7 @@ export function useTrustGate(retryEnable: (name: string) => Promise<void>) {
     } finally {
       setPending(false)
     }
-  }, [gate, pending, refreshTrustViews])
+  }, [gate, pending, granted, refreshTrustViews])
 
   return {
     target: gate?.app ?? null,
@@ -393,24 +407,9 @@ export function useTrustGate(retryEnable: (name: string) => Promise<void>) {
   }
 }
 
-/**
- * Return *raw* as an href ONLY if it is a scheme we can hand a user, else `null`.
- *
- * Repository text still reaches this dialog from a remote source. Parsed
- * with the URL constructor rather than a regex: a prefix check is defeated by
- * `\tjavascript:`, `JaVaScRiPt:`, and percent/entity encodings that the browser
- * still resolves, whereas `new URL().protocol` is the browser's own normalized
- * answer. Everything outside the allowlist — `javascript:`, `data:`, `blob:`,
- * `file:` — is refused, and a value the parser rejects outright is refused too.
- */
-export function safeHref(raw: string): string | null {
-  try {
-    const url = new URL(raw)
-    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null
-  } catch {
-    return null
-  }
-}
+// Repository text still reaches this dialog from a remote source, so its
+// provenance link goes through the shared scheme allowlist.
+export { safeHref }
 
 /**
  * The three capabilities a trust grant confers, each paired with its icon.

@@ -4,7 +4,6 @@ import { useQuery } from '@tanstack/react-query'
 import { Btn, Card, CardTitle, Badge } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useProvider } from '../../providers'
-import type { NormalizedUsage, TokenEstimate } from '../../providers'
 import { providerUsageQuery } from '../../api/providerUsageQuery'
 import { api } from '../../api/client'
 import { reportsCredits } from '../../api/acpBackend'
@@ -15,14 +14,8 @@ import { TokenDailyChart } from './TokenDailyChart'
 import { TokenStackedAreaChart } from './TokenStackedAreaChart'
 import { formatCost } from '../../utils/formatCost'
 
-import { fmtCompact, fmtNumber, fmtPercent } from '../../i18n/format'
+import { fmtCompact, fmtElapsed, fmtNumber, fmtPercent } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
-function fmtNum(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
-  return String(n)
-}
-
 const EM_DASH = '\u2014'
 
 /** A day's credits, localized, in the Billing card's two decimals; a dash when the day has no figure. */
@@ -41,66 +34,6 @@ function fmtCredits(credits: number | undefined): string {
 function fmtCreditsPct(credits: number | undefined, limit: number | undefined): string {
   if (credits == null || limit == null || !(limit > 0)) return EM_DASH
   return fmtPercent(credits / limit, { minimumFractionDigits: 1, maximumFractionDigits: 1 })
-}
-
-/** A day's estimated tokens in the locale's short form (`31M`); a dash when the day has no figure. */
-function fmtTokens(tokens: number | undefined): string {
-  return tokens == null ? EM_DASH : fmtCompact(tokens)
-}
-
-type EstimatedTokens = NonNullable<NormalizedUsage['sessions']['estimatedTokens']>
-
-/**
- * Estimated token use for this calendar month and the whole previous one. Kiro
- * CLI records no token counts, so the backend builds these from each
- * turn's context size and request count; the note under the table says so,
- * because a figure shaped like a measurement would otherwise read as one.
- */
-function EstimatedTokensCard({ e, refreshing }: { e: EstimatedTokens; refreshing: boolean }) {
-  const rows: { label: string; value: (p: TokenEstimate) => string }[] = [
-    { label: i18nT('pages.overview.usageTab.estimated_input_tokens'), value: p => fmtCompact(p.input) },
-    { label: i18nT('pages.overview.usageTab.output_tokens'), value: p => fmtCompact(p.output) },
-    { label: i18nT('pages.overview.usageTab.total_tokens'), value: p => fmtCompact(p.input + p.output) },
-    { label: i18nT('pages.overview.usageTab.model_requests'), value: p => fmtNumber(p.requests) },
-  ]
-  return (
-    <Card>
-      <CardTitle><BarChart3 className="lucide-inline" /> {i18nT('pages.overview.usageTab.estimated_tokens')}</CardTitle>
-      {refreshing ? (
-        <div data-testid="usage-estimate-refreshing" className="skeleton h-32 rounded" />
-      ) : (
-        <>
-          {e.incomplete && (
-            <ErrorNotice
-              variant="inline"
-              askAgent
-              className="mb-3"
-              message={i18nT('pages.overview.usageTab.estimated_tokens_incomplete')}
-            />
-          )}
-          <table className="w-full text-sm tabular-nums">
-            <thead>
-              <tr className="text-muted text-left">
-                <th scope="col" className="pb-2"><span className="sr-only">{i18nT('pages.overview.usageTab.estimate_measure')}</span></th>
-                <th scope="col" className="pb-2 font-medium text-right">{i18nT('pages.overview.usageTab.this_month')}</th>
-                <th scope="col" className="pb-2 pl-4 font-medium text-right">{i18nT('pages.overview.usageTab.last_month')}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map(r => (
-                <tr key={r.label} className="border-t border-border">
-                  <th scope="row" className="py-1.5 font-normal text-left text-muted">{r.label}</th>
-                  <td className="py-1.5 text-right">{r.value(e.thisMonth)}</td>
-                  <td className="py-1.5 pl-4 text-right">{r.value(e.lastMonth)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          <p className="mt-3 text-[12px] text-muted">{i18nT('pages.overview.usageTab.estimated_tokens_note')}</p>
-        </>
-      )}
-    </Card>
-  )
 }
 
 export default function UsageTab() {
@@ -143,19 +76,6 @@ export default function UsageTab() {
   const s = data.sessions
   const b = data.billing
   const pct = b?.percentUsed ?? null
-  // The backend sends an all-zero estimate block to a dashboard with no kiro-cli
-  // sessions, so the estimate shows only when it has something to say: a figure
-  // in either month or on a day, or the unreadable-sessions warning.
-  const e = s.estimatedTokens
-  const hasEstimate = e != null && (
-    e.incomplete
-    || [e.thisMonth, e.lastMonth].some(p => p.input > 0 || p.output > 0 || p.requests > 0)
-    || s.dailyHistory.some(d => d.estTokens != null && d.estTokens > 0)
-  )
-  // The column appears only with the card whose note explains the figures, and
-  // only when the provider reports a per-day estimate, so an older gateway does
-  // not show a column of dashes.
-  const showTokens = hasEstimate && s.dailyHistory.some(d => d.estTokens != null)
 
   return (
     <div className="space-y-4">
@@ -174,22 +94,18 @@ export default function UsageTab() {
         </Card>
       )}
 
-      {hasEstimate && (
-        <EstimatedTokensCard e={e} refreshing={data.refreshing === true} />
-      )}
-
       {data.tokens && (
         <Card>
           <CardTitle><BarChart3 className="lucide-inline" /> {i18nT('pages.overview.usageTab.token_usage')}</CardTitle>
           <div className="grid grid-cols-2 gap-x-6 gap-y-2 max-[600px]:grid-cols-1">
-            <Row label={i18nT('pages.overview.usageTab.input_tokens')} value={fmtNum(data.tokens.input)} />
-            <Row label={i18nT('pages.overview.usageTab.output_tokens')} value={fmtNum(data.tokens.output)} />
-            {data.tokens.cacheCreation > 0 && <Row label={i18nT('pages.overview.usageTab.cache_creation')} value={fmtNum(data.tokens.cacheCreation)} />}
-            {data.tokens.cacheRead > 0 && <Row label={i18nT('pages.overview.usageTab.cache_read')} value={fmtNum(data.tokens.cacheRead)} />}
-            <Row label={i18nT('pages.overview.usageTab.total_tokens')} value={fmtNum(data.tokens.total)} />
+            <Row label={i18nT('pages.overview.usageTab.input_tokens')} value={fmtCompact(data.tokens.input)} />
+            <Row label={i18nT('pages.overview.usageTab.output_tokens')} value={fmtCompact(data.tokens.output)} />
+            {data.tokens.cacheCreation > 0 && <Row label={i18nT('pages.overview.usageTab.cache_creation')} value={fmtCompact(data.tokens.cacheCreation)} />}
+            {data.tokens.cacheRead > 0 && <Row label={i18nT('pages.overview.usageTab.cache_read')} value={fmtCompact(data.tokens.cacheRead)} />}
+            <Row label={i18nT('pages.overview.usageTab.total_tokens')} value={fmtCompact(data.tokens.total)} />
             {data.costUsd != null && <Row label={i18nT('pages.overview.usageTab.total_cost')} value={formatCost(data.costUsd)} />}
             {data.totalTurns != null && data.totalTurns > 0 && <Row label={i18nT('pages.overview.usageTab.total_turns')} value={data.totalTurns} />}
-            {data.totalDurationMs != null && data.totalDurationMs > 0 && <Row label={i18nT('pages.overview.usageTab.total_api_time')} value={`${(data.totalDurationMs / 1000).toFixed(1)}s`} />}
+            {data.totalDurationMs != null && data.totalDurationMs > 0 && <Row label={i18nT('pages.overview.usageTab.total_api_time')} value={fmtElapsed(data.totalDurationMs)} />}
           </div>
         </Card>
       )}
@@ -266,11 +182,6 @@ export default function UsageTab() {
                   <th className="pb-2 font-medium text-right max-[600px]:hidden" title={i18nT('pages.overview.usageTab.credits_used_pct_title')}>
                     {i18nT('pages.overview.usageTab.credits_used_pct')}
                   </th>
-                  {showTokens && (
-                    <th className="pb-2 font-medium text-right max-[600px]:hidden" title={i18nT('pages.overview.usageTab.est_tokens_title')}>
-                      {i18nT('pages.overview.usageTab.est_tokens')}
-                    </th>
-                  )}
                 </tr>
               </thead>
               <tbody>
@@ -286,16 +197,13 @@ export default function UsageTab() {
                         <td className="py-1.5 text-right">{d.toolCalls}</td>
                         <td className="py-1.5 text-right max-[600px]:hidden">{credits}</td>
                         <td className="py-1.5 text-right max-[600px]:hidden">{pct}</td>
-                        {showTokens && <td className="py-1.5 text-right max-[600px]:hidden">{fmtTokens(d.estTokens)}</td>}
                       </tr>
-                      {/* Phone: the extra columns would wrap every cell, and the repo forbids a
-                          sideways-scrolling table, so the day's credit and token figures fold
-                          onto a second line under the day instead of squeezing beside it. */}
+                      {/* Phone: six columns would wrap every cell, and the repo forbids a
+                          sideways-scrolling table, so the two credit figures fold onto a
+                          second line under the day instead of squeezing beside it. */}
                       <tr className="hidden max-[600px]:table-row text-muted text-[12px]" data-phone-line="">
                         <td colSpan={4} className="pb-1.5 text-right">
-                          {showTokens
-                            ? i18nT('pages.overview.usageTab.credits_used_tokens_compact', { credits, pct, tokens: fmtTokens(d.estTokens) })
-                            : i18nT('pages.overview.usageTab.credits_used_compact', { credits, pct })}
+                          {i18nT('pages.overview.usageTab.credits_used_compact', { credits, pct })}
                         </td>
                       </tr>
                     </Fragment>

@@ -402,9 +402,13 @@ describe('start() cannot run twice concurrently', () => {
     expect(cleanup![0]).toContain('startingRef.current = false')
   })
 
-  it('releases the guard once the session is live', () => {
+  it('activates connecting state once the session is live (setActive deferred to ready frame)', () => {
+    // After addModule, startingRef is released and connecting is set to true.
+    // setActive(true) now lives in the 'ready' frame handler — it cannot be right
+    // after startingRef.current = false or a terminal error frame would leave
+    // active=false while cleanup sees it as true and triggers a reconnect loop.
     expect(TranscriptionSource).toMatch(
-      /startingRef\.current = false\n\s*setActive\(true\)/,
+      /startingRef\.current = false\n[\s\S]*?setConnecting\(true\)/,
     )
   })
 })
@@ -435,32 +439,24 @@ describe('the configured default preset survives an async config', () => {
 })
 
 describe('task sidebar inputs track the server value', () => {
-  // `defaultValue` is read on MOUNT only. So when the extractor agent revised a
-  // task, the poll updated the props and the input kept showing the old text — and
-  // `onBlur` then wrote that stale value back, silently reverting the agent's
-  // update. Keying on the server value remounts the input when the server's copy
-  // changes, which is what makes the refresh visible.
+  // A field seeded once from `defaultValue` keeps showing the old text after the
+  // extractor agent revises the task, and its blur then writes that stale value
+  // back over the agent's update. Each task field goes through
+  // `ServerSyncedInput`, which shows the server's copy while the field is not
+  // focused and keeps the user's typing while it is. The behaviour is pinned in
+  // `TaskSidebar.typingDuringPoll.test.tsx`; this keeps a third editable field
+  // from bypassing it.
 
   const sidebar = readSource('src/apps/meetings/components/TaskSidebar.tsx')
 
-  it('keys the description input on the server value', () => {
-    expect(sidebar).toContain('key={`desc:${task.description}`}')
+  it('edits the description and the assignee through ServerSyncedInput', () => {
+    expect(sidebar).toMatch(/<ServerSyncedInput\s+value=\{task\.description\}/)
+    expect(sidebar).toMatch(/<ServerSyncedInput\s+value=\{task\.assignee\}/)
   })
 
-  it('keys the assignee input on the server value', () => {
-    expect(sidebar).toContain('key={`assignee:${task.assignee}`}')
-  })
-
-  it('every defaultValue input carries a value-derived key', () => {
+  it('seeds no task field from defaultValue', () => {
     // Structural: a THIRD editable field added later must not reintroduce this.
-    const inputs = sidebar.match(/<Input\b[\s\S]*?\/>/g) ?? []
-    const withDefault = inputs.filter(i => i.includes('defaultValue='))
-    expect(withDefault.length).toBeGreaterThan(0)
-    for (const input of withDefault) {
-      expect(input, `an input uses defaultValue without a key: ${input}`).toMatch(
-        /key=\{`[^`]*\$\{task\./,
-      )
-    }
+    expect(sidebar).not.toMatch(/defaultValue=\{task\./)
   })
 })
 
@@ -753,10 +749,13 @@ describe('the microphone waits for transcript ingress, not just for `active`', (
     // Guards the wiring: the effect must gate BOTH the open and the close branch on
     // the shared rule, so a poll reporting ingress open flips the mic on without a
     // status change and a fast poll observing `active` early cannot race one on.
-    const binding = SessionSource.match(/const mayOpen = canOpenTranscription\(\{[\s\S]*?\n  \}, \[status, ingressReady, transcriptFull, transcriptionActive\]\)/)
+    const binding = SessionSource.match(/const mayOpen = canOpenTranscription\(\{[\s\S]*?\n  \}, \[status, ingressReady, transcriptFull, transcriptionActive, transcriptionConnecting, transcriptionHalted\]\)/)
     expect(binding, 'status binding no longer gates on canOpenTranscription').not.toBeNull()
-    expect(binding![0]).toContain('if (mayOpen && !transcriptionRef.current.active)')
-    expect(binding![0]).toContain('if (!mayOpen && transcriptionRef.current.active)')
+    // open branch: only start when not active, connecting or halted
+    expect(binding![0]).toContain('if (mayOpen && !t.active && !t.connecting && !t.halted)')
+    // close branch: stop when not mayOpen and active, connecting, halted, or a
+    // start still waiting on the permission prompt
+    expect(binding![0]).toContain('if (!mayOpen && (t.active || t.connecting || t.halted || t.isStarting()))')
   })
 
   it('readiness comes from the POLLED server flag, and unknown reads as not-ready', () => {
@@ -772,5 +771,119 @@ describe('the microphone waits for transcript ingress, not just for `active`', (
     const startCall = SessionSource.match(/const startMutation[\s\S]*?\n  \}\)/)
     expect(startCall, 'no startMutation found').not.toBeNull()
     expect(startCall![0]).not.toContain('Ingress')
+  })
+})
+
+describe('STT error frame is terminal — no reconnect loop', () => {
+  // When `stt_stream.py` sends `{"type":"error","code":"stt_streaming_disabled"}`
+  // and then closes the socket, two things must hold:
+  //
+  //  1. onclose must NOT emit a second 'disconnected' error that overwrites the
+  //     code-specific message with a generic "connection lost" string.
+  //
+  //  2. The session effect must NOT restart transcription (restart loop), because
+  //     a configuration error (streaming disabled) will never clear on its own.
+  //
+  // Guard 1 is `stoppingRef.current = true` in the 'error' branch of onmessage.
+  // Guard 2 is `setActive(true)` deferred to the 'ready' branch of onmessage, so
+  // active is never flipped true on the error path, cleanup() is a no-op on the
+  // flag, and the session effect's `transcriptionActive` dependency never changes.
+  //
+  // Asserted against the SOURCE. The fix lives inside `useMeetingTranscription`
+  // between a live WebSocket handler and cleanup(), so exercising it behaviourally
+  // needs a full WebSocket + AudioContext + MediaStream harness; a test built on
+  // those mocks would assert the mocks' wiring, not the shipped logic. The source
+  // assertions below bind to the shipping code and capture both guards
+  // simultaneously so neither can be removed without the tests failing.
+
+  it('sets stoppingRef.current = true in the error branch before resolving ready', () => {
+    // Without this, onclose runs with stoppingRef still false and calls
+    // onError('disconnected'), overwriting 'stt_streaming_disabled' with the
+    // generic "connection lost" message the PR was opened to remove.
+    const errIdx = TranscriptionSource.indexOf("msg.type === 'error'")
+    const stopIdx = TranscriptionSource.indexOf('stoppingRef.current = true', errIdx)
+    expect(errIdx).toBeGreaterThan(0)
+    // stoppingRef.current = true must appear inside (after) the error branch
+    expect(stopIdx).toBeGreaterThan(errIdx)
+    // and before the next top-level handler keyword so it is inside the error if-block
+    const oncloseIdx = TranscriptionSource.indexOf('ws.onclose')
+    expect(stopIdx).toBeLessThan(oncloseIdx)
+  })
+
+  it('exposes a connecting flag — set after addModule, cleared by cleanup and ready/error frames', () => {
+    // The session effect uses connecting to stop() mid-connect if the meeting is
+    // paused. Without it, pausing between worklet-load and 'ready' leaves active=false,
+    // the stop() branch never fires, and buffered PCM is flushed into the notes.
+
+    // Hook must export connecting
+    expect(TranscriptionSource).toContain('connecting, halted, isStarting, start, stop, supported: transcriptionSupported')
+    // connecting is set to true just before await readyPromise
+    expect(TranscriptionSource).toContain('setConnecting(true)')
+    // connecting is cleared once the stream is live, after the ready gate
+    const awaitIdx = TranscriptionSource.indexOf('await readyPromise')
+    expect(TranscriptionSource.indexOf('setConnecting(false)', awaitIdx)).toBeGreaterThan(awaitIdx)
+    // Buffer flush is guarded by stoppingRef so stop() during connect discards the PCM
+    expect(TranscriptionSource).toContain('!stoppingRef.current && ws.readyState === WebSocket.OPEN')
+  })
+
+  it('does not call setActive(true) before readyPromise — activation deferred to ready frame', () => {
+    // If setActive(true) is called after addModule (before readyPromise), a
+    // terminal error frame causes cleanup() to flip active from true→false.
+    // The session effect sees that change and calls start() again, looping.
+    // Deferring setActive to the 'ready' branch means active is never true on
+    // the error path, so cleanup() is a no-op on the state flag and no loop fires.
+
+    // setActive(true) runs only after the ready gate, so setup AND 'ready'
+    // both happened; the 'ready' handler itself does not publish it.
+    const readyIdx = TranscriptionSource.indexOf("msg.type === 'ready'")
+    const readyBranch = TranscriptionSource.slice(readyIdx, TranscriptionSource.indexOf("msg.type === 'partial'"))
+    expect(readyIdx).toBeGreaterThan(0)
+    expect(readyBranch).not.toContain('setActive(true)')
+    const awaitReady = TranscriptionSource.indexOf('await readyPromise')
+    expect(TranscriptionSource.indexOf('setActive(true)', awaitReady)).toBeGreaterThan(awaitReady)
+
+    // The code section between 'addModule(' and 'await readyPromise' must NOT
+    // contain setActive(true) — that section is the early activation site removed
+    // by this fix.
+    const addModuleIdx = TranscriptionSource.indexOf('addModule(')
+    const awaitReadyIdx = TranscriptionSource.indexOf('await readyPromise')
+    expect(addModuleIdx).toBeGreaterThan(0)
+    expect(awaitReadyIdx).toBeGreaterThan(addModuleIdx)
+    const setupSection = TranscriptionSource.slice(addModuleIdx, awaitReadyIdx)
+    expect(setupSection).not.toContain('setActive(true)')
+  })
+})
+
+describe('connecting stuck-true guard and transcriptionErrorMessage lifecycle', () => {
+  // Opus 5.5 advisory findings addressed here.
+
+  it('guards setConnecting(true) against a socket closed during addModule', () => {
+    // If the socket closes while addModule is loading, cleanup() runs first and
+    // sets wsRef.current = null. Without a guard, the code after addModule still
+    // calls setConnecting(true), leaving connecting stuck true with no live
+    // socket. The session effect's !connecting guard then blocks every future
+    // start() call for the rest of the meeting.
+    //
+    // Guard: `if (wsRef.current !== ws) return` placed after source.connect(node)
+    // and before startingRef.current = false / setConnecting(true).
+    const addModuleIdx = TranscriptionSource.indexOf('addModule(')
+    const setConnTrue = TranscriptionSource.indexOf('setConnecting(true)', addModuleIdx)
+    const guard = TranscriptionSource.indexOf('if (wsRef.current !== ws) return', addModuleIdx)
+    expect(addModuleIdx).toBeGreaterThan(0)
+    expect(setConnTrue).toBeGreaterThan(addModuleIdx)
+    // Guard must appear between addModule and setConnecting(true)
+    expect(guard).toBeGreaterThan(addModuleIdx)
+    expect(guard).toBeLessThan(setConnTrue)
+  })
+
+  it('clears transcriptionErrorMessage when transcription reconnects or status leaves active', () => {
+    // A transient disconnect sets transcriptionErrorMessage. When transcription
+    // reconnects (active goes true) or the meeting ends/pauses (status leaves
+    // 'active'), the error bar should disappear — not persist until the next
+    // Start click. Two useEffects implement the contract the state's doc comment
+    // already promised: "Cleared when status leaves 'active' or when a new
+    // meeting starts."
+    expect(SessionSource).toContain('if (transcriptionActive) setTranscriptionError(null)')
+    expect(SessionSource).toContain("if (status !== 'active') setTranscriptionError(null)")
   })
 })

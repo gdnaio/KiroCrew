@@ -1,6 +1,8 @@
 import { api } from '../../api/client'
+import type { SendRaceFields } from '../../api/client/chat'
 import { noteUserChat } from '../../api/membersQuery'
 import { queryClient } from '../../api/queryClient'
+import { noteCrewSteerReceipt } from '../../lib/crewSteerNotice'
 import { confirmedDelivered, readSendReceipt, SendReceiptBody, SendResponseLike } from '../../utils/sendDelivery'
 
 /** The one send-id minter lives in `utils/sendDelivery`; re-exported here so a
@@ -33,10 +35,11 @@ export const SEND_ABORT_MS = 10_000
  *                        The `queue_push` broadcast owns its on-screen card, so
  *                        this is NOT a receipt for an optimistic bubble, and a
  *                        queued message is still cancellable.
- * - `refused`         -- the server said no: a non-2xx status, or a readable
- *                        body with neither `ok` nor `queued`. Nothing was sent,
- *                        so the payload is safe to hand back. `reason` is the
- *                        server's own explanation when there is one.
+ * - `refused`         -- the send was refused: the server said no (a non-2xx
+ *                        status, or a readable body with neither `ok` nor
+ *                        `queued`), or the caller refused before sending.
+ *                        Nothing was sent, so the payload is safe to hand back.
+ *                        `reason` is the explanation when there is one.
  * - `unknown`         -- a 2xx whose body could not be read. The request WAS
  *                        accepted and only the answer is mangled, so the send
  *                        may well have started a turn; reporting it as a
@@ -82,8 +85,9 @@ export interface SendReceipt {
    *  through so card/ask logic that reads the raw acceptance
    *  (`resolveAskAfterSend`) keeps working unchanged. */
   body: SendReceiptBody
-  /** Server-provided explanation, present only on `refused` with a readable
-   *  body. */
+  /** Why a `refused` send was refused: the server's explanation when its body
+   *  is readable, or the caller's own when it refuses before sending (Side Chat
+   *  holding a question until its restore read lands). */
   reason?: string
 }
 
@@ -101,6 +105,8 @@ export interface SendWirePayload {
   responsive?: boolean
   /** See `SendTurnOptions.colorTheme`. Dashboard wire only. */
   colorTheme?: string
+  /** See `SendTurnOptions.race`. Dashboard wire only. */
+  race?: SendRaceFields
 }
 
 /**
@@ -175,7 +181,9 @@ export function settleUnderSignal<T>(
 
 /** The dashboard client's wire: `POST /api/chat?ws=1` with the session key. */
 const dashboardSendWire: SendWire = (payload, signal) =>
-  api.sendChat(payload.message, payload.slot, payload.colorTheme, signal, payload.meta, payload.steer, ...(payload.responsive ? [true] : []))
+  payload.race
+    ? api.sendChat(payload.message, payload.slot, payload.colorTheme, signal, payload.meta, payload.steer, payload.responsive ? true : undefined, payload.race)
+    : api.sendChat(payload.message, payload.slot, payload.colorTheme, signal, payload.meta, payload.steer, ...(payload.responsive ? [true] : []))
 
 export interface SendTurnOptions {
   /** Wire text, already serialized (dir tokens, file markers). The server
@@ -200,6 +208,10 @@ export interface SendTurnOptions {
   /** The active colour theme, so a widget the turn renders inherits it. Sent
    *  only by surfaces that own a theme (ChatPage); embeds and panes omit it. */
   colorTheme?: string
+  /** Shared Crew first submit wins: the session revision this send is based on,
+   *  a deliberate Send now after a lost race, and the retry key. A lost race
+   *  comes back `refused` with a `send_race` body naming who sent first. */
+  race?: SendRaceFields
   /** Which fetch seam carries the POST. Defaults to the dashboard client. */
   wire?: SendWire
 }
@@ -230,6 +242,7 @@ export async function sendTurn(opts: SendTurnOptions): Promise<SendReceipt> {
         steer: opts.steer,
         ...(opts.responsive ? { responsive: true } : {}),
         colorTheme: opts.colorTheme,
+        ...(opts.race ? { race: opts.race } : {}),
       },
       controller.signal,
     )
@@ -248,6 +261,9 @@ export async function sendTurn(opts: SendTurnOptions): Promise<SendReceipt> {
     // Accepted either way: the send is the DM's newest message, which the
     // Crewmates list orders by.
     noteUserChat(queryClient, opts.slot)
+    // A person's steer into a Crew Mode worker says whether it reached the
+    // worker's ledger; a delivered-but-unrecorded one is shown under its composer.
+    if (opts.slot) noteCrewSteerReceipt(opts.slot, body)
     if (confirmedDelivered(body)) return { status: 'dispatched', body }
     return { status: 'queued', body }
   } catch (e: unknown) {

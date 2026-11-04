@@ -147,11 +147,19 @@ def test_the_adapter_is_told_to_run_the_launcher(monkeypatch, tmp_path) -> None:
     assert re.fullmatch(r"[0-9a-f]{32}", nonce), "no nonce was recorded on the session"
     handoff, _payload = rig.client._pi_mcp_handoff
     assert handoff.endswith(f"_mcp_{nonce}.json")
+    # The steer channel is the session's own, bound to the same nonce, and its key is
+    # a fresh one, not the handoff's.
+    steer = rig.client._pi_steer_channel
+    assert steer is rig.adapter._steer and steer.nonce == nonce
+    assert steer._stem().endswith(f"_steer_{nonce}_")
+    assert len(steer.key) == 32 and steer.key != rig.adapter._mcp_key
     assert env == {
         "PI_ACP_PI_COMMAND": rig.LAUNCHER,
         "KIROCREW_PI_GATE_SESSION": nonce,
         "KIROCREW_PI_MCP_HANDOFF": handoff,
         "KIROCREW_PI_MCP_KEY": rig.adapter._mcp_key.hex(),
+        "KIROCREW_PI_STEER": steer._stem(),
+        "KIROCREW_PI_STEER_KEY": steer.key.hex(),
     }
     assert len(rig.adapter._mcp_key) == 32
 
@@ -417,7 +425,7 @@ class TestTheGateArtifactsStayReachableInsideTheSandbox:
         It has to be: ``mount(2)`` cannot seal an absent path, so a leaf left off the
         precreate list stays WRITABLE in the sandbox on every install that has not run
         pi yet -- which is the ordinary install. The nofollow list matters for the same
-        reason it matters for ``playwright-cli``: the gateway later execs out of this
+        reason it matters for ``browser-harness``: the gateway later execs out of this
         name, so the mounted name must stay the real directory.
         """
         assert "pi-gate" in sandbox._CREW_READONLY_LEAVES
@@ -427,7 +435,7 @@ class TestTheGateArtifactsStayReachableInsideTheSandbox:
             sandbox._CREW_PRECREATE_READONLY_DIR_LEAVES
         )
 
-    @pytest.mark.parametrize("leaf_name", ["pi-gate", "playwright-cli"])
+    @pytest.mark.parametrize("leaf_name", ["pi-gate", "browser-harness"])
     @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink creation")
     def test_a_squat_refuses_the_spawn_with_no_per_leaf_exception(
         self, monkeypatch, tmp_path, leaf_name

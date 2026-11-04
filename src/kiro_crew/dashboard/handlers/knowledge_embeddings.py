@@ -50,6 +50,9 @@ def _embedding_counts(store) -> tuple[int, int]:
 
 async def get_embedding_status(request: web.Request) -> web.Response:
     """GET /api/knowledge/embedding/status -- embedding config and progress."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.embedding.status.read")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     embedder = request.app.get("knowledge_embedder")
     total, embedded = await asyncio.to_thread(_embedding_counts, store)
@@ -244,9 +247,14 @@ async def batch_embed_items(request: web.Request) -> web.Response:
     store = _store(request)
     embedder = request.app.get("knowledge_embedder")
     if not embedder:
-        return web.json_response({"error": "Embedding not enabled"}, status=400)
+        return web.json_response(
+            {"error": "Embedding not enabled", "code": "knowledge_embedding_disabled"}, status=400
+        )
     if not await embedder.is_available_async():
-        return web.json_response({"error": "Embedding model not available"}, status=503)
+        return web.json_response(
+            {"error": "Embedding model not available", "code": "knowledge_embedding_unavailable"},
+            status=503,
+        )
 
     body, body_err = await read_bounded_json(request, max_bytes=None, allow_absent=True)
     if body_err is not None:

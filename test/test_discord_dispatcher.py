@@ -67,6 +67,7 @@ from kiro_crew.monitoring.models import (
 )
 from kiro_crew.session import SessionManager
 from kiro_crew.session_allocation import SessionClosingError
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 # ── transport_dispatch.py ────────────────────────────────────────────────
 
@@ -123,6 +124,26 @@ class TestDispatcher:
         await d.handle_message(self._msg("my secret"))
 
         assert not spool.exists(), "an incognito message was persisted to the spool"
+
+    @pytest.mark.asyncio
+    async def test_the_pick_follows_a_promotion_before_the_attachment_cleanup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The cleanup is an await: a prompt that starts there resets the walk."""
+        from kiro_crew.agent_sdk.drivers import acp_vocab
+
+        order: list[str] = []
+        real_follow = acp_vocab.follow_engine_promotion
+
+        def _follow(*args: Any, **kwargs: Any) -> bool:
+            order.append("follow")
+            return real_follow(*args, **kwargs)
+
+        monkeypatch.setattr(acp_vocab, "follow_engine_promotion", _follow)
+        monkeypatch.setattr(td_mod, "cleanup_attachments", lambda _paths: order.append("cleanup"))
+        d, _cli, _sess = _dispatcher({"u1"})
+        await d.handle_message(self._msg("hello"))
+        assert order == ["follow", "cleanup"]
 
     @pytest.mark.asyncio
     async def test_monitor_wake_busy_at_dispatch_boundary_is_not_steered_or_queued(
@@ -189,8 +210,7 @@ class TestDispatcher:
                 if self.pause_next_claim:
                     self.pause_next_claim = False
                     boundary_reached.set()
-                    # flake-ok: the stub waits on an event the test sets; moved verbatim
-                    await resume_monitor.wait()
+                    await await_until(resume_monitor, what="the test releasing the paused claim")
                 return await manager.get_or_create(*args, **kwargs)
 
         sessions = _PausingSessions()
@@ -205,6 +225,21 @@ class TestDispatcher:
         key = dispatcher._session_key("u1")
         await manager.get_or_create(key)
         manager.release(key)
+        # The winning user turn's engine promoted A -> B. The BUSY wake runs no
+        # prompt, so it must leave that promotion for the user turn to follow.
+        from kiro_crew.acp.engine_fallback import (
+            TRACKER_ATTR,
+            EngineFallbackTracker,
+            ModelFallbackNotice,
+        )
+
+        tracker = EngineFallbackTracker()
+        tracker.apply(
+            SimpleNamespace(_model="model-a", _resolved_model_id="model-a"),
+            [ModelFallbackNotice("model-a", "model-b", "refused", promoted=True)],
+        )
+        setattr(provider, TRACKER_ATTR, tracker)
+        dispatcher._model_pref[dispatcher._scope_id("u1")] = "model-a"
         completions: list[MonitorActionCompletion] = []
 
         async def _complete(completion: MonitorActionCompletion) -> None:
@@ -218,18 +253,20 @@ class TestDispatcher:
             )
         )
         try:
-            await asyncio.wait_for(boundary_reached.wait(), timeout=5)
+            await await_until(boundary_reached, what="the monitor reaching the claim boundary")
             await manager.get_or_create(key)  # A user turn wins the actual semaphore.
             resume_monitor.set()
 
             # Await completion while the user still owns the semaphore. Real
             # off-loop metadata reads may need more than a few scheduler turns;
             # a blocking claim cannot finish before finally releases the user.
-            result = await asyncio.wait_for(asyncio.shield(monitor_task), timeout=5)
+            result = await await_until(monitor_task, what="the monitor dispatch completing")
             assert result is MonitorDispatchResult.BUSY
             assert provider.steered == []
             assert manager.dequeue(key) is None
             assert completions == []
+            assert tracker.promotion_followed is False
+            assert dispatcher._model_pref[dispatcher._scope_id("u1")] == "model-a"
         finally:
             resume_monitor.set()
             if manager.is_busy(key):
@@ -685,8 +722,10 @@ class TestDispatcher:
                 ],
             )
         )
-        # flake-ok: zero-delay yield after an awaited turn; moved verbatim
-        await asyncio.sleep(0)
+        await async_wait_until(
+            lambda: d.ctx_builder.messages and cleanup_threads,
+            describe=lambda: f"prompts={d.ctx_builder.messages!r} cleanups on {cleanup_threads!r}",
+        )
 
         prompt = d.ctx_builder.messages[-1]
         lines = prompt.splitlines()
@@ -729,8 +768,7 @@ class TestDispatcher:
         async def _slow_download(download_url: str, dest: str) -> None:
             cli.attachment_downloads.append(download_url)
             download_started.set()
-            # flake-ok: the stub waits on an event the test sets; moved verbatim
-            await finish_download.wait()
+            await await_until(finish_download, what="the test releasing the slow download")
             with open(dest, "wb") as fh:
                 fh.write(_PNG)
 
@@ -766,8 +804,7 @@ class TestDispatcher:
         assert [queued[1] for queued in sess.queued] == ["second"]
 
         finish_download.set()
-        # flake-ok: awaits the turn the line above released; moved verbatim
-        await first
+        await await_until(first, what="the first turn finishing once its download was released")
 
         assert d.ctx_builder.messages[0].splitlines()[0] == "first"
         assert d.ctx_builder.messages[1] == "second"
@@ -794,8 +831,9 @@ class TestDispatcher:
                 ],
             )
         )
-        # flake-ok: zero-delay yield after an awaited turn; moved verbatim
-        await asyncio.sleep(0)
+        await async_wait_until(
+            lambda: d.ctx_builder.messages, describe=lambda: f"prompts={d.ctx_builder.messages!r}"
+        )
 
         prompt = d.ctx_builder.messages[-1]
         assert prompt.splitlines()[0] == "!help"
@@ -824,8 +862,9 @@ class TestDispatcher:
                 ],
             )
         )
-        # flake-ok: zero-delay yield after an awaited turn; moved verbatim
-        await asyncio.sleep(0)
+        await async_wait_until(
+            lambda: d.ctx_builder.messages, describe=lambda: f"prompts={d.ctx_builder.messages!r}"
+        )
 
         prompt = d.ctx_builder.messages[-1]
         paths = [line for line in prompt.splitlines() if line.endswith(".bin")]
@@ -864,8 +903,9 @@ class TestDispatcher:
             "dashboard:chat-1", ChannelLink("discord", channel_id="c1"), accepts_inbound=True
         )
         await d._drain_queue(native_key)
-        # flake-ok: zero-delay yield after an awaited turn; moved verbatim
-        await asyncio.sleep(0)
+        await async_wait_until(
+            lambda: d.ctx_builder.messages, describe=lambda: f"prompts={d.ctx_builder.messages!r}"
+        )
 
         assert sess.get_origin_link(native_key) == ChannelLink("discord", channel_id="c1")
         prompt_path = d.ctx_builder.messages[-1].splitlines()[0]

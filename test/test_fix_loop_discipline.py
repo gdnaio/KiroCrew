@@ -1,10 +1,10 @@
 """The fix-loop discipline stays wired: pattern harvest in, untracked deferrals out.
 
 Two mechanisms exist because this repository measured its own fix loop: 75% of
-escaped defects were preventable, and the largest traceable class was findings a
-reviewer raised and a disposition deferred without follow-through. The pattern-
-harvest half turns each fix into a rule candidate; the deferral half makes every
-deferred finding a tracked promise (label + owner + due date).
+escaped defects were preventable, and the largest traceable class was review
+findings deferred without follow-through. The pattern-harvest half turns each
+fix into a rule candidate; the deferral half makes every deferred
+finding a tracked promise (label + owner + due date).
 
 Each half is spread across surfaces that cannot see each other — a PR template,
 a hygiene step, a semgrep rule, a review-prompt rule, two workflows, and a
@@ -391,7 +391,7 @@ class TestHarvestDenominator:
         ]
         fake = self._fake_gh(prs, {"sha-a": "2026-09-01T00:00:00Z"})
         mod.gh_json = fake
-        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z")
+        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z", prs)
         assert out["merged_fix_prs"] == 1, "only default-branch fix PRs are in scope"
         assert out["escapes"] == 0, "a release backport is not an escape"
         assert out["excluded_other_base"] == 1
@@ -410,7 +410,7 @@ class TestHarvestDenominator:
             self._pr("fix: no run at all", "no section", "sha-none"),
         ]
         mod.gh_json = self._fake_gh(prs, {"sha-old": "2026-08-30T00:00:00Z"})
-        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z")
+        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z", prs)
         assert out["merged_fix_prs"] == 0
         assert out["escapes"] == 0
         assert out["excluded_gate_never_ran"] == 2
@@ -426,7 +426,7 @@ class TestHarvestDenominator:
         mod = self._module()
         prs = [self._pr("fix: opened early, pushed late", "no section", "sha-late")]
         mod.gh_json = self._fake_gh(prs, {"sha-late": "2026-09-01T00:00:00Z"})
-        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z")
+        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z", prs)
         assert out["merged_fix_prs"] == 1
         assert out["escapes"] == 1
         assert out["excluded_gate_never_ran"] == 0
@@ -435,7 +435,7 @@ class TestHarvestDenominator:
         mod = self._module()
         prs = [self._pr("fix: a", "no section", "sha-a")]
         mod.gh_json = self._fake_gh(prs, {"sha-a": "2026-09-01T00:00:00Z"})
-        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z")
+        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z", prs)
         assert out["escapes"] == 1
         assert out["adoption_pct"] == 0.0
 
@@ -606,6 +606,7 @@ class TestDeferralCheckIssueReadFailure:
                 "- **finding**: accepted-and-deferred -- tracked in #123"
             ),
             "REPO": "example/repo",
+            "RELEASE_RECORD": str(ROOT / ".github" / "scripts" / "release_record.py"),
             "PR_NUMBER": "999",
             "COMMENT_URL": "https://example.com/pr/999#comment-1",
             "TMPDIR": str(tmp_path),

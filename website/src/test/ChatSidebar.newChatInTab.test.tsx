@@ -151,7 +151,7 @@ describe('ChatSidebar – New button open-as-tab gestures', () => {
     const store = renderSidebar(onOpen)
     fireEvent.click(newButton(), { ctrlKey: true, shiftKey: true })
     await created()
-    await waitFor(() => expect(onOpen).toHaveBeenCalledWith(NEW_KEY, { background: false }))
+    await waitFor(() => expect(onOpen).toHaveBeenCalledWith(NEW_KEY, { background: false, requestSeq: expect.any(Number) }))
     // The create did not activate: the switch is the tab opener's job, after
     // the tab exists, so the tab the user was on is kept rather than replaced.
     expect(store.getState().chat.activeSlot).toBe(ORIGIN)
@@ -170,7 +170,24 @@ describe('ChatSidebar – New button open-as-tab gestures', () => {
     store.dispatch({ type: 'chat/setActiveSlot', payload: 'elsewhere' })
     resolveCreate({ key: NEW_KEY })
     await waitFor(() => expect(onOpen).toHaveBeenCalledWith(NEW_KEY, { background: true }))
-    expect(onOpen).not.toHaveBeenCalledWith(NEW_KEY, { background: false })
+    expect(onOpen).not.toHaveBeenCalledWith(NEW_KEY, { background: false, requestSeq: expect.any(Number) })
+  })
+
+  it('Ctrl+Shift-click whose create resolves after the user went away and came back opens a BACKGROUND tab', async () => {
+    // Coming back to the origin is a choice too, so the late create must not
+    // switch the view even though the active session matches the origin again.
+    let resolveCreate: (v: unknown) => void = () => {}
+    mocks.createChatSlot.mockReset().mockReturnValue(new Promise(r => { resolveCreate = r }))
+    const onOpen = vi.fn()
+    const store = renderSidebar(onOpen)
+    fireEvent.click(newButton(), { ctrlKey: true, shiftKey: true })
+    await created()
+    store.dispatch({ type: 'chat/setActiveSlot', payload: 'elsewhere' })
+    store.dispatch({ type: 'chat/setActiveSlot', payload: ORIGIN })
+    resolveCreate({ key: NEW_KEY })
+    await waitFor(() => expect(onOpen).toHaveBeenCalledWith(NEW_KEY, { background: true }))
+    expect(onOpen).not.toHaveBeenCalledWith(NEW_KEY, { background: false, requestSeq: expect.any(Number) })
+    expect(store.getState().chat.activeSlot).toBe(ORIGIN)
   })
 
   it('on mac, Cmd+Shift-click opens a foreground tab', async () => {
@@ -179,7 +196,7 @@ describe('ChatSidebar – New button open-as-tab gestures', () => {
     const store = renderSidebar(onOpen)
     fireEvent.click(newButton(), { metaKey: true, shiftKey: true })
     await created()
-    await waitFor(() => expect(onOpen).toHaveBeenCalledWith(NEW_KEY, { background: false }))
+    await waitFor(() => expect(onOpen).toHaveBeenCalledWith(NEW_KEY, { background: false, requestSeq: expect.any(Number) }))
     expect(store.getState().chat.activeSlot).toBe(ORIGIN)
   })
 

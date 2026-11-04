@@ -27,11 +27,13 @@ import { AppIdentityProvider, useAppIdentity, type AppOrigin } from './identity'
 import { AppQueryClientProvider } from './appQueryClient'
 // The scoped-API layer, kept in its own module so it is NOT published on this
 // barrel -- see the header of ./scopedApi for why.
-import { useCtx, AppScopedApiProvider, type AppApi, type AppInfo } from './scopedApi'
+import { useCtx, AppScopedApiProvider, type AppApi, type AppInfo, type AppUpdate } from './scopedApi'
+import type { SlotPush } from './slotPush'
+import { chatLaunchMemoryMode, chatLaunchOpensDraft, type ChatLaunchMemoryMode } from './chatLaunch'
 // Re-exported as TYPES: the barrel<->vendor-stub parity gate counts value
 // exports, and a type vanishes at runtime, so an app author keeps these names
 // without the stub needing an entry it could not provide.
-export type { AppApi, AppApiError, AppInfo, AppPermissions } from './scopedApi'
+export type { AppApi, AppApiError, AppInfo, AppPermissions, AppUpdate } from './scopedApi'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -92,7 +94,7 @@ const WS_SLOT_SCOPED_EVENTS = new Set([
   // Voice
   'voice_chunk', 'voice_complete', 'voice_error',
   // Approvals and question cards
-  'approval', 'approval_resolved', 'question_card',
+  'approval', 'approval_resolved', 'question_card', 'elicitation_resolved',
   // Subagent lifecycle
   'subagent_spawn', 'subagent_done', 'subagent_tool', 'subagent_chunk',
   'subagent_snapshot', 'subagent_status', 'subagent_queued',
@@ -145,7 +147,6 @@ const WS_GLOBAL_EVENT_TO_SCOPE: Record<string, string> = {
   // route, which is owner-gated and re-applies that check.
   dashboard_instance_changed: 'panels',
   log: 'log',
-  browser_event: 'browser',
   // NOTE: `slots` is deliberately absent — the list re-push is always
   // delivered and filtered per app in the payload on the server
   // (state.py::_serialize_for_client), so it needs no declaration.
@@ -342,7 +343,22 @@ export interface ChatLaunchOptions {
   slotKey?: string
   /** False seeds a draft only; the user must press Send. Defaults to true. */
   autoSend?: boolean
+  /**
+   * Memory mode of the NEW session, overriding the owner's default. Honoured
+   * only without `slotKey` (an existing session keeps its mode). Setting it
+   * opens a new draft session: `message` is staged in the composer and never
+   * sent automatically. An unknown value is ignored.
+   */
+  memoryMode?: ChatLaunchMemoryMode
+  /**
+   * `false` keeps the new session out of a per-chat session folder even when the
+   * owner turned that on, for a purpose-built chat. Honoured only without
+   * `slotKey`; like `memoryMode`, it opens a new draft session.
+   */
+  sessionFolder?: false
 }
+
+export type { ChatLaunchMemoryMode }
 
 /** Launch intent written to a global slot for the routed chat to claim. */
 interface ChatLaunchIntent extends ChatLaunchOptions {
@@ -362,16 +378,22 @@ export function useChatLauncher(): {
   const { navigate } = useCtx()
 
   const openChat = useCallback((opts: ChatLaunchOptions = {}) => {
+    // Session-shaping options describe a NEW session, so they are dropped for a
+    // targeted launch rather than applied to a session the user already has.
+    const memoryMode = opts.slotKey ? undefined : chatLaunchMemoryMode(opts.memoryMode)
+    const sessionFolder = !opts.slotKey && opts.sessionFolder === false ? false : undefined
     ;(window as Window & { __mc_chat_launch?: ChatLaunchIntent }).__mc_chat_launch = {
       agent: opts.agent,
       message: opts.message,
       slotKey: opts.slotKey,
       autoSend: opts.autoSend,
+      ...(memoryMode ? { memoryMode } : {}),
+      ...(sessionFolder === false ? { sessionFolder } : {}),
       ts: Date.now(),
     }
     navigate(opts.slotKey
       ? `/chat?sid=${encodeURIComponent(opts.slotKey)}`
-      : opts.autoSend === false ? '/chat?new=1' : '/chat')
+      : chatLaunchOpensDraft({ autoSend: opts.autoSend, memoryMode, sessionFolder }) ? '/chat?new=1' : '/chat')
   }, [navigate])
 
   return { openChat }
@@ -402,6 +424,7 @@ export function AppApiProvider({
   appName,
   appDisplayName,
   appVersion = '0.0.0',
+  appUpdate,
   allowedApiPaths,
   allowedEvents,
   active = true,
@@ -409,6 +432,7 @@ export function AppApiProvider({
   navigateFn,
   notifyFn,
   sessionKey,
+  slotPush,
   origin = 'external',
   children,
 }: {
@@ -421,6 +445,9 @@ export function AppApiProvider({
    */
   appDisplayName?: string
   appVersion?: string
+  /** Cached update state for this app, forwarded to the scoped layer, which
+   *  publishes it as `info.update`. Omitted when the host has no answer. */
+  appUpdate?: AppUpdate
   allowedApiPaths: string[]
   navigateFn: (path: string) => void
   /** Optional since the scoped layer defaults them; see AppScopedApiProvider. */
@@ -441,6 +468,8 @@ export function AppApiProvider({
    * provide the real key so the backend's restricted-session guard can run.
    */
   sessionKey?: string
+  /** The host's per-slot change signal; forwarded to the scoped layer. */
+  slotPush?: SlotPush
   origin?: AppOrigin
   children: ReactNode
 }) {
@@ -449,6 +478,7 @@ export function AppApiProvider({
     appName,
     appDisplayName,
     appVersion,
+    appUpdate,
     allowedApiPaths,
     allowedEvents,
     active,
@@ -456,6 +486,7 @@ export function AppApiProvider({
     navigateFn,
     notifyFn,
     sessionKey,
+    slotPush,
     children,
   })
   if (existing) return scoped
@@ -481,6 +512,8 @@ export { default as ChatPanel } from './ChatPanel'
 // `[STEERING …]` without rendering our transcript components.
 export * from './protocol'
 export { default as ChatEmbed } from './ChatEmbed'
+// The keys `ChatEmbed`'s `hide` prop accepts; any other string is a type error.
+export type { ChatEmbedHideKey } from './chatEmbedHide'
 export { default as ChatMessageList } from './ChatMessageList'
 // The transcript's row registry, so an app can add a row type or replace one
 // instead of forking the message list.
@@ -502,5 +535,7 @@ export type { MessageRenderer, MessageRenderContext } from './messageRenderers'
 // Shared interaction and locale contracts; apps reuse the host implementations.
 export { useImeGuard } from '../hooks/useImeGuard'
 export { useLanguageGeneration } from '../i18n/useLanguageGeneration'
-export { activeLocale, fmtNumber, fmtDate, fmtTime, fmtDateTime, fmtRelative, compareText } from '../i18n/format'
+export { activeLocale, fmtNumber, fmtCurrency, fmtDate, fmtTime, fmtDateTime, fmtRelative, compareText } from '../i18n/format'
 export type { NumberOptions, DateStyleOptions, RelativeStyle } from '../i18n/format'
+// The App Kit seam level; an app feature-detects the seams above by it.
+export { APP_SDK_LEVEL } from './sdkLevel'

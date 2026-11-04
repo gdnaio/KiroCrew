@@ -39,7 +39,6 @@ from kiro_crew.mcp_discovery_server_info import (
 )
 from kiro_crew.mcp_provenance import WITHHELD_KEY, is_withheld_mute
 from kiro_crew.mcp_utils import kiro_entry_client_id, kiro_entry_scopes, mcp_server_alias
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.user_json import loads_user_jsonc
 
 logger = logging.getLogger("kiro_crew.mcp_discovery")
@@ -63,7 +62,7 @@ def _load_agent_config(*, user_home: Path | None = None) -> dict[str, Any]:
                 loaded = json.loads(p.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
                     configs.append(loaded)
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 pass
 
     # Bundled defaults.json (fallback when no project-dir)
@@ -74,7 +73,7 @@ def _load_agent_config(*, user_home: Path | None = None) -> dict[str, Any]:
                 loaded = json.loads(bundled.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
                     configs.append(loaded)
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 pass
 
     # Installed agent config (always check for mcpServers)
@@ -124,7 +123,7 @@ def _mcp_names_from_file(path: Path) -> set[str]:
         return set()
     try:
         data = loads_user_jsonc(safe_read_file(str(path)))
-    except (json.JSONDecodeError, OSError, TypeError):
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError, TypeError):
         return set()
     servers = data.get("mcpServers") if isinstance(data, dict) else None
     if not isinstance(servers, dict):
@@ -191,9 +190,10 @@ def _load_mcp_json_by_source() -> dict[str, dict[str, Any]]:
             # JSONC-tolerant: Kiro itself reads these files with comments, so a
             # commented-out server must not drop every other server in the file.
             data = loads_user_jsonc(safe_read_file(str(p)))
-        except (json.JSONDecodeError, OSError) as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
             # PermissionError (subclass of OSError) is raised by
-            # safe_read_file when is_sensitive_path() blocks the read.
+            # safe_read_file when is_sensitive_path() blocks the read. Bytes
+            # that are not UTF-8 are as unusable as bad JSON: skip the file.
             logger.warning("Failed to load MCP config from %s: %s", p, exc)
             continue
         if not isinstance(data, dict):
@@ -222,7 +222,7 @@ def _load_mcp_json() -> dict[str, Any]:
     by_source = _load_mcp_json_by_source()
     # Iteration order = priority (setdefault is a no-op once populated):
     # kirocrew-specific file > kiro global > any seam provider globals.
-    # Matches rebuild_agent_config's merge order in agent.py.
+    # Matches rebuild_agent_config's merge order in agent_parts/spec_rebuild.py.
     for scope in _scope_priority(by_source):
         for name, spec in by_source.get(scope, {}).items():
             merged.setdefault(name, spec)
@@ -282,8 +282,9 @@ def _display_transport(value: Any) -> str:
         text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     except (TypeError, ValueError):
         text = type(value).__name__
-    text, _ = redact_credentials(text)
-    text, _ = redact_exfiltration_urls(text)
+    from kiro_crew.security import redact
+
+    text = redact(text)
     if len(text) > _MALFORMED_TRANSPORT_MAX:
         text = text[:_MALFORMED_TRANSPORT_MAX] + "..."
     return text

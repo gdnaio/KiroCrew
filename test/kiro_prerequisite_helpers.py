@@ -6,18 +6,17 @@ each module imports them, so every test sees the same autouse set.
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from kiro_crew.kiro_prerequisite import KiroPrerequisiteService, ProcessResult
+from kiro_crew.testing.wait import await_until
 
 
 @pytest.fixture(autouse=True)
-# nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- no test in the test_kiro_prerequisite*.py modules calls monkeypatch.undo()
-def _isolate_agent_specs(tmp_path_factory, monkeypatch):
+def _isolate_agent_specs(tmp_path_factory, _floor_monkeypatch):
     """Point the agents dir at a POPULATED tmp dir for every test in this module.
 
     Readiness folds agent-spec presence into ``ready``: a missing spec means
@@ -36,7 +35,7 @@ def _isolate_agent_specs(tmp_path_factory, monkeypatch):
     agents = tmp_path_factory.mktemp("kiro-agents")
     for name in REQUIRED_KIRO_AGENT_FILES:
         (agents / name).write_text('{"name": "probe-fixture"}', encoding="utf-8")
-    monkeypatch.setattr(agent_module, "KIRO_AGENTS_DIR", agents)
+    _floor_monkeypatch.setattr(agent_module, "KIRO_AGENTS_DIR", agents)
 
 
 def _make_executable(path: Path) -> None:
@@ -86,10 +85,9 @@ async def _no_audit(**kwargs: Any) -> None:
 
 
 @pytest.fixture(autouse=True)
-# nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- no test in the test_kiro_prerequisite*.py modules calls monkeypatch.undo()
 def _agents_dir_never_the_real_home(
     tmp_path_factory: pytest.TempPathFactory,
-    monkeypatch: pytest.MonkeyPatch,
+    _floor_monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep every test in this module off the developer's real ``~/.kiro/agents``.
 
@@ -99,13 +97,15 @@ def _agents_dir_never_the_real_home(
     a validate per spec that happens to exist on the host — making their call-count
     assertions depend on the machine they run on.
     """
-    monkeypatch.setenv("KIRO_HOME", str(tmp_path_factory.mktemp("kiro-home")))
+    _floor_monkeypatch.setenv("KIRO_HOME", str(tmp_path_factory.mktemp("kiro-home")))
     import kiro_crew.kiro_prerequisite as kiro_prerequisite_module
 
-    monkeypatch.setattr(kiro_prerequisite_module, "_default_spec_lister", lambda: [], raising=True)
+    _floor_monkeypatch.setattr(
+        kiro_prerequisite_module, "_default_spec_lister", lambda: [], raising=True
+    )
 
 
 async def _wait_for_operation(service: KiroPrerequisiteService) -> None:
     task = service._task
     assert task is not None
-    await asyncio.wait_for(task, timeout=5)
+    await await_until(task, what="the prerequisite operation")

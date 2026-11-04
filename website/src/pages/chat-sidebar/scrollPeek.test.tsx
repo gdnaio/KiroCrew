@@ -1,7 +1,7 @@
 import { act, render } from '@testing-library/react'
 import { useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import ScrollPeekLayer from './ScrollPeekLayer'
+import ScrollPeekLayer, { PEEK_FADE_MS } from './ScrollPeekLayer'
 import {
   PEEK_COLLAPSE_DELAY_MS,
   PEEK_IDLE_MAX_MS,
@@ -86,6 +86,61 @@ describe('measureClippedTitles', () => {
     expect(got[0]).toMatchObject({ left: 20, top: 40, height: 20, width: 250, maxWidth: 1000 - 20 - 12 })
   })
 
+  it('peeks a title cut off after its last clamped line, which overflows only vertically', () => {
+    const lane = document.createElement('div')
+    stubLane(lane)
+    const mk = (scrollHeight: number, top: number, key: string, whiteSpace = '') => {
+      const row = document.createElement('div')
+      row.dataset.sessionRow = key
+      const t = document.createElement('div')
+      t.setAttribute('data-session-title', '')
+      t.textContent = `title ${key}`
+      t.style.whiteSpace = whiteSpace
+      stubTitle(t, 0, top)
+      Object.defineProperty(t, 'clientHeight', { configurable: true, value: 40 })
+      Object.defineProperty(t, 'scrollHeight', { configurable: true, value: scrollHeight })
+      row.appendChild(t)
+      lane.appendChild(row)
+    }
+    mk(60, 40, 'clamped')
+    mk(40, 80, 'fits')
+    mk(60, 120, 'one-line', 'nowrap')
+    document.body.appendChild(lane)
+    const got = measureClippedTitles(lane, 1000)
+    lane.remove()
+    expect(got.map(t => t.text)).toEqual(['title clamped'])
+    expect(got[0]).toMatchObject({ left: 20, top: 40, height: 20, maxWidth: 1000 - 20 - 12 })
+    expect(got[0].width).toBeGreaterThan(0)
+  })
+
+  it('sizes a clamped title chip to its first line, or the whole title when line-height is normal', () => {
+    const lane = document.createElement('div')
+    stubLane(lane)
+    const mk = (top: number, key: string, lineHeight: string) => {
+      const row = document.createElement('div')
+      row.dataset.sessionRow = key
+      const t = document.createElement('div')
+      t.setAttribute('data-session-title', '')
+      t.textContent = `title ${key}`
+      t.style.lineHeight = lineHeight
+      stubTitle(t, 0, top)
+      t.getBoundingClientRect = () => rect(top, top + 60, 20, 170)
+      Object.defineProperty(t, 'clientHeight', { configurable: true, value: 60 })
+      Object.defineProperty(t, 'scrollHeight', { configurable: true, value: 80 })
+      row.appendChild(t)
+      lane.appendChild(row)
+    }
+    mk(20, 'three-lines', '20px')
+    mk(100, 'normal', 'normal')
+    document.body.appendChild(lane)
+    const got = measureClippedTitles(lane, 1000)
+    lane.remove()
+    expect(got.map(t => [t.text, t.top, t.height])).toEqual([
+      ['title three-lines', 20, 20],
+      ['title normal', 100, 60],
+    ])
+  })
+
   it('skips a title behind a stuck folder header and the row under the pointer', () => {
     const lane = document.createElement('div')
     stubLane(lane)
@@ -113,6 +168,50 @@ describe('measureClippedTitles', () => {
 })
 
 describe('measureClippedTitles occlusion', () => {
+  function laneWith(rows: readonly (readonly [string, number])[]) {
+    const lane = document.createElement('div')
+    stubLane(lane)
+    const els: HTMLElement[] = []
+    for (const [key, top] of rows) {
+      const row = document.createElement('div')
+      row.dataset.sessionRow = key
+      const t = document.createElement('div')
+      t.setAttribute('data-session-title', '')
+      t.textContent = key
+      stubTitle(t, 100, top)
+      row.appendChild(t)
+      lane.appendChild(row)
+      els.push(row)
+    }
+    document.body.appendChild(lane)
+    return { lane, rows: els }
+  }
+
+  it('skips the row whose hover toolbar is showing, even when the pointer resolves to another row', () => {
+    const { lane, rows } = laneWith([['stale-hover', 40], ['shown', 80]])
+    const matches = rows[0].matches.bind(rows[0])
+    rows[0].matches = (sel: string) => sel === ':hover' || matches(sel)
+    const got = measureClippedTitles(lane, 1000, null)
+    lane.remove()
+    expect(got.map(t => t.text)).toEqual(['shown'])
+  })
+
+  it('stops a chip at the left edge of a peek-stop surface beside its row, and drops one it would leave empty', () => {
+    const { lane } = laneWith([['above', 40], ['beside', 200], ['tight', 240]])
+    const dock = document.createElement('div')
+    dock.setAttribute('data-scroll-peek-stop', '')
+    // The composer dock: from the sidebar edge rightward, over the lower rows.
+    dock.getBoundingClientRect = () => rect(190, 300, 300, 900)
+    document.body.appendChild(dock)
+    const narrow = document.createElement('div')
+    narrow.setAttribute('data-scroll-peek-stop', '')
+    narrow.getBoundingClientRect = () => rect(235, 265, 180, 260)
+    document.body.appendChild(narrow)
+    const got = measureClippedTitles(lane, 1000)
+    lane.remove(); dock.remove(); narrow.remove()
+    expect(got.map(t => [t.text, t.maxWidth])).toEqual([['above', 1000 - 20 - 12], ['beside', 300 - 20]])
+  })
+
   it('skips a title that something outside the lane covers', () => {
     const lane = document.createElement('div')
     stubLane(lane)
@@ -303,6 +402,16 @@ describe('useSidebarScrollPeek', () => {
     expect(root.dataset.count).toBe('0')
   })
 
+  it('counts a wheel as pointer presence when no pointerenter fired', () => {
+    const { lane, root } = setup()
+    // The cursor was already over the list when the listeners attached.
+    act(() => { wheel(lane) })
+    act(() => { vi.advanceTimersByTime(PEEK_COLLAPSE_DELAY_MS * 2) })
+    expect(root.dataset.count).toBe('1')
+    act(() => { root.dispatchEvent(new Event('pointerleave')); vi.advanceTimersByTime(PEEK_LEAVE_DELAY_MS + 1) })
+    expect(root.dataset.count).toBe('0')
+  })
+
   it('ends at once on any press in the sidebar', () => {
     const { lane, root, getByTestId } = setup()
     act(() => { root.dispatchEvent(new Event('pointerenter')); wheel(lane) })
@@ -352,6 +461,67 @@ describe('ScrollPeekLayer', () => {
     const chip = document.querySelector<HTMLElement>('[data-scroll-peek-title]')
     expect(chip?.textContent).toBe('Full title')
     expect(chip?.style.width).toBe('300px')
+    // The row's own type on a plain background: no border, shadow or bolder weight.
+    expect(chip?.className).not.toMatch(/\bborder\b|shadow|font-semibold/)
     r.unmount()
+  })
+
+  describe('fade', () => {
+    const t: PeekTitle = { key: 'a', text: 'Full title', left: 20, top: 40, height: 20, width: 600, maxWidth: 300 }
+    const layer = () => document.querySelector<HTMLElement>('[data-testid="scroll-peek-layer"]')
+    const mockReducedMotion = (reduce: boolean) => vi.stubGlobal('matchMedia', (q: string) => ({
+      matches: reduce && q.includes('prefers-reduced-motion'), media: q,
+      addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {},
+    }))
+    beforeEach(() => { vi.useFakeTimers() })
+    afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
+
+    it('fades each chip in and the layer out with opacity transitions', () => {
+      const r = render(<ScrollPeekLayer titles={[t]} />)
+      const chip = document.querySelector<HTMLElement>('[data-scroll-peek-title]')
+      expect(chip?.className).toMatch(/\banimate-in\b/)
+      expect(chip?.className).toMatch(/\bfade-in-0\b/)
+      expect(layer()?.className).toMatch(/\btransition-opacity\b/)
+      expect(layer()?.className).toContain(`duration-[${PEEK_FADE_MS}ms]`)
+      expect(layer()?.className).toMatch(/\bopacity-100\b/)
+      r.unmount()
+    })
+
+    it('keeps the last chips at opacity 0 for one fade after the peek ends, then removes the layer', () => {
+      mockReducedMotion(false)
+      const r = render(<ScrollPeekLayer titles={[t]} />)
+      r.rerender(<ScrollPeekLayer titles={[]} />)
+      expect(layer()).not.toBeNull()
+      expect(layer()?.className).toMatch(/\bopacity-0\b/)
+      expect(layer()?.className).toContain('pointer-events-none')
+      expect(layer()?.querySelector('[data-scroll-peek-title]')?.textContent).toBe('Full title')
+      act(() => { vi.advanceTimersByTime(PEEK_FADE_MS - 1) })
+      expect(layer()).not.toBeNull()
+      act(() => { vi.advanceTimersByTime(1) })
+      expect(layer()).toBeNull()
+      r.unmount()
+    })
+
+    it('takes the layer back at once when a peek starts during the fade', () => {
+      mockReducedMotion(false)
+      const r = render(<ScrollPeekLayer titles={[t]} />)
+      r.rerender(<ScrollPeekLayer titles={[]} />)
+      act(() => { vi.advanceTimersByTime(PEEK_FADE_MS / 2) })
+      r.rerender(<ScrollPeekLayer titles={[{ ...t, top: 60 }]} />)
+      expect(layer()?.className).toMatch(/\bopacity-100\b/)
+      act(() => { vi.advanceTimersByTime(PEEK_FADE_MS * 2) })
+      expect(layer()).not.toBeNull()
+      expect(layer()?.querySelector<HTMLElement>('[data-scroll-peek-title]')?.style.top).toBe('60px')
+      r.unmount()
+    })
+
+    it('removes the layer on the render the peek ends under reduced motion', () => {
+      mockReducedMotion(true)
+      const r = render(<ScrollPeekLayer titles={[t]} />)
+      expect(layer()).not.toBeNull()
+      r.rerender(<ScrollPeekLayer titles={[]} />)
+      expect(layer()).toBeNull()
+      r.unmount()
+    })
   })
 })

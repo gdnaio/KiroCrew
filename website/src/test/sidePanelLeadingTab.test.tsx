@@ -10,8 +10,9 @@
  * 2. Focus — a fresh strip opens on the FIRST one (not on the first pinned view,
  *    which is what `syncPinned` would otherwise pick), a stored focus on any of
  *    them survives, a stored focus on an id the host no longer offers falls back
- *    to the first, and closing the last dynamic tab lands back on the first
- *    rather than on `null`.
+ *    to the first, closing the focused tab returns to the tab viewed before it
+ *    (a leading one included) or to the first when none was, and an emptied
+ *    bucket lands back on the first rather than on `null`.
  * 3. The panel's close control follows `onClose`: absent means permanent (no
  *    button), present means the button renders — the Crewmates page relies on
  *    the former for its docked column and the latter for its overlay.
@@ -24,7 +25,7 @@
  * end.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, act, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, act, cleanup, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { createTestStore } from './helpers'
@@ -46,8 +47,11 @@ vi.mock('../utils/terminalRegistry', () => ({
   useTerminalEnabled: () => true,
   useTerminalTitle: () => 'Terminal',
 }))
-vi.mock('../hooks/useDevMode', () => ({ useDevMode: () => false }))
 vi.mock('../hooks/useIsMobile', () => ({ useIsMobile: () => false }))
+// These menu/host tests run on a positively confirmed local session.
+vi.mock('../components/sessionEnvironmentHooks', () => ({
+  useSlotEnvironmentPlacement: () => ({ remote: null, error: null }),
+}))
 // One installed app contributes a panel tab, so the `'app'` withdrawal below
 // has something to withhold. Only the descriptor hook is mocked; the pure
 // helpers stay real (same shape as sidePanelAppTab.test.tsx).
@@ -81,6 +85,8 @@ const THREE_TITLES = ['Notes', 'Work log', 'Dashboard'] as const
 let ctl: ReturnType<typeof usePanelTabs> | null = null
 /** What the strip reported it SHOWS (the `onActiveTabChange` contract). */
 let shown: string | null | undefined
+/** The client of the last `renderPanel`, so a case can wait on a read the strip makes on mount. */
+let queryClient: QueryClient | null = null
 
 interface HarnessProps {
   closable: boolean
@@ -125,7 +131,7 @@ const leadingBody = () => screen.getByTestId(`leading-body-${LEADING_ID}`)
 const queryLeadingBody = () => screen.queryByTestId(`leading-body-${LEADING_ID}`)
 
 function renderPanel(props: HarnessProps) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   return render(
     <QueryClientProvider client={queryClient}>
       <Provider store={createTestStore()}>
@@ -133,6 +139,14 @@ function renderPanel(props: HarnessProps) {
       </Provider>
     </QueryClientProvider>,
   )
+}
+
+/** `renderPanel`, then wait for the `['apps']` list the strip reads on mount. `AppPanelTabsErrorNotice`
+ *  observes it, so a case that goes on to wait in real time would see that answer land mid-wait, outside act(). */
+async function renderPanelSettled(props: HarnessProps) {
+  const view = renderPanel(props)
+  await waitFor(() => expect(['success', 'error']).toContain(queryClient?.getQueryState(['apps'])?.status))
+  return view
 }
 
 const chips = () => screen.getAllByRole('tab')
@@ -177,15 +191,20 @@ describe('SidePanel leading tab', () => {
     expect(screen.getByRole('menuitem', { name: 'Terminal' })).toBeTruthy()
   })
 
-  it('closing the last dynamic tab returns focus to the leading tab, not to null', () => {
+  it('closing the focused tab returns to the tab viewed before it, and to the leading tab when none was', () => {
     renderPanel({ closable: false })
     act(() => { ctl!.openView('workflows') })
     expect(screen.getByRole('tab', { name: /Workflows/ })).toHaveAttribute('aria-selected', 'true')
     expect(queryLeadingBody()).toBeNull()
     act(() => { ctl!.closeTab('workflows') })
-    // `closeTab` refocuses a neighbour first (the pinned Files view sits to the
-    // left), so the fallback-to-leading arm is reached by emptying the bucket.
-    // A pinned view remains, so this is the neighbour case: Files is focused.
+    // The fresh strip was showing the leading tab, and nothing was viewed
+    // since: focus rests there, not on Files, the closed tab's left neighbour.
+    expect(ctl?.activeId).toBe(LEADING_ID)
+    expect(leadingBody()).toBeInTheDocument()
+    // A tab viewed in between is the one focus returns to.
+    act(() => { ctl!.setActive('files') })
+    act(() => { ctl!.openView('workflows') })
+    act(() => { ctl!.closeTab('workflows') })
     expect(ctl?.activeId).toBe('files')
     // Empty the bucket entirely and the leading tab is the resting focus.
     act(() => { ctl!.closeAll() })
@@ -307,7 +326,7 @@ describe('SidePanel leading tab', () => {
   })
 
   it('a focus on the leading tab survives persistence: reload restores it, not the last stored tab', async () => {
-    renderPanel({ closable: false })
+    await renderPanelSettled({ closable: false })
     act(() => { ctl!.openView('workflows') })
     act(() => { ctl!.setActive(LEADING_ID) })
     expect(ctl?.activeId).toBe(LEADING_ID)
@@ -325,7 +344,7 @@ describe('SidePanel leading tab', () => {
     // that first opened the strip: changing the default later would reach only
     // strips nobody had opened. The default is resolved on READ instead, so the
     // strip renders the leading tab while the bucket stays unfocused.
-    renderPanel({ closable: false })
+    await renderPanelSettled({ closable: false })
     // Rendered focus IS the leading tab; the BUCKET is what must stay unwritten.
     expect(ctl?.activeId).toBe(LEADING_ID)
     await new Promise(r => setTimeout(r, 400))
@@ -436,7 +455,16 @@ describe('SidePanel leading tabs — three host tabs', () => {
     expect(fixed.contains(close)).toBe(false)
   })
 
-  it('closing the last dynamic tab lands on the first leading tab, whichever was focused before', () => {
+  it('closing the focused tab returns to the leading tab viewed before it, not to the first', () => {
+    renderPanel({ closable: false, leading: THREE_LEADING })
+    fireEvent.click(chipFor('crew-work-log'))
+    act(() => { ctl!.openView('workflows') })
+    act(() => { ctl!.closeTab('workflows') })
+    expect(ctl?.activeId).toBe('crew-work-log')
+    expect(chipFor('crew-work-log')).toHaveAttribute('aria-selected', 'true')
+  })
+
+  it('emptying the bucket lands on the first leading tab, whichever was focused before', () => {
     renderPanel({ closable: false, leading: THREE_LEADING })
     fireEvent.click(chipFor('crew-work-log'))
     act(() => { ctl!.openView('workflows') })

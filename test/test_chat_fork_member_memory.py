@@ -19,6 +19,7 @@ from kiro_crew.dashboard import chat_fork, chat_persistence
 from kiro_crew.dashboard.chat_utils import effective_session_key
 from kiro_crew.dashboard.state import _ChatSlot
 from kiro_crew.history import ConversationLog
+from kiro_crew.testing.wait import await_until
 
 
 @pytest.fixture
@@ -131,6 +132,36 @@ async def test_member_fork_inherits_identity_before_copy_and_keeps_bodies_under_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source_vouched", [True, False])
+async def test_member_fork_carries_only_the_vouch_its_source_holds(fork_source, source_vouched):
+    # The fork copies the source's recorded identity, so it may claim own-store
+    # authority only where the gateway already vouches the source for that
+    # member and store. The durable copy follows the in-memory vouch, so the
+    # child keeps it across a restart.
+    from kiro_crew._durable_vouch import read_durable_vouch
+
+    _cfg, state, parent, _store, _peer_store = fork_source
+    parent_key = effective_session_key(parent)
+    if source_vouched:
+        execution.bind_session_execution(
+            parent_key, execution.read_session_execution(parent_key), vouch=True
+        )
+    await chat_persistence.save_slot_off_loop(state, parent)
+
+    status, body = await _fork(state, parent)
+    assert status == 200, body
+    key = effective_session_key(state._slots[body["key"]])
+    inherited = execution.read_session_execution(key)
+    vouched = execution.read_vouched_session_execution(key)
+    if source_vouched:
+        assert vouched == inherited
+        assert read_durable_vouch(key) == inherited.to_record()
+    else:
+        assert vouched is None
+        assert read_durable_vouch(key) is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "damage", ["missing-identity", "malformed-identity", "changed-recorded-store"]
 )
@@ -164,7 +195,7 @@ async def test_private_pin_failure_discards_empty_child_and_keeps_source(fork_so
     restricted = set(state._restricted_keys)
     attempted = []
 
-    def cannot_publish(key, captured):
+    def cannot_publish(key, captured, **_kwargs):
         attempted.append(key)
         raise OSError("binding publication unavailable")
 
@@ -198,11 +229,11 @@ async def test_cancelled_private_fork_drains_binding_and_keeps_landed_proof(
     loop = asyncio.get_running_loop()
     original_bind = execution.bind_session_execution
 
-    def blocked_bind(key, selected_store):
+    def blocked_bind(key, selected_store, **kwargs):
         attempted.append(key)
         loop.call_soon_threadsafe(entered.set)
         assert released.wait(10), "test did not release the binding worker"
-        original_bind(key, selected_store)
+        original_bind(key, selected_store, **kwargs)
         completed.set()
 
     monkeypatch.setattr(execution, "bind_session_execution", blocked_bind)
@@ -215,7 +246,7 @@ async def test_cancelled_private_fork_drains_binding_and_keeps_landed_proof(
     )
     task = asyncio.create_task(chat_fork.api_chat_slot_fork(request))
     try:
-        await asyncio.wait_for(entered.wait(), 10)
+        await await_until(entered, what="the fork entering the blocked bind")
         assert task.cancel()
         # The cancelled await runs before this queued checkpoint. It must keep
         # draining the worker, rather than remove a child the worker still owns.
@@ -226,10 +257,12 @@ async def test_cancelled_private_fork_drains_binding_and_keeps_landed_proof(
         assert not completed.is_set()
         released.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, 10)
+            await await_until(task, what="the cancelled fork finishing")
     finally:
         released.set()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        await await_until(
+            asyncio.gather(task, return_exceptions=True), what="the fork task settling"
+        )
 
     assert completed.is_set()
     assert len(attempted) == 1
@@ -267,3 +300,114 @@ async def test_existing_v1_forks_keep_their_unprotected_memory_contract(tmp_path
     assert child.is_restricted is True
     assert execution.read_session_execution(effective_session_key(child)).member_id is None
     assert child.messages[0]["content"] == "Keep this V1 conversation"
+
+
+@pytest.mark.asyncio
+async def test_legacy_fork_keeps_the_identity_the_parent_ran_as(tmp_path):
+    """A parent with no carrier must fork to the identity its own turns resolved to.
+
+    A ``config.agents`` alias on a slot not stamped ``template`` runs as that
+    crewmate: its template, model pin and store. Stamping the alias as a
+    template id made the forked chat ask kiro-cli for an agent called
+    ``default`` and fail on its first turn. A template-stamped slot, and a name
+    that is no alias (possibly a template only the parent's project declares),
+    stay template sessions under the name as written.
+    """
+    from kiro_crew.config.loader import resolve_agent_bindings
+    from kiro_crew.session_agent_selection import resolve_session_agent_bindings
+
+    cfg = KiroCrewConfig.load()
+    cfg.agents["default"] = KiroCrewAgentConfig(kiro_agent="kirocrew")
+    cfg.agents["builder"] = KiroCrewAgentConfig(kiro_agent="amzn-builder", model="sonnet")
+    cfg.save()
+    state = _make_state(tmp_path / "sessions")
+    state.conversation_log = ConversationLog()
+    for alias, agent_kind, kind, template, model in (
+        ("default", "", "member", "kirocrew", ""),
+        ("builder", "", "member", "amzn-builder", "sonnet"),
+        ("builder", "member", "member", "amzn-builder", "sonnet"),
+        ("builder", "template", "template", "builder", ""),
+        ("project-only-template", "", "template", "project-only-template", ""),
+    ):
+        parent = state.get_or_create_slot(f"legacy-{alias}-{agent_kind or 'blank'}", agent=alias)
+        parent.agent_kind = agent_kind
+        parent.append("user", "An old conversation", "msg msg-u")
+        parent.drain()
+        assert execution.read_session_execution(effective_session_key(parent)) is None
+
+        status, body = await _fork(state, parent)
+
+        assert status == 200, body
+        child = state._slots[body["key"]]
+        child_key = effective_session_key(child)
+        carrier = execution.read_session_execution(child_key)
+        assert (carrier.selection_kind, carrier.template_id) == (kind, template)
+        if kind == "member":
+            assert carrier.selection_name == alias
+            bindings = resolve_session_agent_bindings(
+                resolve_agent_bindings, KiroCrewConfig.load(), child_key, child.agent
+            )
+            assert bindings.requested_resolved
+            assert (bindings.kiro_agent, bindings.resolved_alias) == (template, alias)
+            assert bindings.model == model
+
+
+@pytest.mark.asyncio
+async def test_legacy_fork_of_a_skill_view_name_resolves_its_source_agent(tmp_path, monkeypatch):
+    """A stored skill-view name forks as the agent the view was built from.
+
+    The parent's carrier-less turns map the view name back to its source before
+    the alias check, so a view built from the ``builder`` crewmate alias ran as
+    that crewmate. The fork makes the same mapping and records the crewmate,
+    instead of a template carrier the child would launch without its pin.
+    """
+    from kiro_crew.agent_sdk.drivers import acp as acp_driver
+    from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
+
+    view = f"{NATIVE_SKILL_ALIAS_PREFIX}0123abcd"
+    monkeypatch.setattr(
+        acp_driver, "skill_view_source_agent", lambda name: "builder" if name == view else name
+    )
+    cfg = KiroCrewConfig.load()
+    cfg.agents["builder"] = KiroCrewAgentConfig(kiro_agent="amzn-builder", model="sonnet")
+    cfg.save()
+    state = _make_state(tmp_path / "sessions")
+    state.conversation_log = ConversationLog()
+    parent = state.get_or_create_slot("legacy-view", agent=view)
+    parent.append("user", "An old conversation", "msg msg-u")
+    parent.drain()
+    assert execution.read_session_execution(effective_session_key(parent)) is None
+
+    status, body = await _fork(state, parent)
+
+    assert status == 200, body
+    carrier = execution.read_session_execution(effective_session_key(state._slots[body["key"]]))
+    assert (carrier.selection_kind, carrier.selection_name, carrier.template_id) == (
+        "member",
+        "builder",
+        "amzn-builder",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recorded_store", ["", "default"])
+async def test_legacy_fork_of_a_v2_crewmate_alias_is_refused(fork_source, recorded_store):
+    """A record-less parent cannot prove it ran on a crewmate's private V2 store.
+
+    With no recorded store the recorded-store V2 check passes on the default
+    store, so the crewmate's resolved store must be checked too; the fork is
+    refused before any child exists rather than bound to that private memory.
+    """
+    _cfg, state, _parent, _store, _peer_store = fork_source
+    parent = state.get_or_create_slot("legacy-writer", agent="writer")
+    parent.memory_store = recorded_store
+    parent.append("user", "An old conversation", "msg msg-u")
+    parent.drain()
+    assert execution.read_session_execution(effective_session_key(parent)) is None
+    before = set(state._slots)
+
+    status, body = await _fork(state, parent)
+
+    assert status == 503, body
+    assert body["code"] == "store_unavailable"
+    assert set(state._slots) == before

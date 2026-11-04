@@ -36,6 +36,7 @@ from kiro_crew.apps.builtins.spec_builder.tests.routes_facade import routes as r
 _no_autonudge = spec_builder_routes_coverage_helpers._no_autonudge
 _pin_state_dir = spec_builder_routes_coverage_helpers._pin_state_dir
 _quiet_sel = spec_builder_routes_coverage_helpers._quiet_sel
+_real_nudge = spec_builder_routes_coverage_helpers._real_nudge
 
 
 # -- git ----------------------------------------------------------------------
@@ -124,12 +125,18 @@ class TestGit:
 
     @pytest.mark.asyncio
     async def test_a_command_with_no_arguments_still_audits_a_blank_subcommand(
-        self, tmp_path, _quiet_sel
+        self, tmp_path, sel_private_root
     ):
+        from kiro_crew.sel import sel as real_sel
+
         _spawn, _create, patch = _git_env()
-        with patch:
+        with patch, mock.patch.object(r, "sel", real_sel):
             await r._git(str(tmp_path))
-        assert _quiet_sel.log_tool_invocation.call_args.kwargs["metadata"]["subcommand"] == ""
+        raw = (sel_private_root / "security_events.jsonl").read_text(encoding="utf-8")
+        rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
+        git_rows = [row for row in rows if row["operation"] == "git"]
+        assert git_rows, "the invocation must be audited"
+        assert [row["metadata"]["subcommand"] for row in git_rows] == [""] * len(git_rows)
 
 
 class TestHaltGit:
@@ -755,15 +762,17 @@ class TestHaltExecution:
         assert order == ["sentinel", "loop", "turn"]
 
     @pytest.mark.asyncio
-    async def test_a_missing_sentinel_is_not_fatal_because_the_two_stops_are(self, tmp_path):
-        with (
-            mock.patch.object(r, "_write_stop_sentinel_for_spec", return_value=False),
-            mock.patch.object(r, "_remove_nudge_loop", mock.AsyncMock()) as loop,
-            mock.patch.object(r, "_halt_active_turn", mock.AsyncMock()) as turn,
-        ):
-            await r._halt_execution(_State(), "demo", tmp_path, reason="user stop")
-        loop.assert_awaited_once()
-        turn.assert_awaited_once()
+    async def test_a_missing_sentinel_is_not_fatal_because_the_two_stops_are(
+        self, tmp_path, monkeypatch
+    ):
+        slot = _Slot(r._slot_key("demo"), running=True)
+        slot._queue.append("next task")
+        state = _State(**{slot.key: slot})
+        async with _real_nudge(tmp_path / "nudge", monkeypatch) as (svc, _loop):
+            with mock.patch.object(r, "_write_stop_sentinel_for_spec", return_value=False):
+                await r._halt_execution(state, "demo", tmp_path, reason="user stop")
+            assert svc.get_by_slot(r._slot_key("demo")) is None
+        assert slot._queue == []
 
 
 # -- transcript relay ---------------------------------------------------------

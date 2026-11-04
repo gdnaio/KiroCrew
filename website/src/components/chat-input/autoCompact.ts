@@ -3,7 +3,17 @@ import { useMutation, useQuery, type QueryClient } from '@tanstack/react-query'
 import { api } from '../../api/client'
 import type { useAppDispatch } from '../../store'
 import { setAgentSwitchNotice } from '../../store/chatSlice'
-import { agentSwitchFailureMessage } from '../../utils/agentSwitchFeedback'
+import { agentSwitchErrorNotice } from '../../utils/agentSwitchFeedback'
+
+/* The harness that compacts this session on its own, when the popover should
+   say so and that a threshold set here compacts sooner: only while the session
+   follows the global. An override or an agent default is an explicit threshold,
+   and the gate compacts a harness-managed backend at it. */
+export function harnessManagedNoteBackend(ac: { pct: number | null; agent_pct?: number | null; harness_managed?: string | null } | null): string | null {
+  if (!ac || !ac.harness_managed) return null
+  if (ac.pct != null || ac.agent_pct != null) return null
+  return ac.harness_managed
+}
 
 /* The per-session auto-compact threshold behind the context popover's slider:
    read lazily on open, written through one per-slot chain so writes commit in
@@ -59,7 +69,7 @@ export function useAutoCompactThreshold({ activeSlot, ctxPopoverOpen, queryClien
       setAutoCompactError('')
       queryClient.setQueryData(
         ['slot-autocompact', vars.slot],
-        (prev: { pct: number | null; global_pct: number; agent_pct?: number | null; agent?: string | null; min: number; max: number } | undefined) =>
+        (prev: { pct: number | null; global_pct: number; agent_pct?: number | null; agent?: string | null; harness_managed?: string | null; min: number; max: number } | undefined) =>
           prev ? { ...prev, pct: r.pct, global_pct: r.global_pct, agent_pct: r.agent_pct ?? null, agent: r.agent ?? null } : prev,
       )
     },
@@ -72,9 +82,9 @@ export function useAutoCompactThreshold({ activeSlot, ctxPopoverOpen, queryClien
       // intent unapplied with no explanation — and with the popover closed,
       // no visible change at all. The toast is transient feedback only; the
       // in-popover ErrorNotice (autoCompactError) is the error surface.
-      const msg = agentSwitchFailureMessage(err)
-      dispatch(setAgentSwitchNotice(msg))
-      setAutoCompactError(msg)
+      const notice = agentSwitchErrorNotice(err)
+      dispatch(setAgentSwitchNotice(notice))
+      setAutoCompactError(notice.message)
     },
   })
   const pushAutoCompact = useCallback((pct: number | null) => {
@@ -82,7 +92,7 @@ export function useAutoCompactThreshold({ activeSlot, ctxPopoverOpen, queryClien
     const slot = activeSlot
     queryClient.setQueryData(
       ['slot-autocompact', slot],
-      (prev: { pct: number | null; global_pct: number; agent_pct?: number | null; agent?: string | null; min: number; max: number } | undefined) =>
+      (prev: { pct: number | null; global_pct: number; agent_pct?: number | null; agent?: string | null; harness_managed?: string | null; min: number; max: number } | undefined) =>
         prev ? { ...prev, pct } : prev,
     )
     if (autoCompactTimer.current) clearTimeout(autoCompactTimer.current)
@@ -119,7 +129,7 @@ export function useAutoCompactThreshold({ activeSlot, ctxPopoverOpen, queryClien
         // The component is gone but the store is not: surface the failure
         // like the sibling settings do, or the user's last change before
         // navigating away silently never applies.
-        dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(err)))
+        dispatch(setAgentSwitchNotice(agentSwitchErrorNotice(err)))
       })
     }
   }, [queryClient, enqueueAutoCompactWrite, dispatch])

@@ -69,7 +69,8 @@ OWNERS = (
 
 #: Every name the facade bound at the base the split was cut from, private ones
 #: included: tests and callers import several of them, and a name that silently stops
-#: resolving breaks a caller nobody can see from here.
+#: resolving breaks a caller nobody can see from here. A name an import in the facade
+#: gained since is listed here too, since it is not one of the composition's own.
 BASE_NAMES = frozenset(
     {
         "APPROVAL_INTERACTIVE",
@@ -108,6 +109,7 @@ BASE_NAMES = frozenset(
         "TurnOutcome",
         "TurnRecord",
         "Verdict",
+        "_APPROVAL_REGISTRY",
         "_BUSY_OPTIONS_REFUSAL",
         "_CHANNEL",
         "_CHAT_TYPE_THREAD",
@@ -155,6 +157,7 @@ BASE_NAMES = frozenset(
         "dataclass",
         "describe_grant_lifetime",
         "drain_until_quiet",
+        "drain_when_free",
         "entry_channel",
         "entry_person_origin",
         "handle_channel_agent_command",
@@ -491,7 +494,7 @@ BASE_MEMBERS: dict[str, tuple[str, bool, str]] = {
             "(self, msg: 'InboundMessage', *, drain: 'bool' = True, interpret_commands: "
             "'bool' = True, origin_tag: 'str' = '', monitor_completion: "
             "'MonitorCompletionHook | None' = None, monitor_session_key: 'str | None' = "
-            "None) -> 'MonitorDispatchResult | None'"
+            "None, skill_trigger_text: 'str | None' = None) -> 'MonitorDispatchResult | None'"
         ),
     ),
     "is_authorized": ("function", False, "(self, user_id: 'str') -> 'bool'"),
@@ -1058,11 +1061,12 @@ def test_the_placement_scan_passes_the_constructs_an_owner_may_hold() -> None:
 
 def test_the_direct_send_sink_names_the_owner_that_redacts_compact() -> None:
     """``security_posture`` registers "Discord direct send" at the module holding
-    ``_handle_compact``'s redaction pass, and that pass runs both scanners, so the
-    posture panel names where the redaction happens and its checks read that code."""
+    ``_handle_compact``'s redaction pass, and that pass is the composed one that runs
+    both scanners, so the posture panel names where the redaction happens and its
+    checks read that code."""
     from kiro_crew import security_posture
 
     sinks = {label: module for label, module, _detail in security_posture._REDACTION_SINKS}
     assert sinks["Discord direct send"] == "discord/transport_dispatch_commands.py"
     compact = inspect.getsource(_owner("commands")._handle_compact)
-    assert "redact_credentials(" in compact and "redact_exfiltration_urls(" in compact
+    assert "redact(" in compact

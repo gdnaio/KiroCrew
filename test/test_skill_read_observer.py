@@ -166,7 +166,13 @@ class TestRegistrationIsNotRouteDependent:
 
         import kiro_crew.dashboard.server as mod
 
-        src = Path(mod.__file__).read_text(encoding="utf-8")
+        src = "".join(
+            path.read_text(encoding="utf-8")
+            for path in (
+                Path(mod.__file__),
+                Path(mod.__file__).parent / "server_runtime" / "api_entrypoint.py",
+            )
+        )
         for entry in ("async def start_dashboard(", "async def start_api_server("):
             assert entry in src
         assert src.count("register_skill_read_observer(") == 2
@@ -176,7 +182,9 @@ class TestRegistrationIsNotRouteDependent:
 
         import kiro_crew.dashboard.server as mod
 
-        src = Path(mod.__file__).read_text(encoding="utf-8")
+        src = (Path(mod.__file__).parent / "server_runtime" / "api_entrypoint.py").read_text(
+            encoding="utf-8"
+        )
         assert 'getattr(task_runner, "_ctx", None)' in src
 
     def test_the_cli_entry_point_registers_without_importing_the_dashboard(self):
@@ -315,11 +323,16 @@ class TestObserveSkillRead:
         client = _FakeClient()
         await client.call(_call_event(raw=SKILL_ARGS))
         client.result(_result_event())
+        assert client._tracker.noted == set()
+        assert client._tracker.pending == {}
 
     @pytest.mark.asyncio
     async def test_resolver_failure_does_not_propagate(self):
         set_global_skill_read_observer(_Observer(fail_resolve=True))
-        await _FakeClient().call(_call_event(raw=SKILL_ARGS))
+        client = _FakeClient()
+        await client.call(_call_event(raw=SKILL_ARGS))
+        assert len(client._tracker.noted) == 1
+        assert client._tracker.pending == {}
 
     @pytest.mark.asyncio
     async def test_credit_failure_does_not_propagate(self):
@@ -328,7 +341,10 @@ class TestObserveSkillRead:
         set_global_skill_read_observer(obs)
         client = _FakeClient()
         await client.call(_call_event(raw=SKILL_ARGS))
+        assert list(client._tracker.pending.values()) == [["alpha"]]
         client.result(_result_event())
+        assert client._tracker.pending == {}
+        assert obs.credited == []
 
     @pytest.mark.asyncio
     async def test_resolution_runs_off_the_event_loop(self):

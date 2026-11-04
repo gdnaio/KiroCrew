@@ -725,7 +725,7 @@ AREAS: dict[str, _Area] = {
         related=("sessions",),
     ),
     "crewmates": _Area(
-        "crewmates: the Crewmates page and the Crewmates and Custom agents tabs of Customize",
+        "mates: the Mates page and the Mates and Custom agents tabs of Customize",
         title="page.members",
         anchors=("page.members", "tab.capabilities.crews", "tab.capabilities.templates"),
     ),
@@ -751,7 +751,7 @@ AREAS: dict[str, _Area] = {
         related=("settings",),
     ),
     "customize": _Area(
-        "the Customize page: crewmates, connections, skills, hooks, knowledge, prompts, steering, workflows",
+        "the Customize page: mates, connections, skills, hooks, knowledge, prompts, steering, workflows",
         title="page.capabilities",
         anchors=("page.capabilities",),
         related=("settings",),
@@ -774,9 +774,9 @@ AREAS: dict[str, _Area] = {
         related=("customize",),
     ),
     "developer": _Area(
-        "the Developer, Logs, Webhooks and Task Runner pages",
-        title="page.developer",
-        anchors=("page.developer", "page.logs", "page.webhooks", "page.projects"),
+        "the Logs, Webhooks and Task Runner pages (the developer tools are settings.developer)",
+        title="page.logs",
+        anchors=("page.logs", "page.webhooks", "page.projects"),
     ),
 }
 #: The area split into sub-areas, and the tab-id prefix each sub-area is named from.

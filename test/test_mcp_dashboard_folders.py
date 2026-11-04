@@ -1,6 +1,6 @@
 """Tests for the chat (sidebar) folder tools on the kirocrew-dashboard server.
 
-Covers ``chat_folder_tree/create/move/move_session/delete/file_self`` — schema
+Covers ``chat_folder_tree/create/move/move_session/delete`` — schema
 validation, path→id resolution, mkdir -p, session-reference resolution, the
 requests sent, and result formatting. Each case runs one tools/call frame
 through ``mcp_dashboard.TABLE`` against an in-memory dashboard and asserts on
@@ -10,7 +10,7 @@ tested by ``test_folder_store_writer.py`` and ``test_dashboard_chat_folders.py``
 This file holds the tree, create, move, move_session and delete cases, the
 folder-name rules and the folder policy. The siblings hold the rest:
 ``test_mcp_dashboard_folders_caller_scope.py`` (which caller a request speaks
-for, and ``chat_folder_file_self``), ``test_mcp_dashboard_folders_session_create.py``
+for), ``test_mcp_dashboard_folders_session_create.py``
 (``session_create`` and the advertised tool set) and
 ``test_mcp_dashboard_folders_position.py`` (sibling order: ``before``/``after``
 and the folder sort mode). The shared rows and call helpers are in
@@ -379,6 +379,66 @@ class TestSlashBearingFolderNames:
         )
         # Exactly one POST: the leaf. No "A" and no "B" were manufactured.
         assert [r.body for r in _writes(dash)] == [{"name": "leaf", "parent_id": "aaaaaaaaaaaa"}]
+
+    def test_a_path_below_a_literal_slash_name_files_inside_it(self) -> None:
+        """``A/B/worker`` extends the folder named ``A/B``; it does not rebuild it.
+
+        A conductor filed in a folder literally named ``A/B`` creates its workers
+        under ``A/B/<agent>``. Splitting every ``/`` minted a new top-level
+        ``A`` > ``B`` pair for them instead of using the existing folder.
+        """
+        made = {"id": "dddddddddddd", "name": "worker", "parent_id": "aaaaaaaaaaaa"}
+        out, dash = _call(
+            "chat_folder_create",
+            {"name": "leaf", "parent": "A/B/worker"},
+            self._routes(self.LITERAL, made=made),
+        )
+        assert not out.startswith("Error:"), out
+        # The first POST is the missing `worker` segment, under the literal folder.
+        assert _writes(dash)[0].body == {"name": "worker", "parent_id": "aaaaaaaaaaaa"}
+        assert all(r.body.get("name") not in ("A", "B") for r in _writes(dash))
+
+    def test_an_existing_folder_below_a_literal_slash_name_resolves(self) -> None:
+        worker = {"id": "dddddddddddd", "name": "worker", "parent_id": "aaaaaaaaaaaa"}
+        tree = [*self.LITERAL, worker]
+        out, dash = _call(
+            "chat_folder_move_session",
+            {"session": "chat-1-100", "folder": "A/B/worker"},
+            self._routes(tree),
+        )
+        assert not out.startswith("Error:"), out
+        assert _writes(dash)[-1].body == {"folder_id": "dddddddddddd"}
+
+    def test_a_duplicate_on_a_shallower_reading_does_not_refuse_a_unique_path(self) -> None:
+        """Two literal ``A/B`` siblings must not refuse the one ``A`` > ``B`` > ``C``.
+
+        Only one folder renders ``A/B/C``; the duplicates sit on a reading that
+        never reaches that depth, so the deeper unique reading resolves.
+        """
+        tree = [
+            {"id": "aaaaaaaaaaaa", "name": "A/B", "parent_id": ""},
+            {"id": "eeeeeeeeeeee", "name": "A/B", "parent_id": ""},
+            {"id": "bbbbbbbbbbbb", "name": "A", "parent_id": ""},
+            {"id": "cccccccccccc", "name": "B", "parent_id": "bbbbbbbbbbbb"},
+            {"id": "dddddddddddd", "name": "C", "parent_id": "cccccccccccc"},
+        ]
+        out, dash = _call(
+            "chat_folder_move_session",
+            {"session": "chat-1-100", "folder": "A/B/C"},
+            self._routes(tree),
+        )
+        assert not out.startswith("Error:"), out
+        assert _writes(dash)[-1].body == {"folder_id": "dddddddddddd"}
+
+    def test_a_path_below_both_readings_is_refused(self) -> None:
+        out, dash = _call(
+            "chat_folder_create",
+            {"name": "leaf", "parent": "A/B/worker"},
+            self._routes(self.BOTH),
+        )
+        assert out.startswith("Error:") and "ambiguous" in out
+        assert "aaaaaaaaaaaa" in out and "cccccccccccc" in out
+        assert _writes(dash) == []
 
     def test_collision_between_the_two_readings_is_refused(self) -> None:
         out, dash = _call(

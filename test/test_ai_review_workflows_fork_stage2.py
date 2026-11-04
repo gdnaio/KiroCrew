@@ -19,6 +19,7 @@ from ai_review_workflows_helpers import (
     _concurrency_group,
     _flat,
     _proc_log,
+    _script_file,
     _step_env,
     _step_script,
     _stub_path,
@@ -553,16 +554,16 @@ class TestForkLaneFinalizeRetries:
 
 # (lane file, check-run name, external_id prefix, finalize step name)
 FORK_SWEEP_LANES = (
-    ("fork-design-review.yml", "Design Review", "design", "Finalize check-run (advisory)"),
+    ("fork-design-review.yml", "Design Review", "design", "Finalize check-run"),
     (
         "fork-first-principles-review.yml",
         "First Principles Review",
         "first-principles",
-        "Finalize check-run (advisory)",
+        "Finalize check-run",
     ),
     ("fork-gpt-review.yml", "GPT 6.1 Review", "gpt", "Finalize check-run (fail closed)"),
     ("fork-opus-review.yml", "Opus 5.5 Review", "opus", "Finalize check-run (fail closed)"),
-    ("fork-ux-review.yml", "UX Review", "ux", "Finalize check-run (advisory)"),
+    ("fork-ux-review.yml", "UX Review", "ux", "Finalize check-run"),
 )
 
 
@@ -705,8 +706,14 @@ class TestForkLaneStrandedRunSweeps:
                 bash,
                 "-uo",
                 "pipefail",
-                "-c",
-                _step_script(_workflow("fork-gpt-review.yml"), "Finalize check-run (fail closed)"),
+                # A script file, not ``-c``: MSYS re-parses a long multi-line
+                # argument on the Windows command line and can split its quotes.
+                _script_file(
+                    tmp_path,
+                    _step_script(
+                        _workflow("fork-gpt-review.yml"), "Finalize check-run (fail closed)"
+                    ),
+                ),
             ],
             check=False,
             capture_output=True,
