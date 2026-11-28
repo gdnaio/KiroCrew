@@ -22,21 +22,42 @@ masks and agent read-only directories. The same freeze carries each of those inp
 reader reads it from the row (``builtin_adoption_pins.frozen_limit_input``), so every
 limit answers as the last shipped copy made it answer, and nothing past it.
 
+A copy may also ship an ``agent_placeholders`` module computing agent-template names
+beyond the host set, which a tree adopted at an earlier pin can still name. The freeze
+carries the module's ``HOST_SPELLINGS`` table, each of those names spelled in host
+placeholders alone (``builtin_adoption_pins.PLACEHOLDER_SPELLINGS_KEY``), and with no
+wheel copy :func:`no_copy_placeholder_values` renders them for a record adopted under pin
+trust, so its agents keep registering.
+
 Owning spec: ``docs/system-specs/modules/app-kit-platform.md`` § Former built-in
 adoption, "A pin row with no wheel copy".
 """
 
 from __future__ import annotations
 
+import ast
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from kiro_crew.apps.builtin_adoption_pins import AdoptionPin, frozen_limit_input
+from kiro_crew.apps.builtin_adoption_pins import (
+    PLACEHOLDER_RE,
+    PLACEHOLDER_SPELLINGS_KEY,
+    SPELLING_SEGMENT_SEP,
+    AdoptionPin,
+    adoption_pin,
+    frozen_limit_input,
+    placeholder_spellings_error,
+)
 
 #: The frozen input of the gate's agent-to-app map: the names the copy's agents declare.
 AGENT_NAMES_KEY = "agentNames"
+#: A built-in's own agent-template placeholder module, the one
+#: ``bridges_agents._placeholder_values`` imports, and the table in it that the freeze reads.
+PLACEHOLDERS_MODULE = "agent_placeholders.py"
+HOST_SPELLINGS = "HOST_SPELLINGS"
 
 
 @dataclass(frozen=True)
@@ -91,7 +112,9 @@ def freeze_deleted_copy(copy_root: Path) -> dict[str, Any]:
       ``app_agent_tools``;
     - ``credentialMasks`` and ``agentReadOnlyDirs``: the built-in leg's entries for the
       package (``credential_masks.builtin_package_entries``, which takes the app's name
-      from the directory, as that leg does).
+      from the directory, as that leg does);
+    - ``placeholderSpellings``: the ``agent_placeholders`` module's spellings
+      (:func:`host_spellings`), no limit but what an adopted tree's agents may still name.
 
     *copy_root* is made absolute once, here, so every reader reads the same directory
     whatever the working directory; only the agent reader then resolves it, as
@@ -115,8 +138,58 @@ def freeze_deleted_copy(copy_root: Path) -> dict[str, Any]:
     }
     for kind in (credential_masks.CREDENTIAL_MASKS, agent_readonly_dirs.KIND):
         inputs[kind.key] = list(credential_masks.builtin_package_entries(package, kind))
+    inputs[PLACEHOLDER_SPELLINGS_KEY] = host_spellings(package)
     frozen.update({key: value for key, value in inputs.items() if value})
     return frozen
+
+
+def host_spellings(copy_root: Path) -> dict[str, str]:
+    """The :data:`HOST_SPELLINGS` table of the copy's :data:`PLACEHOLDERS_MODULE`, or ``{}``.
+
+    Read from the source and never imported: ``adoption_pin.py`` freezes a copy written
+    out of git history, which cannot be imported. A module with no literal table, or one
+    ``builtin_adoption_pins.placeholder_spellings_error`` refuses, raises, so a copy whose
+    names a pin row could not render is never frozen without them. That the table says
+    what ``placeholder_values()`` computes is the copy's own test's to pin.
+    """
+    path = copy_root / PLACEHOLDERS_MODULE
+    if not path.is_file():
+        return {}
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        # Only a plain or annotated assignment with a value can bind the table.
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+            continue
+        targets: list[ast.expr] = (
+            list(node.targets) if isinstance(node, ast.Assign) else [node.target]
+        )
+        if not any(
+            isinstance(target, ast.Name) and target.id == HOST_SPELLINGS for target in targets
+        ):
+            continue
+        table = ast.literal_eval(node.value)
+        error = placeholder_spellings_error(table)
+        if error:
+            raise ValueError(f"{path}: {HOST_SPELLINGS}: {error}")
+        return dict(table)
+    raise ValueError(f"{path} has no literal {HOST_SPELLINGS} table")
+
+
+def render_spelling(spelling: str, host: dict[str, str]) -> str | None:
+    """*spelling* with each host placeholder replaced from *host*, or None when one is missing.
+
+    The relative segments are joined with this host's separator, so a spelled path
+    renders exactly as the module that computed it wrote it.
+    """
+    rendered: list[str] = []
+    end = 0
+    for match in PLACEHOLDER_RE.finditer(spelling):
+        value = host.get(match.group(0))
+        if value is None:
+            return None
+        rendered += [spelling[end : match.start()].replace(SPELLING_SEGMENT_SEP, os.sep), value]
+        end = match.end()
+    rendered.append(spelling[end:].replace(SPELLING_SEGMENT_SEP, os.sep))
+    return "".join(rendered)
 
 
 def deleted_copy_baseline(document: dict[str, Any]) -> GrantBaseline:
@@ -171,3 +244,30 @@ def no_copy_baseline(pin: AdoptionPin) -> GrantBaseline | None:
     if wheel_copy_ships(pin.name):
         return None
     return deleted_copy_baseline(json.loads(pin.deleted_copy) if pin.deleted_copy else {})
+
+
+def no_copy_placeholder_values(
+    name: str, names: frozenset[str], host: dict[str, str]
+) -> dict[str, str]:
+    """What *name*'s deleted copy's ``agent_placeholders`` gave for *names*, from its pin row.
+
+    Only once the wheel copy is gone (:func:`no_copy_limit_input`) and only for a record
+    adopted under pin trust (``builtin_adoption_gate.adopted_under_pin_trust``): each of
+    *names* the row's frozen spellings spell, rendered through *host*, the host values
+    the gateway computed for this render. Anything else, and a name whose spelling needs
+    a host value *host* lacks, is left out, so the template naming it stays unregistered.
+    """
+    spellings = no_copy_limit_input(adoption_pin(name), PLACEHOLDER_SPELLINGS_KEY)
+    spelled = names & frozenset(spellings) if isinstance(spellings, dict) else frozenset()
+    if not spelled:
+        return {}
+    from kiro_crew.apps.builtin_adoption_gate import adopted_under_pin_trust
+
+    if not adopted_under_pin_trust(name):
+        return {}
+    values: dict[str, str] = {}
+    for key in sorted(spelled):
+        rendered = render_spelling(spellings[key], host)
+        if rendered is not None:
+            values[key] = rendered
+    return values

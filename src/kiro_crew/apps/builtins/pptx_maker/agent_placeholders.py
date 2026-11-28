@@ -14,6 +14,20 @@ from kiro_crew.apps.manager import app_dir
 
 APP_NAME = "pptx-maker"
 
+#: Each name :func:`placeholder_values` adds to the host set, spelled in host placeholders
+#: alone, as this app's own repository spells them in its agent templates. The release
+#: that deletes this copy freezes the table into the pin row (``adoption_pin.py freeze``
+#: reads it from the source), and the gateway then renders a tree adopted at a pin whose
+#: agents still name these from the row. ``tests/test_host_spellings.py`` holds each
+#: spelling equal to the value computed below, for the root an adopted record registers
+#: from. ``{TOOLS_PATH}`` names the managed tool directory whether or not it exists yet.
+HOST_SPELLINGS: dict[str, str] = {
+    "{ENGINE_ROOT}": "{APP_DATA}/vendor/sdpm",
+    "{ENGINE_MCP_DIR}": "{APP_DATA}/vendor/sdpm/mcp-local",
+    "{APP_PROMPTS}": "{APP_ROOT}/prompts",
+    "{TOOLS_PATH}": "{HOST_PATH}{PATH_SEP}{APP_DATA}/vendor/preview-tools/bin",
+}
+
 
 def placeholder_values() -> dict[str, str]:
     """``{"{PLACEHOLDER}": value}``, or ``{}`` while ``uv`` cannot be resolved."""

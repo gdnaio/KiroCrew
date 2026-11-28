@@ -830,7 +830,7 @@ def _preserve_user_agent_edits(
 #: :mod:`kiro_crew.apps.agent_template_values`. A builtin may add its own through an
 #: ``agent_placeholders`` submodule whose ``placeholder_values()`` computes them; for a
 #: released name only the names outside the host set are taken from it
-#: (:func:`_placeholder_values`).
+#: (:func:`_placeholder_values`), and once the package is gone, from its pin row.
 
 
 _TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{[A-Z][A-Z0-9_]*\}")
@@ -862,19 +862,30 @@ def _placeholder_values(
       outside the host set, and only those names are taken from it. A tree adopted at
       an earlier pin names the built-in's own placeholders; a tree naming the host set
       alone never imports the module, so it keeps registering once the package leaves
-      core.
+      core;
+    * once the package has left core, for a record adopted under pin trust, each name
+      outside the host set that the deleted copy's module added, rendered through the
+      host set from the spelling its pin row froze
+      (``builtin_adoption_baseline.no_copy_placeholder_values``), so a tree adopted at
+      an earlier pin keeps its agents too. The spelling names host placeholders alone,
+      so it reaches nothing the host set does not.
 
-    A placeholder neither computes is left unrendered, and the agent naming it is not
-    registered (see :func:`_render_shipped_agent`): fail-closed. A builtin result that
+    A placeholder none of these computes is left unrendered, and the agent naming it is
+    not registered (see :func:`_render_shipped_agent`): fail-closed. A builtin result that
     is not a ``{"{NAME}": str}`` mapping is refused whole the same way.
     """
     root = app_root if app_root is not None else _app_resource_root(app_name)
-    values = host_placeholder_values(app_name, root)
+    host = host_placeholder_values(app_name, root)
     outside_host_set = named - frozenset(HOST_PLACEHOLDERS)
     shipped = _shipped_builtin_placeholder_values(app_name, outside_host_set)
     if shipped is None:
         return {}
-    values.update(shipped)
+    values = {**host, **shipped}
+    unresolved = outside_host_set - frozenset(values)
+    if unresolved:
+        from kiro_crew.apps.builtin_adoption_baseline import no_copy_placeholder_values
+
+        values.update(no_copy_placeholder_values(app_name, unresolved, host))
     return values
 
 

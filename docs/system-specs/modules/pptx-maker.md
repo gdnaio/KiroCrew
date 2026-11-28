@@ -324,6 +324,18 @@ the window instead of narrowing it. `_register_resources` is kept as the seam it
 disable-check tests drive. Pinned by
 `test_pptx_maker_provision.py::test_provisioning_does_not_register_resources_itself`.
 
+`agent_placeholders.HOST_SPELLINGS` states the four names that module adds to the host
+set in host placeholders alone, as this app's repository spells them in its own templates:
+`{ENGINE_ROOT}` is `{APP_DATA}/vendor/sdpm`, `{ENGINE_MCP_DIR}` its `mcp-local`,
+`{APP_PROMPTS}` is `{APP_ROOT}/prompts` and `{TOOLS_PATH}` is
+`{HOST_PATH}{PATH_SEP}{APP_DATA}/vendor/preview-tools/bin`. The release that deletes this
+wheel copy freezes the table into the pin row, so a tree adopted at `8fa8a42`, whose
+agents still name those four, keeps registering with the module gone (app-kit-platform.md
+§ 33, "The row carries the copy's own agent placeholders"). `tests/test_host_spellings.py`
+holds each spelling equal to what `placeholder_values()` computes for the root an adopted
+record registers from; the one difference is that `{TOOLS_PATH}` names the managed tool
+directory before it exists, where the module appends it only once it does.
+
 It is a Python job rather than a `setup.onInstall` script because the platform
 does not stage a BUILTIN app's non-manifest files into `~/.kiro/crew/apps/<name>/`
 — a shell script would have nothing to run there, and a manifest-declared

@@ -15,9 +15,10 @@ first page. ``verify`` does the same for every row and fails on any difference.
 A pin row can outlive its wheel copy: the copy is deleted and the row kept. For such
 a name the tree checks run with no shipped built-in, as the gateway runs them, and
 ``legacyNav`` is carried from the name's current row. A name that is neither shipped
-nor pinned is refused. Such a row must carry ``deletedCopy``, the copy's E9 input and
-the input of each limit only a wheel copy supplies, and a row whose copy still ships
-must not (``builtin_adoption_baseline``). ``freeze`` prints the row with it, read from
+nor pinned is refused. Such a row must carry ``deletedCopy``, the copy's E9 input, the
+input of each limit only a wheel copy supplies and the host spellings of any agent
+placeholders the copy added, and a row whose copy still ships must not
+(``builtin_adoption_baseline``). ``freeze`` prints the row with it, read from
 the wheel copy a deletion PR is about to remove, or, once it is gone, from the parent
 of the commit that deleted it, written out whole so the copy is read as the gateway's
 readers read a shipped one. ``verify`` checks both rules, re-derives every

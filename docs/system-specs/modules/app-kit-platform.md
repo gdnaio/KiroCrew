@@ -9098,6 +9098,33 @@ is never loaded (`test_a_table_that_names_no_frozen_key_is_never_loaded`); and
 `test_a_deleted_copy_keeps_its_limits_only_through_its_frozen_row`
 (`test/test_builtin_adoption_pins.py`) for the per-limit list below.
 
+**The row carries the copy's own agent placeholders.** A copy may ship
+`agent_placeholders.py` (§ 34) adding agent-template names outside the host set, and a
+tree adopted at a pin from before its repository spelled those in host placeholders still
+names them. With the module gone such an agent would no longer register, and STAGE never
+moves an adopted record to a newer pin. So the module also states each name it adds as a
+spelling in host placeholders alone (`HOST_SPELLINGS`), which the copy's own test holds
+equal to what `placeholder_values()` computes for the root an adopted record registers
+from, and the freeze reads that table from the source, never importing it
+(`builtin_adoption_baseline.host_spellings`), into `deletedCopy.placeholderSpellings`; a
+module with no literal table, or one the loader would refuse, fails the freeze. The loader
+holds each spelling to one grammar (`builtin_adoption_pins.placeholder_spellings_error`):
+the key is a placeholder outside the host set, and the value is entries joined by
+`{PATH_SEP}`, each `{UV_BIN}` or `{HOST_PATH}` whole, or `{APP_ROOT}` or `{APP_DATA}`
+followed by relative `/` segments, so it names no other placeholder, no absolute path and
+no `..`; any other value drops the row. With no wheel copy, `bridges_agents._placeholder_values`
+asks `builtin_adoption_baseline.no_copy_placeholder_values` for each name outside the host
+set that a template names and nothing else computed. It answers only for a record adopted
+under pin trust (`builtin_adoption_gate.adopted_under_pin_trust`), rendering the spelling
+through the host values computed for that same render, with this host's path separator;
+any other record, a name the row does not spell, and a spelling whose host value is missing
+get nothing, so that agent stays unregistered. A rendered value therefore reaches only what
+the host set already gives every app (its own root and data directory, the gateway's
+`PATH` and `uv`), and the rendered config passes the same MCP policy, tool ceiling and
+auto-approve strip as any other. A spelling names a directory whether or not it exists yet,
+where the module may have added it only once it did. Pinned by
+`test/test_builtin_adoption_placeholder_spellings.py`.
+
 Every other core path that reads the wheel copy to decide a limit or a grant finds
 none. The table names each, what it does then, and which way it fails. Rows 1 to 4, 7
 and 9 are handled by the frozen copy above, so they block no deletion whose row carries
@@ -9629,9 +9656,12 @@ of a built-in's state out of a layout core created, is a core row keyed on the a
   those names are taken from it: a tree adopted at an earlier pin (pptx-maker at
   `8fa8a42`, whose agents name the built-in's own `{ENGINE_ROOT}` family) keeps its
   agents while the wheel ships the package, and a tree naming the host set alone
-  never imports it, so it keeps registering once the package leaves core. A
-  placeholder neither source computes leaves the template unrendered and the agent
-  unregistered. App authors: `docs/app-kit/manifest-reference.md`
+  never imports it, so it keeps registering once the package leaves core. The module
+  also spells each name it adds in host placeholders (`HOST_SPELLINGS`), which the
+  release that deletes the package freezes into its pin row, so once the package has
+  left a record adopted under pin trust takes those names from the row (§ 33, "The row
+  carries the copy's own agent placeholders"). A placeholder no source computes leaves
+  the template unrendered and the agent unregistered. App authors: `docs/app-kit/manifest-reference.md`
   "Host paths in an agent file".
 
 A capability the core itself offers lives in the core, and an app that needs it too
@@ -9643,9 +9673,11 @@ PPTX Maker both find `soffice` (and its install hint) through
 or PPTX Maker.
 
 Writers: `apps/builtin_host_grants.py`, `apps/bridges_agents.py`,
-`apps/agent_template_values.py`, `apps/builtins/dev_fleet/host_grants.py`,
+`apps/agent_template_values.py`, `apps/builtin_adoption_baseline.py`,
+`apps/builtins/dev_fleet/host_grants.py`,
 `apps/builtins/pptx_maker/agent_placeholders.py`. Tests:
-`test/test_app_agent_template_values.py`.
+`test/test_app_agent_template_values.py`,
+`test/test_builtin_adoption_placeholder_spellings.py`.
 
 ## 35. Desktop window host: app-declared windows and shortcuts, no app code in the shell
 

@@ -66,6 +66,27 @@ _DELETED_COPY_KEYS = frozenset({"permissions", "grants"})
 DELETED_COPY_LIMIT_KEYS = frozenset(
     {"mcpServers", "agentNames", "agentTools", "credentialMasks", "agentReadOnlyDirs"}
 )
+#: The optional key of a :data:`DELETED_COPY_KEY` object that is no limit: how the copy's
+#: ``agent_placeholders`` module spelled each name it added in host placeholders alone, so
+#: a tree adopted at a pin whose agents still name them keeps registering once the module
+#: is gone (``builtin_adoption_baseline.no_copy_placeholder_values``).
+PLACEHOLDER_SPELLINGS_KEY = "placeholderSpellings"
+#: An agent-template placeholder, as ``bridges_agents`` matches one.
+PLACEHOLDER_RE = re.compile(r"\{[A-Z][A-Z0-9_]*\}")
+#: ``agent_template_values.HOST_PLACEHOLDERS``, restated because this module loads while
+#: ``security`` imports and that one needs the app manager; a test pins the two equal.
+#: The two that name a directory may carry a relative path in a spelling; the other two
+#: stand whole, and ``{PATH_SEP}`` only joins entries.
+_HOST_DIR_PLACEHOLDERS = ("{APP_ROOT}", "{APP_DATA}")
+_HOST_WHOLE_PLACEHOLDERS = ("{UV_BIN}", "{HOST_PATH}")
+_HOST_PATH_SEP = "{PATH_SEP}"
+HOST_PLACEHOLDER_NAMES = frozenset(
+    {*_HOST_DIR_PLACEHOLDERS, *_HOST_WHOLE_PLACEHOLDERS, _HOST_PATH_SEP}
+)
+#: What joins the relative segments of a spelling, whatever the host's own separator:
+#: ``builtin_adoption_baseline.render_spelling`` writes this host's in its place.
+SPELLING_SEGMENT_SEP = "/"
+_SPELLING_SEGMENT_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
 #: The one extra key a harness table's row may carry: an absolute path to a
 #: codeload-shaped archive of the pinned commit, read instead of the codeload GET
 #: (and in place of the git fetch), still checked against ``archiveSha256``.
@@ -189,16 +210,22 @@ def deleted_copy_error(value: Any) -> str:
     ``permissions`` is the deleted copy's own ``permissions`` object and ``grants`` maps
     a grant family to the entries the copy declared in it. Of
     :data:`DELETED_COPY_LIMIT_KEYS`, ``mcpServers`` and ``agentTools`` are objects and the
-    rest are lists of names or entries. Only the shape is checked here; what the object
+    rest are lists of names or entries, and :data:`PLACEHOLDER_SPELLINGS_KEY` is held to
+    :func:`placeholder_spellings_error`. Only the shape is checked here; what the object
     must equal is ``adoption_pin.py verify``'s.
     """
+    optional = DELETED_COPY_LIMIT_KEYS | {PLACEHOLDER_SPELLINGS_KEY}
     if not isinstance(value, dict) or not (
-        _DELETED_COPY_KEYS <= set(value) <= _DELETED_COPY_KEYS | DELETED_COPY_LIMIT_KEYS
+        _DELETED_COPY_KEYS <= set(value) <= _DELETED_COPY_KEYS | optional
     ):
         return (
-            f"{DELETED_COPY_KEY} must hold permissions and grants, and only the limit inputs"
-            f" {sorted(DELETED_COPY_LIMIT_KEYS)} beside them"
+            f"{DELETED_COPY_KEY} must hold permissions and grants, and only"
+            f" {sorted(optional)} beside them"
         )
+    if PLACEHOLDER_SPELLINGS_KEY in value:
+        error = placeholder_spellings_error(value[PLACEHOLDER_SPELLINGS_KEY])
+        if error:
+            return f"{DELETED_COPY_KEY}.{PLACEHOLDER_SPELLINGS_KEY}: {error}"
     if not isinstance(value["permissions"], dict):
         return f"{DELETED_COPY_KEY}.permissions is not an object"
     grants = value["grants"]
@@ -221,6 +248,53 @@ def deleted_copy_error(value: Any) -> str:
     return ""
 
 
+def placeholder_spellings_error(value: Any) -> str:
+    """Why *value* is not a :data:`PLACEHOLDER_SPELLINGS_KEY` map, or ``""``.
+
+    A non-empty map from placeholders outside :data:`HOST_PLACEHOLDER_NAMES` to a
+    spelling in host placeholders alone: one or more entries joined by ``{PATH_SEP}``,
+    each ``{UV_BIN}`` or ``{HOST_PATH}`` whole, or ``{APP_ROOT}`` or ``{APP_DATA}``
+    followed by ``/``-separated relative segments. So a spelling names no other
+    placeholder, no absolute path and no ``..``, and renders only to what the host set
+    already gives any app: its own root and data directory, the gateway's ``PATH`` and
+    ``uv``.
+    """
+    if not isinstance(value, dict) or not value:
+        return "not a non-empty object"
+    for name, spelling in value.items():
+        if (
+            not isinstance(name, str)
+            or not PLACEHOLDER_RE.fullmatch(name)
+            or name in HOST_PLACEHOLDER_NAMES
+        ):
+            return f"{name!r} is not a placeholder outside the host set"
+        if (
+            not isinstance(spelling, str)
+            or ".." in spelling
+            or not all(_is_spelling_entry(entry) for entry in spelling.split(_HOST_PATH_SEP))
+        ):
+            return f"{name} is not spelled in host placeholders and relative path segments"
+    return ""
+
+
+def _is_spelling_entry(entry: str) -> bool:
+    """Whether *entry* is one ``{PATH_SEP}``-separated entry of a valid spelling."""
+    if entry in _HOST_WHOLE_PLACEHOLDERS:
+        return True
+    for root in _HOST_DIR_PLACEHOLDERS:
+        if entry.startswith(root):
+            rest = entry[len(root) :]
+            head, _, segments = rest.partition(SPELLING_SEGMENT_SEP)
+            return not rest or (
+                not head
+                and all(
+                    _SPELLING_SEGMENT_RE.fullmatch(part)
+                    for part in segments.split(SPELLING_SEGMENT_SEP)
+                )
+            )
+    return False
+
+
 @functools.lru_cache(maxsize=MAX_PINS)
 def _frozen_document(text: str) -> dict[str, Any]:
     """A row's ``deletedCopy`` text parsed once; never handed out, only copied from."""
@@ -231,11 +305,12 @@ def _frozen_document(text: str) -> dict[str, Any]:
 def frozen_limit_input(pin: AdoptionPin | None, key: str) -> Any:
     """The input *key* of a limit that *pin*'s row froze from its deleted copy, or None.
 
-    *key* is one of :data:`DELETED_COPY_LIMIT_KEYS`; a copy that declared nothing under
-    it left it out, and so does a row with no ``deletedCopy``. No check that the copy is
-    gone: the caller asks only for a name whose wheel copy its own scan of the shipped
-    copies did not find (``builtin_adoption_baseline.no_copy_limit_input`` checks that
-    itself). A copy, so a caller cannot change what the next one reads.
+    *key* is one of :data:`DELETED_COPY_LIMIT_KEYS` or :data:`PLACEHOLDER_SPELLINGS_KEY`;
+    a copy that declared nothing under it left it out, and so does a row with no
+    ``deletedCopy``. No check that the copy is gone: the caller asks only for a name
+    whose wheel copy its own scan of the shipped copies did not find
+    (``builtin_adoption_baseline.no_copy_limit_input`` checks that itself). A copy, so a
+    caller cannot change what the next one reads.
     """
     if pin is None or not pin.deleted_copy:
         return None
