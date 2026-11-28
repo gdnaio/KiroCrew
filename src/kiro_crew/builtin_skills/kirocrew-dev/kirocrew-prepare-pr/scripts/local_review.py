@@ -153,6 +153,8 @@ def _load_sibling(module_name: str, filename: str) -> Any:
 _tool_argv = _load_sibling("_lr_tool_argv", "_tool_argv.py")
 # The base-side reads of one review, through one git process.
 _base_files = _load_sibling("_lr_base_files", "_review_base_files.py")
+# Quoting for the spawn lines printed for PowerShell and cmd.exe.
+_quoting = _load_sibling("_lr_quoting", "_review_quoting.py")
 
 
 def _show_base(worktree: str, base_sha: str, relpath: str, base: Any = None) -> tuple[int, str, str]:
@@ -1498,7 +1500,7 @@ def assemble(
     # One reader for this review's base-side files: it starts git at its first read
     # and is closed here however the assembly ends.
     with _base_files.BaseFiles(run, _tool_argv.resolve, worktree) as base:
-        return _assemble(worktree, base_ref, out_dir, stage_dir, resolved, base)
+        return _assemble(worktree, base_ref, out_dir, stage_dir, resolved, base, served)
 
 
 def _assemble(
@@ -1508,6 +1510,7 @@ def _assemble(
     stage_dir: str,
     resolved: Optional[dict[str, str]],
     base: Any,
+    served: Any,
 ) -> dict[str, Any]:
     resolve_profile = _load_sibling("_lr_resolve_profile", "resolve_profile.py")
     # The ref the profile is READ from is settled BEFORE any profile value is
@@ -1782,21 +1785,6 @@ def _pr_number(worktree: str) -> Optional[str]:
     return None if number is None else str(number)
 
 
-#: Every character PowerShell reads as a single quote: the ASCII apostrophe and
-#: U+2018 to U+201B. A doubled one stands for itself.
-_POWERSHELL_SINGLE_QUOTES = frozenset("'\u2018\u2019\u201a\u201b")
-
-
-def _powershell_quoted(word: str) -> str:
-    return "'{}'".format("".join(ch * 2 if ch in _POWERSHELL_SINGLE_QUOTES else ch for ch in word))
-
-
-def _cmd_quoted(word: str) -> str:
-    # A backslash before the closing quote would escape it, so trailing ones are doubled.
-    trailing = len(word) - len(word.rstrip("\\"))
-    return '"{}{}"'.format(word, "\\" * trailing)
-
-
 def _shell_lines(commands: list[list[str]], windows: bool) -> list[str]:
     """Indented lines that run ``commands`` in order, under a label per Windows shell.
 
@@ -1810,10 +1798,10 @@ def _shell_lines(commands: list[list[str]], windows: bool) -> list[str]:
     if not windows:
         return ["    " + shlex.join(command) for command in commands]
     lines = ["In PowerShell:"]
-    lines += ["    & " + " ".join(map(_powershell_quoted, command)) for command in commands]
+    lines += ["    & " + " ".join(map(_quoting.powershell_quoted, command)) for command in commands]
     if not any(ch in word for command in commands for word in command for ch in '%!"'):
         lines.append("In cmd.exe:")
-        lines += ["    " + " ".join(map(_cmd_quoted, command)) for command in commands]
+        lines += ["    " + " ".join(map(_quoting.cmd_quoted, command)) for command in commands]
     return lines
 
 
