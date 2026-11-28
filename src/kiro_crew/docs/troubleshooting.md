@@ -199,6 +199,25 @@ A copied value does not follow later changes on the host:
 MCP servers that Kiro Crew's shared MCP gateway runs for every session do not
 receive `SSH_AUTH_SOCK` wherever it is set: it is removed from their environment.
 
+### ssh says `Permission denied (publickey)` in a Pi session
+
+Pi, and the other harnesses that depend on Kiro Crew's OS sandbox to hide your
+credential files, start with `~/.ssh` (all but `known_hosts`) and some of the
+data home's directories hidden, `~/.kiro/crew/run/` among them, because it holds
+the gateway's credential. Under `agent.sandbox="strict"` every agent sees
+`~/.ssh` that way. On Linux, a socket, or a symlink to one, placed inside one of
+those directories does not exist in the session, even though `SSH_AUTH_SOCK`
+still names it. ssh then finds no agent and reports
+`Permission denied (publickey)`, which looks like an expired key; in the
+session, `ssh-add -l` cannot connect to the agent.
+
+Point `SSH_AUTH_SOCK` at a socket outside those directories. On Linux that can
+be the one `ssh-agent` creates (`/tmp/ssh-*/agent.*`) or a systemd user agent's
+`/run/user/<uid>/ssh-agent.socket`. A symlink works when it and the socket it
+points to are both outside them. These harnesses, and every agent under
+`strict`, receive `SSH_AUTH_SOCK` only once you allow it in Settings → Security
+→ SSH agent.
+
 ### Agent config missing or stale
 
 ```bash

@@ -232,6 +232,15 @@ sandbox hides `~/.ssh`. When a spawn starts without the socket for lack of this
 consent, the gateway log carries one warning per harness that names the file and
 this remedy, and `kirocrew doctor` lists those harnesses under Sandbox.
 
+The forward hands over a path, so the socket must also be reachable inside the
+child's sandbox. A harness whose mask hides `~/.ssh` (Pi, for example) also sees
+the data home's `run/` as empty (`_CREW_CHILD_WITHHELD_LEAVES` keeps it masked
+for the gateway secret), and `strict` masks `~/.ssh` for every agent it wraps.
+On Linux a socket or symlink placed under `run/` or `~/.ssh` is absent there,
+so ssh finds no agent and fails with `Permission denied (publickey)`. The answer
+is a socket outside them, such as the agent's own `/tmp/ssh-*/agent.*`, never
+exposing `run/`.
+
 A Kerberos `KEYRING:persistent:` or `KEYRING:user:` ticket cache does not
 cross into the sandbox: the Linux launcher enters a new user namespace, and the
 kernel keeps those keyrings per user namespace, so the child resolves an empty
