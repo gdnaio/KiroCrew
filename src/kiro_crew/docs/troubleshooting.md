@@ -626,6 +626,10 @@ still uses it as its temp directory, as its working directory or through an open
 file, and the gateway log names it and that process in a WARNING line on every
 hourly sweep that keeps it:
 `agent-scratch: keeping '<name>': its owners are dead, but live pid <pid> still uses it`.
+A Codex runtime's private database directory goes sooner: when Kiro Crew stops
+that runtime and finds none of its processes left, it deletes the directory at
+once with the same checks, and leaves anything it cannot delete to the hourly
+sweep.
 
 A directory that holds a git repository (a clone, a workspace of checkouts, a
 bare repository) is never deleted this way, because nothing outside the agent

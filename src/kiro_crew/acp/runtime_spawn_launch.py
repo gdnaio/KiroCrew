@@ -16,8 +16,8 @@ Instance fields written: ``_agent``, ``_agent_capabilities``, ``_agent_version``
 ``_launch_cwd_roots``, ``_launch_process_cwd``, ``_max_age_secs``,
 ``_max_rss_depth``, ``_max_rss_mb``, ``_native_launch_resources``,
 ``_native_launch_sources``, ``_native_launch_view_alias``, ``_native_skill_projection``,
-``_pid``, ``_process``, ``_process_instance``, ``_process_tree_confirmed_dead``,
-``_prompt_capabilities``, ``_reader_task``, ``_sandbox_cleanup``, ``_scope_unit``,
+``_pid``, ``_private_state_dir``, ``_process``, ``_process_instance``,
+``_process_tree_confirmed_dead``, ``_prompt_capabilities``, ``_reader_task``, ``_sandbox_cleanup``, ``_scope_unit``,
 ``_skill_projection_generation``, ``_spawn_agent_env``, ``_spawn_monotonic``,
 ``_spawn_skill_projection``, ``_spawn_spec``, ``_kas_telemetry_sent``, ``_spawn_start_token``, ``_start_time``, ``_stderr_task``,
 ``_tool_search_wire``.
@@ -174,7 +174,7 @@ def _allocate_private_state() -> Path | None:
     Not the process's own scratch directory: when this process starts a session
     tree, that directory is the tree's work directory, and every process spawned
     for its sessions mounts it writable (``AcpRuntime.work_scratch_dir``). This
-    one is handed to this process alone and reclaimed once it is dead.
+    one goes to this process alone; its kill deletes it, else the sweep once it is dead.
     """
     try:
         return agent_scratch.allocate_scratch("private-state")
@@ -194,7 +194,7 @@ def _point_private_state_at_scratch(
     workflow ``extra_env``): they chose that location, and it reaches the child
     as set. Otherwise the variable names the directory :func:`_allocate_private_state`
     made: no other process is handed it, and it is reclaimed once this one is dead
-    (``agent_scratch.sweep_dead_scratch``). Without one the child gets the
+    (by its kill, else ``agent_scratch.sweep_dead_scratch``). Without one the child gets the
     host's shared default and a warning says so: a shared database home is
     better than a refused spawn.
     """
@@ -773,6 +773,7 @@ async def _spawn_admitted(self: AcpRuntime) -> None:
     private_state_dir = None
     if plan.private_state_env is not None:
         private_state_dir = await asyncio.to_thread(_allocate_private_state)
+        self._private_state_dir = private_state_dir
 
     # The launch tail both drivers share (``acp.launch.launch``): the pod bundle
     # swap and the delegation verdict, this runtime's scratch window, the sandbox

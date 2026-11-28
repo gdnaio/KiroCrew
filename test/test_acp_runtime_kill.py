@@ -16,11 +16,14 @@ import signal
 import sys
 import threading
 from collections import deque
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-from kiro_crew import _process_group_supervisor, platform_compat
+from kiro_crew import _process_group_supervisor
+from kiro_crew import agent_scratch as sc
+from kiro_crew import platform_compat
 from kiro_crew.acp import runtime as rt
 from kiro_crew.process_identity import ProcessHandle, process_survived
 from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS, async_wait_until, await_until
@@ -1081,3 +1084,125 @@ async def test_an_admitted_kill_marks_the_runtime_dead_before_the_leftover_read(
     await r.kill()
 
     assert dead_at_read == [True]
+
+
+@pytest.fixture
+def scratch_root(monkeypatch, tmp_path: Path) -> Path:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(sc, "config_dir", lambda: home)
+    return home / "scratch"
+
+
+async def _start_eof_bound_root() -> asyncio.subprocess.Process:
+    """A runtime root leading its own session, blocked on stdin until the kill ends it."""
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _EOF_BOUND_CHILD,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert proc.stdout is not None
+    await asyncio.wait_for(proc.stdout.readline(), timeout=60)
+    return proc
+
+
+def _runtime_killing_for_real(monkeypatch, proc: asyncio.subprocess.Process) -> rt.AcpRuntime:
+    """A bare runtime around *proc* whose kill signals and reaps it for real."""
+    r = _bare_runtime(pid=proc.pid)
+    r._process = proc
+    r._start_time = platform_compat.get_process_start_id(proc.pid)
+    for name in ("kill_process_tree", "kill_process_tree_pinned", "pid_exists"):
+        monkeypatch.setattr(rt.platform_compat, name, getattr(platform_compat, name))
+    # Lost-run bounds only: the root exits on the SIGTERM at once.
+    monkeypatch.setattr(rt.AcpRuntime, "_KILL_TERM_TIMEOUT", FALLBACK_TIMEOUT_SECS)
+    monkeypatch.setattr(rt.AcpRuntime, "_KILL_REAP_TIMEOUT", FALLBACK_TIMEOUT_SECS)
+    monkeypatch.setattr(rt, "_untrack_pid", lambda pid: None)
+    monkeypatch.setattr(rt, "_untrack_session_pid", lambda pid: None)
+    return r
+
+
+async def _end(proc: asyncio.subprocess.Process) -> None:
+    if proc.returncode is None:
+        # It leads its own group, so the number is still ours to signal.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    await await_until(asyncio.ensure_future(proc.wait()), what=f"pid {proc.pid}'s exit")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.xdist_group(name=_REAL_TREE_GROUP)
+@pytest.mark.asyncio
+async def test_a_kill_that_confirms_the_tree_dead_removes_its_private_state_dir(
+    scratch_root, monkeypatch
+):
+    """A Codex runtime's private SQLite home goes with the kill, not an hour later."""
+    private = sc.allocate_scratch("private-state")
+    proc = await _start_eof_bound_root()
+    try:
+        assert sc.record_owner(private, proc.pid) == "recorded"
+        r = _runtime_killing_for_real(monkeypatch, proc)
+        r._private_state_dir = private
+
+        await r.kill(expected=True, reason="provider shutdown")
+
+        assert r._process_tree_confirmed_dead is True
+        assert not private.exists(), "the kill left the private-state dir to the hourly sweep"
+        assert r._private_state_dir is None
+    finally:
+        await _end(proc)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.xdist_group(name=_REAL_TREE_GROUP)
+@pytest.mark.asyncio
+async def test_the_kill_keeps_a_private_state_dir_whose_owner_group_lives(
+    scratch_root, monkeypatch
+):
+    """The reclaim's own owner-group check decides, whatever the kill confirmed."""
+    private = sc.allocate_scratch("private-state")
+    proc = await _start_eof_bound_root()
+    owner = await _start_eof_bound_root()
+    try:
+        assert sc.record_owner(private, owner.pid) == "recorded"
+        r = _runtime_killing_for_real(monkeypatch, proc)
+        r._private_state_dir = private
+
+        await r.kill(expected=True, reason="provider shutdown")
+
+        assert r._process_tree_confirmed_dead is True
+        assert private.is_dir(), "a dir whose recorded owner group is alive was deleted"
+        assert (private / sc.OWNER_FILENAME).read_text().strip() == str(owner.pid)
+    finally:
+        await _end(proc)
+        await _end(owner)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.xdist_group(name=_REAL_TREE_GROUP)
+@pytest.mark.asyncio
+async def test_a_kill_with_a_tracked_survivor_leaves_the_private_state_dir(
+    scratch_root, monkeypatch
+):
+    """An unconfirmed death is the hourly sweep's, even with the owner's group gone."""
+    private = sc.allocate_scratch("private-state")
+    proc = await _start_eof_bound_root()
+    try:
+        assert sc.record_owner(private, proc.pid) == "recorded"
+        r = _runtime_killing_for_real(monkeypatch, proc)
+        r._private_state_dir = private
+        # 700 escaped the group kill (its own setsid), so the kill cannot confirm the tree.
+        r._child_pids = {700: ("s700", b"node")}
+        monkeypatch.setattr(rt, "_pid_gone_or_unmanaged", lambda pid: pid != 700)
+        monkeypatch.setattr(rt, "_untrack_child_pids", lambda d, **k: None)
+
+        await r.kill(expected=True, reason="provider shutdown")
+
+        assert proc.returncode is not None
+        assert r._process_tree_confirmed_dead is False
+        assert private.is_dir(), "the kill reclaimed a dir its tree may still be using"
+        assert r._private_state_dir == private
+    finally:
+        await _end(proc)

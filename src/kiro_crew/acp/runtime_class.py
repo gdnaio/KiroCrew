@@ -528,6 +528,8 @@ class AcpRuntime:
         # while any of them runs.
         self._shared_scratch: Path | None = Path(shared_scratch) if shared_scratch else None
         self._scratch_dir: Path | None = None
+        # A Codex spawn's private-state scratch dir, until the kill that reclaims it.
+        self._private_state_dir: Path | None = None
         # What the pre-spawn freshness check verified, for the post-handshake half of
         # the bracket. ``None`` until a spawn takes it, and ``None`` for every agent
         # that mirrors no other spec.

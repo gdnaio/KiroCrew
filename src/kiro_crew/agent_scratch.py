@@ -17,10 +17,13 @@ Reclamation is keyed on PROCESS liveness, never on file age:
 
 * Allocation writes a PROVISIONAL owner pid atomically with the directory
   (and fails the allocation otherwise); the spawner replaces it with the
-  child's pid right after spawn. There is deliberately NO per-teardown
-  sweep -- agent processes die many ways (clean shutdown, kill escalation,
-  crash, gateway restart with survivors), and the positive liveness signal
-  below covers every death path by construction.
+  child's pid right after spawn. There is no general per-teardown sweep --
+  agent processes die many ways (clean shutdown, kill escalation, crash,
+  gateway restart with survivors), and the positive liveness signal below
+  covers every death path by construction. One exception: a Codex runtime's
+  private-state directory, which no other process mounts, is reclaimed by its
+  own kill once that confirmed the tree dead, through the sweep's one-directory
+  mode with no idle wait; every other death is left to the sweep.
 * The gateway sweeps hourly (first pass an hour after start -- never on the
   boot path). A directory is reclaimed only when its recorded owner's process
   GROUP is dead AND the whole tree has been idle past the grace window AND,
@@ -1444,7 +1447,7 @@ def _expire_quarantine(now: float) -> int:
     return expired
 
 
-def sweep_dead_scratch(now: float | None = None) -> int:
+def sweep_dead_scratch(now: float | None = None, *, only: str | None = None) -> int:
     """Periodic sweep: remove directories whose owner is DEAD and content IDLE.
 
     Deletion needs BOTH signals, because each alone is an unfaithful proxy
@@ -1491,18 +1494,17 @@ def sweep_dead_scratch(now: float | None = None) -> int:
       do not count (:func:`holds_git_repository`).
 
     Returns the number of directories deleted, from the root or the quarantine;
-    a tree moved into the quarantine is not counted.
+    a tree moved into the quarantine is not counted. *only* names one direct child to
+    judge alone, with no owned-dir idle wait and no quarantine expiry (a Codex kill).
     """
     root = scratch_root()
     if platform_compat.is_link_or_junction(root):
-        # The per-entry lstat below classifies the CHILDREN, and
         # "name-composed: cannot escape the root" holds only while the root is
-        # real -- a link here aims every rmtree at another tree. Fail-open like
-        # the rest of the sweep: report it and sweep nothing.
+        # real: a link aims every rmtree at another tree. Report, sweep nothing.
         logger.warning("agent-scratch: managed root %r is a link; skipping sweep", _SUBDIR)
         return 0
     try:
-        entries = list(os.scandir(root))
+        entries = [e for e in os.scandir(root) if only is None or e.name == only]
     except FileNotFoundError:
         return 0
     except OSError:
@@ -1512,6 +1514,7 @@ def sweep_dead_scratch(now: float | None = None) -> int:
     relocated = root != config_dir() / _SUBDIR
     removed = 0
     users: dict[str, int] | None = None
+    grace = 0.0 if only else _UNOWNED_GRACE_SECONDS  # an owned dir's idle wait
     for entry in entries:
         if entry.name == QUARANTINE_DIRNAME:
             continue  # the sweep's own holding area: expired below, never swept
@@ -1522,17 +1525,14 @@ def sweep_dead_scratch(now: float | None = None) -> int:
             idle = reference - _tree_newest_mtime(child, fallback=reference)
         except OSError:
             continue
-        if idle < _UNOWNED_GRACE_SECONDS:
+        if idle < grace:
             continue  # recently active anywhere in the tree, whoever owns it
         marker = child / OWNER_FILENAME
         if platform_compat.is_link_or_junction(marker):
-            # A LINK where the marker belongs, read by the one loop here that
-            # DELETES. ``read_text`` follows it, so an owner planted by the very
-            # process being judged would name whatever pid those bytes hold --
-            # pick a dead one and the sweep destroys a live agent's own tree.
-            # Joins the garbled rule below: never delete on evidence the
-            # subject controls. The dir is then unreclaimable while the link
-            # stands, which is the safe direction to fail.
+            # A LINK where the marker belongs: ``read_text`` follows it, so the
+            # process being judged could name a dead pid and have its own live
+            # tree destroyed. Like the garbled rule below, never delete on
+            # evidence the subject controls; unreclaimable is the safe failure.
             logger.warning(
                 "agent-scratch: %r has a linked %s; not judging its owner",
                 entry.name,
@@ -1551,7 +1551,7 @@ def sweep_dead_scratch(now: float | None = None) -> int:
             # Garbled, oversized or linked: never delete on evidence the
             # subject controls.
             continue
-        quiet_for = _UNOWNED_IDLE_SECONDS if not pids else _UNOWNED_GRACE_SECONDS
+        quiet_for = _UNOWNED_IDLE_SECONDS if not pids else grace
         if idle < quiet_for:
             continue
         if any(_pgroup_alive(pid) for pid in pids):
@@ -1559,8 +1559,7 @@ def sweep_dead_scratch(now: float | None = None) -> int:
             # one alive is a live user.
             continue
         if users is None:
-            # One read of the process table per sweep, taken only once some
-            # tree is otherwise reclaimable.
+            # One process-table read per sweep, once some tree is otherwise reclaimable.
             users = agent_scratch_users.scratch_users(root, SCRATCH_ENV_KEYS)
         user = users.get(entry.name)
         if user is not None:
@@ -1571,9 +1570,8 @@ def sweep_dead_scratch(now: float | None = None) -> int:
                 user,
             )
             continue
-        # Walked before the sweep lock is taken, because a large checkout
-        # takes a while to list; a spawn that marks the tree active meanwhile
-        # still wins at the final look under the lock.
+        # Walked before the lock (a large checkout lists slowly); a spawn that
+        # marks the tree active meanwhile still wins at the final look under it.
         holds_git = bool(pids) and holds_git_repository(child)
         with _SWEEP_LOCK:
             # Final look under the lock a spawn's validate-and-touch also
@@ -1594,6 +1592,9 @@ def sweep_dead_scratch(now: float | None = None) -> int:
                 _restore_owner_after_partial_delete(child, pids)
                 continue
         removed += 1
+    if only is not None:
+        logger.debug("agent-scratch: removed %d dead dir(s) named %r at kill", removed, only)
+        return removed
     if removed:
         logger.info("agent-scratch: sweep removed %d dead idle scratch dir(s)", removed)
     return removed + _expire_quarantine(reference)

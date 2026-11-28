@@ -712,7 +712,8 @@ async def run_gateway(
     # each recorded owner pid instead of clearing wholesale at boot. Hourly
     # repeats catch processes that die while the gateway stays up (no
     # per-teardown hook: the positive liveness signal covers every death
-    # path by construction). Same containment posture as the janitor above:
+    # path by construction; one exception: a Codex runtime's kill reclaims its
+    # private-state dir, see agent_scratch). Same containment posture as the janitor above:
     # offloaded, fail-open, skipped in test_mode. The same wake also sweeps the
     # cross-process work root (see kiro_crew.work_root), which is idle-keyed
     # BECAUSE outliving its creator is that root's contract.

@@ -9,11 +9,11 @@ binds it by name, so it reads and writes the runtime's own state on the instance
 of the method on the class or on an instance reaches every caller.
 
 Instance fields written: ``_dead``, ``_death_expected``, ``_death_label``,
-``_death_reason``, ``_death_summary``, ``_death_tail``, ``_process_tree_confirmed_dead``,
-``_kas_extract_broken_message``, ``_kas_extract_server_path``, ``_saw_auth_failure``,
-``_saw_delegate_launch_failure``, ``_saw_kas_engine_refusal``, ``_saw_sandbox_init_failure``,
-``_scratch_dir``, ``_stall_turn_sessions``, ``_stderr_lines``, ``_stdin_stall_death``,
-``chat_joinable``.
+``_death_reason``, ``_death_summary``, ``_death_tail``, ``_private_state_dir``,
+``_process_tree_confirmed_dead``, ``_kas_extract_broken_message``, ``_kas_extract_server_path``,
+``_saw_auth_failure``, ``_saw_delegate_launch_failure``, ``_saw_kas_engine_refusal``,
+``_saw_sandbox_init_failure``, ``_scratch_dir``, ``_stall_turn_sessions``, ``_stderr_lines``,
+``_stdin_stall_death``, ``chat_joinable``.
 
 Instance fields read: ``_acp_backend``, ``_answer_tasks``, ``_broken_kas_server_path``,
 ``_initialized``, ``_process``, ``_remote_workspace``, ``_session_queues``,
@@ -441,6 +441,7 @@ async def _revive_after_failed_start(self: AcpRuntime) -> bool:
         if still_running:
             return False
     self._scratch_dir = None
+    self._private_state_dir = None
     self._dead = False
     self._process_tree_confirmed_dead = False
     self._death_summary = None

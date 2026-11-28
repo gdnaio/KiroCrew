@@ -9,8 +9,8 @@ binds it by name, so it reads and writes the runtime's own state on the instance
 of the method on the class or on an instance reaches every caller.
 
 Instance fields written: ``_bound_workspace_fd``, ``_child_pids``, ``_descendant_rescan_task``,
-``_process``, ``_process_instance``, ``_process_tree_confirmed_dead``, ``_scope_unit``,
-``_start_tree_scans``, ``_spawn_work_dir``, ``_unreaped_pids``, ``_windows_cleanup_receipt``.
+``_private_state_dir``, ``_process``, ``_process_instance``, ``_process_tree_confirmed_dead``,
+``_scope_unit``, ``_start_tree_scans``, ``_spawn_work_dir``, ``_unreaped_pids``, ``_windows_cleanup_receipt``.
 
 Instance fields read: ``_KILL_TREE_WAIT_SECS``, ``_close_remote_workspace``, ``_descendant_scan_lock``,
 ``_exit_watch_task``, ``_native_skill_projection``, ``_pid``, ``_reader_task``,
@@ -25,7 +25,7 @@ import functools
 import logging
 from typing import TYPE_CHECKING, Awaitable, Callable
 
-from kiro_crew import platform_compat
+from kiro_crew import agent_scratch, platform_compat
 from kiro_crew.acp import runtime_process_tree
 from kiro_crew.acp.runtime_process_tree import ChildRecord, _capture_child_records, _get_child_pids
 from kiro_crew.executors import subprocess_executor
@@ -711,6 +711,16 @@ async def kill(self: AcpRuntime, *, expected: bool = False, reason: str = "") ->
                     projection.release()
                 except Exception:
                     logger.debug("skill projection release failed", exc_info=True)
+        # A Codex runtime's private SQLite home is mounted by this process alone, so a
+        # kill that confirmed the tree dead reclaims it now: the sweep's own checks for
+        # that one directory, with no idle wait. Every other ending leaves it to the sweep.
+        private_state = getattr(self, "_private_state_dir", None)
+        if private_state is not None and self._process_tree_confirmed_dead:
+            try:
+                await asyncio.to_thread(agent_scratch.sweep_dead_scratch, only=private_state.name)
+            except Exception:
+                logger.debug("private-state reclaim at kill failed", exc_info=True)
+            self._private_state_dir = None
     finally:
         self._discard_sandbox_cleanup()
         await self._discard_bound_workspace()

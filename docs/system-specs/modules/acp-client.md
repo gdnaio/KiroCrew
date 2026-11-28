@@ -6934,9 +6934,19 @@ The Codex spawn environment also sets `CODEX_SQLITE_HOME`, so concurrent
 one set of SQLite databases and fail new sessions with `database is locked`. The
 harness names the need (`SpawnPlan.private_state_env`) and the runtime points the
 variable at a scratch allocation of its own (`<data home>/scratch/<token>`), made before
-the sandbox wrap, mounted as a private window of that process alone and reclaimed
-by `agent_scratch.sweep_dead_scratch` once the process is dead -- so no new tree,
-lock or slot exists. It is not the process's own scratch directory (the one
+the sandbox wrap and mounted as a private window of that process alone. The
+runtime keeps it in `_private_state_dir`, and `AcpRuntime.kill` deletes it once
+that kill confirms the tree dead (`_process_tree_confirmed_dead`): the last step
+of the kill's `try` block runs `agent_scratch.sweep_dead_scratch(only=<name>)`
+off the loop, the sweep's one-directory mode with the same checks (owner groups
+dead, the Linux live-user read, a linked or garbled marker kept, a repository
+quarantined, a partial delete writing the owner back) and no idle wait, logging
+any failure at DEBUG. A refused kill, a raised one (a Windows drain pending), a
+kill with survivors and a death no kill reaps leave it to the hourly
+`agent_scratch.sweep_dead_scratch`, which reclaims it once the process is dead.
+Each index can be gigabytes, and a host restarting runtimes on `initialize`
+timeouts otherwise piles up an hour of dead ones. No new tree, lock or
+slot exists. It is not the process's own scratch directory (the one
 `TMPDIR` names): when the process starts a session tree, that directory is the
 tree's work directory, and every subagent, companion runtime and successor
 spawned for its sessions mounts it writable. Only the databases move: config,
