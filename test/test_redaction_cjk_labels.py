@@ -11,6 +11,7 @@ import random
 import unicodedata
 
 import pytest
+from named_cases_helpers import named_cases
 from redaction_structured_cases import assert_linear_work
 
 from kiro_crew.default_ignorable import DEFAULT_IGNORABLE
@@ -35,7 +36,8 @@ def test_an_upper_case_env_key_glued_after_cjk_is_read() -> None:
     assert redact(f"密码DB_PASSWORD={PW}") == f"密码DB_PASSWORD={TAG}"
 
 
-@pytest.mark.parametrize(
+_FULL_WIDTH_SEPARATOR = named_cases(
+    "test_a_full_width_separator_is_read",
     ("text", "want"),
     [
         (f"password：{PW}，下一个", f"password：{TAG}，下一个"),
@@ -57,11 +59,9 @@ def test_an_upper_case_env_key_glued_after_cjk_is_read() -> None:
         ("password：\u2605Ab3dEf9h，好", f"password：{TAG}，好"),
     ],
 )
-def test_a_full_width_separator_is_read(text: str, want: str) -> None:
-    assert redact(text) == want
 
-
-@pytest.mark.parametrize(
+_FULL_WIDTH_LABEL = named_cases(
+    "test_a_full_width_label_is_read",
     ("text", "want"),
     [
         (f"ｐａｓｓｗｏｒｄ={PW}，好", f"ｐａｓｓｗｏｒｄ={TAG}，好"),
@@ -69,8 +69,6 @@ def test_a_full_width_separator_is_read(text: str, want: str) -> None:
         (f"ＡＷＳ_SECRET_ACCESS_KEY={SAMPLE_AWS_SECRET}", f"ＡＷＳ_SECRET_ACCESS_KEY={TAG}"),
     ],
 )
-def test_a_full_width_label_is_read(text: str, want: str) -> None:
-    assert redact(text) == want
 
 
 @pytest.mark.parametrize(
@@ -97,7 +95,8 @@ def test_cjk_prose_naming_a_key_stays(text: str) -> None:
     assert redact(text) == text
 
 
-@pytest.mark.parametrize(
+_ASCII_LABEL = named_cases(
+    "test_an_ascii_label_reads_its_value_as_without_the_fold",
     ("text", "want"),
     [
         # Other punctuation inside a value on an ASCII label stays in the value.
@@ -131,7 +130,14 @@ def test_cjk_prose_naming_a_key_stays(text: str) -> None:
         (f"\uff0d--password={PW}\uff0cabc", f"\uff0d--password={TAG}"),
     ],
 )
-def test_an_ascii_label_reads_its_value_as_without_the_fold(text: str, want: str) -> None:
+
+
+# A full-width separator or label reads as its ASCII form, and a value on an ASCII
+# label reads as written.
+@pytest.mark.parametrize(
+    ("text", "want"), [*_FULL_WIDTH_SEPARATOR, *_FULL_WIDTH_LABEL, *_ASCII_LABEL]
+)
+def test_a_labelled_value_is_read(text: str, want: str) -> None:
     assert redact(text) == want
 
 

@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 
 import pytest
+from named_cases_helpers import named_cases
 
 from kiro_crew.config import loosening_provenance, syntax_report
 from kiro_crew.config.loader import (
@@ -181,7 +182,8 @@ def test_a_trailing_comma_names_the_line_it_must_leave(files: tuple[Path, Path])
     assert err.fix == "remove the comma at the end of line 3"
 
 
-@pytest.mark.parametrize(
+_ONE_LINE_FILE = named_cases(
+    "test_on_a_one_line_file_the_fix_names_the_column",
     ("content", "fix"),
     [
         pytest.param(
@@ -196,18 +198,9 @@ def test_a_trailing_comma_names_the_line_it_must_leave(files: tuple[Path, Path])
         ),
     ],
 )
-def test_on_a_one_line_file_the_fix_names_the_column(
-    files: tuple[Path, Path], content: str, fix: str
-) -> None:
-    base, _local = files
-    base.write_text(content, encoding="utf-8")
 
-    (err,) = syntax_report.find_config_syntax_errors()
-
-    assert err.fix == fix
-
-
-@pytest.mark.parametrize(
+_NOT_A_COMMA = named_cases(
+    "test_no_comma_fix_where_a_comma_is_not_the_mistake",
     ("content", "fix"),
     [
         pytest.param(
@@ -233,7 +226,10 @@ def test_on_a_one_line_file_the_fix_names_the_column(
         pytest.param("[1, foo]", "correct the JSON on line 1 at column 5", id="bare-word"),
     ],
 )
-def test_no_comma_fix_where_a_comma_is_not_the_mistake(
+
+
+@pytest.mark.parametrize(("content", "fix"), [*_ONE_LINE_FILE, *_NOT_A_COMMA])
+def test_the_fix_names_the_line_and_the_column(
     files: tuple[Path, Path], content: str, fix: str
 ) -> None:
     base, _local = files

@@ -9,6 +9,7 @@ renderer, so the two grammars cannot answer one shape differently.
 from __future__ import annotations
 
 import pytest
+from named_cases_helpers import named_cases
 
 from kiro_crew.constants import OPTIONS_RE_LINE, OPTIONS_RE_TRAILER
 from kiro_crew.dashboard.state_parts.slot_transcript import _parse_options, _strip_options
@@ -29,7 +30,8 @@ def _assert_every_reader(raw: str, text: str, options: list[str]) -> None:
         assert got == (text, options), name
 
 
-@pytest.mark.parametrize(
+_SAME_LINE_CHAIN = named_cases(
+    "test_a_same_line_chain_strips_every_marker_and_the_last_offers",
     ("raw", "text", "options"),
     [
         ("Body [OPTIONS: A] [OPTIONS: B]", "Body", ["B"]),
@@ -38,8 +40,6 @@ def _assert_every_reader(raw: str, text: str, options: list[str]) -> None:
         ("Body [OPTIONS: A](OPTIONS) [OPTIONS: B]", "Body", ["B"]),
     ],
 )
-def test_a_same_line_chain_strips_every_marker_and_the_last_offers(raw, text, options):
-    _assert_every_reader(raw, text, options)
 
 
 def test_a_long_same_line_chain_is_one_run():
@@ -122,7 +122,8 @@ def test_a_label_that_carries_a_closer_still_parses(raw, options):
     _assert_every_reader(raw, "", options)
 
 
-@pytest.mark.parametrize(
+_PIPES_OR_COMMAS = named_cases(
+    "test_labels_split_on_pipes_when_present_else_on_commas",
     ("raw", "text", "options"),
     [
         ("Pick [OPTIONS: A, B]", "Pick", ["A", "B"]),
@@ -131,7 +132,10 @@ def test_a_label_that_carries_a_closer_still_parses(raw, options):
         ("Pick [OPTIONS: Rebase, then merge |]", "Pick", ["Rebase, then merge"]),
     ],
 )
-def test_labels_split_on_pipes_when_present_else_on_commas(raw, text, options):
+
+
+@pytest.mark.parametrize(("raw", "text", "options"), [*_SAME_LINE_CHAIN, *_PIPES_OR_COMMAS])
+def test_every_reader_strips_the_markers_and_reads_the_labels(raw, text, options):
     _assert_every_reader(raw, text, options)
 
 

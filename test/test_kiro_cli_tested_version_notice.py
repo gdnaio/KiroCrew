@@ -9,6 +9,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from named_cases_helpers import named_cases
 
 from kiro_crew.acp import chat_runtime_sharing
 from kiro_crew.acp import client as client_mod
@@ -28,13 +29,18 @@ def test_the_range_is_the_one_the_label_names():
     assert KIRO_CLI_TESTED_RANGE == ((2, 27, 0), (4, 0, 0))
 
 
-@pytest.mark.parametrize("version", ["2.27.0", "2.27.1", "2.32.0", "3.1.0", "3.3.0", "3.99.9"])
-def test_the_docker_pin_and_every_3x_release_are_silent(version):
-    assert untested_version_issue(ACP_BACKEND_KIRO, version) == ""
+_TESTED = named_cases(
+    "test_the_docker_pin_and_every_3x_release_are_silent",
+    "version",
+    ["2.27.0", "2.27.1", "2.32.0", "3.1.0", "3.3.0", "3.99.9"],
+)
+_UNREADABLE = named_cases(
+    "test_an_unreadable_version_is_silent", "version", ["", "unknown", "3.3", "v3.3.0", None]
+)
 
 
-@pytest.mark.parametrize("version", ["", "unknown", "3.3", "v3.3.0", None])
-def test_an_unreadable_version_is_silent(version):
+@pytest.mark.parametrize("version", [*_TESTED, *_UNREADABLE])
+def test_a_tested_or_unreadable_version_is_silent(version):
     assert untested_version_issue(ACP_BACKEND_KIRO, version) == ""
 
 

@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 
 import pytest
+from named_cases_helpers import named_cases
 
 import kiro_crew.config.paths as paths_mod
 from conftest import requires_symlinks
@@ -84,17 +85,20 @@ def test_a_pre_approval_in_another_spelling_is_stripped_by_the_tool_limit():
     assert out["allowedTools"] == ["fs_read"]
 
 
-@pytest.mark.parametrize("matcher", ["web", "FS_WRITE", "USE_AWS", "some_tool"])
-def test_a_tag_a_case_variant_or_an_unknown_name_still_covers_every_call(matcher):
-    hooks = {"preToolUse": [{"matcher": matcher, "command": "x"}]}
+_TAG_VARIANT_OR_UNKNOWN = named_cases(
+    "test_a_tag_a_case_variant_or_an_unknown_name_still_covers_every_call",
+    "matcher",
+    ["web", "FS_WRITE", "USE_AWS", "some_tool"],
+)
+_NO_SINGLE_TOOL = named_cases(
+    "test_a_matcher_that_names_no_single_tool_still_covers_every_call",
+    "matcher",
+    ["use_*", "*", "", "a b"],
+)
 
-    _out, held = mate_held_rules.split_policy(False, BASE, {"hooks": hooks}, _FILE)
 
-    assert [h["capability"] for h in held] == [mate_held_rules.ANY]
-
-
-@pytest.mark.parametrize("matcher", ["use_*", "*", "", "a b"])
-def test_a_matcher_that_names_no_single_tool_still_covers_every_call(matcher):
+@pytest.mark.parametrize("matcher", [*_TAG_VARIANT_OR_UNKNOWN, *_NO_SINGLE_TOOL])
+def test_a_matcher_that_is_not_one_tool_name_still_covers_every_call(matcher):
     hooks = {"preToolUse": [{"matcher": matcher, "command": "x"}]}
 
     _out, held = mate_held_rules.split_policy(False, BASE, {"hooks": hooks}, _FILE)

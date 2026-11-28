@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from named_cases_helpers import named_cases
 
 import kiro_crew.env as env_mod
 import kiro_crew.env_krb5_conf as conf_mod
@@ -66,13 +67,12 @@ class TestKeyringCcache:
         conf = _conf(tmp_path, "[libdefaults]\n default_ccache_name = KEYRING:user:%{USERID}\n")
         assert env_mod.krb5_keyring_ccache({"KRB5_CONFIG": str(conf)}) == "KEYRING:user:4242"
 
-    @pytest.mark.parametrize(
-        "value", ["KEYRING:session:abc", "KEYRING:process:x", "KEYRING:krb5cc", "KEYRING:thread:t"]
+    # Only the kinds the kernel registers per user namespace are flagged.
+    _PROCESS_OWN_KEYRINGS = named_cases(
+        "test_process_own_keyrings_are_not_claimed",
+        "value",
+        ["KEYRING:session:abc", "KEYRING:process:x", "KEYRING:krb5cc", "KEYRING:thread:t"],
     )
-    def test_process_own_keyrings_are_not_claimed(self, linux, tmp_path, value) -> None:
-        # Only the kinds the kernel registers per user namespace are flagged.
-        conf = _conf(tmp_path, _AL2023_CONF)
-        assert env_mod.krb5_keyring_ccache({"KRB5_CONFIG": str(conf), "KRB5CCNAME": value}) is None
 
     def test_tab_separated_include_is_followed(self, linux, tmp_path) -> None:
         inc = _conf(tmp_path, "[libdefaults]\n default_ccache_name = KEYRING:persistent:1\n", "i")
@@ -100,8 +100,12 @@ class TestKeyringCcache:
         conf = _conf(tmp_path, f"include {fifo}\n[libdefaults]\n default_ccache_name = KCM:\n")
         assert env_mod.krb5_keyring_ccache({"KRB5_CONFIG": f"{fifo}:{conf}"}) is None
 
-    @pytest.mark.parametrize("value", ["FILE:/tmp/krb5cc_4242", "KCM:", "DIR:/run/x"])
-    def test_non_keyring_value_is_none(self, linux, tmp_path, value) -> None:
+    _NON_KEYRING = named_cases(
+        "test_non_keyring_value_is_none", "value", ["FILE:/tmp/krb5cc_4242", "KCM:", "DIR:/run/x"]
+    )
+
+    @pytest.mark.parametrize("value", [*_PROCESS_OWN_KEYRINGS, *_NON_KEYRING])
+    def test_a_cache_the_sandbox_does_not_hide_is_none(self, linux, tmp_path, value) -> None:
         conf = _conf(tmp_path, _AL2023_CONF)
         assert env_mod.krb5_keyring_ccache({"KRB5_CONFIG": str(conf), "KRB5CCNAME": value}) is None
 

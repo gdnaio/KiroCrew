@@ -19,6 +19,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+from named_cases_helpers import named_cases
 
 from conftest import make_dir_link, requires_symlinks
 from kiro_crew import mcp_cron
@@ -220,11 +221,6 @@ WINDOWS_PATH_ALLOWED_BODIES = [
 ]
 
 
-@pytest.mark.parametrize("body", WINDOWS_PATH_ALLOWED_BODIES)
-def test_vet_script_contents_allows_a_benign_or_doubled_backslash_windows_path(body):
-    assert _vet_script_contents(body) is None, f"should allow: {body!r}"
-
-
 @pytest.mark.parametrize("body,name", SINGLE_BACKSLASH_PROTECTED_PATH_BODIES)
 def test_vet_script_contents_refuses_a_single_backslash_protected_path(body, name):
     err = _vet_script_contents(body)
@@ -246,8 +242,22 @@ REGEX_ESCAPE_SCRUBBER_BODIES = [
 ]
 
 
-@pytest.mark.parametrize("body", REGEX_ESCAPE_SCRUBBER_BODIES)
-def test_vet_script_contents_allows_a_regex_escape_before_a_protected_name(body):
+@pytest.mark.parametrize(
+    "body",
+    [
+        *named_cases(
+            "test_vet_script_contents_allows_a_benign_or_doubled_backslash_windows_path",
+            "body",
+            WINDOWS_PATH_ALLOWED_BODIES,
+        ),
+        *named_cases(
+            "test_vet_script_contents_allows_a_regex_escape_before_a_protected_name",
+            "body",
+            REGEX_ESCAPE_SCRUBBER_BODIES,
+        ),
+    ],
+)
+def test_vet_script_contents_allows_a_body_that_opens_no_protected_path(body):
     assert _vet_script_contents(body) is None, f"should allow: {body!r}"
 
 
