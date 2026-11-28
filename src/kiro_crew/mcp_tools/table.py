@@ -98,7 +98,7 @@ class Caller:
 
 
 class GatewayCaller:
-    """Production identity for ``server``: ``mcp_core``'s resolvers, per call.
+    """Production identity for ``server``: the gateway's session resolvers, per call.
 
     Read as module attributes when asked, so the per-frame caller block the
     stdio loop installs is what they see, and so does any test that rebinds a
@@ -109,23 +109,22 @@ class GatewayCaller:
         self.server = server
 
     def attribution(self) -> str:
-        return _mcp_core()._resolve_session_key()
+        return _identity_resolvers()._resolve_session_key()
 
     def require_strict_session_key(self, refusal: str) -> tuple[str, str]:
-        return _mcp_core().require_strict_session_key(refusal, server=self.server)
+        return _identity_resolvers().require_strict_session_key(refusal, server=self.server)
 
 
-def _mcp_core() -> Any:
-    """``kiro_crew.mcp_core``, imported on the first call that needs a caller.
+def _identity_resolvers() -> Any:
+    """The module whose ``_resolve_session_key`` / ``require_strict_session_key`` a caller reads.
 
-    Not at module scope: the dashboard and work servers build their tables from
-    this module, and ``mcp_core`` brings history, knowledge and skills with it.
-    A server that is started but never called, such as one an auxiliary Codex
-    thread launches, then pays none of that.
+    Their owner, ``kiro_crew.mcp_core_parts.identity``. ``mcp_core`` re-exports the
+    same objects, and its facade mirror forwards a patch written through it to this
+    owner; importing ``mcp_core`` would load history, knowledge and members.
     """
-    from kiro_crew import mcp_core
+    from kiro_crew.mcp_core_parts import identity
 
-    return mcp_core
+    return identity
 
 
 @dataclass(frozen=True)

@@ -376,6 +376,29 @@ def test_a_small_servers_handlers_do_not_load_the_core_server(command: str, tmp_
     assert len(package) <= HANDLER_MODULE_CEILING[command], (len(package), package)
 
 
+_DASHBOARD_CALL_PROBE = f"""
+import json, sys
+from kiro_crew import mcp_dashboard
+reply = mcp_dashboard._call_tool("chat_folder_tree", {{}})
+sys.stderr.write({_MARK!r} + json.dumps([reply, sorted(sys.modules)]) + "\\n")
+"""
+
+
+def test_a_dashboard_tool_call_does_not_load_the_core_server(
+    loaded_snapshots: tuple[set[str], tuple[str, set[str]], set[str]],
+) -> None:
+    """The client's verbs and the caller's resolvers come from ``mcp_core_parts``.
+
+    Importing ``kiro_crew.mcp_core`` for those seven names took ``mcp-dashboard``
+    from about 58 to 83 MB RSS after its first call.
+    """
+    _, (reply, modules), _ = loaded_snapshots
+    # The stub answers every GET with the policy body, so the tree refuses its shape:
+    # proof the request went out through the client.
+    assert "/api/chat/folders" in reply, reply
+    assert "kiro_crew.mcp_core" not in modules
+
+
 #: Never loaded by a config load. Every server loads its config before it lists, so
 #: what the load imports is on every server's floor. These are the roster and hook
 #: graph (the artifact store, webhooks, metrics, milestones: about 124 modules, about
@@ -405,7 +428,9 @@ sys.stderr.write({_MARK!r} + json.dumps(sorted(sys.modules)) + "\\n")
 
 
 @pytest.fixture(scope="module")
-def loaded_snapshots(tmp_path_factory: pytest.TempPathFactory) -> tuple[set[str], set[str]]:
+def loaded_snapshots(
+    tmp_path_factory: pytest.TempPathFactory, gateway_port: int
+) -> tuple[set[str], tuple[str, set[str]], set[str]]:
     tmp_path = tmp_path_factory.mktemp("loaded_snapshots")
     (tmp_path / "home").mkdir()
     (tmp_path / "home" / "config.json").write_text(
@@ -416,11 +441,16 @@ def loaded_snapshots(tmp_path_factory: pytest.TempPathFactory) -> tuple[set[str]
         [
             sys.executable,
             "-c",
-            _CONFIG_PROBE + _IMPORTS_PROBE,
+            _CONFIG_PROBE + _DASHBOARD_CALL_PROBE + _IMPORTS_PROBE,
             handler_module,
             "kiro_crew.mcp_tools.sessions",
         ],
-        env=_child_env(tmp_path, KIROCREW_PROJECT_DIR=str(tmp_path)),
+        env=_child_env(
+            tmp_path,
+            KIROCREW_PROJECT_DIR=str(tmp_path),
+            KIROCREW_PORT=str(gateway_port),
+            KIROCREW_SESSION_KEY="dashboard:budget",
+        ),
         cwd=str(tmp_path),
         capture_output=True,
         timeout=FALLBACK_TIMEOUT_SECS,
@@ -428,22 +458,23 @@ def loaded_snapshots(tmp_path_factory: pytest.TempPathFactory) -> tuple[set[str]
         **UTF8_TEXT,
     )
     marked = [line for line in done.stderr.splitlines() if line.startswith(_MARK)]
-    assert done.returncode == 0 and len(marked) == 2, done.stderr[-4000:]
-    config_modules, core_modules = [set(json.loads(line[len(_MARK) :])) for line in marked]
-    return config_modules, core_modules
+    assert done.returncode == 0 and len(marked) == 3, done.stderr[-4000:]
+    config_modules, dashboard, core_modules = [json.loads(line[len(_MARK) :]) for line in marked]
+    reply, dashboard_modules = dashboard
+    return set(config_modules), (reply, set(dashboard_modules)), set(core_modules)
 
 
 def test_a_config_load_cleans_the_roster_without_the_roster_graph(
-    loaded_snapshots: tuple[set[str], set[str]],
+    loaded_snapshots: tuple[set[str], tuple[str, set[str]], set[str]],
 ) -> None:
     """A disk read runs the unsafe-row check (the ``../x`` row is dropped) and still
     leaves the roster and hook graph unloaded."""
-    modules, _ = loaded_snapshots
+    modules, _, _ = loaded_snapshots
     assert sorted(set(FORBIDDEN_IN_A_CONFIG_LOAD) & modules) == []
 
 
 def test_core_does_not_load_the_context_graph_before_a_call(
-    loaded_snapshots: tuple[set[str], set[str]],
+    loaded_snapshots: tuple[set[str], tuple[str, set[str]], set[str]],
 ) -> None:
-    _, modules = loaded_snapshots
+    _, _, modules = loaded_snapshots
     assert sorted(set(FORBIDDEN_IN_CORE_BEFORE_A_CALL) & modules) == []

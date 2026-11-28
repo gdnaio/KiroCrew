@@ -36,19 +36,17 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 
-def _mcp_core() -> Any:
-    """``kiro_crew.mcp_core``, imported by the first request.
+def _gateway_verbs() -> Any:
+    """The module whose ``_get``/``_post``/``_patch``/``_put``/``_delete`` a request calls.
 
-    Not at module scope: ``mcp_core`` brings history, knowledge and skills with
-    it, and a dashboard server that is started but never called needs none of
-    them. The gateway port is resolved on first use either way
-    (``mcp_core_parts.gateway._api_port``), so the import time does not change
-    which gateway a request reaches. Each verb reads its helper as an attribute
-    at call time, so a test that rebinds one in ``mcp_core`` is still seen.
+    Their owner, ``kiro_crew.mcp_core_parts.gateway``. ``mcp_core`` re-exports the
+    same objects, and its facade mirror forwards a patch written through it to this
+    owner; importing ``mcp_core`` would load history, knowledge and members. Each
+    verb is read as an attribute at call time.
     """
-    from kiro_crew import mcp_core
+    from kiro_crew.mcp_core_parts import gateway
 
-    return mcp_core
+    return gateway
 
 
 class DashboardError(Exception):
@@ -128,8 +126,8 @@ class LoopbackDashboardClient:
         self, path: str, *, session_key: str | None = None, timeout: float | None = None
     ) -> Any:
         if timeout is None:
-            return _accepted(_mcp_core()._get(path, session_key))
-        return _accepted(_mcp_core()._get(path, session_key, timeout=timeout))
+            return _accepted(_gateway_verbs()._get(path, session_key))
+        return _accepted(_gateway_verbs()._get(path, session_key, timeout=timeout))
 
     def post(
         self,
@@ -140,23 +138,25 @@ class LoopbackDashboardClient:
         timeout: float | None = None,
     ) -> Any:
         if timeout is None:
-            return _accepted(_mcp_core()._post(path, body, session_key=session_key))
-        return _accepted(_mcp_core()._post(path, body, timeout=timeout, session_key=session_key))
+            return _accepted(_gateway_verbs()._post(path, body, session_key=session_key))
+        return _accepted(
+            _gateway_verbs()._post(path, body, timeout=timeout, session_key=session_key)
+        )
 
     def patch(
         self, path: str, body: dict[str, Any] | None = None, *, session_key: str | None = None
     ) -> Any:
-        return _accepted(_mcp_core()._patch(path, body, session_key=session_key))
+        return _accepted(_gateway_verbs()._patch(path, body, session_key=session_key))
 
     def put(
         self, path: str, body: dict[str, Any] | None = None, *, session_key: str | None = None
     ) -> Any:
-        return _accepted(_mcp_core()._put(path, body, session_key=session_key))
+        return _accepted(_gateway_verbs()._put(path, body, session_key=session_key))
 
     def delete(
         self, path: str, body: dict[str, Any] | None = None, *, session_key: str | None = None
     ) -> Any:
-        return _accepted(_mcp_core()._delete(path, body, session_key=session_key))
+        return _accepted(_gateway_verbs()._delete(path, body, session_key=session_key))
 
 
 @dataclass(frozen=True)

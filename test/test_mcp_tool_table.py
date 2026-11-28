@@ -11,11 +11,14 @@ out of it: the reply text, the requests the dashboard saw, the audit row.
 from __future__ import annotations
 
 import json
+import sys
 from typing import Any
 
 import pytest
 
 from kiro_crew import mcp_core, mcp_shared
+from kiro_crew.mcp_core_parts import gateway as gateway_owner
+from kiro_crew.mcp_core_parts import identity as identity_owner
 from kiro_crew.mcp_tools.dashboard_client import (
     DashboardError,
     DashboardRequest,
@@ -23,9 +26,17 @@ from kiro_crew.mcp_tools.dashboard_client import (
     LoopbackDashboardClient,
     UndeclaredRoute,
     UnroutedRequest,
+    _gateway_verbs,
     restrict_routes,
 )
-from kiro_crew.mcp_tools.table import Caller, GatewayCaller, Tool, ToolContext, ToolTable
+from kiro_crew.mcp_tools.table import (
+    Caller,
+    GatewayCaller,
+    Tool,
+    ToolContext,
+    ToolTable,
+    _identity_resolvers,
+)
 from kiro_crew.validation import FieldSpec, ToolSchema
 
 _SERVER = "kirocrew-test-table"
@@ -288,6 +299,29 @@ class TestCaller:
             "",
             "Error: no [kirocrew-dashboard]",
         )
+
+    def test_without_mcp_core_the_caller_and_client_read_the_owners(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A dashboard server never imports ``mcp_core``: the owners answer, and it stays out.
+
+        Shared names are patched only through the facade (``test_facade_mirror_guards``),
+        so the unloaded request path is proven end to end by
+        ``test_mcp_listing_import_budget``'s dashboard call instead.
+        """
+        monkeypatch.delitem(sys.modules, "kiro_crew.mcp_core")
+        assert _gateway_verbs() is gateway_owner
+        assert _identity_resolvers() is identity_owner
+        GatewayCaller("kirocrew-dashboard").attribution()
+        assert "kiro_crew.mcp_core" not in sys.modules
+
+    @pytest.mark.parametrize(
+        ("owner", "name"),
+        [(gateway_owner, n) for n in ("_get", "_post", "_patch", "_put", "_delete")]
+        + [(identity_owner, n) for n in ("_resolve_session_key", "require_strict_session_key")],
+    )
+    def test_mcp_core_serves_the_owners_objects(self, owner: Any, name: str) -> None:
+        assert getattr(owner, name) is getattr(mcp_core, name)
 
     def test_the_production_frame_context(self) -> None:
         ctx = ToolContext.for_frame("kirocrew-dashboard")
