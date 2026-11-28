@@ -977,11 +977,20 @@ class TestFileReaderPdf:
         p.write_bytes(flate_bomb_pdf())
         text, meta = FileReader().read(str(p))
         assert meta["format"] == "error"
-        assert meta["error"] == "PDF extraction failed: memory"
+        assert meta["error"] == readers._PDF_FAILURE_MESSAGES["memory"]
         assert text.startswith("Error reading file:")
 
     def test_read_pdf_child_failure_kinds_are_all_errors(self, tmp_path, monkeypatch):
-        for kind in ("cpu", "timeout", "killed", "parse", "protocol", "spawn"):
+        expected = {
+            "parse": "This PDF looks damaged or is not a real PDF. "
+            "Replace it with a working copy of the document.",
+            "cpu": "This PDF took too long to read. Split it into smaller files.",
+            "timeout": "This PDF took too long to read. Split it into smaller files.",
+            "killed": readers._PDF_FAILURE_FALLBACK,
+            "protocol": readers._PDF_FAILURE_FALLBACK,
+            "spawn": readers._PDF_FAILURE_FALLBACK,
+        }
+        for kind, message in expected.items():
             monkeypatch.setattr(
                 readers,
                 "extract_pdf_segments",
@@ -990,7 +999,9 @@ class TestFileReaderPdf:
             p = tmp_path / f"{kind}.pdf"
             p.write_bytes(_make_pdf("x"))
             _text, meta = FileReader()._read_pdf(str(p))
-            assert meta == {"format": "error", "error": f"PDF extraction failed: {kind}"}
+            assert meta == {"format": "error", "error": message}
+            # The reason words that are internal jargon never reach the person.
+            assert kind not in message
 
     def test_read_pdf_does_not_hit_missing_dep_guard(self, tmp_path):
         # A malformed PDF must surface a real parse error, never the
@@ -1002,6 +1013,8 @@ class TestFileReaderPdf:
         text, meta = reader.read(str(p))
         assert "PDF support requires pdfplumber" not in text
         assert meta.get("error") != "PDF support requires pdfplumber"
+        assert meta["error"].startswith("This PDF looks damaged or is not a real PDF.")
+        assert "parse" not in meta["error"]
 
 
 # 4. EntityExtractor

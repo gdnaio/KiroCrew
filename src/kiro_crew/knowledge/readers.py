@@ -73,6 +73,25 @@ _PDF_MAX_CHARS = 4_000_000
 #: Wall-clock ceiling for one PDF's extraction. Generous next to the child's own
 #: 60 CPU-second limit, since a document can also wait on I/O.
 _PDF_WALL_SECS = 120.0
+#: What the source's file list shows for a PDF the extractor child gave up on,
+#: keyed by ``PdfExtraction.failure``. The person reading it chose the file, so
+#: each says what went wrong and what to do, never the child's own reason word.
+_PDF_FAILURE_MESSAGES = {
+    'parse': (
+        'This PDF looks damaged or is not a real PDF. '
+        'Replace it with a working copy of the document.'
+    ),
+    'memory': (
+        'This PDF needs more memory to read than the reader allows. '
+        'Split it into smaller files.'
+    ),
+    'cpu': 'This PDF took too long to read. Split it into smaller files.',
+    'timeout': 'This PDF took too long to read. Split it into smaller files.',
+}
+_PDF_FAILURE_FALLBACK = (
+    'The PDF reader stopped before it finished this file. '
+    'Scan the source again; if it keeps failing, replace the file.'
+)
 
 
 #: AsciiDoc ``include::target[attrs]`` directive, matched the way Asciidoctor's
@@ -457,7 +476,8 @@ class FileReader:
         except OSError as e:
             return _read_error(e)
         if outcome.failure is not None:
-            return _read_error(RuntimeError(f'PDF extraction failed: {outcome.failure}'))
+            message = _PDF_FAILURE_MESSAGES.get(outcome.failure, _PDF_FAILURE_FALLBACK)
+            return _read_error(RuntimeError(message))
         meta: dict = {'format': 'pdf', 'page_count': outcome.pages}
         if outcome.truncated:
             meta['truncated'] = True

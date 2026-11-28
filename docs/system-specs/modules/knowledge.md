@@ -258,7 +258,10 @@ It includes markdown/plain-text (`.md`/`.txt`/`.org`, AsciiDoc `.adoc`/`.asciido
   the document at `_PDF_MAX_CHARS` characters / `PDF_MAX_PAGES` pages / `_PDF_WALL_SECS`
   wall seconds, setting `truncated: True` when a cap cut it. A child stopped by its ceiling
   is the ordinary `format: 'error'` result, which `ingest_file` records as a per-file
-  failure. The child releases each page immediately after extraction (`Page.close()` when
+  failure. Its `error` is a plain sentence with a next step, picked by the child's reason
+  from `_PDF_FAILURE_MESSAGES` (`parse`: the file looks damaged or is not a real PDF;
+  `memory`, `cpu`, `timeout`: too big or slow to read) or `_PDF_FAILURE_FALLBACK` for any
+  other reason; the reason word itself never reaches the file list. The child releases each page immediately after extraction (`Page.close()` when
   available, `flush_cache()` for pdfplumber 0.10). Shared with file-grep's document pass
   (`file-search.md`) so the two call sites cannot drift in what they bound.
 - `_read_docx` — python-docx; extracts body and table-cell paragraphs in document order, including nested tables, each physical merged cell once, and content-control (`w:sdt` / `w:customXml`) wrappers. Converts `Heading N` paragraph styles to `#`-prefixed markdown (`content_type: 'markdown'`); `paragraph_count` remains the top-level body paragraph count. Revision-wrapped paragraphs remain excluded.

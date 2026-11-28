@@ -94,7 +94,8 @@ def test_pdf_extractor_failure_is_an_error(tmp_path, monkeypatch):
         readers, "extract_pdf_segments", lambda *a, **k: SimpleNamespace(failure="too big")
     )
     text, meta = FileReader().read(str(doc))
-    assert "PDF extraction failed: too big" in text and meta["format"] == "error"
+    assert meta["format"] == "error" and meta["error"] == readers._PDF_FAILURE_FALLBACK
+    assert "too big" not in text
 
 
 def test_docx_without_python_docx_is_a_missing_dependency(tmp_path, monkeypatch):
