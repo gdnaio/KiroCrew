@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import errno
 import hashlib
 import hmac
 import importlib
@@ -27,7 +28,6 @@ import inspect
 import json
 import os
 import re
-import shutil
 import tempfile
 import threading
 import types
@@ -59,6 +59,7 @@ from kiro_crew.apps.builtins.ops_mission_control.backend import (
 from kiro_crew.apps.builtins.ops_mission_control.backend.providers import set_top_level, webhook
 from kiro_crew.apps.builtins.ops_mission_control.backend.providers.base import ActionResult
 from kiro_crew.apps.builtins.ops_mission_control.backend.secrets import put_secret
+from kiro_crew.platform_compat import remove_with_retry
 
 _BASE = "/api/apps/ops-mission-control"
 
@@ -259,6 +260,18 @@ def _payload(response: web.StreamResponse) -> Any:
     return json.loads(response.text)
 
 
+def _remove_home(home: str) -> None:
+    """Remove a test's data home, or fail that test naming what is still there.
+
+    ``shutil.rmtree(..., ignore_errors=True)`` would hide a failed removal: on Windows the
+    home outlives its test and the session's residue guard reports it against whichever
+    test ran last. Another process briefly holding the directory (winerror 32 or 33) is
+    retried for about three seconds; any other failure raises here, in the test that
+    made the home.
+    """
+    remove_with_retry(home, retry_hint="A test's data home must not outlive the test.")
+
+
 class _Home(unittest.IsolatedAsyncioTestCase):
     """An isolated data home, a fresh provider registry and an empty webhook spool.
 
@@ -268,7 +281,7 @@ class _Home(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self) -> None:
         self.home = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.addCleanup(_remove_home, self.home)
         self.enterContext(mock.patch.dict(os.environ, {"KIROCREW_HOME": self.home}))
         registry.reset_registry()
         self.addCleanup(registry.reset_registry)
@@ -602,6 +615,65 @@ class TestCancellationPropagates(_Home):
         hygiene = self.enterContext(mock.patch.object(ledger, "hygiene"))
         await self._cancel_once_entered(routes._handle_ledger_hygiene(_request()), entered)
         hygiene.assert_not_called()
+
+
+class TestTheHomeLeavesWithItsTest(unittest.TestCase):
+    """``_Home``'s data home is gone when its test ends, or that test fails.
+
+    The removal is refused the way Windows refuses it while another process holds the
+    directory (``PermissionError`` with winerror 32), so the case runs on every OS.
+    """
+
+    _CASE = "test_a_webhook_cancelled_mid_body_never_reaches_enqueue"
+
+    @staticmethod
+    def _remove_if_left(home: str) -> None:
+        if os.path.isdir(home):
+            _remove_home(home)
+
+    def _run_held(self, refusals: int) -> tuple[unittest.TestResult, str]:
+        """Run the cancelled-webhook case with its home's removal refused *refusals* times."""
+        homes: list[str] = []
+        real_mkdtemp, real_rmdir = tempfile.mkdtemp, os.rmdir
+
+        def _mkdtemp(*args: Any, **kwargs: Any) -> str:
+            home = real_mkdtemp(*args, **kwargs)
+            # Registered before the case runs, so a home it leaves goes with THIS test.
+            self.addCleanup(self._remove_if_left, home)
+            homes.append(home)
+            return home
+
+        left = [refusals]
+
+        def _rmdir(path: Any, *args: Any, **kwargs: Any) -> None:
+            if homes and os.fspath(path) == homes[0] and left[0] > 0:
+                left[0] -= 1
+                held = PermissionError(errno.EACCES, "held by another process", homes[0])
+                held.winerror = 32  # type: ignore[attr-defined]
+                raise held
+            real_rmdir(path, *args, **kwargs)
+
+        result = unittest.TestResult()
+        with (
+            mock.patch.object(tempfile, "mkdtemp", _mkdtemp),
+            mock.patch.object(os, "rmdir", _rmdir),
+            mock.patch("kiro_crew.platform_compat_files._RMTREE_BACKOFF_SECONDS", 0),
+        ):
+            TestCancellationPropagates(self._CASE).run(result)
+        self.assertEqual(len(homes), 1, homes)
+        return result, homes[0]
+
+    def test_a_briefly_held_home_is_still_removed(self) -> None:
+        result, home = self._run_held(refusals=1)
+        self.assertEqual((result.errors, result.failures), ([], []))
+        self.assertTrue(result.wasSuccessful())
+        self.assertFalse(os.path.lexists(home))
+
+    def test_a_home_that_stays_held_fails_its_own_test(self) -> None:
+        result, home = self._run_held(refusals=1_000)
+        self.assertEqual(len(result.errors), 1, result.errors)
+        self.assertIn("must not outlive the test", result.errors[0][1])
+        self.assertTrue(os.path.isdir(home))
 
 
 class TestTheFacadeKeepsItsHistoricSurface(unittest.TestCase):
