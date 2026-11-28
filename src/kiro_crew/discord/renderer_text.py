@@ -56,7 +56,13 @@ def _strip_steering(text: str) -> str:
     including an UNCLOSED trailing fragment still streaming in (see the
     Telegram renderer for the show-then-vanish rationale)."""
     cleaned = strip_steering_acks(text)
-    cleaned = re.sub(r"\[STEERING\b[^\]\r\n]*$", "", cleaned)  # unclosed, streaming
+    # A match cannot start before the last character that ends it, so the literal
+    # runs on the text after that point only. A final newline stays in the tail
+    # because ``$`` also matches just before it.
+    last_end = max(cleaned.rfind("]"), cleaned.rfind("\r"))
+    bound = max(last_end, cleaned.rfind("\n", 0, len(cleaned) - 1)) + 1
+    tail = re.sub(r"\[STEERING\b[^\]\r\n]*$", "", cleaned[bound:])  # unclosed, streaming
+    cleaned = cleaned[:bound] + tail
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned
 

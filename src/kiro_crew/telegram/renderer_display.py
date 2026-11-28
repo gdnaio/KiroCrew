@@ -140,7 +140,11 @@ def _strip_steering(text: str) -> str:
     sync with the final message.
     """
     cleaned = strip_steering_acks(text)  # complete markers anywhere
-    cleaned = re.sub(r"\[STEERING\b[^\]]*$", "", cleaned)  # unclosed, still streaming
+    # A match cannot start before the last ``]``, so the literal runs on the text
+    # after it only; every opener before it would scan to that bracket and fail.
+    bound = cleaned.rfind("]") + 1
+    tail = re.sub(r"\[STEERING\b[^\]]*$", "", cleaned[bound:])  # unclosed, still streaming
+    cleaned = cleaned[:bound] + tail
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)  # collapse gaps left behind
     return cleaned.strip()
 
