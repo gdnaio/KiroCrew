@@ -57,7 +57,10 @@ async def init_workspace(run: Project) -> None:
         # General coding task on a non-git folder — run directly in it, no git.
         return
 
-    run.base_branch = (await _git(orig_dir, "rev-parse", "--abbrev-ref", "HEAD")).strip()
+    base = (await _git(orig_dir, "rev-parse", "--abbrev-ref", "HEAD")).strip()
+    if base == "HEAD":  # detached: the word "HEAD" would compare the worktree with itself
+        base = (await _git(orig_dir, "rev-parse", "HEAD")).strip()
+    run.base_branch = base
     repo_root = (await _git(orig_dir, "rev-parse", "--show-toplevel")).strip()
     wt_dir = str(Path(repo_root).parent / ".kirocrew-work" / run.task_id)
     if await _branch_exists(repo_root, branch):
