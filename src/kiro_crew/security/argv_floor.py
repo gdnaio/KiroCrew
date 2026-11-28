@@ -519,6 +519,7 @@ if TYPE_CHECKING:  # names it serves from outside its owners, from their homes
         _substitution_depth_delta,
         _xargs_here_string_rebuild,
     )
+    from kiro_crew.security.shell_normalizer_walk import _BACKTICK_BODY_ESCAPE_RE  # noqa: F401
     from kiro_crew.security.vocabulary import (  # noqa: F401
         _KILL_BY_NAME_PROGRAMS,
         _SELF_NAME_RE,
