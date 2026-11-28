@@ -1,0 +1,10 @@
++53
+The ssh-to-self floor refused every IP literal in host position while the netlink
+address table was unread, so the first ssh to a remote IP in a fresh process was
+refused and the same command was allowed a moment later. Off the event loop,
+_netlink_publish_waited now waits for the enrichment worker's read through a
+condition the publisher and the worker's exit signal (_OWN_HOST_SETTLED), from the
+same per-check budget as the DNS wait (_host_verdict_wait_left), and
+_unlisted_ip_is_self then judges the literal against the published table and the
+kernel, as a check after publication does. On the loop, with no worker running, or
+with the table still unread when the wait ends, it stays refused.

@@ -131,7 +131,8 @@ _HOST_VERDICT_SETTLED = threading.Condition(_HOST_VERDICT_LOCK)
 
 
 # How long, in total, one check off the event loop waits for the lookups of
-# new dotted names before it answers.  A lookup still running after this is
+# new dotted names, and for the netlink table (``_netlink_publish_waited``),
+# before it answers.  A lookup still running after this is
 # refused, as before; the event loop itself never waits.
 _HOST_VERDICT_WAIT_SECS = 0.5
 
@@ -673,6 +674,12 @@ _OWN_HOST_RESOLVE_DONE = False
 _OWN_HOST_RESOLVE_LOCK = threading.Lock()
 
 
+# Signalled under the lock when the netlink table publishes and when an
+# enrichment worker exits, so an IP-literal check off the event loop can wait
+# for the table (``_netlink_publish_waited``).
+_OWN_HOST_SETTLED = threading.Condition(_OWN_HOST_RESOLVE_LOCK)
+
+
 _OWN_HOST_RESOLVE_NEXT_TRY: float = 0.0
 
 
@@ -801,7 +808,8 @@ def _own_interface_addresses() -> "set[str]":
 # is a blocking socket read, so it runs in the enrichment WORKER, never the
 # synchronous seed -- and until its addresses land, a non-own IP literal in
 # host position could be an unlisted secondary of this very machine, so
-# ``_host_is_self`` denies those (fail closed).  Off Linux there is no
+# ``_host_is_self`` denies those (fail closed); off the event loop it first
+# waits briefly for the worker's read.  Off Linux there is no
 # netlink layer to wait for, so the window starts closed.
 _NETLINK_ADDRS_PUBLISHED: bool = not (
     sys.platform.startswith("linux") and hasattr(socket, "AF_NETLINK")
@@ -813,10 +821,11 @@ def warm_own_host_names() -> None:
 
     Without it the first IP-literal ssh check of a process is what starts the
     worker, and that check sees the still-unpublished flag in the same instant,
-    so it is always refused.  The worker reads the netlink table before any DNS
-    lookup and publishes it at once.  This only runs the synchronous seed and
-    schedules the worker; the gateway startup hook calls it through
-    ``asyncio.to_thread`` so the seed stays off the event loop.
+    so on the event loop it is always refused (off the loop it waits briefly for
+    the read, ``_netlink_publish_waited``).  The worker reads the netlink table
+    before any DNS lookup and publishes it at once.  This only runs the
+    synchronous seed and schedules the worker; the gateway startup hook calls it
+    through ``asyncio.to_thread`` so the seed stays off the event loop.
     """
     _own_host_names()
 
@@ -834,6 +843,46 @@ def _publish_netlink_addresses(addrs: "set[str]") -> None:
         base = _OWN_HOST_NAMES_CACHE if _OWN_HOST_NAMES_CACHE is not None else _own_host_seed()
         _OWN_HOST_NAMES_CACHE = base | frozenset(a for a in addrs if a)
         _NETLINK_ADDRS_PUBLISHED = True
+        _OWN_HOST_SETTLED.notify_all()
+
+
+def _netlink_publish_waited() -> bool:
+    """Whether the netlink table has published, after waiting for it off the event loop.
+
+    The first IP-literal check of a process is what starts the worker that
+    reads the table, so rather than refuse at once it waits for that read,
+    from the same per-check budget a new name's DNS lookup waits from
+    (``_host_verdict_wait_left``).  On the event loop, with no worker running,
+    or with the budget spent it answers False at once.
+    """
+    if _event_loop_running() or not _OWN_HOST_RESOLVE_IN_FLIGHT:
+        return False
+    remaining = _host_verdict_wait_left()
+    if remaining <= 0:
+        return False
+    with _OWN_HOST_SETTLED:
+        _OWN_HOST_SETTLED.wait_for(
+            lambda: _NETLINK_ADDRS_PUBLISHED or not _OWN_HOST_RESOLVE_IN_FLIGHT, remaining
+        )
+        return _NETLINK_ADDRS_PUBLISHED
+
+
+def _unlisted_ip_is_self(
+    ip: "ipaddress.IPv4Address | ipaddress.IPv6Address", zone: str, published: bool
+) -> bool:
+    """Host position: whether an IP literal the own set did not list is this machine.
+
+    *published* is the flag the caller read BEFORE the own set.  While the table
+    is unread the literal could be an unlisted secondary, so it is refused unless
+    the table lands within the wait; then it is judged as a published check is:
+    the own set, which now holds the table, then the kernel.
+    """
+    if not published:
+        if not _netlink_publish_waited():
+            return True
+        if str(ip).lower() in _own_host_names():
+            return True
+    return _kernel_says_own_address(ip, zone)
 
 
 # Consecutive worker passes whose netlink dump did not complete.  A host
@@ -954,6 +1003,7 @@ def _resolve_own_host_names_into_cache() -> None:
     finally:
         with _OWN_HOST_RESOLVE_LOCK:
             _OWN_HOST_RESOLVE_IN_FLIGHT = False
+            _OWN_HOST_SETTLED.notify_all()
 
 
 def _own_host_names() -> "frozenset[str]":
@@ -1080,7 +1130,7 @@ def _host_is_self(host: str, *, dns_fallback: bool = True, match_globs: bool = T
         published = _NETLINK_ADDRS_PUBLISHED
         if str(ip).lower() in _own_host_names():
             return True
-        if dns_fallback and (not published or _kernel_says_own_address(ip, zone)):
+        if dns_fallback and _unlisted_ip_is_self(ip, zone, published):
             # Same unread-table window as the ``inet_aton`` branch below --
             # this branch is the one IPv6 literals take.
             return True
@@ -1094,7 +1144,7 @@ def _host_is_self(host: str, *, dns_fallback: bool = True, match_globs: bool = T
         published = _NETLINK_ADDRS_PUBLISHED
         if str(ip4) in _own_host_names():
             return True
-        if dns_fallback and (not published or _kernel_says_own_address(ip4)):
+        if dns_fallback and _unlisted_ip_is_self(ip4, "", published):
             # The kernel address table is unread; this literal could be an
             # unlisted secondary of this machine.  Deny until the worker
             # publishes -- host position only.  Published, an address gained

@@ -348,6 +348,57 @@ class TestSandboxEscapeSshSelfOwnHost:
             release.set()
             self._join_resolver()
 
+    @pytest.mark.parametrize(
+        ("target", "lands", "allowed"),
+        [
+            ("198.51.100.9", True, True),
+            ("3325256713", True, True),  # 198.51.100.9, numeric
+            ("203.0.113.66", True, False),  # an own secondary only the table lists
+            ("3405803842", True, False),  # the same address, numeric
+            ("198.51.100.9", False, False),  # the wait ends before the table lands
+        ],
+    )
+    def test_an_ip_literal_checked_off_the_loop_waits_for_the_netlink_table(
+        self, monkeypatch, target, lands, allowed
+    ):
+        # A fresh process with no warm: the first IP-literal check starts the
+        # worker that reads the table.  On the event loop it is refused at once;
+        # off the loop it waits for the read, then judges the literal against
+        # it.  The netlink read is held until the check asks for its wait
+        # budget, so the check provably starts before the table lands.  The
+        # off-loop check is one ``_host_is_self`` call: the gate may read a
+        # line more than once, and a later reading answers from the landed table.
+        release = threading.Event()
+
+        def _held_netlink():
+            release.wait(self._PUBLISH_DEADLINE_SECS)
+            return {"203.0.113.66"}
+
+        def _budget():
+            if not lands:
+                return 0.05
+            release.set()
+            return self._PUBLISH_DEADLINE_SECS
+
+        # A neighbour's resolver exiting mid-wait would end this wait early.
+        for t in threading.enumerate():
+            if t.name == self._RESOLVER_THREAD:
+                t.join(self._RESOLVER_JOIN_SECS)
+        self._open_window(monkeypatch, netlink=_held_netlink)
+        monkeypatch.setattr(_argv_floor, "_host_verdict_wait_left", _budget)
+
+        async def _on_loop():
+            return _denied_by(f"ssh {target} id")
+
+        try:
+            assert asyncio.run(_on_loop()) == self._RULE
+            assert _argv_floor._NETLINK_ADDRS_PUBLISHED is False
+            assert _argv_floor._host_is_self(target) is (not allowed)
+            assert _argv_floor._NETLINK_ADDRS_PUBLISHED is lands
+        finally:
+            release.set()
+            self._join_resolver()
+
     @staticmethod
     def _hook(monkeypatch, warm):
         from kiro_crew.dashboard import server as _server
@@ -449,6 +500,8 @@ class TestSandboxEscapeSshSelfOwnHost:
         # The check reads the names, the publisher lands, then the check
         # reads the flag: it must judge by the flag it saw BEFORE the names.
         monkeypatch.setattr(_argv_floor, "_NETLINK_ADDRS_PUBLISHED", False)
+        # No worker to wait for: a neighbour's resolver thread must not open a wait.
+        monkeypatch.setattr(_argv_floor, "_OWN_HOST_RESOLVE_IN_FLIGHT", False)
 
         def stale_names():
             monkeypatch.setattr(_argv_floor, "_NETLINK_ADDRS_PUBLISHED", True)

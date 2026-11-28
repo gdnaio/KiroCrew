@@ -584,6 +584,8 @@ def test_each_form_uses_the_live_address_guard(
 ):
     if reason == "unpublished":
         monkeypatch.setattr(argv_floor_hosts, "_NETLINK_ADDRS_PUBLISHED", False)
+        # No worker to wait for: a neighbour's resolver thread must not open a wait.
+        monkeypatch.setattr(argv_floor_hosts, "_OWN_HOST_RESOLVE_IN_FLIGHT", False)
     elif reason == "kernel-own":
         monkeypatch.setattr(argv_floor_hosts, "_kernel_says_own_address", lambda *_a: True)
     elif reason == "host-block":
