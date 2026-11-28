@@ -158,6 +158,21 @@ class TestInterpreterArgvLiteralMint:
         assert _denied_by(cmd) is not None
 
     @pytest.mark.parametrize(
+        "sink", ["spawn" + "x" * 100, "exec" + "x" * 100 + "sync", "create_subprocess_" + "x" * 100]
+    )
+    @pytest.mark.parametrize(
+        ("rule", "payload"),
+        [
+            (_RULE_MINT + "-argv", _NAME + " " + _TOK),
+            (_RULE_KILL + "-interpreter", _PK + " -f " + _NAME),
+        ],
+    )
+    def test_long_call_name_tail_still_blocked(self, sink, rule, payload):
+        # The word tail after these call names is unbounded: a fixed bound on it is
+        # escapable with a longer name.
+        assert _denied_by("node -e '" + sink + "(" + Q + payload + Q + ")'") == rule
+
+    @pytest.mark.parametrize(
         ("origin", "cmd"),
         [
             *_named(
