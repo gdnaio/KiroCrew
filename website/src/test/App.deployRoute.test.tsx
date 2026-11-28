@@ -27,7 +27,6 @@ vi.mock('../pages/HooksPage', () => ({ default: () => <div data-testid="hooks-pa
 vi.mock('../pages/CapabilitiesPage', () => ({ default: () => <div data-testid="capabilities-page">CapabilitiesPage</div> }))
 vi.mock('../pages/KnowledgePage', () => ({ default: () => <div data-testid="knowledge-page">KnowledgePage</div> }))
 vi.mock('../pages/DeveloperPage', () => ({ default: () => <div data-testid="developer-page">DeveloperPage</div> }))
-vi.mock('../pages/AppsPage', () => ({ default: () => <div data-testid="apps-page">AppsPage</div> }))
 vi.mock('../pages/AppPage', () => ({ default: () => <div data-testid="app-page">AppPage</div> }))
 vi.mock('../pages/AppDetailPage', () => ({ default: () => <div data-testid="app-detail-page">AppDetailPage</div> }))
 vi.mock('../pages/MigrationPage', () => ({ default: () => <div data-testid="migration-page">MigrationPage</div> }))

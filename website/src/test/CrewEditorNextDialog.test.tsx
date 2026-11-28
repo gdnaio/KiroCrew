@@ -155,7 +155,7 @@ vi.mock('../components/CrewAvatarBuilder', () => ({
 import CrewEditorModal from '../components/crew/CrewEditorModal'
 import { useCrewEditor } from '../components/crew/useCrewEditor'
 import { NavigationLeaveGuardProvider, useGuardedLeave, useRegisterNavigationLeaveGuard } from '../components/NavigationLeaveGuard'
-import type { KiroCrewAgent } from '../api/types'
+import type { KiroCrewAgent } from '../components/AgentSelector'
 import { acpBackendName } from '../api/acpBackend'
 
 const DEFAULT_CREW = { name: 'kirocrew', kiro_agent: 'kirocrew', workspace: 'core-ws', memory_store: 'core-mem' }

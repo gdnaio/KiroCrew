@@ -27,22 +27,7 @@ interface MockChatMessageListProps {
   transcript?: { aboveRows?: React.ReactNode }
 }
 
-vi.mock('./ChatMessageList', () => ({
-  default: ({ messages, running, onApprove, canTrust, transcript }: MockChatMessageListProps) => (
-    <div data-testid="chat-message-list" data-count={messages.length} data-running={String(running)}
-      data-can-approve={String(!!onApprove)} data-can-trust={String(!!canTrust)}>
-      {transcript?.aboveRows}
-      {onApprove && (
-        <>
-          <button data-testid="mock-approve" onClick={() => onApprove('appr-1', 'approved', MOCK_ROW_META)}>approve</button>
-          <button data-testid="mock-trust" onClick={() => onApprove('appr-1', 'trust', MOCK_ROW_META)}>trust</button>
-        </>
-      )}
-    </div>
-  ),
-}))
-
-// Mock ChatMessageList from the correct path (ChatEmbed imports from ./ChatMessageList)
+// ChatEmbed imports ./ChatMessageList, which is ../app-sdk/ChatMessageList from this folder.
 vi.mock('../app-sdk/ChatMessageList', () => ({
   default: ({ messages, running, onApprove, canTrust, transcript }: MockChatMessageListProps) => (
     <div data-testid="chat-message-list" data-count={messages.length} data-running={String(running)}

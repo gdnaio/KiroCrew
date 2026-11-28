@@ -30,7 +30,7 @@ import {
   useGuardedLeave,
   useRegisterNavigationLeaveGuard,
 } from '../src/components/NavigationLeaveGuard'
-import type { KiroCrewAgent } from '../src/api/types'
+import type { KiroCrewAgent } from '../src/components/AgentSelector'
 import '../src/index.css'
 
 const params = new URLSearchParams(location.search)

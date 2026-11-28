@@ -152,7 +152,7 @@ function FolderBlockRig({
     slotFilter: '',
     slotFolders: {} as Record<string, string>,
     unreadSet: new Set<string>(),
-    pinned: { has: () => false } as unknown as ReturnType<typeof import('../pages/chat-sidebar/sidebarRows').useSidebarRows>['pinned'],
+    pinned: { has: () => false } as unknown as SidebarScope['pinned'],
     staleExpanded: new Set<string>(),
     hiddenByContainer: new Map<string, ChatFolder[]>(),
     revealFlash: null,
