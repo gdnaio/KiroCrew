@@ -1004,6 +1004,35 @@ def test_an_empty_platform_list_drops_nothing(
     assert "not collected" not in verdict
 
 
+# ---------------------------------------------------------------------------
+# selection: a fixture tree is read from disk, never from a walk kept by its path
+# ---------------------------------------------------------------------------
+
+
+def test_a_second_tree_at_the_same_path_is_walked_afresh(
+    tmp_path, monkeypatch, collect_ignore_helpers
+) -> None:
+    """pytest hands a passing test's removed ``tmp_path`` to a later test whose name
+    shares its first 30 characters, so one path holds two trees in one worker. Both
+    readers of the test-tree walk must answer the second tree from its own files."""
+    selector = importlib.import_module("run_scoped_tests")
+    monkeypatch.setattr(collect_ignore_helpers, "PLATFORM_IGNORED", frozenset())
+    root = tmp_path / "repo"
+    (root / "src" / "kiro_crew").mkdir(parents=True)
+    (root / "src" / "kiro_crew" / "widget.py").write_text("X = 1\n", encoding="utf-8")
+    (root / "test").mkdir()
+    guard_text = "from source_corpus import iter_source_texts\n"
+    diff = ["src/kiro_crew/widget.py"]
+    (root / "test" / "test_widget.py").write_text(guard_text, encoding="utf-8")
+    assert selector.related_targets("backend", diff, root=root)[0] == ["test/test_widget.py"]
+    assert selector.tree_scan_targets(root) == ["test/test_widget.py"]
+
+    (root / "test" / "test_widget_extra.py").write_text(guard_text, encoding="utf-8")
+    both = ["test/test_widget.py", "test/test_widget_extra.py"]
+    assert selector.related_targets("backend", diff, root=root)[0] == both
+    assert selector.tree_scan_targets(root) == both
+
+
 _BARE_INTERPRETER_GROUP = "local_gate_bare_interpreter"
 
 # Every case that needs an interpreter without site-packages is answered by this
@@ -1370,15 +1399,12 @@ _COMPOSING_PACKAGE = {
     ],
 )
 def test_each_way_a_module_offers_a_changed_module_name_is_read(
-    tmp_path, request, facade, source, changed, extra, offered
+    tmp_path, facade, source, changed, extra, offered
 ) -> None:
     """Every spelling of an offer this tree uses is read, an import the module only
     uses is not an offer, and a mirror or compose facade serves what its owner
     defines (not what the owner imports)."""
     selector = importlib.import_module("run_scoped_tests")
-    # The selector caches a tree's file list by its root, and a passed case's
-    # tmp_path is deleted and handed to the next case, so each case gets its own root.
-    root = tmp_path / request.node.callspec.id
     files = {
         "src/kiro_crew/__init__.py": "",
         _PACKAGE: "HEADER_RE = 1\n",
@@ -1397,10 +1423,10 @@ def test_each_way_a_module_offers_a_changed_module_name_is_read(
         facade: source,
     }
     for rel, text in files.items():
-        target = root / rel
+        target = tmp_path / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
-    assert selector.facade_reexports([changed], root).get(facade, set()) == offered
+    assert selector.facade_reexports([changed], tmp_path).get(facade, set()) == offered
 
 
 def test_a_test_importing_from_a_package_facade_is_selected(
