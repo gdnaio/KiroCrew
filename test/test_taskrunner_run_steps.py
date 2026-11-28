@@ -1,6 +1,6 @@
 """Running a planned project's steps within the run's bounds.
 
-The watchdog notices and cancels a stalled step on the monotonic clock, the
+The watchdog notices and cancels a stalled step on the awake clock, the
 global timeout counts from the run's start stamp, a dead process is caught by its
 heartbeat, the token budget stops a run, dependency groups run in order, and a
 semaphore keeps the parallel steps at the configured cap without a batch stall.
@@ -22,6 +22,7 @@ from taskrunner_helpers import (
 )
 
 import kiro_crew.taskrunner as taskrunner_module
+from kiro_crew import platform_compat
 from kiro_crew.taskrunner import (
     _STALL_CANCEL_TIMEOUT,
     _STALL_TIMEOUT,
@@ -36,14 +37,16 @@ from kiro_crew.testing.wait import async_wait_until, await_until, finished
 class _SteppedClock:
     """Stands in for the ``time`` module: seconds pass only when a test says so.
 
-    ``monotonic()`` follows the real passage of time the test scripts;
-    ``time()`` follows it too, plus any wall-clock step on top. Every other
-    name is the real module's.
+    ``monotonic()`` and ``awake_now()`` follow the real passage of time the test
+    scripts; ``time()`` follows it too, plus any wall-clock step on top. A Windows
+    sleep moves ``time()`` and ``monotonic()`` (GetTickCount64 counts it) but not
+    ``awake_now()``. Every other name is the real module's.
     """
 
     def __init__(self) -> None:
         self._wall = 1_800_000_000.0
         self._mono = 5_000.0
+        self._awake = 9_000.0
 
     def time(self) -> float:
         return self._wall
@@ -51,9 +54,13 @@ class _SteppedClock:
     def monotonic(self) -> float:
         return self._mono
 
-    def advance(self, passed: float, *, step: float = 0.0) -> None:
-        self._mono += passed
-        self._wall += passed + step
+    def awake_now(self) -> float:
+        return self._awake
+
+    def advance(self, passed: float, *, step: float = 0.0, suspend: float = 0.0) -> None:
+        self._awake += passed
+        self._mono += passed + suspend
+        self._wall += passed + step + suspend
 
     def __getattr__(self, name: str) -> Any:
         import time as _time
@@ -145,34 +152,49 @@ class TestWatchdog:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("passed", "step", "cancelled"),
+        ("passed", "step", "suspend", "cancelled"),
         [
-            (5.0, 0.0, False),
-            (5.0, 2 * 3600.0 + 60, False),
-            (_STALL_CANCEL_TIMEOUT + 60.0, 0.0, True),
-            (_STALL_CANCEL_TIMEOUT + 60.0, -3600.0, True),
+            (5.0, 0.0, 0.0, False),
+            (5.0, 2 * 3600.0 + 60, 0.0, False),
+            (_STALL_CANCEL_TIMEOUT + 60.0, 0.0, 0.0, True),
+            (_STALL_CANCEL_TIMEOUT + 60.0, -3600.0, 0.0, True),
+            (30.0, 0.0, 7_500.0, False),
         ],
-        ids=["progressing", "progressing_forward_step", "stalled", "stalled_backward_step"],
+        ids=[
+            "progressing",
+            "progressing_forward_step",
+            "stalled",
+            "stalled_backward_step",
+            "windows_sleep",
+        ],
     )
     async def test_watchdog_measures_stalls_on_the_monotonic_clock(
-        self, monkeypatch: pytest.MonkeyPatch, passed: float, step: float, cancelled: bool
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        passed: float,
+        step: float,
+        suspend: float,
+        cancelled: bool,
     ) -> None:
-        """A wall-clock step neither cancels a progressing task nor spares a stalled one.
+        """A wall-clock step or a sleep neither cancels a progressing task nor spares a stalled one.
 
-        *passed* seconds really pass after the last progress stamp, and the wall
-        clock also steps by *step*. Before the fix the watchdog read the age from
-        the wall clock: the forward step reset a task that progressed 5 s ago,
-        and the backward step left a task stalled past the cancel timeout alone.
+        *passed* seconds really pass after the last progress stamp, the wall
+        clock also steps by *step*, and the host then sleeps *suspend* seconds
+        the way Windows does (``time.monotonic()`` counts it). Read from the wall
+        clock, the forward step reset a task that progressed 5 s ago and the
+        backward step left a stalled one alone; read from ``time.monotonic()``,
+        the Windows sleep reset a task that progressed 30 s before it.
         """
         clock = _SteppedClock()
         monkeypatch.setattr(taskrunner_module, "time", clock)
+        monkeypatch.setattr(platform_compat, "awake_now", clock.awake_now)
         sessions = _make_mock_sessions()
         sessions.is_provider_alive = AsyncMock(return_value=True)
         runner = TaskRunner(sessions=sessions, auto_test=False)
         run = TaskRun(spec_path="/t.md", spec_content="s", status="running")
         run.current_task = 1
         run.started_at = run.last_task_time = clock.time()
-        ticks = [lambda: clock.advance(passed, step=step)]
+        ticks = [lambda: clock.advance(passed, step=step, suspend=suspend)]
 
         async def _tick(_secs: float) -> None:
             if not ticks:
@@ -191,8 +213,9 @@ class TestWatchdog:
         await runner._watchdog_loop(run)
 
         assert sessions.reset.await_count == (1 if cancelled else 0), (
-            f"{passed:.0f} s after the last progress, with a {step:+.0f} s wall-clock step, "
-            f"the watchdog reset the step's session {sessions.reset.await_count} time(s)"
+            f"{passed:.0f} s after the last progress, with a {step:+.0f} s wall-clock step "
+            f"and a {suspend:.0f} s sleep, the watchdog reset the step's session "
+            f"{sessions.reset.await_count} time(s)"
         )
         assert (run.task_id in runner._stall_cancelled_ids) is cancelled
 
@@ -287,14 +310,15 @@ class TestWatchdog:
 class TestGlobalTimeoutClock:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("passed", "step", "timed_out"),
+        ("passed", "step", "suspend", "timed_out"),
         [
-            (5.0, 0.0, False),
-            (5.0, 2 * 3600.0, False),
-            (2 * 3600.0, 0.0, True),
-            (2 * 3600.0, -3 * 3600.0, True),
+            (5.0, 0.0, 0.0, False),
+            (5.0, 2 * 3600.0, 0.0, False),
+            (2 * 3600.0, 0.0, 0.0, True),
+            (2 * 3600.0, -3 * 3600.0, 0.0, True),
+            (5.0, 0.0, 4_000.0, False),
         ],
-        ids=["healthy", "healthy_forward_step", "over", "over_backward_step"],
+        ids=["healthy", "healthy_forward_step", "over", "over_backward_step", "windows_sleep"],
     )
     async def test_executor_measures_the_global_timeout_on_the_monotonic_clock(
         self,
@@ -302,17 +326,22 @@ class TestGlobalTimeoutClock:
         monkeypatch: pytest.MonkeyPatch,
         passed: float,
         step: float,
+        suspend: float,
         timed_out: bool,
     ) -> None:
-        """A wall-clock step neither fails a run inside its global timeout nor spares one past it.
+        """A wall-clock step or a sleep neither fails a run in its timeout nor spares a late one.
 
-        The first step really takes *passed* seconds, and the wall clock also steps by
-        *step*. The executor checks the 1 h timeout before the second step. Read as
-        ``time.time() - started_at``, the forward step failed a run 5 s old with "Global
-        timeout exceeded", and the backward step let a run 2 h old start another step.
+        The first step really takes *passed* seconds, the wall clock also steps by
+        *step*, and the host then sleeps *suspend* seconds the way Windows does
+        (``time.monotonic()`` counts it). The executor checks the 1 h timeout before
+        the second step. Read as ``time.time() - started_at``, the forward step failed
+        a run 5 s old with "Global timeout exceeded" and the backward step let a run
+        2 h old start another step; read from ``time.monotonic()``, the Windows sleep
+        failed a run 5 s old.
         """
         clock = _SteppedClock()
         monkeypatch.setattr(taskrunner_module, "time", clock)
+        monkeypatch.setattr(platform_compat, "awake_now", clock.awake_now)
         runner = TaskRunner(
             sessions=_make_mock_sessions(),
             auto_test=False,
@@ -325,7 +354,7 @@ class TestGlobalTimeoutClock:
         async def _execute(run, task, hk="", session_key=""):
             executed.append(task.index)
             if task.index == 1:
-                clock.advance(passed, step=step)
+                clock.advance(passed, step=step, suspend=suspend)
             task.status = StepStatus.PASSED
             return True
 
@@ -340,8 +369,9 @@ class TestGlobalTimeoutClock:
         await runner._execute_tasks(run, "hk")
 
         assert executed == ([1] if timed_out else [1, 2]), (
-            f"{passed:.0f} s into the run, with a {step:+.0f} s wall-clock step, "
-            f"the executor ran steps {executed} ({run.status}: {run.error!r})"
+            f"{passed:.0f} s into the run, with a {step:+.0f} s wall-clock step "
+            f"and a {suspend:.0f} s sleep, the executor ran steps {executed} "
+            f"({run.status}: {run.error!r})"
         )
         assert (run.status == "failed" and "Global timeout" in run.error) is timed_out
 
@@ -371,6 +401,7 @@ class TestGlobalTimeoutClock:
         """
         clock = _SteppedClock()
         monkeypatch.setattr(taskrunner_module, "time", clock)
+        monkeypatch.setattr(platform_compat, "awake_now", clock.awake_now)
         runner = TaskRunner(
             sessions=_make_mock_sessions(),
             auto_test=False,

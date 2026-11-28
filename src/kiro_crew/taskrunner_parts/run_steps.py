@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from kiro_crew import git_coord
+from kiro_crew import git_coord, platform_compat
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.task_executor import build_task_prompt, execute_single_task
 from kiro_crew.task_executor import self_review as self_review_fn
@@ -63,31 +63,31 @@ _WORKFLOW_RESULT_SUMMARY_CAP = 120
 
 
 class _MonotonicAge:
-    """How old one of a run's wall-clock stamps is, measured on the monotonic clock.
+    """How old one of a run's wall-clock stamps is, measured on the awake clock.
 
     ``started_at`` and ``last_task_time`` stay wall-clock for display and
     ``runs.json``; the watchdog and the executor read their AGE from here, so a
     wall-clock step (an NTP correction, a manual change, a restored VM) neither
     cancels or times out a task that is progressing nor spares one that is
     stalled or past its global timeout. A reader sees a new stamp on its next
-    read, so the age a new stamp starts at is bounded by the monotonic time
-    since the previous read. The age is awake time: ``time.monotonic()`` stops
-    while the host is suspended on Linux and macOS, so a suspend there is
-    neither stall time nor timeout time (see ``taskrunner.md``).
+    read, so the age a new stamp starts at is bounded by the awake time since
+    the previous read. The age is awake time: ``platform_compat.awake_now()``
+    stands still while the host is suspended on Linux, macOS and Windows, so a
+    suspend is neither stall time nor timeout time (see ``taskrunner.md``).
     """
 
     def __init__(self, wall: float) -> None:
         self._wall = wall
-        self._read = time.monotonic()
+        self._read = platform_compat.awake_now()
         self._at = self._read - max(0.0, time.time() - wall)
 
     def age(self, wall: float) -> float:
-        mono = time.monotonic()
+        now = platform_compat.awake_now()
         if wall != self._wall:
             self._wall = wall
-            self._at = mono - min(max(0.0, time.time() - wall), mono - self._read)
-        self._read = mono
-        return mono - self._at
+            self._at = now - min(max(0.0, time.time() - wall), now - self._read)
+        self._read = now
+        return now - self._at
 
     @classmethod
     def of_run_start(cls, run: Project, *, fresh: bool = False) -> _MonotonicAge:
