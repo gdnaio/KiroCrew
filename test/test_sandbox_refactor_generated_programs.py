@@ -4,7 +4,7 @@ The Linux namespace launcher and the macOS Seatbelt profile are renderings of on
 confinement plan (``kiro_crew.sandbox_plan``). Each is pinned here by ONE golden, taken
 through the live host adapter (``kiro_crew.sandbox._live_plan_host``) with every host
 input pinned so the golden does not depend on the machine that computes it: the run
-root is ``tmp_path`` and is folded to ``<ROOT>``, and every table whose entries reach
+root is ``tmp_path`` or a directory in it, folded to ``<ROOT>``, and every table whose entries reach
 either program is replaced by the small stand-in in ``_PINNED_TABLES``, so a leaf
 added to a real table leaves these goldens alone.
 
@@ -266,9 +266,15 @@ def _everything(host: _Host) -> dict[str, Any]:
 
 
 def _fold(value: Any, host: _Host) -> Any:
-    """*value* with the run root spelled ``<ROOT>``."""
+    """*value* with the run root spelled ``<ROOT>``.
+
+    A socket deny names the root inside a regex, through ``sandbox_plan.ere_literal``, so
+    a root holding a regex metacharacter (a ``.`` that ``mktemp`` put in ``$TMPDIR``) is
+    spelled escaped there and is folded in that spelling too.
+    """
     if isinstance(value, str):
-        return value.replace(str(host.root), "<ROOT>")
+        root = str(host.root)
+        return value.replace(sandbox_plan.ere_literal(root), "<ROOT>").replace(root, "<ROOT>")
     if isinstance(value, list):
         return [_fold(item, host) for item in value]
     if isinstance(value, dict):
@@ -750,10 +756,17 @@ def test_the_launcher_is_the_program_module_plus_the_plan(host: _Host) -> None:
     )
 
 
-def test_the_seatbelt_profile_is_the_golden(host: _Host) -> None:
+@pytest.mark.parametrize("root_name", ["plain", "tmp.d+x(y"])
+def test_the_seatbelt_profile_is_the_golden(
+    root_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second root holds regex metacharacters, as a ``$TMPDIR`` can."""
+    root = tmp_path / root_name
+    root.mkdir()
+    host = _pinned_host(root, monkeypatch)
     kwargs = {k: v for k, v in _private_windows(host).items() if not k.endswith("_ids")}
     profile = sandbox._build_seatbelt_profile("cc", **kwargs)
-    assert profile.replace(str(host.root), "<ROOT>") == _PROFILE_GOLDEN
+    assert _fold(profile, host) == _PROFILE_GOLDEN
 
 
 def test_each_pinned_host_input_reaches_the_plan(

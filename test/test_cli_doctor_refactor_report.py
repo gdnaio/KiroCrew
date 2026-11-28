@@ -17,6 +17,7 @@ each section takes are the section tests' subject.
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 import sys
 import urllib.error
@@ -361,6 +362,10 @@ class _Host:
         except SystemExit as exc:
             code = exc.code
         out = capsys.readouterr().out
+        # The project_dir remedy lines shell-quote the file they name, which adds quotes
+        # once the run root holds a character the shell reads, such as "(".
+        project_dir_file = str(self.home / "project_dir")
+        out = out.replace(shlex.quote(project_dir_file), project_dir_file)
         out = out.replace(str(self.tmp), "<TMP>")
         out = out.replace(sys.executable, "<PYTHON>").replace(sys.version.split()[0], "<PYVER>")
         return out, code
@@ -832,7 +837,14 @@ Connectivity
 """
 
 
-def test_a_broken_host_reports_every_issue_in_order_and_exits_one(host, capsys) -> None:
+@pytest.mark.parametrize("root_name", ["plain", "tmp.d+x(y"])
+def test_a_broken_host_reports_every_issue_in_order_and_exits_one(
+    root_name, tmp_path, monkeypatch, capsys
+) -> None:
+    """The second root holds a ``(``, as a ``$TMPDIR`` can, so a remedy line shell-quotes it."""
+    root = tmp_path / root_name
+    root.mkdir()
+    host = _Host(root, monkeypatch)
     host.kiro = None
     # A git checkout without git, and a running gateway without its agent spec:
     # both are real faults, so both rows stay red.
