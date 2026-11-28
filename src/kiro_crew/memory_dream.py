@@ -1145,7 +1145,8 @@ def person_turn_running(orchestrator: Any) -> bool:
 
     The gateway's turn census (``_in_flight_work_counts``, the one a restart waits
     on) counts a turn on any channel's session, a dashboard slot task and a channel
-    session task; a queued message counts too. Any probe that fails reads as busy.
+    session task; a queued message counts too, except an idle chat's saved queue of
+    restored cards nobody chose, which waits for a person. Any probe that fails reads as busy.
     shortcut: a background turn (cron, worker or crewmate chat) counts too, since the
     census does not say who started a turn; that only makes runs rarer.
     """

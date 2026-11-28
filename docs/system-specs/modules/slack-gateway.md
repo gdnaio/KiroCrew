@@ -897,7 +897,15 @@ take the hold in `cli.main` after argument parsing.
   dashboard slot queue, no approval card waits (a dashboard slot's, or a typed
   reply prompt, `messaging.approval.pending_count`), nobody typed into a chat
   for `QUIET_WINDOW_SECS` (15 min), and a census last seen busy has stayed
-  clear for `SETTLE_SECS` (60s, the hysteresis). An open interactive session
+  clear for `SETTLE_SECS` (60s, the hysteresis). A slot queue the restart hands
+  back as it was is left out of that count: the slot is not `running`, nothing
+  it holds is unsaved (`queue_persist_pending`), and every entry the queue
+  writer persists (`durable_source`: held peer steers, then the queue) is a
+  restored card nobody chose (`is_held_queue_entry`) that the durable bounds
+  keep (`durable_queue_entries`). Any other slot queue still counts, since a
+  restart would drop part of it or bring it back changed: one past those
+  bounds, or one holding a live entry (a paused crew's send, a held peer steer,
+  a cron or subagent message) or a chosen card. An open interactive session
   between turns reads as idle to the census alone, which is why the typing
   window exists. Typing is recorded where it enters, never at a turn: the
   dashboard chat send (`chat_send._api_chat_send`, person sends only) and the

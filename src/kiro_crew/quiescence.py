@@ -12,7 +12,8 @@ Quiescent means ALL of:
   channel handlers, sub-agents, scripts and the TaskRunner
   (``GatewayOrchestrator._in_flight_work_counts``);
 * no channel message waits in a session queue and no dashboard slot has queued
-  sends;
+  sends, except an idle slot whose whole queue is saved for the boot to restore
+  and already waits for a person to send it;
 * no approval card waits for a person;
 * nobody typed into a chat (dashboard or channel) for ``QUIET_WINDOW_SECS``: an
   open conversation between turns reads as idle to the census, and a restart
@@ -161,7 +162,8 @@ def queued_message_holders(orchestrator: Any) -> list[Holder]:
     """Messages waiting behind a turn, by the session or slot they wait in.
 
     A source that cannot answer is one ``unreadable`` holder, so the answer
-    fails toward "not quiescent".
+    fails toward "not quiescent". A slot queue a restart hands back whole
+    (:func:`_carried_across_restart`) is no holder.
     """
     held: list[Holder] = []
     sessions = getattr(orchestrator, "sessions", None)
@@ -185,17 +187,53 @@ def queued_message_holders(orchestrator: Any) -> list[Holder]:
             held = [Holder(work_holders.UNREADABLE, "channel queue")]
     for key, slot in _slot_items(state):
         try:
-            waiting = len(getattr(slot, "_queue", None) or ())
-            if waiting:
-                held.append(Holder(work_holders.QUEUED, str(key), count=waiting))
+            queue = list(getattr(slot, "_queue", None) or ())
+            if not queue:
+                continue
+            if _carried_across_restart(slot):
+                continue
+            held.append(Holder(work_holders.QUEUED, str(key), count=len(queue)))
         except Exception:
             logger.warning("quiescence: slot queue count failed", exc_info=True)
             held.append(Holder(work_holders.UNREADABLE, "slot queue"))
     return held
 
 
+def _carried_across_restart(slot: Any) -> bool:
+    """Whether a restart now would hand the slot's queue back whole.
+
+    True only for an idle slot (``running`` covers a live task and an admitted
+    one) whose every entry is on disk already and is a restored card nobody
+    chose (``is_held_queue_entry``): the boot restores it as the same cards. An
+    entry the durable bounds refuse, or a save still owed, would be lost, and
+    any other entry (a paused crew's send, a chosen card) would come back as a
+    restored card, which changes who sends it, so that queue still counts.
+    """
+    if (
+        getattr(slot, "running", True) is not False
+        or getattr(slot, "queue_persist_pending", True) is not False
+    ):
+        return False
+    # circular import: the dashboard package imports the gateway at load.
+    from kiro_crew.dashboard.slot_queue_repository import (
+        durable_queue_entries,
+        is_held_queue_entry,
+    )
+
+    # The writer persists from the slot's durable source (held steers first),
+    # so both checks read that list.
+    source = slot.durable_source()
+    if not all(is_held_queue_entry(e) for e in source):
+        return False
+    return len(durable_queue_entries(source)) == len(source)
+
+
 def queued_message_count(orchestrator: Any) -> int:
-    """Messages waiting behind a turn: channel session queues and dashboard slot queues."""
+    """Messages waiting behind a turn: channel session queues and dashboard slot queues.
+
+    An idle slot's saved queue that a restart hands back whole is left out
+    (:func:`_carried_across_restart`).
+    """
     return work_holders.total(queued_message_holders(orchestrator))
 
 
