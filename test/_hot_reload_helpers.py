@@ -34,9 +34,6 @@ from kiro_crew.config.sections import _clamp_pct, _normalize_threshold_pair
 # Config documents and the shape a subscriber receives
 # ------------------------------------------------------------------
 
-#: Highest mtime written per path, so a rewrite is always strictly newer.
-_LAST_MTIME_NS: dict[Path, int] = {}
-
 
 def write_config(path: Path, doc: dict) -> None:
     """Write *doc* to *path* with a strictly increasing mtime.
@@ -44,12 +41,15 @@ def write_config(path: Path, doc: dict) -> None:
     Two writes inside one clock tick (Windows, and any coarse filesystem) land
     on the SAME mtime, and a same-size edit is then invisible to the watcher's
     fingerprint -- so the mtime is forced forward rather than left to the clock.
+    The mtime to pass is the one the file carries before this write, so the
+    guarantee needs no table that outlives the file: pytest can hand a later
+    test the ``tmp_path`` a passing test's teardown removed, and a table kept
+    by path would push that test's mtimes past every write the earlier test made.
     """
+    before = path.stat().st_mtime_ns if path.exists() else 0
     path.write_text(json.dumps(doc), encoding="utf-8")
     st = path.stat()
-    mtime = max(st.st_mtime_ns, _LAST_MTIME_NS.get(path, 0)) + 1_000_000_000
-    os.utime(path, ns=(st.st_atime_ns, mtime))
-    _LAST_MTIME_NS[path] = mtime
+    os.utime(path, ns=(st.st_atime_ns, max(st.st_mtime_ns, before) + 1_000_000_000))
 
 
 def change(new: Any, *changed: str, old: Any = None) -> ConfigChange:

@@ -80,7 +80,10 @@ def _path_factories() -> frozenset[str]:
 def _path_factories_for(paths_module: Path) -> frozenset[str]:
     """Cached by the actual module path, so a monkeypatched ``PATHS_MODULE``
     (see ``TestNoImportTimePathResolution``'s fake-tree tests) gets its own
-    cache entry instead of silently reusing the real tree's result."""
+    cache entry instead of silently reusing the real tree's result. A fake tree
+    lives under a ``tmp_path_factory.mktemp`` directory for that reason: pytest
+    hands a passing test's removed ``tmp_path`` to a later test, whose fake tree
+    would then be answered from this cache."""
     tree = ast.parse(paths_module.read_text(encoding="utf-8"))
     out: set[str] = set()
     for node in tree.body:
@@ -357,7 +360,9 @@ class TestNoImportTimePathResolution:
         ):
             assert name not in factories, name
 
-    def test_detector_covers_class_body_and_default_args(self, tmp_path, monkeypatch) -> None:
+    def test_detector_covers_class_body_and_default_args(
+        self, tmp_path_factory, monkeypatch
+    ) -> None:
         """Negative control for the two shapes a ``tree.body``-only walk misses.
 
         Both freeze at import exactly like a module constant: a class body runs
@@ -368,7 +373,7 @@ class TestNoImportTimePathResolution:
 
         mod = sys.modules[__name__]
 
-        fake_src = tmp_path / "kiro_crew"
+        fake_src = tmp_path_factory.mktemp("fake-src") / "kiro_crew"
         (fake_src / "config").mkdir(parents=True)
         (fake_src / "config" / "paths.py").write_text(
             "from pathlib import Path\n\n\ndef config_dir() -> Path:\n    return Path('.')\n",
@@ -388,7 +393,7 @@ class TestNoImportTimePathResolution:
         assert "class-body" in kinds, found
         assert "def-default" in kinds, found
 
-    def test_detector_covers_transitive_accessor(self, tmp_path, monkeypatch) -> None:
+    def test_detector_covers_transitive_accessor(self, tmp_path_factory, monkeypatch) -> None:
         """A module-level call to an accessor that transitively calls a paths.py
         factory must be flagged.
         """
@@ -396,7 +401,7 @@ class TestNoImportTimePathResolution:
 
         mod = sys.modules[__name__]
 
-        fake_src = tmp_path / "kiro_crew"
+        fake_src = tmp_path_factory.mktemp("fake-src") / "kiro_crew"
         (fake_src / "config").mkdir(parents=True)
         (fake_src / "config" / "paths.py").write_text(
             "from pathlib import Path\n\n\ndef data_home() -> Path:\n    return Path('.')\n",

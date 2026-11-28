@@ -2609,8 +2609,11 @@ Two things the survey CANNOT tell you, both of which misled the first pass:
 - **Ratchets that re-parse the tree per test.** Fourteen files `rglob`+`ast.parse`d all
   ~1,300 modules under `src/` once per TEST (15–30 s each, ~10 CPU-minutes per run).
   Cache the derived facts once per module: `test/source_corpus.py` for scans its filters
-  fit, or an `lru_cache` keyed on the tree root (so a test that points the scan at a fake
-  tree under `tmp_path` gets its own entry). Bound the retention — the corpus helper
+  fit, or an `lru_cache` keyed on the tree root. A fake tree a test points such a scan at
+  goes under a `tmp_path_factory.mktemp` directory, never under `tmp_path`: pytest removes
+  a passing test's `tmp_path` and hands that path to a later test whose name shares its
+  first 30 characters, which then reads the earlier tree's entry
+  (`test/test_tmp_path_memo_guard.py` fails on such a memo). Bound the retention — the corpus helper
   streams file text and caches only the tree's path list, and exposes `_clear_caches()`
   for a module-scoped teardown; it used to memoise ~160 MB of source text for the life of
   the worker, paid by every later test on it (see the [tenth pass](testing-sweep-findings.md#what-a-tenth-five-run-pass-found-linux-16-workers-126905-tests-per-run)). And mark the module

@@ -186,7 +186,9 @@ def _dict_code(node: ast.Dict) -> tuple[bool, bool, str | None]:
 def scan(src: pathlib.Path = _SRC) -> list[_Finding]:
     """Every error-response site in ``src``, bucketed. Deterministic order.
 
-    Memoized: six assertions below share one AST pass over ~600 files.
+    Memoized: six assertions below share one AST pass over ~600 files. The memo is
+    keyed by ``src``, so a planted tree goes under a ``tmp_path_factory.mktemp``
+    directory: pytest hands a passing test's removed ``tmp_path`` to a later test.
     """
     return list(_scan_uncached(src))
 
@@ -368,9 +370,10 @@ def test_the_scan_actually_reaches_the_backend() -> None:
     assert any(f.bucket == "compliant" for f in findings), "no compliant site found - scan broken?"
 
 
-def test_dynamic_status_requires_an_explicit_unshadowed_code(tmp_path) -> None:
+def test_dynamic_status_requires_an_explicit_unshadowed_code(tmp_path_factory) -> None:
     """Computed status cannot hide an uncoded or opaque error response."""
-    (tmp_path / "handler.py").write_text(
+    planted = tmp_path_factory.mktemp("handlers")
+    (planted / "handler.py").write_text(
         "\n".join(
             [
                 'web.json_response({"error": message}, status=status)',
@@ -382,7 +385,7 @@ def test_dynamic_status_requires_an_explicit_unshadowed_code(tmp_path) -> None:
         ),
         encoding="utf-8",
     )
-    findings = scan(tmp_path)
+    findings = scan(planted)
     assert [finding.bucket for finding in findings] == [
         "dynamic_status",
         "dynamic_status",

@@ -368,8 +368,19 @@ def _bare_git_dir(root: Path) -> Path:
     return git_dir
 
 
-def test_an_object_store_outside_the_copy_is_refused(tmp_path: Path) -> None:
-    template, outside = tmp_path / "template", tmp_path / "elsewhere" / "objects"
+@pytest.fixture
+def template_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Where a test builds its template: never under its ``tmp_path``.
+
+    ``copy_repo`` remembers each template whose first copy it checked, by the template's
+    path, for the whole process, and pytest hands a passing test's removed ``tmp_path`` to
+    a later test whose name shares its first 30 characters.
+    """
+    return tmp_path_factory.mktemp("template-root")
+
+
+def test_an_object_store_outside_the_copy_is_refused(tmp_path: Path, template_root: Path) -> None:
+    template, outside = template_root / "template", tmp_path / "elsewhere" / "objects"
     git_dir = _bare_git_dir(template)
     (git_dir / "objects" / "info" / "alternates").write_text(f"{outside}\n", encoding="utf-8")
     with pytest.raises(RepoTemplateError, match="shares an object store outside the copy"):
@@ -381,8 +392,10 @@ def test_an_object_store_outside_the_copy_is_refused(tmp_path: Path) -> None:
     ["[include]\n\tpath = file://{root}/extra\n", '[remote "o"]\n\turl = "{root}/origin.git\n'],
     ids=["a-path-inside-a-longer-value", "a-value-that-runs-on"],
 )
-def test_a_config_value_that_cannot_be_re_pointed_is_refused(tmp_path: Path, line: str) -> None:
-    template = tmp_path / "template"
+def test_a_config_value_that_cannot_be_re_pointed_is_refused(
+    tmp_path: Path, template_root: Path, line: str
+) -> None:
+    template = template_root / "template"
     git_dir = _bare_git_dir(template)
     with (git_dir / "config").open("a", encoding="utf-8") as config:
         config.write(line.format(root=template.as_posix()))
@@ -390,10 +403,10 @@ def test_a_config_value_that_cannot_be_re_pointed_is_refused(tmp_path: Path, lin
         copy_repo(template, tmp_path / "copy")
 
 
-def test_only_git_s_own_files_are_re_pointed(tmp_path: Path) -> None:
+def test_only_git_s_own_files_are_re_pointed(tmp_path: Path, template_root: Path) -> None:
     # A template named like a path segment others use, a URL that shares only
     # that name, and working files named like git's own.
-    template = tmp_path / "repo"
+    template = template_root / "repo"
     git_dir = _bare_git_dir(template)
     url = "https://example.invalid/org/repo"
     with (git_dir / "config").open("a", encoding="utf-8") as config:
@@ -410,8 +423,10 @@ def test_only_git_s_own_files_are_re_pointed(tmp_path: Path) -> None:
         assert (copied / "repo" / "notes" / name).read_bytes() == (tracked / name).read_bytes()
 
 
-def test_a_template_path_under_another_spelling_is_refused(tmp_path: Path) -> None:
-    template = tmp_path / "template"
+def test_a_template_path_under_another_spelling_is_refused(
+    tmp_path: Path, template_root: Path
+) -> None:
+    template = template_root / "template"
     git_dir = _bare_git_dir(template)
     make_dir_link(tmp_path / "alias", template)
     (template / "repo" / ".git" / "worktrees" / "w").mkdir(parents=True)
@@ -423,11 +438,11 @@ def test_a_template_path_under_another_spelling_is_refused(tmp_path: Path) -> No
 
 
 def test_a_directory_link_in_the_template_never_leaves_a_copy_reading_the_template(
-    tmp_path: Path,
+    tmp_path: Path, template_root: Path
 ) -> None:
     # A symlink is refused; a Windows junction is copied as the directory it
     # names. Either way no copy holds a link that resolves into the template.
-    template = tmp_path / "template"
+    template = template_root / "template"
     (template / "real").mkdir(parents=True)
     (template / "real" / "file.txt").write_text("x\n", encoding="utf-8")
     make_dir_link(template / "linked", template / "real")
@@ -471,8 +486,8 @@ def test_a_hidden_git_file_is_rewritten_in_place(
 
 
 @requires_symlinks
-def test_a_link_into_the_template_is_refused(tmp_path: Path) -> None:
-    template = tmp_path / "template"
+def test_a_link_into_the_template_is_refused(tmp_path: Path, template_root: Path) -> None:
+    template = template_root / "template"
     template.mkdir()
     (template / "real.txt").write_text("x\n", encoding="utf-8")
     (template / "link.txt").symlink_to(template / "real.txt")
@@ -492,16 +507,20 @@ def test_a_link_into_the_template_is_refused(tmp_path: Path) -> None:
     ],
     ids=["version-4", "sha-256-trailer"],
 )
-def test_an_index_in_a_form_not_handled_is_refused(tmp_path: Path, header: bytes, why: str) -> None:
-    template = tmp_path / "template"
+def test_an_index_in_a_form_not_handled_is_refused(
+    tmp_path: Path, template_root: Path, header: bytes, why: str
+) -> None:
+    template = template_root / "template"
     git_dir = _bare_git_dir(template)
     (git_dir / "index").write_bytes(header + b"\0" * 20)
     with pytest.raises(RepoTemplateError, match=why):
         copy_repo(template, tmp_path / "copy")
 
 
-def test_a_copy_into_a_directory_never_replaces_what_is_there(tmp_path: Path) -> None:
-    template, dest = tmp_path / "template", tmp_path / "dest"
+def test_a_copy_into_a_directory_never_replaces_what_is_there(
+    tmp_path: Path, template_root: Path
+) -> None:
+    template, dest = template_root / "template", tmp_path / "dest"
     for name in ("repo", "other"):
         (template / name).mkdir(parents=True)
         (template / name / "file.txt").write_text(name, encoding="utf-8")
@@ -554,17 +573,15 @@ class _Builder:
 
 
 @pytest.fixture
-def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> RepoTemplates:
-    root = tmp_path / "store"
-    root.mkdir()
+def store(template_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> RepoTemplates:
     config = tmp_path / "global.gitconfig"
     config.write_text("[user]\n\tname = One\n", encoding="utf-8")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
-    return RepoTemplates(root)
+    return RepoTemplates(template_root)
 
 
 def test_a_template_is_built_once_and_every_copy_is_its_own(
-    store: RepoTemplates, tmp_path: Path
+    store: RepoTemplates, template_root: Path, tmp_path: Path
 ) -> None:
     build = _Builder()
     one = store.copy(build, tmp_path / "one")
@@ -572,7 +589,7 @@ def test_a_template_is_built_once_and_every_copy_is_its_own(
     two = store.copy(build, tmp_path / "two")
     assert build.runs == 1
     assert (two / "built.txt").read_text(encoding="utf-8") == "run 1"
-    (kept,) = (tmp_path / "store").iterdir()
+    (kept,) = template_root.iterdir()
     assert (kept / "built.txt").read_text(encoding="utf-8") == "run 1"
 
 
@@ -618,7 +635,7 @@ def test_a_template_is_not_reused_under_another_identity_or_config(
 
 
 def test_a_builder_that_fails_fails_the_test_and_leaves_no_template(
-    store: RepoTemplates, tmp_path: Path
+    store: RepoTemplates, template_root: Path, tmp_path: Path
 ) -> None:
     build = _Builder(fail=True)
     for attempt in (1, 2):
@@ -626,7 +643,7 @@ def test_a_builder_that_fails_fails_the_test_and_leaves_no_template(
             store.copy(build, tmp_path / f"copy-{attempt}")
         assert build.runs == attempt, "a failed build was kept and reused"
         assert not (tmp_path / f"copy-{attempt}").exists()
-        assert list((tmp_path / "store").iterdir()) == []
+        assert list(template_root.iterdir()) == []
     build.fail = False
     assert (store.copy(build, tmp_path / "copy-3") / "built.txt").read_text("utf-8") == "run 3"
 

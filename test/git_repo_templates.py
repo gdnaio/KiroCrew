@@ -102,7 +102,9 @@ def copy_repo(template: Path | str, dest: Path | str) -> Path:
     return dest
 
 
-#: Templates whose first copy real git has agreed with, in this process.
+#: Templates whose first copy real git has agreed with, in this process. Kept by path, so a
+#: template lives where no later test is handed it: a ``tmp_path_factory.mktemp`` directory,
+#: never a test's ``tmp_path``, which pytest gives to a later test once a passing one is removed.
 _CHECKED: set[Path] = set()
 
 

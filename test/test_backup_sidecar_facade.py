@@ -241,7 +241,10 @@ def _patches_in(tree: ast.Module, aliases: set[str]) -> tuple[set[str], list[str
 @functools.lru_cache(maxsize=None)
 def _corpus_patches(corpus: Path = CORPUS) -> tuple[frozenset[str], tuple[str, ...]]:
     """Every facade name the crew container suite patches, read off its source, plus any patch
-    of the facade whose name the scan could not read."""
+    of the facade whose name the scan could not read.
+
+    Kept by *corpus*, so a planted suite goes under a ``tmp_path_factory.mktemp`` directory:
+    pytest hands a passing test's removed ``tmp_path`` to a later test."""
     trees = {path: _parse(path) for path in sorted(corpus.glob("*.py"))}
     helper_aliases: dict[str, set[str]] = {}
     grew = True
@@ -431,15 +434,16 @@ def test_every_patch_the_container_suite_makes_on_the_facade_is_readable() -> No
     )
 
 
-def test_the_corpus_scan_reads_every_patch_shape(tmp_path: Path) -> None:
+def test_the_corpus_scan_reads_every_patch_shape(tmp_path_factory) -> None:
     """Each spelling of a patch is recognised, through a helper's re-export too."""
-    (tmp_path / "first_helpers.py").write_text(
+    suite = tmp_path_factory.mktemp("container_tests")
+    (suite / "first_helpers.py").write_text(
         "from container.sidecar import backup as backup_mod\n", encoding="utf-8"
     )
-    (tmp_path / "second_helpers.py").write_text(
+    (suite / "second_helpers.py").write_text(
         "from .first_helpers import backup_mod as facade\n", encoding="utf-8"
     )
-    (tmp_path / "test_shapes.py").write_text(
+    (suite / "test_shapes.py").write_text(
         "import container.sidecar.backup as direct\n"
         "import container.sidecar.backup\n"
         "from unittest import mock\n"
@@ -462,14 +466,14 @@ def test_the_corpus_scan_reads_every_patch_shape(tmp_path: Path) -> None:
         "    monkeypatch.setattr(backup_mod.os, 'fwalk', None)\n",
         encoding="utf-8",
     )
-    (tmp_path / "test_strings_only.py").write_text(
+    (suite / "test_strings_only.py").write_text(
         "from unittest import mock\n"
         "@mock.patch('container.sidecar.backup.via_decorator')\n"
         "def test_y(monkeypatch, _p):\n"
         "    monkeypatch.setattr('container.sidecar.backup.via_string', 1)\n",
         encoding="utf-8",
     )
-    (tmp_path / "test_unreadable.py").write_text(
+    (suite / "test_unreadable.py").write_text(
         "from unittest import mock\n"
         "from container.sidecar import backup as backup_mod\n"
         "NAME = 'time'\n"
@@ -479,7 +483,7 @@ def test_the_corpus_scan_reads_every_patch_shape(tmp_path: Path) -> None:
         "    monkeypatch.setitem(backup_mod.__dict__, 'time', 1)\n",
         encoding="utf-8",
     )
-    patched, unreadable = _corpus_patches(tmp_path)
+    patched, unreadable = _corpus_patches(suite)
     assert sorted(patched) == sorted(
         {
             "via_setattr",
