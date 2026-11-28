@@ -551,14 +551,17 @@ opens the Actions tab. `scheduled-failure-watch.yml` is the one messenger for
 every scheduled workflow that does not already file its own failure issue. It
 runs on `workflow_run: completed` of each listed workflow, only when that run was
 a *scheduled* one (a manual dispatch has a human watching; a `workflow_call` run
-is surfaced by its caller) that ended `failure` or `timed_out` (a run that hit
-its workflow-level clock is as invisible as a red one). `cancelled` is deliberately
-not a trigger: `pr-merge-conflict-label.yml`, `nightly.yml` and
-`memory-benchmark.yml` cancel their own in-flight scheduled run by design
-(`cancel-in-progress: true`), so a cancelled scheduled run is a collapse, not a
-failure, and filing on it would make every merge to `main` during a sweep a false
-report. It opens
-ONE issue per source workflow titled `<workflow name> scheduled run is failing`,
+is surfaced by its caller) that ended `failure` or `timed_out`, or `cancelled`
+because a job reached its `timeout-minutes`. A job that reaches its limit ends
+the job and the run `cancelled`, not `failure`, and a run cut off by its clock is
+as invisible as a red one. `cancelled` is also what a by-design collapse reports:
+`pr-merge-conflict-label.yml`, `nightly.yml` and `memory-benchmark.yml` cancel
+their own in-flight scheduled run (`cancel-in-progress: true`), and filing on
+those would make every merge to `main` during a sweep a false report. So a
+cancelled run is filed only when one of its cancelled check-runs carries GitHub's
+time-limit annotation (`The job has exceeded the maximum execution time of
+10m0s`); any other cancel is logged in the watcher's run and files nothing. It
+opens ONE issue per source workflow titled `<workflow name> scheduled run is failing`,
 deduped by that fixed title compared for *equality* over the open issues
 carrying its `scheduled-failure` label. The lookup reads the issues API by label
 and never `--search`: the search index lags a create by minutes while two watched
@@ -572,20 +575,21 @@ unthrottled bump would bury those links under ~144 comments a day. Closing the
 issue resets the cycle on the same window: a red run within 6 hours of the close
 is logged in the watcher's run, not filed, so a maintainer closing the issue
 while a 10-minute lane is still red does not get a fresh issue every tick. It
-holds `issues: write` and nothing else, never checks out code, and runs at most
+holds `issues: write` and `checks: read` (to read a cancelled run's check-run
+annotations) and nothing else, never checks out code, and runs at most
 one watcher per source workflow at a time without ever killing the one in
 progress (GitHub evicts an older *pending* run when a newer one queues, which
 costs nothing: the newest completion still runs after the incumbent and finds
 its issue).
 
 The rule for a new `schedule:` workflow is one line: add its `name:` to the
-watcher's `workflows:` list. Three scheduled workflows are deliberately NOT
-listed because each already files its own issue on failure and watching them too
-would report every red run twice: `add-contributor.yml` and
-`fix-loop-analysis.yml` (each carries a per-workflow "Surface failure as an
-issue" step, the hand-copied ancestor of this watcher) and `gui-user-test.yml`
-(its nightly report issue). `test/test_scheduled_failure_watch.py` fails when a
-`schedule:` workflow is neither listed nor self-reporting, when one is both, or
+watcher's `workflows:` list. Two workflows are deliberately NOT listed because
+each already files its own issue on failure and watching them too would report
+every red run twice: `fix-loop-analysis.yml` (it carries a per-workflow "Surface
+failure as an issue" step, the hand-copied ancestor of this watcher) and
+`gui-user-test.yml` (its nightly report issue).
+`test/test_scheduled_failure_watch.py` fails when a `schedule:` workflow is
+neither listed nor self-reporting, when one is both, or
 when a listed name matches no workflow -- a `workflow_run` trigger on a misspelt
 name never fires and never says so.
 

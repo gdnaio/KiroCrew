@@ -60,7 +60,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  issues: write # only to open/update the failure-tracking issue (see last step)
+  issues: write # only to open/update the handoff issue (see the handoff step)
 
 concurrency:
   # One rolling branch, so serialize every run onto it -- do NOT cancel in
@@ -80,8 +80,8 @@ jobs:
     # default-branch commit, 100 a page, so its time grows with the repository:
     # about 7 minutes at 22,000 of each, near 0.8 s a page. The limit leaves
     # room for that growth and for a slow clone. A job that reaches it ends
-    # `cancelled`, which the failure-issue step below does not see, so a limit
-    # set close to the real run time fails with no signal.
+    # `cancelled`; `scheduled-failure-watch.yml` files that scheduled run as
+    # failing, so a limit set close to the real run time opens an issue.
     # shortcut: the sweeps are not incremental, so the limit is reached at
     # roughly four times that history; give them a cursor then.
     timeout-minutes: 30
@@ -497,7 +497,7 @@ jobs:
       # is the whole signal -- it must carry the one-click compare link, and it
       # must say what a repo admin can change to make the job fully automatic
       # again. Deduped by a fixed title, and distinct from the failure issue
-      # below: this one is a handoff, not a defect.
+      # `scheduled-failure-watch.yml` files: this one is a handoff, not a defect.
       - name: Hand the branch to a human when Actions may not open the PR
         if: steps.pr.outputs.handoff != ''
         env:
@@ -521,30 +521,4 @@ jobs:
             gh issue comment "$existing" --repo "$REPO" --body "$note"
           else
             gh issue create --repo "$REPO" --title "$TITLE" --body "$note"
-          fi
-
-      # A scheduled workflow that fails is easy to miss. If any step above failed
-      # (e.g. the script fails loud on a corrupted, non-contiguous block), open or
-      # update a single tracking issue so a human actually sees it. Deduped by a
-      # fixed title so repeated daily failures do not spam new issues.
-      - name: Surface failure as an issue
-        if: failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          TITLE="Add Contributor workflow is failing"
-          existing="$(gh issue list --repo "$REPO" --state open --search "in:title \"$TITLE\"" \
-            --json number --jq '.[0].number // empty')"
-          body="The scheduled \`add-contributor.yml\` run failed: $RUN_URL
-
-          A common cause is the README Contributors block no longer being a single
-          contiguous run of \`<a>\` entries (the script fails loud rather than
-          corrupt it). Check the run log, fix the block, and re-run."
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --repo "$REPO" --body "Still failing: $RUN_URL"
-          else
-            gh issue create --repo "$REPO" --title "$TITLE" --body "$body"
           fi

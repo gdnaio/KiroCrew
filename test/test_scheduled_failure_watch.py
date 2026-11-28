@@ -10,9 +10,11 @@ source workflow. Three properties are pinned rather than assumed:
   added without a line in the watcher's list is exactly the silent failure this
   watcher exists to close, and a workflow that is both watched and self-reporting
   would file every red run twice.
-* GATING -- the job runs only for a scheduled run that failed or timed out
-  (never a cancelled one: the watched workflows cancel their own scheduled runs
-  by design), with ``issues: write`` as its only permission and no checkout.
+* GATING -- the job runs only for a scheduled run that failed, timed out or was
+  cancelled, and a cancelled one is filed only when a job's check-run carries
+  GitHub's time-limit annotation (the watched workflows also cancel their own
+  scheduled runs by design), with ``issues: write`` and ``checks: read`` as its
+  only permissions and no checkout.
 * DEDUPE -- executed for real with ``gh`` stubbed: a first failure creates an
   issue with the fixed title, a repeat comments on the open one instead, a
   failed dedupe query aborts rather than filing blind, and the selector that
@@ -67,10 +69,10 @@ def _scheduled_workflows() -> dict[str, Path]:
 def _files_an_issue_on_failure(document: dict) -> bool:
     """True when some step still runs after a failure and calls ``gh issue create``.
 
-    The three self-reporting workflows spell their condition differently
-    (``failure()``, ``always() && (failure() || cancelled())``, and an
-    ``always()`` guarded on a non-PASS verdict), so the check is for a
-    failure-reachable ``if:`` plus the create call, not one exact spelling.
+    The self-reporting workflows spell their condition differently
+    (``always() && (failure() || cancelled())``, and an ``always()`` guarded on
+    a non-PASS verdict), so the check is for a failure-reachable ``if:`` plus
+    the create call, not one exact spelling.
     """
     for job in (document.get("jobs") or {}).values():
         for step in job.get("steps") or []:
@@ -125,7 +127,7 @@ def test_the_self_reporting_workflows_are_the_ones_left_out() -> None:
     self_reporting = {
         name for name, path in scheduled.items() if _files_an_issue_on_failure(_load(path))
     }
-    assert self_reporting == {"Add Contributor", "Fix Loop Analysis"}
+    assert self_reporting == {"Fix Loop Analysis"}
 
 
 def test_the_watched_list_has_no_duplicates() -> None:
@@ -163,38 +165,23 @@ def test_the_trigger_is_filtered_to_the_default_branch() -> None:
     assert _triggers(_load(WATCHER))["workflow_run"]["branches"] == central_gate[:1]
 
 
-def test_the_job_is_gated_on_a_red_or_timed_out_scheduled_run() -> None:
+def test_the_job_is_gated_on_a_red_timed_out_or_cancelled_scheduled_run() -> None:
     (job,) = _load(WATCHER)["jobs"].values()
     condition = " ".join(str(job["if"]).split())
     assert "github.event.workflow_run.event == 'schedule'" in condition
     assert "github.event.workflow_run.conclusion == 'failure'" in condition
-    # A workflow-level `timeout-minutes` reports `timed_out`, not `failure`; a
-    # gate that names only `failure` lets a hung nightly stay silent.
+    # `timed_out` is a run conclusion GitHub can report; a gate that names only
+    # `failure` would let such a run stay silent.
     assert "github.event.workflow_run.conclusion == 'timed_out'" in condition
+    # A job that reaches its `timeout-minutes` ends the run `cancelled`, not
+    # `failure`; the step tells that apart from a by-design cancel.
+    assert "github.event.workflow_run.conclusion == 'cancelled'" in condition
     assert "'success'" not in condition
 
 
-def test_a_cancelled_scheduled_run_is_not_a_failure() -> None:
-    """Watched workflows cancel their own scheduled runs on purpose --
-    `pr-merge-conflict-label.yml` shares a `cancel-in-progress: true` group
-    with its push trigger, `nightly.yml` and `memory-benchmark.yml` single-flight
-    -- so a `cancelled` conclusion is a by-design collapse and filing on it would
-    turn every merge to main during a sweep into a false "is failing" issue."""
-    (job,) = _load(WATCHER)["jobs"].values()
-    assert "cancelled" not in str(job["if"])
-    # The premise is measured, not assumed: at least one watched workflow really
-    # does cancel its own in-flight run.
-    self_cancelling = {
-        name
-        for name, path in _scheduled_workflows().items()
-        if (_load(path).get("concurrency") or {}).get("cancel-in-progress") is True
-    }
-    assert self_cancelling & set(_watched_names()), self_cancelling
-
-
-def test_issues_write_is_the_only_permission() -> None:
+def test_issues_write_and_checks_read_are_the_only_permissions() -> None:
     document = _load(WATCHER)
-    assert document["permissions"] == {"issues": "write"}
+    assert document["permissions"] == {"issues": "write", "checks": "read"}
     for job in document["jobs"].values():
         assert "permissions" not in job
 
@@ -252,8 +239,10 @@ def _step_script() -> str:
 
 
 def _dedupe_selector() -> str:
-    """The ``--jq`` expression the step hands ``gh issue list``."""
-    match = re.search(r"--jq '([^']+)'", _step_script())
+    """The ``--jq`` expression the step hands the open-issue ``gh issue list``."""
+    match = re.search(
+        r"--state open --label scheduled-failure.*?--jq '([^']+)'", _step_script(), re.S
+    )
     assert match, "the dedupe step no longer passes a --jq selector; update this test"
     return match.group(1)
 
@@ -299,21 +288,27 @@ def _run_step(
     list_exit: int = 0,
     label_exit: int = 0,
     comments_json: str = "[]",
+    check_runs_json: str = '{"check_runs": []}',
+    annotations_json: str = "[]",
     conclusion: str = "failure",
 ) -> tuple[subprocess.CompletedProcess, list[str]]:
     """Run the step with a ``gh`` stub.
 
     ``issue list --state open`` answers ``open_reply`` and ``--state closed``
     answers ``closed_reply`` (both with ``list_exit``); ``label create`` exits
-    ``label_exit``; ``api .../comments?since=...`` answers ``comments_json`` and
-    the step's own ``--jq`` filter is then evaluated over it with ``jq``, so the
-    bot-only bump count is exercised for real. Every ``gh`` invocation is
-    recorded as one ``"$*"`` string.
+    ``label_exit``; ``api .../comments?since=...`` answers ``comments_json``,
+    ``api .../check-suites/...`` answers ``check_runs_json`` and
+    ``api .../annotations`` answers ``annotations_json``, and the step's own
+    ``--jq`` filter is then evaluated over the reply with ``jq``, so the
+    bot-only bump count and the time-limit match are exercised for real. Every
+    ``gh`` invocation is recorded as one ``"$*"`` string.
     """
     stubs = tmp_path / "stubs"
     stubs.mkdir()
     log = tmp_path / "gh.log"
     (tmp_path / "comments.json").write_text(comments_json, encoding="utf-8")
+    (tmp_path / "check_runs.json").write_text(check_runs_json, encoding="utf-8")
+    (tmp_path / "annotations.json").write_text(annotations_json, encoding="utf-8")
     gh = stubs / "gh"
     gh.write_text(
         "#!/usr/bin/env bash\n"
@@ -329,12 +324,17 @@ def _run_step(
         f"  exit {list_exit}\n"
         "fi\n"
         'if [ "$1" = "api" ]; then\n'
-        "  # Honour the step's own --jq filter over the canned comment list.\n"
+        '  case "$*" in\n'
+        f'    *"/annotations"*) reply="{tmp_path / "annotations.json"}" ;;\n'
+        f'    *"/check-suites/"*) reply="{tmp_path / "check_runs.json"}" ;;\n'
+        f'    *) reply="{tmp_path / "comments.json"}" ;;\n'
+        "  esac\n"
+        "  # Honour the step's own --jq filter over the canned reply.\n"
         '  while [ "$#" -gt 0 ]; do\n'
         '    if [ "$1" = "--jq" ]; then filter="$2"; break; fi\n'
         "    shift\n"
         "  done\n"
-        f'  jq -r "$filter" < "{tmp_path / "comments.json"}"\n'
+        '  jq -r "$filter" < "$reply"\n'
         "fi\n",
         encoding="utf-8",
     )
@@ -348,6 +348,7 @@ def _run_step(
             "SOURCE_NAME": "Nightly Build",
             "SOURCE_PATH": ".github/workflows/nightly.yml",
             "SOURCE_CONCLUSION": conclusion,
+            "CHECK_SUITE_ID": "77",
             "RUN_URL": "https://example.invalid/actions/runs/1",
         }
     )
@@ -399,6 +400,72 @@ def test_a_first_failure_opens_an_issue_with_the_fixed_title(tmp_path: Path) -> 
     assert ".github/workflows/nightly.yml" in calls[3]
     assert "conclusion `failure`" in calls[3]
     assert "https://example.invalid/actions/runs/1" in calls[3]
+
+
+def _run_cancelled_step(
+    tmp_path: Path, annotation: str
+) -> tuple[subprocess.CompletedProcess, list[str]]:
+    """Run the step for a cancelled run of two jobs: one finished, and one
+    cancelled whose check-run carries ``annotation``."""
+    return _run_step(
+        tmp_path,
+        open_reply="",
+        conclusion="cancelled",
+        check_runs_json=json.dumps(
+            {
+                "check_runs": [
+                    {"id": 11, "conclusion": "success"},
+                    {"id": 12, "conclusion": "cancelled"},
+                ]
+            }
+        ),
+        annotations_json=json.dumps(
+            [{"message": annotation}, {"message": "The operation was canceled."}]
+        ),
+    )
+
+
+@pytestmark_posix
+@pytestmark_jq
+def test_a_run_cut_off_by_a_job_time_limit_is_filed(tmp_path: Path) -> None:
+    """A job that reaches its `timeout-minutes` ends the run `cancelled`, and
+    GitHub's annotation on that job is what says so."""
+    out, calls = _run_cancelled_step(
+        tmp_path, "The job has exceeded the maximum execution time of 10m0s"
+    )
+    assert out.returncode == 0, out.stderr
+    assert calls[0].startswith("api --paginate repos/example/repo/check-suites/77/check-runs")
+    # Only the cancelled job's annotations are read.
+    assert calls[1].startswith("api --paginate repos/example/repo/check-runs/12/annotations")
+    (create,) = [call for call in calls if call.startswith("issue create")]
+    assert "conclusion `cancelled at a job's timeout-minutes`" in create
+
+
+@pytestmark_posix
+@pytestmark_jq
+def test_a_by_design_cancel_files_nothing(tmp_path: Path) -> None:
+    """Watched workflows cancel their own scheduled runs on purpose --
+    `pr-merge-conflict-label.yml` shares a `cancel-in-progress: true` group
+    with its push trigger, `nightly.yml` and `memory-benchmark.yml` single-flight
+    -- so a cancel with no time-limit annotation must not turn every merge to
+    main during a sweep into a false "is failing" issue."""
+    # The premise is measured, not assumed: at least one watched workflow really
+    # does cancel its own in-flight run.
+    self_cancelling = {
+        name
+        for name, path in _scheduled_workflows().items()
+        if (_load(path).get("concurrency") or {}).get("cancel-in-progress") is True
+    }
+    assert self_cancelling & set(_watched_names()), self_cancelling
+
+    out, calls = _run_cancelled_step(
+        tmp_path,
+        "Canceling since a higher priority waiting request for pr-merge-conflict-label exists",
+    )
+    assert out.returncode == 0, out.stderr
+    assert len(calls) == 2, calls
+    assert all(call.startswith("api --paginate") for call in calls), calls
+    assert "not filing" in out.stdout
 
 
 def test_the_dedupe_lookup_never_goes_through_the_search_index() -> None:

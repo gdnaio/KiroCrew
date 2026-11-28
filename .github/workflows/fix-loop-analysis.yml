@@ -25,9 +25,9 @@
 # FAIL-SOFT ON THE MODEL, FAIL-HARD ON THE NUMBERS: if the metrics script
 # fails the run fails; if the model step fails the issue is still filed with
 # the deterministic table and an honest note that the narrative half did not
-# run. Either failure then opens or bumps ONE tracking issue (the same
-# fixed-title pattern add-contributor.yml uses), because a red scheduled run
-# is otherwise seen by nobody. That is a per-workflow copy of a repo-wide gap
+# run. Either failure then opens or bumps ONE fixed-title tracking issue,
+# because a red scheduled run is otherwise seen by nobody. That is a
+# per-workflow copy of a repo-wide gap
 # -- 11 other scheduled workflows have no surfacing at all; the shared
 # watcher that would replace these copies is tracked in issue 9562.
 name: Fix Loop Analysis
@@ -168,8 +168,8 @@ jobs:
 
       # A scheduled workflow that fails is easy to miss: the metrics half going
       # red means NO issue at all is filed this week, and nothing else notices.
-      # Same fixed-title tracking issue as add-contributor.yml, deduped so a
-      # run that fails every Monday does not open a new issue every Monday.
+      # One fixed-title tracking issue, deduped so a run that fails every
+      # Monday does not open a new issue every Monday.
       # `cancelled()` too: a job killed by its own timeout is cancelled, not
       # failed, and that is exactly the week with the most to report.
       - name: Surface failure as an issue
@@ -418,9 +418,9 @@ jobs:
 
       # A red run is still a signal nobody receives (two scheduled runs went
       # metrics-only before anyone looked), so a missing narrative also becomes
-      # a tracking issue a human sees -- the same fixed-title, deduped pattern
-      # add-contributor.yml uses. It runs BEFORE the re-raise so the run's last
-      # word is the red exit, and it keys on the same flag: `failure()` alone
+      # a tracking issue a human sees -- the same fixed-title, deduped
+      # pattern. It runs BEFORE the re-raise so the run's last word is the
+      # red exit, and it keys on the same flag: `failure()` alone
       # would miss a job cancelled by its own timeout (cancelled is not failed),
       # and an unset analysis_ok means the filing step itself never ran.
       - name: Surface failure as an issue

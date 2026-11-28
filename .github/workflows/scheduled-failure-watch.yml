@@ -2,13 +2,13 @@ name: Scheduled Failure Watch
 
 # A red `schedule:` run notifies nobody: no pull request carries its check, no
 # commit author gets the e-mail, and the Actions tab is the only place it shows.
-# Two workflows (`add-contributor.yml`, `fix-loop-analysis.yml`) each carry a
-# hand-copied "Surface failure as an issue" step for exactly this reason, and
-# `gui-user-test.yml` files its own nightly report issue. Every other scheduled
-# workflow was silent when red. This one watcher replaces the per-workflow copy:
-# it listens for the completion of every listed scheduled workflow and, when the
-# run was a SCHEDULED one that failed or timed out, opens (or bumps) ONE fixed-title
-# tracking issue per source workflow so a human actually sees it.
+# `fix-loop-analysis.yml` carries a hand-copied "Surface failure as an issue"
+# step for exactly this reason, and `gui-user-test.yml` files its own nightly
+# report issue. This one watcher replaces the per-workflow copy: it listens for
+# the completion of every listed scheduled workflow and, when the run was a
+# SCHEDULED one that failed, timed out, or was cut off by a job's
+# `timeout-minutes`, opens (or bumps) ONE fixed-title tracking issue per source
+# workflow so a human actually sees it.
 #
 # WHY `workflow_run` AND NOT A STEP IN EACH WORKFLOW: the failure-surfacing
 # step must run after everything else and must exist in every scheduled
@@ -21,16 +21,22 @@ name: Scheduled Failure Watch
 # a human at the keyboard who sees the result, and a `workflow_call` run is
 # surfaced by its caller. Only the unattended schedule needs a messenger.
 #
-# WHY FAILURE *AND* TIMED_OUT, BUT NOT CANCELLED: a scheduled run that hit its
-# workflow-level clock is as invisible as a red one, and the timeout is the exact
-# shape that hid `fix-loop-analysis.yml`'s broken narrative half for two
-# consecutive Mondays. A job-level `timeout-minutes` reports as `failure`; only
-# the workflow-level clock reports `timed_out`, so both are listed. `cancelled`
-# is NOT: several watched workflows cancel their own scheduled run on purpose
-# (`pr-merge-conflict-label.yml` shares a `cancel-in-progress: true` group with
-# its push trigger, `nightly.yml` and `memory-benchmark.yml` single-flight, the
-# sweeps document pending-run supersession), so a cancelled scheduled run is a
-# by-design collapse, not a failure, and filing on it would be noise.
+# WHY FAILURE, TIMED_OUT, AND A CANCELLED RUN ONLY WHEN A TIME LIMIT ENDED IT:
+# a scheduled run cut off by its clock is as invisible as a red one, and the
+# timeout is the exact shape that hid `fix-loop-analysis.yml`'s broken narrative
+# half for two consecutive Mondays. A job that reaches its `timeout-minutes`
+# ends the job AND the run `cancelled`, not `failure`. `cancelled` is also what
+# a by-design collapse reports: several watched workflows cancel their own
+# scheduled run on purpose (`pr-merge-conflict-label.yml` shares a
+# `cancel-in-progress: true` group with its push trigger, `nightly.yml` and
+# `memory-benchmark.yml` single-flight, the sweeps document pending-run
+# supersession), and filing on those would be noise. So the job admits
+# `cancelled`, and the step files it only when one of the run's cancelled
+# check-runs carries GitHub's own time-limit annotation ("The job has exceeded
+# the maximum execution time of 10m0s"); a superseded run carries "Canceling
+# since a higher priority waiting request ... exists" instead and is logged,
+# not filed. `timed_out` is a run conclusion GitHub can report, so it stays
+# listed.
 #
 # DEDUPE: one open issue per source workflow, found by its EXACT fixed title
 # among the open issues carrying the `scheduled-failure` label. A repeat failure
@@ -59,13 +65,15 @@ name: Scheduled Failure Watch
 #
 # NOT LISTED, on purpose (each already reaches a human on failure through its
 # own issue step; watching them too would file every red run twice):
-#   - Add Contributor      -- "Surface failure as an issue" (`if: failure()`)
 #   - Fix Loop Analysis    -- "Surface failure as an issue" in both jobs
 #   - GUI User Test        -- "File or update the nightly report issue"
 #
-# PERMISSIONS: `issues: write` only. The watcher never checks out code and
-# never reads the source run's artifacts; everything it needs is in the event
-# payload. `issues: write` implies the read that `gh issue list` needs.
+# PERMISSIONS: `issues: write` and `checks: read`. The watcher never checks out
+# code and never reads the source run's artifacts; everything else it needs is
+# in the event payload. `issues: write` implies the read that `gh issue list`
+# needs; `checks: read` reads a cancelled run's check-runs and their
+# annotations, which is the only way to tell a time limit from a by-design
+# cancel.
 #
 # RUNNER: the `kirocrew-linux-4-core` larger runner upstream, `ubuntu-latest` in
 # a fork. A `workflow_run` completion has no live collaborator actor for the AWS
@@ -81,6 +89,7 @@ name: Scheduled Failure Watch
 on:
   workflow_run:
     workflows:
+      - "Add Contributor"
       - "CI Red-Cause Census"
       - "CI Runner Watchdog"
       - "CodeQL"
@@ -128,6 +137,7 @@ on:
 
 permissions:
   issues: write
+  checks: read
 
 # At most one watcher per source workflow runs at a time, and the one in
 # progress is never killed: two watchers for the same workflow running side by
@@ -147,7 +157,8 @@ jobs:
     if: >-
       github.event.workflow_run.event == 'schedule' &&
       (github.event.workflow_run.conclusion == 'failure' ||
-       github.event.workflow_run.conclusion == 'timed_out')
+       github.event.workflow_run.conclusion == 'timed_out' ||
+       github.event.workflow_run.conclusion == 'cancelled')
     steps:
       - name: Open or bump the tracking issue
         env:
@@ -156,9 +167,27 @@ jobs:
           SOURCE_NAME: ${{ github.event.workflow_run.name }}
           SOURCE_PATH: ${{ github.event.workflow_run.path }}
           SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          CHECK_SUITE_ID: ${{ github.event.workflow_run.check_suite_id }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
         run: |
           set -euo pipefail
+          if [ "$SOURCE_CONCLUSION" = "cancelled" ]; then
+            # A time limit and a by-design cancel both end the run `cancelled`;
+            # only GitHub's annotation on the cut-off job tells them apart.
+            cancelled_runs="$(gh api --paginate "repos/$REPO/check-suites/$CHECK_SUITE_ID/check-runs?per_page=100" \
+              --jq '.check_runs[] | select(.conclusion == "cancelled") | .id')"
+            hit=""
+            for check_run in $cancelled_runs; do
+              hit="$(gh api --paginate "repos/$REPO/check-runs/$check_run/annotations?per_page=100" \
+                --jq '.[] | select((.message // "") | contains("exceeded the maximum execution time")) | .message')"
+              if [ -n "$hit" ]; then break; fi
+            done
+            if [ -z "$hit" ]; then
+              echo "No job of $RUN_URL reached its timeout-minutes, so the cancel was by design; not filing."
+              exit 0
+            fi
+            SOURCE_CONCLUSION="cancelled at a job's timeout-minutes"
+          fi
           export TITLE="$SOURCE_NAME scheduled run is failing"
           # One 6-hour window governs both bumps and re-filing after a close.
           # `SINCE` is exported for the jq filters below; the issues API compares
