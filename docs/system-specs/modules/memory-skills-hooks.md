@@ -5669,6 +5669,15 @@ file holds the skill's two draft blocks to the forms' field labels, and the
 fallback's two field lists to the same labels in order. `kirocrew-prepare-pr`
 sends its issue-first step through this skill's draft step.
 
+The skill's commands run in either shell an agent may have, a POSIX shell on
+macOS and Linux or PowerShell on Windows: each `gh` command is one line in an
+unmarked block, which both shells run as written, and each step they spell
+differently (the repository variable, the two temp files, loading the title) is
+a `bash` block followed by its `powershell` block. Untrusted text still reaches
+`gh` only through those files and variables. `test/test_feature_request_skill_routing.py`
+holds the skill to the shape: no line of a command block ends in a backslash
+continuation, and every `bash` block is followed by a `powershell` one.
+
 **`GET /api/skills` coalesces concurrent readers onto one scan, and stores nothing.**
 The catalog assembly is filesystem-heavy (`os.walk` plus per-file frontmatter reads, package
 path globs, per-skill resolve/read, agent annotation), so N simultaneous skill-menu opens

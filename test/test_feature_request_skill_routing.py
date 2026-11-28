@@ -73,3 +73,23 @@ def test_cited_kirocrew_commands_parse() -> None:
         args, unknown = parser.parse_known_args(command.split())
         assert args.command == "doctor", f"{command!r} is not a kirocrew doctor command"
         assert unknown == [], f"{command!r}: {unknown} are not options of kirocrew doctor"
+
+
+# The agent's shell on Windows is PowerShell, where a trailing backslash continues no
+# line and `mktemp` does not exist. So no command line in the skill leans on a
+# continuation, and each step written for bash is followed by its PowerShell form.
+def test_command_blocks_run_in_powershell_too() -> None:
+    blocks = re.findall(
+        r"^ *```(\w*)\n(.*?)^ *```\s*$", SKILL.read_text(encoding="utf-8"), re.M | re.S
+    )
+    commands = [(lang, body) for lang, body in blocks if lang in ("", "bash", "powershell")]
+    continued = [line for _, body in commands for line in body.splitlines() if line.endswith("\\")]
+    assert continued == [], f"backslash continuations do not parse in PowerShell: {continued}"
+    langs = [lang for lang, _ in commands]
+    assert "powershell" in langs, "SKILL.md has no powershell block"
+    unpaired = [
+        i
+        for i, lang in enumerate(langs)
+        if lang == "bash" and langs[i + 1 : i + 2] != ["powershell"]
+    ]
+    assert unpaired == [], f"a bash block with no powershell block after it: {unpaired}"

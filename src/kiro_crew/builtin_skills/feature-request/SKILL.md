@@ -62,17 +62,25 @@ put it in a shell **heredoc** — a heredoc ends on a line equal to its delimite
 so a body containing a line that is exactly `EOF` (or whatever delimiter you
 pick) would terminate it early and let the following lines execute as shell.
 
+**Which shell.** Every `gh` command below is one line in an unmarked block, and
+runs as written in a POSIX shell (`bash`, on macOS and Linux) and in PowerShell
+(the agent's shell on Windows). The steps the two shells spell differently come
+as a `bash` block followed by a `powershell` block: run the one for your shell.
+
 Follow these rules for every `gh` invocation below:
 
 - **Body & title:** write them to temp files using *your own file-writing tool*
-  (not a shell heredoc, not `echo`/`cat >`), then feed those files to `gh`.
-  Create the files with `mktemp` so the path is unpredictable and
-  per-invocation (no fixed `/tmp/...` name to clobber or symlink-attack).
+  (not a shell heredoc, not `echo`/`cat >`/`Set-Content`), then feed those
+  files to `gh`. Create the files with `mktemp` in bash or `New-TemporaryFile`
+  in PowerShell, so the path is unpredictable and per-invocation (no fixed
+  `/tmp/...` name to clobber or symlink-attack).
 - Pass the body with `--body-file "$BODY_FILE"` (never `--body "..."`).
-- Load the title via command substitution into a double-quoted variable —
-  `TITLE="$(cat "$TITLE_FILE")"` — then pass `--title "$TITLE"`. Command
-  substitution assigns the text literally (it is not re-parsed as shell) and
-  the double quotes contain word-splitting/globbing.
+- Load the title from its file into a variable — `TITLE="$(cat "$TITLE_FILE")"`
+  in bash, `Get-Content` in PowerShell — then pass `--title "$TITLE"`. Both
+  assign the text literally (it is not re-parsed as shell), and the double
+  quotes keep it one argument. Windows PowerShell 5.1 passes a `"` or a
+  trailing `\` in an argument to `gh` unescaped, which can split the title, so
+  in PowerShell write a title with no double quotes and no trailing backslash.
 - **Search keywords:** derive a few plain alphanumeric words yourself from the
   conversation and pass them as a double-quoted literal. Do not paste raw user
   text (with its punctuation/metacharacters) into the search string.
@@ -127,12 +135,15 @@ once; `gh` accepts a full URL wherever it accepts `OWNER/REPO`:
 REPO=https://github.com/kirodotdev/KiroCrew
 ```
 
+```powershell
+$REPO = 'https://github.com/kirodotdev/KiroCrew'
+```
+
 Search existing issues to avoid duplicates. Derive plain keywords yourself (a
 few alphanumeric words) — do not paste raw user text:
 
-```bash
-gh issue list --repo "$REPO" \
-  --search "your derived keywords" --state open --limit 10
+```
+gh issue list --repo "$REPO" --search "your derived keywords" --state open --limit 10
 ```
 
 If you find related issues, show them to the user and ask if any cover their
@@ -143,7 +154,8 @@ call in the flow, so its outcome tells you — *before* you draft anything —
 whether direct submission (Option 3) will work on this host:
 
 - If it succeeds, `gh` is installed and authenticated, so Option 3 is available.
-- If it fails with `command not found`, `gh` is not installed on this host.
+- If it fails with `command not found` (PowerShell: `is not recognized`), `gh`
+  is not installed on this host.
 - If it fails with an auth error, `gh` is installed but not authenticated.
 
 In either failure case **say so now, before drafting**, so the user is not
@@ -157,7 +169,7 @@ losing it does not block filing.
 **If the search succeeded, also check whether this account can attach labels.**
 Run this once:
 
-```bash
+```
 gh repo view "$REPO" --json viewerPermission -q .viewerPermission
 ```
 
@@ -255,7 +267,7 @@ Show the draft to the user for confirmation before submitting.
 **Never hard-code the label vocabulary here.** Read it from the repository at
 submit time, so labels added later are picked up without editing this skill:
 
-```bash
+```
 gh label list --repo "$REPO" --limit 100
 ```
 
@@ -366,15 +378,25 @@ BODY_FILE=$(mktemp -t kc-issue-body.XXXXXX.md)
 TITLE_FILE=$(mktemp -t kc-issue-title.XXXXXX.txt)
 ```
 
-Then run:
+```powershell
+$BODY_FILE = (New-TemporaryFile).FullName
+$TITLE_FILE = (New-TemporaryFile).FullName
+```
+
+Then load the title:
 
 ```bash
 TITLE="$(cat "$TITLE_FILE")"
-gh issue create --repo "$REPO" \
-  --title "$TITLE" \
-  --body-file "$BODY_FILE" \
-  --label '<type label>' \
-  --label '<grouping label, if one was chosen>'
+```
+
+```powershell
+$TITLE = (Get-Content -Raw -Encoding UTF8 -LiteralPath $TITLE_FILE).TrimEnd()
+```
+
+and create the issue:
+
+```
+gh issue create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --label '<type label>' --label '<grouping label, if one was chosen>'
 ```
 
 Pass one `--label` flag per name chosen in step 5, each **single**-quoted. Label
