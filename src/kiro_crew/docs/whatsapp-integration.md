@@ -176,7 +176,12 @@ them to a family group:
 Here `447700900111` can use the agent in Work only; Family uses the global list.
 An empty list (`"allowed_wa_ids": []`) admits nobody but you in that group, even
 if the global list has numbers, and so does a value that is not a list. Numbers
-are digits only, with the country code and no `+`; anything else is ignored.
+are digits only, with the country code and no `+`; anything else in
+`config.json` is ignored. The Settings panel's save (`PUT /api/whatsapp/config`)
+stores a number typed with its `+`, spaces, dashes or brackets, or as a
+`<number>@s.whatsapp.net` JID, as its digits, in the global list and in any
+group's own list the request carries, and refuses an entry that is still not a
+number (`invalid WhatsApp number: …`).
 Attachments follow the same answer: files are downloaded only for numbers that
 group admits.
 

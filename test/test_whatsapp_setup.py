@@ -409,6 +409,50 @@ def test_config_save_rejects_non_list_allowed_wa_ids(cfg_file: Path) -> None:
     assert body["code"] == "allowed_wa_ids_not_list"
 
 
+#: How people type the one number 447700900000, every form of it the loader drops.
+_TYPED_FORMS = [
+    "+44 7700 900000",
+    "44-7700-900000",
+    "447700900000@s.whatsapp.net",
+    "+44 (7700) 900000",
+]
+
+
+def test_config_save_stores_a_typed_number_in_the_form_the_loader_keeps(cfg_file: Path) -> None:
+    status, body = _call(
+        _serve(_FakeState()),
+        "PUT",
+        "/api/whatsapp/config",
+        json={
+            "allowed_wa_ids": [*_TYPED_FORMS, "15551234567"],
+            "groups": [{"jid": "g1@g.us", "allowed_wa_ids": _TYPED_FORMS}],
+        },
+    )
+    assert (status, body["ok"]) == (200, True)
+    # What the gateway runs with after the reload, not only what the file holds.
+    wa = loader.KiroCrewConfig.load().whatsapp
+    assert wa.allowed_wa_ids == ["447700900000", "15551234567"]
+    assert wa.groups[0]["allowed_wa_ids"] == ["447700900000"]
+
+
+@pytest.mark.parametrize("entry", ["alice", "447700900000@g.us", "++447700900000", "+", "4.4"])
+@pytest.mark.parametrize("field", ["global", "group"])
+def test_config_save_refuses_an_entry_that_is_not_a_number(
+    cfg_file: Path, entry: str, field: str
+) -> None:
+    ids = ["447700900000", entry]
+    sent = (
+        {"allowed_wa_ids": ids}
+        if field == "global"
+        else {"groups": [{"jid": "g1@g.us", "allowed_wa_ids": ids}]}
+    )
+    status, body = _call(_serve(_FakeState()), "PUT", "/api/whatsapp/config", json=sent)
+    assert status == 400
+    assert body["code"] == "invalid_wa_id"
+    assert entry in body["error"]
+    assert not cfg_file.exists()
+
+
 def test_config_save_rejects_non_list_groups(cfg_file: Path) -> None:
     status, body = _call(
         _serve(_FakeState()), "PUT", "/api/whatsapp/config", json={"groups": {"jid": "g1@g.us"}}

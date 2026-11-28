@@ -19,8 +19,13 @@ from kiro_crew.dashboard.channel_folders import (
 from kiro_crew.dashboard.handlers.agents import _get_config_lock
 from kiro_crew.dashboard.handlers.core import _hot_apply_after_write
 from kiro_crew.dashboard.handlers.messaging import _channel_sdk_status, is_direct_local_request
+from kiro_crew.whatsapp.jids import USER_SERVER
 
 logger = logging.getLogger(__name__)
+
+#: What people type between the digits of a phone number besides spaces. A dot is
+#: left out: a JSON number such as ``447700900000.0`` would turn into another number.
+_WA_ID_SEPARATORS = str.maketrans("", "", "-()")
 
 
 def _live_client(request: web.Request) -> Any:
@@ -74,6 +79,33 @@ async def whatsapp_config_get(request: web.Request) -> web.Response:
     )
 
 
+def _clean_wa_ids(raw: list) -> list[str]:
+    """Each typed number in the form the config loader keeps: digits only.
+
+    The loader drops every entry that is not all digits, so a number stored with
+    its ``+``, with spaces or dashes, or as a ``<number>@s.whatsapp.net`` JID
+    would admit nobody. Raises ``ValueError`` naming an entry that is still not a
+    number once those are removed.
+    """
+    out: list[str] = []
+    for item in raw:
+        typed = str(item).strip()
+        if not typed:
+            continue
+        number = typed
+        if number.lower().endswith(f"@{USER_SERVER}"):
+            number = number[: -len(USER_SERVER) - 1]
+        number = "".join(number.removeprefix("+").split()).translate(_WA_ID_SEPARATORS)
+        if not (number.isascii() and number.isdigit()):
+            raise ValueError(
+                f"invalid WhatsApp number: {typed} (digits with the country code, "
+                "such as 447700900000)"
+            )
+        if number not in out:
+            out.append(number)
+    return out
+
+
 async def whatsapp_config_save(request: web.Request) -> web.Response:
     """PUT /api/whatsapp/config: persist policy fields (config-lock serialized)."""
     if not is_direct_local_request(request):
@@ -110,6 +142,21 @@ async def whatsapp_config_save(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "groups must be a list", "code": "groups_not_list"}, status=400
         )
+    # A group's own list is cleaned like the global one; one that is not a list
+    # is stored as sent, because the loader reads it as an empty list on purpose.
+    try:
+        allowed_wa_ids = _clean_wa_ids(body.get("allowed_wa_ids", []))
+        groups = [
+            (
+                {**g, "allowed_wa_ids": _clean_wa_ids(g["allowed_wa_ids"])}
+                if isinstance(g.get("allowed_wa_ids"), list)
+                else g
+            )
+            for g in body.get("groups", [])
+            if isinstance(g, dict)
+        ]
+    except ValueError as exc:
+        return web.json_response({"error": str(exc), "code": "invalid_wa_id"}, status=400)
     session_folder = ""
     if "session_folder" in body:
         try:
@@ -139,11 +186,9 @@ async def whatsapp_config_save(request: web.Request) -> web.Response:
         if "dm_policy" in body:
             wa["dm_policy"] = str(body["dm_policy"])
         if "allowed_wa_ids" in body:
-            wa["allowed_wa_ids"] = [
-                str(u).strip() for u in body["allowed_wa_ids"] if str(u).strip()
-            ]
+            wa["allowed_wa_ids"] = allowed_wa_ids
         if "groups" in body:
-            wa["groups"] = [g for g in body["groups"] if isinstance(g, dict)]
+            wa["groups"] = groups
         if "session_folder" in body:
             wa["session_folder"] = session_folder
         # Read back inside the lock: the folder reconciliation below needs the
