@@ -14,6 +14,8 @@ showed the server as an error. These tests pin that the rebuild's drop record
    unconfigured too.
 3. A new chat session gets one warn notice naming it.
 4. ``kirocrew doctor`` prints a line for it and counts an issue.
+5. A session on the shared ``AcpRuntime`` (kiro, KAS and codex chats) records each
+   drop the same way, new or resumed: the pooled and mirrored hops read the record.
 """
 
 from __future__ import annotations
@@ -21,13 +23,18 @@ from __future__ import annotations
 import os
 import sys
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import codex_session_mcp_helpers
 import pytest
+from codex_session_mcp_helpers import _write_spec
 
 from kiro_crew import mcp_dropped_servers
+from kiro_crew.acp import runtime as runtime_mod
 from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.mcp_prune import record_pruned, spec_dropped_servers
 from kiro_crew.acp.mcp_session_report import BUCKET_CAP, McpSessionReport
+from kiro_crew.acp.runtime import AcpRuntime, AcpSessionHandle
 from kiro_crew.acp.types import EVENT_MCP_SERVER_INIT_FAILURE
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
@@ -41,6 +48,8 @@ from kiro_crew.doctor_checks import mcp as doctor_mcp
 
 # abspath gives it a drive on Windows, where a drive-less rooted path is not absolute.
 _MISSING = os.path.abspath(os.path.join(os.sep, "nonexistent", "bin", "no-such-server"))
+
+agents_dir = codex_session_mcp_helpers.agents_dir
 
 
 @pytest.fixture
@@ -234,6 +243,89 @@ def test_a_clean_session_or_a_host_failure_gets_no_notice(notices):
     chat_runner._notice_crew_left_out_mcp(SimpleNamespace(), SimpleNamespace(), _Provider(report))
     chat_runner._notice_crew_left_out_mcp(SimpleNamespace(), SimpleNamespace(), object())
     assert notices == []
+
+
+# ── The shared runtime ───────────────────────────────────────────────────────
+
+#: What each host answers ``session/new`` and the restore with: kiro names the agent
+#: it runs, codex its permission tiers.
+_RUNTIME_ANSWERS = {
+    ACP_BACKEND_KIRO: {"sessionId": "s-1", "modes": {"currentModeId": "kirocrew"}},
+    ACP_BACKEND_CODEX: {
+        "sessionId": "s-1",
+        "modes": {"currentModeId": "agent"},
+        "configOptions": [{"id": "mode", "options": [{"value": "read-only"}, {"value": "agent"}]}],
+    },
+}
+
+
+def _shared_runtime(tmp_path, monkeypatch, backend: str) -> AcpRuntime:
+    """An initialized shared runtime whose control plane answers every request.
+
+    The array is built as it is on each host: kiro's pooled hop, codex's mirror. Only
+    what they read besides the spec is supplied: no gateway overlay is running.
+    """
+    (tmp_path / "rt").mkdir()
+    rt = AcpRuntime(work_dir=str(tmp_path / "rt"), acp_backend=backend, expect_mcp_reports=False)
+    rt._initialized = True
+    rt._can_load_session = True
+    monkeypatch.setattr(runtime_mod, "pooled_session_servers", lambda *_a, **_k: [])
+    monkeypatch.setattr(runtime_mod, "injection_server_names", lambda *_a, **_k: frozenset())
+    # Not under test, and each reads more of the spec than this test writes.
+    monkeypatch.setattr(rt, "_refuse_over_ceiling_start", AsyncMock())
+    monkeypatch.setattr(
+        rt, "_unpooled_control_planes", AsyncMock(side_effect=lambda entries, *_a: entries)
+    )
+    answer = _RUNTIME_ANSWERS[backend]
+
+    async def _send_and_await(_method, _params, timeout=None):
+        return answer
+
+    async def _send_request(_method, _params, **_kw):
+        return 999
+
+    async def _send_notification(_method, _params):
+        return None
+
+    async def _wait_for_response(_self, _req_id, timeout=None):
+        return {}
+
+    monkeypatch.setattr(rt, "_send_and_await", _send_and_await)
+    monkeypatch.setattr(rt, "send_request", _send_request)
+    monkeypatch.setattr(rt, "send_notification", _send_notification)
+    monkeypatch.setattr(AcpSessionHandle, "_wait_for_response", _wait_for_response)
+    return rt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["create", "load"])
+@pytest.mark.parametrize("backend", [ACP_BACKEND_KIRO, ACP_BACKEND_CODEX])
+async def test_a_shared_runtime_session_names_the_dropped_server_as_failed(
+    tmp_path, monkeypatch, dropped_store, agents_dir, notices, backend, path
+):
+    """kiro, KAS and codex chats run here, never through ``AcpClient``."""
+    # The rebuild keeps a dropped server's ``@`` ref (``ResolvedServers.narrowed_away``).
+    _write_spec(agents_dir, servers={}, tools=["@p-dead"])
+    rt = _shared_runtime(tmp_path, monkeypatch, backend)
+    chat = tmp_path / "chat"
+    chat.mkdir()
+
+    if path == "create":
+        handle = await rt.create_session(cwd=str(chat), agent="kirocrew")
+    else:
+        handle = await rt.load_session("", "s-1", cwd=str(chat), agent="kirocrew")
+
+    report = handle.mcp_session_report()
+    payload = report.payload() or {}
+    assert payload["failed"] == ["p-dead"]
+    assert payload["failures"]["p-dead"].endswith(f"MCP Servers page): {_MISSING}")
+    assert report.crew_left_out == ("p-dead",)
+    # Configured, so not also "declared by the agent spec but not configured".
+    assert "@p-dead" not in payload["unresolved_refs"]
+    chat_runner._notice_crew_left_out_mcp(SimpleNamespace(), SimpleNamespace(), _Provider(report))
+    [(_role, text, _cls, kw)] = notices
+    assert kw["meta"] == {"kind": "mcp_servers_left_out"}
+    assert "p-dead: command not found" in text
 
 
 # ── Doctor ───────────────────────────────────────────────────────────────────

@@ -203,7 +203,7 @@ class TestStartPriorityOnTheWire:
         monkeypatch.setattr(
             acp_runtime,
             "_pooled_session_servers_and_ref_spec",
-            lambda *_a, **_kw: (entries, None, ()),
+            lambda *_a, **_kw: (entries, None, (), ()),
         )
         handed_on: list[list[dict[str, Any]]] = []
 

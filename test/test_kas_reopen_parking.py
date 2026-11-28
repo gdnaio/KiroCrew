@@ -88,7 +88,7 @@ def _no_pooled_stub_read(_floor_monkeypatch):
     _floor_monkeypatch.setattr(
         runtime_facade,
         "_pooled_session_servers_and_ref_spec",
-        lambda *_a, **_k: ([], None, ()),
+        lambda *_a, **_k: ([], None, (), ()),
     )
 
 

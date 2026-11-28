@@ -7,8 +7,8 @@ named in the log and recorded on the session's MCP report as failed. ``AcpClient
 records it when it begins the session's report; ``AcpRuntime`` when it opens it.
 
 A server the spec writer already dropped for a command not found never reaches any
-array, on any host; :func:`spec_dropped_servers` reads that drop record so
-``AcpClient`` names it on the report the same way.
+array, on any host; :func:`spec_dropped_servers` reads that drop record so both
+drivers name it on the report the same way.
 """
 
 from __future__ import annotations
@@ -96,7 +96,7 @@ def spec_dropped_servers(agent: str | None, spec: Any) -> tuple[PrunedServer, ..
     otherwise say nothing. Read from the rebuild's drop record, for an agent that
     carries the default agent's servers, minus any name *spec* (the session's own
     snapshot) still defines. Each name and reason is bounded like an array prune's
-    entry; the caller caps the count with the pruned ones (:func:`record_pruned`).
+    entry; :func:`record_pruned` caps the count with the pruned ones.
 
     Blocking (one small file read) and non-raising: callers run it in the hop that
     already snapshots the spec, and an unreadable record reads as nothing dropped.
@@ -136,10 +136,13 @@ def record_pruned(
     """Record each pruned server on *report* as failed; the names it admitted.
 
     Called after the report's session began, since beginning it clears the failed
-    bucket. A name the bucket refused gets no row anywhere.
+    bucket. *pruned* may join an array prune's servers and the spec writer's drops:
+    one cap covers both, and the overflow is counted with *omitted*. A name the
+    bucket refused gets no row anywhere.
     """
+    omitted += max(0, len(pruned) - MCP_REPORT_BUCKET_CAP)
     admitted: list[str] = []
-    for server in pruned:
+    for server in pruned[:MCP_REPORT_BUCKET_CAP]:
         if report.record_pruned(server.name, server.reason) and server.name not in admitted:
             admitted.append(server.name)
     report.record_pruned_omitted(omitted)

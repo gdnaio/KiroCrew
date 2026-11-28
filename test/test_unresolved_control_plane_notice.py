@@ -232,7 +232,7 @@ def _guarded_report(backend: str, checkout: Any) -> McpSessionReport:
         _pooled_session_servers_and_ref_spec,
     )
 
-    pooled, ref_spec, mcp_json = _pooled_session_servers_and_ref_spec(
+    pooled, ref_spec, mcp_json, _dropped = _pooled_session_servers_and_ref_spec(
         None, "mine", backend, checkout
     )
     assert ref_spec is not None, "the guard read the authored spec"

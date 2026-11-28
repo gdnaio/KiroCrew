@@ -59,6 +59,7 @@ from kiro_crew.acp.mcp_start_wait import (
     person_waits,
     policy_hidden_servers,
 )
+from kiro_crew.acp.mcp_startable import PrunedServer
 from kiro_crew.acp.member_goal_mount import mount_member_goal_tools
 from kiro_crew.acp.runtime_session_setup import (
     _disable_check_scope,
@@ -284,6 +285,8 @@ async def load_session(
     ref_spec: Any = None
     # The mcp.json servers the spec opts in to, read beside it in the pooled hop.
     mcp_json: tuple[str, ...] = ()
+    # The servers the spec writer dropped for a command not found, read in the same hop.
+    spec_dropped: tuple[PrunedServer, ...] = ()
     # A mirrored host re-declares the array its projection built, not the raw
     # pooled one: session/load re-initializes the session's servers, so an
     # unprojected array here does not merely fail to withhold a stub -- it MOUNTS
@@ -342,9 +345,10 @@ async def load_session(
         mirrored_snapshot = mirrored.derived_spec_snapshot
         consumed_spec = mirrored.agent_spec
         ref_spec = mirrored.ref_spec
+        spec_dropped = mirrored.spec_dropped
     else:
         pool_agent, launch_spec = self._pool_lookup(active_agent)
-        pooled, ref_spec, mcp_json = await asyncio.to_thread(
+        pooled, ref_spec, mcp_json, spec_dropped = await asyncio.to_thread(
             _pooled_session_servers_and_ref_spec,
             self._mcp_gateway_overlay,
             pool_agent,
@@ -695,9 +699,13 @@ async def load_session(
     # session gets its own report against the roster load re-declared. Opened
     # with the queue and no await in between, as create_session does.
     report = self._open_mcp_report(resume_sid, wire_servers)
-    if pruned is not None:
-        # What the array left out is this resume's own failure, on its new report.
-        record_pruned(report, pruned.pruned, pruned.omitted)
+    # What the array left out is this resume's own failure, on its new report: the
+    # prune's servers, and the spec writer's drops, which no array carries.
+    record_pruned(
+        report,
+        (*(pruned.pruned if pruned is not None else ()), *spec_dropped),
+        pruned.omitted if pruned is not None else 0,
+    )
     # A host with per-session state (claude) can start a turn on its own; its
     # queue tells the handle (``session_handle_agent_turns``). One flag read.
     queue: asyncio.Queue[JsonRpcMessage | None] = (

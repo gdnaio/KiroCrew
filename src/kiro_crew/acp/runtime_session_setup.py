@@ -38,11 +38,13 @@ from kiro_crew.acp import kas_engine_features, kas_env_launch, runtime_start
 from kiro_crew.acp.harness import SessionExtras
 from kiro_crew.acp.ipc_pickup import with_ipc_pickups
 from kiro_crew.acp.mcp_mount_check import schedule_mount_check
+from kiro_crew.acp.mcp_prune import spec_dropped_servers
 from kiro_crew.acp.mcp_ref_guard import (
     warn_remote_header_secret_refs,
     warn_unresolved_server_refs,
     warn_unset_env_placeholders,
 )
+from kiro_crew.acp.mcp_startable import PrunedServer
 from kiro_crew.acp.runtime_start import _SESSION_NEW_TIMEOUT, _resolve_start_collect_timeout
 from kiro_crew.acp.session_handle import AcpRuntimeError, AcpSessionHandle
 from kiro_crew.acp.session_mcp import (
@@ -153,12 +155,15 @@ def _pooled_session_servers_and_ref_spec(
     work_dir: str | Path,
     ref_spec: dict[str, Any] | None = None,
     session_key: str = "",
-) -> tuple[list[dict[str, Any]], dict[str, Any] | None, tuple[str, ...]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, tuple[str, ...], tuple[PrunedServer, ...]]:
     """The pooled stub array AND the guard's spec snapshot, from one off-loop hop.
 
     The third element names the ``mcp.json`` servers that spec's opt-in mounts on
     *backend* (:func:`mcp_json_server_names`), read in the same hop for the same
-    reason, and empty when there is no snapshot.
+    reason, and empty when there is no snapshot. The fourth is the servers the spec
+    writer dropped from *agent*'s spec for a command not found
+    (:func:`~kiro_crew.acp.mcp_prune.spec_dropped_servers`), read here too so the
+    session's report can name them as failed with no hop of its own.
 
     Module-level so the hop is one ``to_thread`` call with no closure, and so the
     two reads stay together: adding the snapshot as a second hop would be the
@@ -194,7 +199,12 @@ def _pooled_session_servers_and_ref_spec(
         overlay, agent, **overlay_project_scope(backend, scope_dir), **worker
     )
     spec = ref_spec if ref_spec is not None else _ref_spec_snapshot(agent, work_dir)
-    return servers, spec, mcp_json_server_names(spec, backend, work_dir)
+    return (
+        servers,
+        spec,
+        mcp_json_server_names(spec, backend, work_dir),
+        spec_dropped_servers(agent, spec),
+    )
 
 
 def _kas_worker_stub_names(
@@ -277,6 +287,9 @@ class _MirroredSessionMcp(NamedTuple):
     builtin_tools: tuple[str, ...] | None = None
     """The harness built-ins this session keeps (``SessionProjection.builtin_tools``),
     from the same parse as the array; ``None`` keeps all of them."""
+    spec_dropped: tuple[PrunedServer, ...] = ()
+    """The servers the spec writer dropped for a command not found, read beside
+    :attr:`ref_spec` (``mcp_prune.spec_dropped_servers``); the report names each."""
 
 
 async def _session_work_dir(self: AcpRuntime, cwd: str | Path | None = None) -> str | Path:
@@ -808,7 +821,7 @@ async def _mirrored_session_mcp(
         stubbed = frozenset(str(s["name"]) for s in stubs if s.get("name"))
     stubs, stub_token = await self._own_stub_session(stubs, session_key)
 
-    def _project_and_snapshot() -> tuple[Any, Any, frozenset[str]]:
+    def _project_and_snapshot() -> tuple[Any, Any, frozenset[str], tuple[PrunedServer, ...]]:
         # One hop, two reads of the same file: the projection the array is
         # built from and the snapshot the unresolved-ref guard judges against.
         # Both go through session_mcp's own resolution order, so they resolve
@@ -848,9 +861,10 @@ async def _mirrored_session_mcp(
             from kiro_crew.acp.harness.kas import withdrawn_worker_stubs
 
             withdrawn = withdrawn_worker_stubs(projection.agent_spec or {}, stubbed)
-        return projection, _ref_spec_snapshot(active_agent, work_dir), withdrawn
+        snapshot = _ref_spec_snapshot(active_agent, work_dir)
+        return projection, snapshot, withdrawn, spec_dropped_servers(active_agent, snapshot)
 
-    projection, ref_spec, withdrawn = await asyncio.to_thread(_project_and_snapshot)
+    projection, ref_spec, withdrawn, spec_dropped = await asyncio.to_thread(_project_and_snapshot)
     servers = projection.params.get("mcpServers") or []
     servers = _drop_withdrawn_stubs(list(servers) if isinstance(servers, list) else [], withdrawn)
     crew_bridged: list[str] = []
@@ -947,6 +961,7 @@ async def _mirrored_session_mcp(
         crew_bridged=crew_bridged,
         zero_tools=projection.zero_tools,
         builtin_tools=projection.builtin_tools,
+        spec_dropped=spec_dropped,
     )
 
 
@@ -1344,6 +1359,9 @@ def _guard_unresolved_mcp_refs(
     adds no scheduling point to any host's session start; ``None`` -- no hop
     (a caller-supplied array) or an unreadable spec -- means nothing to say.
     *mcp_json* came from that hop too: the ``mcp.json`` servers the spec opts in to.
+    A server the report already lists as failed because Crew left it out of the
+    array (``crew_left_out``, recorded when the report opened) is configured, so
+    its ref is not also called unconfigured, as on ``AcpClient``.
     Every failure resolves to silence rather than a failed session, because a
     diagnostic that can fail a session is a worse defect than the one it
     detects. It changes nothing: not the array, not the session's fate.
@@ -1351,9 +1369,13 @@ def _guard_unresolved_mcp_refs(
     if spec is None:
         return
     try:
+        left_out = getattr(handle.mcp_session_report(), "crew_left_out", ())
+        configured = wire_servers
+        if left_out and isinstance(wire_servers, (list, tuple)):
+            configured = [*wire_servers, *({"name": name} for name in left_out)]
         unresolved = warn_unresolved_server_refs(
             spec,
-            wire_servers,
+            configured,
             backend=self.acp_backend,
             agent=agent or "",
             gateway_enabled=self._mcp_gateway_overlay is not None,

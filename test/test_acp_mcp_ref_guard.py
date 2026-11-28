@@ -1085,7 +1085,7 @@ class TestTheRuntimeCallSitesAreWired:
             return ["s"]
 
         monkeypatch.setattr(runtime_mod, "pooled_session_servers", _pooled)
-        servers, spec, mcp_json = _pooled_session_servers_and_ref_spec(
+        servers, spec, mcp_json, _dropped = _pooled_session_servers_and_ref_spec(
             None, "kirocrew-worker", "kiro", "/tmp"
         )
         assert servers == ["s"]
@@ -1364,7 +1364,7 @@ class TestServersTheSpecMountsFromMcpJson:
         self._global(tmp_path, monkeypatch)
         monkeypatch.setattr(runtime_mod, "agent_spec_snapshot", lambda _a, **_k: dict(self._SPEC))
         monkeypatch.setattr(runtime_mod, "pooled_session_servers", lambda *_a, **_k: [])
-        servers, spec, mcp_json = runtime_mod._pooled_session_servers_and_ref_spec(
+        servers, spec, mcp_json, _dropped = runtime_mod._pooled_session_servers_and_ref_spec(
             None, "kirocrew", ACP_BACKEND_KIRO, tmp_path / "w"
         )
         rt = AcpRuntime(work_dir="/tmp", acp_backend=ACP_BACKEND_KIRO, expect_mcp_reports=False)

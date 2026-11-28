@@ -19,7 +19,7 @@ Instance fields read: ``_agent``, ``_agent_capabilities``, ``_agent_version``,
 ``_crew_agent``, ``_dead``, ``_entitlement_probe_lock``, ``_expect_mcp_reports``,
 ``_fold_mcp_frame``, ``_hold_project_servers``, ``_host_sends_mcp_init``, ``_initialized``,
 ``_kas_telemetry_sent``,
-``_mcp_gateway_overlay``, ``_mcp_reports``, ``_member_context``, ``_model``, ``_open_mcp_report``,
+``_mcp_gateway_overlay``, ``_member_context``, ``_model``, ``_open_mcp_report``,
 ``_pending_init_notifications``,
 ``_pid``, ``_pool_lookup``, ``_process``, ``_record_tree_in_background``,
 ``_refuse_over_ceiling_start``, ``_remote_session_servers``, ``_remote_workspace_agents``,
@@ -50,7 +50,8 @@ from kiro_crew.acp._dispatch import (
 )
 from kiro_crew.acp.kas_agents import hoist_servers_for_session
 from kiro_crew.acp.kas_settings_mcp import without_excluded_stubs
-from kiro_crew.acp.mcp_prune import prune_session_servers, record_pruned
+from kiro_crew.acp.mcp_prune import PruneResult, prune_session_servers, record_pruned
+from kiro_crew.acp.mcp_startable import PrunedServer
 from kiro_crew.acp.member_goal_mount import mount_member_goal_tools
 from kiro_crew.acp.runtime_models import _substitute_model_from_advisory
 from kiro_crew.acp.runtime_session_setup import (
@@ -347,6 +348,8 @@ async def create_session(
     ref_spec: Any = None
     # The mcp.json servers the spec opts in to, read beside it in the pooled hop.
     mcp_json: tuple[str, ...] = ()
+    # The servers the spec writer dropped for a command not found, read in the same hop.
+    spec_dropped: tuple[PrunedServer, ...] = ()
     # The KAS crewmate worker's stub names, set beside its one overlay lookup.
     worker_stubs: frozenset[str] | None = None
     member_withheld = False
@@ -402,9 +405,10 @@ async def create_session(
             mirrored_snapshot = mirrored.derived_spec_snapshot
             consumed_spec = mirrored.agent_spec
             ref_spec = mirrored.ref_spec
+            spec_dropped = mirrored.spec_dropped
         else:
             pool_agent, launch_spec = self._pool_lookup(agent or self._agent)
-            pooled, ref_spec, mcp_json = await asyncio.to_thread(
+            pooled, ref_spec, mcp_json, spec_dropped = await asyncio.to_thread(
                 _pooled_session_servers_and_ref_spec,
                 self._mcp_gateway_overlay,
                 pool_agent,
@@ -789,6 +793,8 @@ async def create_session(
             mirror_used=mirror_used,
             ref_spec=ref_spec,
             mcp_json=mcp_json,
+            pruned=pruned,
+            spec_dropped=spec_dropped,
             active_agent=active_agent,
             session_work_dir=session_work_dir,
             projected_sources=projected_sources,
@@ -861,6 +867,8 @@ async def create_session(
             mirror_used=mirror_used,
             ref_spec=ref_spec,
             mcp_json=mcp_json,
+            pruned=pruned,
+            spec_dropped=spec_dropped,
             active_agent=active_agent,
             session_work_dir=session_work_dir,
             projected_sources=projected_sources,
@@ -874,11 +882,6 @@ async def create_session(
             start_priority=start_priority,
             prereg_clients=getattr(kas_extras, "mcp_prereg_clients", None),
         )
-        if pruned is not None:
-            # On the report the session opened with: what the array left out failed.
-            report = self._mcp_reports().get(session_id)
-            if report is not None:
-                record_pruned(report, pruned.pruned, pruned.omitted)
         if harness_state is not None:
             # What the host's own setup decided that the handle enforces.
             self._harness.bind_session_handle(harness_state, handle)
@@ -940,6 +943,8 @@ def _collect_late_start(
     mirror_used: bool = False,
     ref_spec: Any,
     mcp_json: tuple[str, ...] = (),
+    pruned: PruneResult | None = None,
+    spec_dropped: tuple[PrunedServer, ...] = (),
     active_agent: str,
     session_work_dir: str | Path,
     projected_sources: dict[str, str],
@@ -1040,6 +1045,8 @@ def _collect_late_start(
                 mirror_used=mirror_used,
                 ref_spec=ref_spec,
                 mcp_json=mcp_json,
+                pruned=pruned,
+                spec_dropped=spec_dropped,
                 active_agent=active_agent,
                 session_work_dir=session_work_dir,
                 projected_sources=projected_sources,
@@ -1112,6 +1119,8 @@ async def _finish_create_session(
     mirror_used: bool = False,
     ref_spec: Any,
     mcp_json: tuple[str, ...] = (),
+    pruned: PruneResult | None = None,
+    spec_dropped: tuple[PrunedServer, ...] = (),
     active_agent: str,
     session_work_dir: str | Path,
     projected_sources: dict[str, str],
@@ -1139,6 +1148,13 @@ async def _finish_create_session(
     # Register the session's queue, and its MCP report with it: no await in
     # between, so a frame that reaches the queue has reached the report.
     report = self._open_mcp_report(session_id, mcp_servers)
+    # What Crew left out of the array failed: the prune's servers, and the spec
+    # writer's drops, which no array carries. A late adoption records them too.
+    record_pruned(
+        report,
+        (*(pruned.pruned if pruned is not None else ()), *spec_dropped),
+        pruned.omitted if pruned is not None else 0,
+    )
     # A host with per-session state (claude) can start a turn on its own; its
     # queue tells the handle (``session_handle_agent_turns``). One flag read.
     queue: asyncio.Queue[JsonRpcMessage | None] = (

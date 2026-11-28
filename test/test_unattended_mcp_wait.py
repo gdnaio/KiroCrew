@@ -252,7 +252,7 @@ def test_the_runtime_waits_for_a_server_only_the_global_mcp_json_defines(tmp_pat
     _global_mcp_json(tmp_path, monkeypatch, {"slow": {"command": "npx"}})
     monkeypatch.setattr(runtime_mod, "agent_spec_snapshot", lambda _a, **_k: dict(_OPTED_IN))
     monkeypatch.setattr(runtime_mod, "pooled_session_servers", lambda *_a, **_k: [])
-    servers, spec, mcp_json = runtime_mod._pooled_session_servers_and_ref_spec(
+    servers, spec, mcp_json, _dropped = runtime_mod._pooled_session_servers_and_ref_spec(
         None, "kirocrew", ACP_BACKEND_KIRO, tmp_path / "work"
     )
     rt, _, _ = _make_runtime()

@@ -591,7 +591,7 @@ class TestTheRealSessionNewRequest:
         monkeypatch.setattr(runtime, "terminate_session", delete)
         monkeypatch.setattr(
             "kiro_crew.acp.runtime._pooled_session_servers_and_ref_spec",
-            lambda *_args: ([], None, ()),
+            lambda *_args: ([], None, (), ()),
         )
         monkeypatch.setattr(runtime, "_unpooled_control_planes", AsyncMock(return_value=[]))
         monkeypatch.setattr(runtime, "_own_stub_session", AsyncMock(return_value=([], "")))
@@ -609,7 +609,7 @@ class TestTheRealSessionNewRequest:
         monkeypatch.setattr(runtime, "evict_session", AsyncMock())
         monkeypatch.setattr(
             "kiro_crew.acp.runtime._pooled_session_servers_and_ref_spec",
-            lambda *_args: ([], None, ()),
+            lambda *_args: ([], None, (), ()),
         )
         monkeypatch.setattr(runtime, "_unpooled_control_planes", AsyncMock(return_value=[]))
         monkeypatch.setattr(runtime, "_own_stub_session", AsyncMock(return_value=([], "")))
