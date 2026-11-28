@@ -38,6 +38,7 @@ from typing import Any, Callable, Optional
 
 from kiro_crew.acp.worker_pool import WorkerPool
 from kiro_crew.agent_sdk.mcp_problems import UNATTENDED_MCP_WAIT_SECS, wait_for_declared_mcp
+from kiro_crew.channel_spec_hooks import SessionSpecGate
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect
 from kiro_crew.messaging.identity import publish_turn_identity
@@ -134,6 +135,7 @@ async def _run_step(
         max_turns=_MAX_TURNS_PER_STEP,
         on_complete=watch.on_complete,
         on_event=step_on_event(key, refusals, opts, provider),
+        spec_hooks=SessionSpecGate(provider, key),
     )
     text = await (asyncio.wait_for(coro, timeout) if timeout is not None else coro)
     if stop is None:

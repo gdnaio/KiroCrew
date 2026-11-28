@@ -1638,7 +1638,11 @@ never spawns `kiro-cli` in tests. Two production adapters:
   restarts at `:0`), released with `cleanup=True` afterwards. A `session=<key>`
   call reuses the named session, which persists so a stateful chain keeps its
   history. Each step runs through `llm_helpers.stream_and_collect` with
-  `AUTO_APPROVE` and `max_turns=_MAX_TURNS_PER_STEP`. A turn that ends `cancelled`
+  `AUTO_APPROVE` and `max_turns=_MAX_TURNS_PER_STEP`. Both executors hand it the
+  step session's `channel_spec_hooks.SessionSpecGate`, which asks the step agent's
+  own spec `preToolUse` hooks first on each permission request of a session that
+  reports Crew firing them, so their exit 2 refuses the call before the automatic
+  approval. A turn that ends `cancelled`
   or `error: cancel unacked` (a gateway stop or session reset cancelled it; a run
   cancel or step timeout cancels the task instead) raises `WorkflowStepInterrupted`
   through `StepStopWatch`, in both executors, so its cut-off text never becomes the

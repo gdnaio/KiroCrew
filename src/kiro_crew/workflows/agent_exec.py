@@ -45,6 +45,7 @@ from kiro_crew.agent_sdk.drivers.acp_vocab import (
     STOP_REASON_CANCELLED,
 )
 from kiro_crew.agent_sdk.mcp_problems import UNATTENDED_MCP_WAIT_SECS, wait_for_declared_mcp
+from kiro_crew.channel_spec_hooks import SessionSpecGate
 from kiro_crew.effort import EFFORT_LEVELS, is_valid_effort
 from kiro_crew.llm_helpers import ToolApprovalPolicy, provider_last_turn_usage, stream_and_collect
 from kiro_crew.security import redact
@@ -469,6 +470,7 @@ def build_agent_fn(
                 max_turns=_MAX_TURNS_PER_STEP,
                 on_complete=stop.on_complete,
                 on_event=step_on_event(key, refusals, opts, provider),
+                spec_hooks=SessionSpecGate(provider, key),
             )
             text = step_text(refusals, text, opts)
             # ── Per-turn usage row: attribute workflow spend. ──
