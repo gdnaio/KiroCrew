@@ -557,7 +557,9 @@ class MemoryConfig:
             "finding instead, and gives an agent-triggered learn_add its own source. "
             "A span with a message from you keeps its tiers; judging each lesson by "
             "your own words is memory.lesson_tier_policy. Stored lessons are never "
-            "changed.",
+            "changed. Whether a kirocrew learn add run counts as an agent's is "
+            "decided by a best-effort check, not a boundary; on Windows it reads "
+            "only the environment Kiro Crew gives an agent's processes.",
             enum=list(LESSON_ORIGIN_GATE_MODES),
         ),
     )
