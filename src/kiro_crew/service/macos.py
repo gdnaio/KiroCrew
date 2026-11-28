@@ -184,13 +184,13 @@ def _write_plist_atomic(contents: str) -> None:
     atomic_write(PLIST_PATH, contents, mode=0o600)
 
 
-def _launchctl(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+def _launchctl(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["launchctl", *args],
         capture_output=True,
         # launchctl writes labels and plist paths as UTF-8 whatever the locale.
         **UTF8_TEXT,
-        check=check,
+        check=False,
     )
 
 

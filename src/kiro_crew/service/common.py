@@ -330,9 +330,11 @@ def service_dotenv(
     """
     source = os.environ if environ is None else environ
     account = source.get("SUDO_USER", "").strip()
-    if account in ("", "root") or _home_override_is_set(environ):
-        return loader.env_path(), ""
-    if (plat or current_platform()) is not Platform.SYSTEMD:
+    if (
+        account in ("", "root")
+        or _home_override_is_set(environ)
+        or (plat or current_platform()) is not Platform.SYSTEMD
+    ):
         return loader.env_path(), ""
     from kiro_crew.service import linux  # circular import: linux imports this module at load
 
