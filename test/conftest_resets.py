@@ -1140,23 +1140,6 @@ def _isolate_context_store_caches(_floor_monkeypatch):
 
 
 @per_test_guard
-def _isolate_kas_approve_for_me():
-    """Drop the approve-for-me owner check and engine answer a test left behind.
-
-    A gateway boot registers an owner check bound to its own ``DashboardState``
-    and may cache the engine's answer; both are process state. Only a module
-    already imported can hold them, so a run that never imports it pays nothing.
-    """
-    module = sys.modules.get("kiro_crew.acp.kas_approve_for_me")
-    if module is not None:
-        module.reset_owner_check()
-    yield
-    module = sys.modules.get("kiro_crew.acp.kas_approve_for_me")
-    if module is not None:
-        module.reset_owner_check()
-
-
-@per_test_guard
 def _isolate_member_identity_cache(_floor_monkeypatch):
     """Give each test an empty cache of passed member-database identity checks.
 
@@ -1407,30 +1390,6 @@ def _reset_persisted_truncation_reports():
         reported = getattr(module, "_PERSISTED_TRUNCATION_REPORTED", None)
         if reported is not None:
             reported.clear()
-
-    clear()
-    try:
-        yield
-    finally:
-        clear()
-
-
-@per_test_guard
-def _reset_kas_parent_notes():
-    """Start each test with no noted sub-agent run parents.
-
-    Every manager run notes the session that started it, keyed by run key. Tests
-    reuse run keys, so a parent one test noted would join the next test's run and
-    hold it to an unrelated agent's denies. The directory noted for a parent goes
-    with it: it would anchor the next test's limits in a folder of this one.
-    """
-
-    def clear():
-        module = sys.modules.get("kiro_crew.acp.kas_parent_limits")
-        if module is not None:
-            module._NOTED.clear()
-            module._NOTED_DIRS.clear()
-            module._INCOMPLETE.clear()
 
     clear()
     try:

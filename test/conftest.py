@@ -329,7 +329,6 @@ from conftest_resets import (  # noqa: E402,F401 -- bound for pytest and importe
     _isolate_advertised_model_cache,
     _isolate_context_store_caches,
     _isolate_display_verdicts,
-    _isolate_kas_approve_for_me,
     _isolate_kiro_window_cache,
     _isolate_member_identity_cache,
     _ledger_create_ignores_live_memory,
@@ -358,7 +357,6 @@ from conftest_resets import (  # noqa: E402,F401 -- bound for pytest and importe
     _reset_degraded_config_observations,
     _reset_env_boot_record_and_ownership,
     _reset_kas_machine_fence_config,
-    _reset_kas_parent_notes,
     _reset_live_execution_records,
     _reset_materialized_agents_snapshot,
     _reset_persisted_truncation_reports,
@@ -379,8 +377,10 @@ from conftest_resets import (  # noqa: E402,F401 -- bound for pytest and importe
 
 # Per-test resets of process-global kiro_crew.acp state.
 from conftest_resets_acp import (  # noqa: E402,F401 -- bound for pytest and importers
+    _isolate_kas_approve_for_me,
     _isolate_kas_model_catalog_recording,
     _reset_kas_agent_config_error_reports,
+    _reset_kas_parent_notes,
     _reset_kas_secret_storage_unknown_kind_warnings,
     _reset_kas_skill_facts,
 )

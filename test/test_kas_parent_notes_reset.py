@@ -2,7 +2,7 @@
 
 ``kas_parent_limits._NOTED`` is filled by every manager run (``note_parent``) and
 keyed by run key, which tests reuse. ``_reset_kas_parent_notes`` in
-``conftest_resets.py`` is the floor's guard for it; the conftest's seal refuses a
+``conftest_resets_acp.py`` is the floor's guard for it; the conftest's seal refuses a
 guard it does not bind, so these tests drive the guard itself.
 """
 
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sys
 
-from conftest_resets import _reset_kas_parent_notes
+from conftest_resets_acp import _reset_kas_parent_notes
 
 from kiro_crew.acp import kas_parent_limits
 
