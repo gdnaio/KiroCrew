@@ -4,7 +4,9 @@ sessions/provider/context."""
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -230,7 +232,7 @@ class FakeConvLog:
         self.appended: list[tuple[str, str, str]] = []
         self.titles: dict[str, str] = {}
 
-    def append(self, key, role, text, agent=None, mid=None) -> None:
+    def append(self, key, role, text, agent=None, mid=None, ingested_images=()) -> None:
         self.appended.append((key, role, text))
 
     def set_title(self, key, title) -> None:
@@ -271,6 +273,11 @@ _SVC = "https://smba.trafficmanager.net/"
 #: of the body. It carries no file, and the ingest skips it as a duplicate of
 #: ``text`` -- so it must not make the message look like an upload either.
 _BODY_ECHO = {"contentType": "text/html", "content": "<p>/help</p>"}
+
+#: A one-pixel PNG: real leading bytes, so the ingest's signature check accepts it.
+_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+)
 
 #: A genuine personal-chat upload, which the ingest fetches.
 _FILE_UPLOAD = {
@@ -315,6 +322,41 @@ class TestTurn:
         assert sessions.released == [key]
         assert (key, "user", "hello") in conv.appended
         assert (key, "assistant", "hi there") in conv.appended
+
+    @pytest.mark.asyncio
+    async def test_a_picture_row_names_a_copy_kept_with_the_session(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The user row names a stored copy, not the temp file the turn deletes."""
+        from kiro_crew.chat_attachments import attachments_dir
+        from kiro_crew.history import ConversationLog
+
+        monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
+        downloaded: list[str] = []
+
+        class _PictureClient(FakeClient):
+            async def download_inbound_file(self, url, dest, *, authenticated=False) -> None:
+                downloaded.append(dest)
+                with open(dest, "wb") as fh:
+                    fh.write(_PNG)
+
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        provider = FakeProvider([AcpEvent(kind=EVENT_COMPLETE)])
+        d = _dispatcher(FakeSessions(provider), FakeCtx(), _PictureClient(), conv_log=log)
+        picture = {"contentType": "image/png", "contentUrl": f"{_SVC}img/1", "name": "shot.png"}
+
+        await d.handle_message(_inbound("look", attachments=[picture]))
+
+        key = d._session_key(_EMAIL)
+        path = log._path(key)
+        rows = log.read_messages(key)
+        user_text = next(row["content"] for row in rows if row.get("role") == "user")
+        store = attachments_dir(path.parent, path.stem)
+        assert store.is_dir(), user_text
+        (stored,) = store.iterdir()
+        stored_dest = str(stored).replace(os.sep, "/")
+        assert user_text.splitlines() == ["look", f"![image]({stored_dest})"]
+        assert downloaded and not os.path.exists(downloaded[0])
 
     @pytest.mark.asyncio
     async def test_agent_resolves_to_kirocrew_when_unset(self) -> None:

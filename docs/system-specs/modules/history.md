@@ -4068,8 +4068,8 @@ Contract:
   `store_image_file` copies each one, its bare path line becomes
   `![image](<stored copy>)`, and its `image_location_note` is dropped, since that
   note holds only until the turn's temp cleanup. A picture that cannot be kept
-  leaves both lines as written, and nothing the user typed is copied. Feishu passes
-  its pictures. A Slack message routed to a linked dashboard slot is stored the same
+  leaves both lines as written, and nothing the user typed is copied. Feishu and
+  Teams pass their pictures. A Slack message routed to a linked dashboard slot is stored the same
   way before the hand-off, through `ConversationLog.store_ingested_images(key,
   content, images)` (the slot saves its own window, so this is the store without the
   append); see [slack-gateway](slack-gateway.md). Telegram calls the same method

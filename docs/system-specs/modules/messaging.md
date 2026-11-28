@@ -6664,7 +6664,11 @@ the identity resolution and the allow-list check have all passed in
 unauthorized sender or a group conversation can never make the gateway fetch
 anything. A file-only activity (attachments, no text) survives the empty-activity
 guard, or the whole message would be discarded. Temp paths are owned by the frame
-that awaits the turn and unlinked in a worker once it returns.
+that awaits the turn and unlinked in a worker once it returns. The turn's persist
+runs before that, and passes the downloaded pictures (`IngestResult.image_paths`) to
+`ConversationLog.append(ingested_images=...)`, so the user row names a copy kept with
+the session rather than the deleted temp file
+([history](history.md#inline-image-attachments-chat_attachmentspy)).
 
 - **A personal-chat upload** arrives as
   `application/vnd.microsoft.teams.file.download.info`, whose `content.downloadUrl`

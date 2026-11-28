@@ -135,7 +135,7 @@ from kiro_crew.teams.session_resume import (
 from kiro_crew.teams.transport import TEAMS_CAPABILITIES, allowed_emails_from_config
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Sequence
 
     from kiro_crew.config.loader import KiroCrewConfig
     from kiro_crew.context import ContextBuilder
@@ -706,9 +706,11 @@ class TeamsDispatcher:
         # the frame that awaits the turn reading the temp files is the one that unlinks
         # them.
         temp_paths: list[str] = []
+        images: list[str] = []
         if inbound.attachments and TEAMS_CAPABILITIES.files_inbound:
             result = await process_teams_attachments(self.client, inbound.attachments)
             temp_paths = list(result.temp_paths)
+            images = list(result.image_paths)
             text = append_attachment_context(text, result)
         try:
             await self._run_turn(
@@ -719,6 +721,7 @@ class TeamsDispatcher:
                 drain=drain,
                 resumed_key=resumed_key,
                 option_session_key=option_session_key,
+                images=images,
             )
         finally:
             if temp_paths:
@@ -736,6 +739,7 @@ class TeamsDispatcher:
         drain: bool,
         resumed_key: str | None = None,
         option_session_key: str | None = None,
+        images: Sequence[str] = (),
     ) -> None:
         """Rotate, build the renderer, drive one turn, then drain what arrived."""
         assert self.client is not None
@@ -843,7 +847,7 @@ class TeamsDispatcher:
                         None
                         if session_restricted
                         else lambda user_text, reply, is_new: self._persist_turn(
-                            session_key, user_text, reply, is_new, agent
+                            session_key, user_text, reply, is_new, agent, images
                         )
                     ),
                     notice=lambda sk, provider: self._maybe_notice(inbound, sk, provider),
@@ -1862,11 +1866,18 @@ class TeamsDispatcher:
         reply_text: str,
         is_new: bool,
         agent: str | None = None,
+        images: Sequence[str] = (),
     ) -> None:
-        """Record the turn to conversation_log (dashboard visibility + restart)."""
+        """Record the turn to conversation_log (dashboard visibility + restart).
+
+        *images* are the pictures downloaded for the message: the log keeps a copy
+        with the session, because the turn deletes their temp files when it ends.
+        """
         if self.conv_log is None:
             return
-        self.conv_log.append(session_key, "user", user_text, agent=agent, mid=mint_row_mid())
+        self.conv_log.append(
+            session_key, "user", user_text, agent=agent, mid=mint_row_mid(), ingested_images=images
+        )
         if reply_text:
             self.conv_log.append(
                 session_key, "assistant", reply_text, agent=agent, mid=mint_row_mid()
