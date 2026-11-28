@@ -31,6 +31,7 @@ from kiro_crew.acp.harness import harness_for
 from kiro_crew.acp.harness.base import SpawnPlan
 from kiro_crew.acp.harness.codex import _read_codex_mcp_disable_overrides
 from kiro_crew.acp.types import ACP_BACKEND_CODEX, ACP_BACKEND_KIRO
+from kiro_crew.mate_worker import MATE_WORKER_AGENT
 
 SQLITE_HOME = "CODEX_SQLITE_HOME"
 
@@ -407,14 +408,13 @@ _TOOLLESS_SPEC = {
 }
 
 
-def _helper_layout(tmp_path: Path, spec: dict) -> tuple[Path, Path]:
+def _helper_layout(tmp_path: Path, spec: dict, agent: str = "helper") -> tuple[Path, Path]:
     """A user config.toml and project .codex/config.toml layers, each with one
-    server, and *spec* as the checkout's own agent ``helper`` (a project-only
-    spec, so its ``includeMcpJson`` must survive the read). Returns (codex home,
-    work dir)."""
+    server, and *spec* as the checkout's own *agent* (a project-only spec, so its
+    ``includeMcpJson`` must survive the read). Returns (codex home, work dir)."""
     work = tmp_path / "repo" / "sub"
     (work / ".kiro" / "agents").mkdir(parents=True)
-    (work / ".kiro" / "agents" / "helper.json").write_text(json.dumps(spec), encoding="utf-8")
+    (work / ".kiro" / "agents" / f"{agent}.json").write_text(json.dumps(spec), encoding="utf-8")
     codex_home = tmp_path / "codex_home"
     codex_home.mkdir()
     (codex_home / "config.toml").write_text(
@@ -432,11 +432,13 @@ def _helper_layout(tmp_path: Path, spec: dict) -> tuple[Path, Path]:
     return codex_home, work
 
 
-async def _helper_spawn_env(codex_home: Path, work: Path, tmp_path: Path) -> dict[str, str]:
+async def _helper_spawn_env(
+    codex_home: Path, work: Path, tmp_path: Path, agent: str = "helper"
+) -> dict[str, str]:
     harness = harness_for(ACP_BACKEND_CODEX)
     await harness.resolve_spawn(
         SpawnContext(
-            agent="helper",
+            agent=agent,
             work_dir=str(work),
             model=None,
             environ={"CODEX_HOME": str(codex_home)},
@@ -468,6 +470,19 @@ async def test_a_spec_that_mounts_anything_keeps_the_operators_servers(
     codex_home, work = _helper_layout(tmp_path, {**_TOOLLESS_SPEC, "tools": ["*"]})
     env = await _helper_spawn_env(codex_home, work, tmp_path)
     assert "CODEX_CONFIG" not in env
+
+
+@pytest.mark.asyncio
+async def test_a_bot_worker_disables_user_and_project_servers(codex_spawn_stubbed, tmp_path):
+    """A Bot's worker mounts its grant, and starts none of the user's or the project's servers."""
+    spec = {**_TOOLLESS_SPEC, "name": MATE_WORKER_AGENT, "tools": ["*"]}
+    codex_home, work = _helper_layout(tmp_path, spec, agent=MATE_WORKER_AGENT)
+    env = await _helper_spawn_env(codex_home, work, tmp_path, agent=MATE_WORKER_AGENT)
+
+    assert "CODEX_CONFIG" in env
+    servers = json.loads(env["CODEX_CONFIG"])["mcp_servers"]
+    assert list(servers) == ["user_srv", "root_srv", "project_srv"]
+    assert all(entry["enabled"] is False for entry in servers.values())
 
 
 def test_project_layers_stop_at_the_git_root(tmp_path):

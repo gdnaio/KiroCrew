@@ -176,6 +176,7 @@ from kiro_crew.acp.types import (
     METHOD_SESSION_UPDATE,
 )
 from kiro_crew.agent_sdk.codex_transcripts import delete_codex_session_files
+from kiro_crew.mate_worker import MATE_WORKER_AGENT
 from kiro_crew.providers.mirrors.codex import drop_unadvertised_transports
 from kiro_crew.sandbox import detect_backend, wrap_argv, wrap_argv_async
 
@@ -674,8 +675,9 @@ class CodexHarness(MembershipHarness):
     #: spawn, or empty string when no override was computed.  Consumed by
     #: :meth:`apply_spawn_env` which runs on the spawn worker after the full env
     #: (including ``agent.env``) is assembled.
-    #: ``(home, work_dir)`` of a helper spawn (background agent or tool-less spec),
-    #: whose MCP servers :meth:`apply_spawn_env` disables; ``None`` otherwise.
+    #: ``(home, work_dir)`` of a helper spawn (background agent, tool-less spec or
+    #: Bot worker), whose MCP servers :meth:`apply_spawn_env` disables; ``None``
+    #: otherwise.
     _helper_spawn: tuple[Path, str | Path | None] | None = None
 
     backend = ACP_BACKEND_CODEX
@@ -779,10 +781,13 @@ class CodexHarness(MembershipHarness):
         is_background = ctx.agent == _bg_agent
         # A tool-less helper (a spec that mounts nothing) gets the same override:
         # it can call no MCP tool, so the operator's servers would start for
-        # nothing. codex keys agent and spec_generation per process,
-        # so no chat shares it.
-        is_helper = is_background or await asyncio.to_thread(
-            _spawn_spec_is_toolless, ctx.agent, ctx.work_dir
+        # nothing. So does a Bot's worker, so from codex-acp 2.8.0 it starts none
+        # of the config.toml servers beside its grant. codex keys agent and
+        # spec_generation per process, so no chat shares it.
+        is_helper = (
+            is_background
+            or ctx.agent == MATE_WORKER_AGENT
+            or await asyncio.to_thread(_spawn_spec_is_toolless, ctx.agent, ctx.work_dir)
         )
 
         # For helper sessions apply_spawn_env reads the user config.toml and the
@@ -801,17 +806,15 @@ class CodexHarness(MembershipHarness):
         # Known residuals: a server renamed after spawn starts its fleet again
         # under the new name until the runtime recycles, and one that switches
         # between command and url under the same name conflicts with the
-        # placeholder until then. This override is lost in a session/new or
-        # a restore that carries mcpServers. codex-acp's createSessionConfig
-        # sets the mcp_servers key of the config overrides that it sends to
-        # codex to those servers alone, and codex loads the config.toml
-        # servers beneath the overrides, so that session starts the
-        # config.toml servers too. A session whose spec mounts anything, a
-        # Bot's worker included, gets no override at all, so codex starts the
-        # config.toml servers beside the servers Crew mounts. A mounted server
-        # takes the place of a config.toml server with the same name
-        # (DISABLE_MCP_CONFIG_FILTERING below). codex-acp 2.3.0 has no
-        # per-session channel that would narrow them.
+        # placeholder until then. A session/new or a restore that carries
+        # mcpServers (a worker's grant) keeps this override from codex-acp
+        # 2.8.0: createSessionConfig writes those servers over the CODEX_CONFIG
+        # mcp_servers table, so a mounted server with a config.toml server's
+        # name still starts (DISABLE_MCP_CONFIG_FILTERING below). Up to 2.7.x
+        # it set that key to the session's servers alone, and codex loads the
+        # config.toml servers beneath the overrides, so such a session starts
+        # them too. Any other spec that mounts anything gets no override, so
+        # codex starts the config.toml servers beside the servers Crew mounts.
         self._helper_spawn = (ctx.home, ctx.work_dir) if is_helper else None
 
         return SpawnPlan(

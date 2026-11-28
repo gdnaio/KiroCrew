@@ -172,17 +172,18 @@ with no mirror, reads the same projection by the worker's key in Crew's own reso
 handoff to the gate extension, its gateway stubs are looked up by its key and
 replace the spec entries of the same name, those stubs pass the worker spec's `tools`
 allowlist, and an unreadable kit or a single-tool limit raises there instead of
-running the worker as plain chat. On codex the worker's
-servers are not the only ones: codex also starts the servers in the operator's
-own `config.toml` beside them. A mounted server takes the place of a
-`config.toml` server with the same name (`DISABLE_MCP_CONFIG_FILTERING`). Crew
-turns the `config.toml` servers off only for a `kirocrew-lite` background
-session, and codex-acp 2.3.0 has no per-session channel that would narrow them
-for a worker (`acp/harness/codex.py`, the `CODEX_CONFIG` residuals). From
+running the worker as plain chat. On codex Crew turns the servers in the
+user's and the project's `config.toml` off for a worker, as for a `kirocrew-lite`
+background session and a tool-less helper, so from codex-acp 2.8.0 none of them
+starts beside the worker's servers. A mounted server takes the place of a
+`config.toml` server with the same name (`DISABLE_MCP_CONFIG_FILTERING`).
+codex-acp 2.7.x and older drop that override for a session that mounts servers,
+so there codex still starts the `config.toml` servers beside them
+(`acp/harness/codex.py`, the `CODEX_CONFIG` residuals). From
 codex-acp 1.8.0 the adapter titles a session after its first turn on its own
 `thread/start`, which carries only `cwd`, so that thread would start the
 `config.toml` servers even for a helper session. Crew therefore names each
-helper session (a background agent or a tool-less spec) with codex-acp's
+helper session (a background agent, a tool-less spec or a worker) with codex-acp's
 `/rename` before its first turn, and the title generator skips a session with an
 explicit title; a chat keeps its generated title, and a refused rename closes the
 session (`CodexHarness.after_session_start`). On claude,
