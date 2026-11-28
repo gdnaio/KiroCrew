@@ -228,8 +228,10 @@ async def get_state_summary(run: Project) -> str:
     if not _git_runs_in_own_worktree(run):
         return ""
     try:
-        log = await _git(run.work_dir, "log", "--oneline", f"{run.base_branch}..HEAD")
-        stat = await _git(run.work_dir, "diff", "--stat", run.base_branch)
+        log = await _git(
+            run.work_dir, "log", "--oneline", f"{run.base_branch}..HEAD", errors="replace"
+        )
+        stat = await _git(run.work_dir, "diff", "--stat", run.base_branch, errors="replace")
     except Exception:
         return ""
     parts = []
@@ -245,7 +247,7 @@ async def get_step_diff(run: Project) -> str:
     if not _git_runs_in_own_worktree(run):
         return ""
     try:
-        return await _git(run.work_dir, "diff", "HEAD~1")
+        return await _git(run.work_dir, "diff", "HEAD~1", errors="replace")
     except Exception:
         return ""
 
@@ -867,8 +869,10 @@ async def _is_git_repo(path: str) -> bool:
             Path(cleanup).unlink(missing_ok=True)
 
 
-async def _git(work_dir: str, *args: str) -> str:
+async def _git(work_dir: str, *args: str, errors: str = "strict") -> str:
     # Agent-influenced git invocation: sandbox + scrubbed env.
+    # ``errors`` decodes stdout only. Output that is compared or reused as a path
+    # keeps "strict"; a read that only feeds a prompt passes "replace".
     argv, env, cleanup = await sandboxed_spawn_argv_async(
         ["git", *args], _prepare=sandboxed_spawn_argv
     )
@@ -886,4 +890,4 @@ async def _git(work_dir: str, *args: str) -> str:
             Path(cleanup).unlink(missing_ok=True)
     if proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {stderr.decode()}")
-    return stdout.decode()
+    return stdout.decode(errors=errors)
