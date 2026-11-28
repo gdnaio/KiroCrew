@@ -521,3 +521,38 @@ def test_the_remove_checks_expand_and_match_the_catalog_once_not_once_per_row(mo
     assert counts["expand"] <= len(catalog) + len(added)
     # Each distinct resource is matched against the catalog once.
     assert counts["match"] <= len(added) * len(catalog)
+
+
+def test_the_summary_resolves_each_catalog_skill_once_however_many_resources(monkeypatch):
+    """Each skill resource is matched against the whole catalog, and a path no
+    glob matches as listed is retried in resolved form. Resolved once per
+    resource, a Bot with ~50 skill resources and a ~1,900-skill catalog spent
+    seconds per Abilities read, so each catalog path is resolved at most once."""
+    from collections import Counter
+    from pathlib import Path
+
+    from kiro_crew import skills as sk
+    from kiro_crew.skill_runtime import catalog as skill_catalog
+
+    root = sk.skills_dir().as_posix()
+    catalog = {f"c{i}": f"skill://{root}/c{i}/SKILL.md" for i in range(200)}
+    added = list(catalog.values())[:20]
+    base = {"mcpServers": {}, "tools": [], "resources": []}
+    file_spec = {"resources": list(added)}
+    monkeypatch.setattr(mate_worker, "member_worker_spec", lambda member: dict(file_spec))
+    monkeypatch.setattr(mate_capabilities, "_load_spec", lambda member: (None, file_spec))
+    _patch_base(monkeypatch, base)
+    resolves: Counter[str] = Counter()
+
+    class CountingPath(type(Path())):
+        def resolve(self, strict=False):
+            resolves[self.as_posix()] += 1
+            return super().resolve(strict=strict)
+
+    monkeypatch.setattr(skill_catalog, "Path", CountingPath)
+
+    rows = mate_capabilities.worker_summary("ben", catalog)["rows"]
+
+    skills = {row["id"]: row for row in rows if row["section"] == "skills"}
+    assert all(skills[f"c{i}"]["state"] == "local" for i in range(20))
+    assert max(resolves[f"{root}/c{i}/SKILL.md"] for i in range(200)) == 1

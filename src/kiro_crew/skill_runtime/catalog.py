@@ -281,7 +281,7 @@ def _with_canonical_globs(
     return out
 
 
-def _matches_any(path: str, globs: list[str]) -> bool:
+def _matches_any(path: str, globs: list[str], resolved: dict[str, str] | None = None) -> bool:
     """True if *path* matches any fnmatch glob in *globs*.
 
     Narrows the injected skills block to an agent template's
@@ -290,15 +290,24 @@ def _matches_any(path: str, globs: list[str]) -> bool:
     listed path. Callers comparing against resolved catalog paths pass the
     globs through :func:`_with_canonical_globs` so a glob spelled through a
     symlink (a symlinked ``$HOME``) matches as well.
+
+    *resolved* memoises each path's resolved form (the path itself when it
+    does not resolve) across the calls of one pass, as that function's cache
+    does for globs: a caller matching one catalog against many resources
+    resolves each path once, not once per resource. Omit it for a one-off call.
     """
     if not path:
         return False
     if any(fnmatch.fnmatch(path, g) for g in globs):
         return True
-    try:
-        real = str(Path(path).resolve(strict=True))
-    except OSError:
-        return False
+    real = resolved.get(path) if resolved is not None else None
+    if real is None:
+        try:
+            real = str(Path(path).resolve(strict=True))
+        except OSError:
+            real = path
+        if resolved is not None:
+            resolved[path] = real
     return real != path and any(fnmatch.fnmatch(real, g) for g in globs)
 
 

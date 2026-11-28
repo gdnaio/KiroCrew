@@ -539,16 +539,17 @@ def worker_summary(member: str, catalog: dict[str, str]) -> dict[str, list[dict]
         skill_path = _path or mate_config_path(member)
         skill_uris = dict.fromkeys([*catalog.values(), *_strs(spec.get("resources"))])
         # Every Remove check below re-derives the granted skills of a candidate
-        # spec, so the catalog is expanded once and each resource's grant is
-        # memoised. A grant is a union over resources: each glob and its
-        # canonical spelling match independently, so ``granted(rs)`` is the
-        # union of ``granted([r])``.
+        # spec, so the catalog is expanded once, each catalog path is resolved
+        # once and each resource's grant is memoised. A grant is a union over
+        # resources: each glob and its canonical spelling match independently,
+        # so ``granted(rs)`` is the union of ``granted([r])``.
         skill_paths = [
             (uri, path)
             for uri in skill_uris
             if (path := expand_skill_uri(uri, skill_path, project_dir=project))
         ]
         canonical_cache: dict[tuple[str, str], str] = {}
+        resolved_paths: dict[str, str] = {}
         granted_by: dict[str, frozenset[str]] = {}
 
         def _granted_by(resource: str) -> frozenset[str]:
@@ -569,7 +570,7 @@ def worker_summary(member: str, catalog: dict[str, str]) -> dict[str, list[dict]
                     keys.update(
                         _skill_key(uri)
                         for uri, path in skill_paths
-                        if _matches_any(path, globs)
+                        if _matches_any(path, globs, resolved_paths)
                         or (
                             aliased
                             and _alias_matches(Path(path), globs, [skills_dir()], roots=alias_roots)
