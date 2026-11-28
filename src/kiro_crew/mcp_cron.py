@@ -28,15 +28,9 @@ from zoneinfo import ZoneInfo
 
 from kiro_crew import _facade_mirror, model_registry
 from kiro_crew.config.loader import config_dir
-from kiro_crew.cron import (
-    _JOB_TIMEOUT_SECS,
-    CronJob,
-    CronService,
-    CronStoreBusy,
-    CronStoreUnreadable,
-    agent_sequence_dispatches,
-    cron_job_id_from_session_key,
-    cron_session_key_is_stable,
+from kiro_crew.cron_service.identity import agent_sequence_dispatches, cron_session_key_is_stable
+from kiro_crew.cron_service.model import _JOB_TIMEOUT_SECS, CronJob
+from kiro_crew.cron_service.schedule import (
     format_schedule,
     get_local_tz,
     is_valid_skip_date,
@@ -46,13 +40,7 @@ from kiro_crew.cron import (
     parse_time_string,
     resolve_timezone_name,
 )
-from kiro_crew.cron_script import (
-    compute_secret_env_pin,
-    delivery_fingerprint,
-    resolve_script_path,
-    validate_secret_env_grant,
-)
-from kiro_crew.cron_trigger import _JOB_ID_RE, trigger_cron_job
+from kiro_crew.cron_service.store import CronStoreBusy, CronStoreUnreadable
 from kiro_crew.mcp_caller import current_caller
 from kiro_crew.mcp_core_parts.identity import (
     _resolve_session_key,
@@ -77,6 +65,7 @@ from kiro_crew.mcp_cron_vet import (
     _vet_cron_capability_governance,
     _vet_script_file,
     _vet_shell_command,
+    resolve_script_path,
 )
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.platform import redact_via_context as redact
@@ -87,6 +76,51 @@ from kiro_crew.validation_parts.field_engine import ValidationError, validate_to
 from kiro_crew.validation_parts.input_bounds import CHANNEL_ID_RE, CHANNEL_MAX_LEN, infer_use_case
 
 logger = logging.getLogger("kiro_crew.mcp_cron")
+
+#: Names only a tool call needs -> the module that defines them. Their modules load the
+#: cron engine, the script runner and the hook graph (about 7 MB RSS), so the server
+#: imports them on first use instead of before its first answer. ``mcp_cron.<name>``
+#: still reads them (the module ``__getattr__`` below), and the tool bodies read them
+#: through :func:`_on_first_use`, which looks in this module's globals first, so a
+#: ``monkeypatch.setattr`` / ``mock.patch`` through the facade still wins.
+_ON_FIRST_USE: dict[str, str] = {
+    "CronService": "kiro_crew.cron",
+    "cron_job_id_from_session_key": "kiro_crew.cron",
+    "compute_secret_env_pin": "kiro_crew.cron_script",
+    "delivery_fingerprint": "kiro_crew.cron_script",
+    "validate_secret_env_grant": "kiro_crew.cron_script",
+    "_JOB_ID_RE": "kiro_crew.cron_trigger",
+    "trigger_cron_job": "kiro_crew.cron_trigger",
+}
+
+if TYPE_CHECKING:  # the names above, for type checkers and IDEs
+    from kiro_crew.cron import CronService, cron_job_id_from_session_key  # noqa: F401
+    from kiro_crew.cron_script import (  # noqa: F401
+        compute_secret_env_pin,
+        delivery_fingerprint,
+        validate_secret_env_grant,
+    )
+    from kiro_crew.cron_trigger import _JOB_ID_RE, trigger_cron_job  # noqa: F401
+
+
+def __getattr__(name: str) -> Any:
+    """Read a name of :data:`_ON_FIRST_USE` from its module, importing it on first use.
+
+    The value is then bound here, as the import on main bound it, so ``vars()``,
+    ``delattr`` and later patches see the module main had.
+    """
+    home = _ON_FIRST_USE.get(name)
+    if home is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(_importlib.import_module(home), name)
+    globals()[name] = value
+    return value
+
+
+def _on_first_use(name: str) -> Any:
+    """*name* as this module binds it now (a patch through the facade), else from its home."""
+    namespace = globals()
+    return namespace[name] if name in namespace else __getattr__(name)
 
 
 def _never_fires_note(job: CronJob) -> str:
@@ -672,7 +706,7 @@ def _owner_unusable_caveat(svc: "CronService", session_key: str, job_id: str) ->
     # and a DURABLE per-agent name for an agent_sequence job -- so counting
     # separators warns the multi-agent case wrongly. See
     # cron.cron_session_key_is_stable, which lives next to both mint sites.
-    caller_job_id = cron_job_id_from_session_key(session_key)
+    caller_job_id = _on_first_use("cron_job_id_from_session_key")(session_key)
     if not caller_job_id:
         return ""
     caller_job = svc.get_job(caller_job_id)
@@ -802,7 +836,7 @@ def _refuse_tool_auto_approval(tool_name: str, args: dict[str, Any]) -> str:
 
 def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
     """Execute a cron tool (post-validation)."""
-    svc = CronService(base_dir=config_dir())
+    svc = _on_first_use("CronService")(base_dir=config_dir())
 
     if name == "cron_list":
         verbose = bool(args.get("verbose", False))
@@ -1360,7 +1394,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         # gate's deliberately vague "job not found". The check inside
         # ``trigger_cron_job`` is the enforcing one; this only makes its reason
         # reachable, since an unknown id never survives the ownership lookup.
-        if not _JOB_ID_RE.fullmatch(jid):
+        if not _on_first_use("_JOB_ID_RE").fullmatch(jid):
             return f"Error: Invalid job ID format: {jid}"
         # Ownership check
         own_err = _check_cron_job_ownership(svc, jid)
@@ -1373,7 +1407,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         # is paired to the instance actually serving and the job runs here.
         port = resolve_serving_port()
         secret_path = config_dir() / ".local_secret"
-        ok, msg = trigger_cron_job(jid, port, secret_path)
+        ok, msg = _on_first_use("trigger_cron_job")(jid, port, secret_path)
         sel().log_api_access(
             caller="mcp",
             operation="cron.trigger",
@@ -1416,7 +1450,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                 "bytes of any helper file the command invokes."
             )
         try:
-            validate_secret_env_grant(secrets)
+            _on_first_use("validate_secret_env_grant")(secrets)
         except ValueError as exc:
             return f"Error: {redact(str(exc))}"
         # Deliberately NO vault-name existence probe here: distinguishing
@@ -1429,14 +1463,14 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             # Pin the REQUEST to the job's current code. Approval re-verifies
             # this pin against the code at approval time, so what the operator
             # blesses is exactly what the agent showed them.
-            pin = compute_secret_env_pin(
+            pin = _on_first_use("compute_secret_env_pin")(
                 sjob.script,
                 sjob.command,
                 sjob.message,
                 job_id=sjob.id,
                 grant=secrets,
                 domain="pending",
-                delivery=delivery_fingerprint(
+                delivery=_on_first_use("delivery_fingerprint")(
                     sjob.session_key,
                     sjob.silent,
                     sjob.channel or "",
@@ -1537,10 +1571,19 @@ for _owner in _OWNERS:
     _importlib.import_module(_owner)
 #: Name the facade serves but does not bind -> the owner that answers a read of it.
 _EXPORTS: dict[str, str] = {}
+# The names read on first use are this module's own and no owner reads them, so they are
+# bound while the mirror takes its index: it files them as facade-only, and a patch of one
+# through the facade (and its undo) stays here instead of creating it in every owner. They
+# are unbound again at once, so the first read imports them through ``__getattr__``.
+globals().update(dict.fromkeys(_ON_FIRST_USE))
 _EXPORTS.update(_facade_mirror.install(_sys.modules[__name__], _OWNERS, excluded=()).served)
+for _first_use_name in _ON_FIRST_USE:
+    del globals()[_first_use_name]
 _sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
 #: What a star import binds: every public name of the unsplit module's namespace.
-__all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("_"))
+__all__ = sorted(
+    n for n in set(globals()) | set(_EXPORTS) | set(_ON_FIRST_USE) if not n.startswith("_")
+)
 
 if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
     from kiro_crew.mcp_cron_chat_folder import (  # noqa: F401
@@ -1635,11 +1678,6 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.config.loader import (  # noqa: F401
         read_local_secret,
     )
-    from kiro_crew.cron import (  # noqa: F401
-        compute_next_run_ts,
-        load_cron_folders,
-        lookup_cron_folder_id,
-    )
     from kiro_crew.cron_history import (  # noqa: F401
         keep_ends,
     )
@@ -1647,10 +1685,17 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         running_note,
         running_since_by_job,
     )
+    from kiro_crew.cron_service.folders import (  # noqa: F401
+        load_cron_folders,
+        lookup_cron_folder_id,
+    )
     from kiro_crew.cron_service.model import (  # noqa: F401
         _ALERT_AFTER_DEFAULT,
         _AUTO_PAUSE_MAX,
         _AUTO_PAUSE_THRESHOLD,
+    )
+    from kiro_crew.cron_service.schedule import (  # noqa: F401
+        compute_next_run_ts,
     )
     from kiro_crew.loopback_http import (  # noqa: F401
         loopback_urlopen,

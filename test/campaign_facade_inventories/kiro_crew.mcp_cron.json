@@ -86,7 +86,7 @@
   "read_local_secret": "kiro_crew.config.loader",
   "redact_log_via_context": "kiro_crew.platform",
   "require_strict_session_key": "kiro_crew.mcp_core",
-  "resolve_script_path": "kiro_crew.cron_script",
+  "resolve_script_path": "kiro_crew.mcp_cron_vet",
   "resolve_serving_port": "kiro_crew.port_resolution",
   "run_mcp_stdio_loop": "kiro_crew.mcp_shared",
   "scan_exfiltration_urls": "kiro_crew.security",

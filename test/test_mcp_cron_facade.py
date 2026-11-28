@@ -249,6 +249,8 @@ def test_every_name_served_from_outside_the_family_is_visible_to_type_checkers()
     served = set(_index().exports)
     expected = {name: home for name, home in _home_imports().items() if name in served}
     assert expected, "no served name comes from outside the family -- the scan went blind"
+    # The facade's own module ``__getattr__`` serves these from their homes on first use.
+    expected.update({name: (home, name) for name, home in mcp_cron._ON_FIRST_USE.items()})
     assert sorted(_LOCALLY_IMPORTED - set(expected)) == []
     for name in _LOCALLY_IMPORTED:
         owner = sys.modules[_index().exports[name]]

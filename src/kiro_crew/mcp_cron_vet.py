@@ -22,8 +22,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from kiro_crew.cron import CronJob, lookup_cron_folder_id
-from kiro_crew.cron_script import resolve_script_path
+from kiro_crew.cron_service.folders import lookup_cron_folder_id
+from kiro_crew.cron_service.model import CronJob
 from kiro_crew.mcp_core_parts.gateway import _post
 from kiro_crew.mcp_core_parts.identity import _resolve_session_key
 from kiro_crew.mcp_cron_shell_scan import (
@@ -714,6 +714,23 @@ def _vet_app_owner_enabled(job: CronJob) -> str | None:
     reason = f"Error: cron is owned by app {redact(app)}, which {verdict}"
     _audit_fire_time_decision(job.id, "app_owner_enabled", "denied", reason)
     return reason
+
+
+def resolve_script_path(
+    script_path: str, *, app_root: Path | None = None, allow_bundle_roots: bool = False
+) -> tuple[str, str]:
+    """``cron_script.resolve_script_path``, read through its facade on each call.
+
+    Importing ``cron_script`` loads the script runner and the hook graph, which
+    listing the cron server's tools never needs, so it is imported here on first use.
+    One binding the family shares, so a patch of ``mcp_cron.resolve_script_path``
+    reaches every reader.
+    """
+    from kiro_crew import cron_script
+
+    return cron_script.resolve_script_path(
+        script_path, app_root=app_root, allow_bundle_roots=allow_bundle_roots
+    )
 
 
 def vet_job_at_fire_time(job: CronJob) -> str | None:

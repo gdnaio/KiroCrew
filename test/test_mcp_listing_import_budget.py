@@ -327,8 +327,10 @@ def test_the_live_hint_readers_are_inside_cores_budget(
 #: Lowered by 29 for ``mcp-guide``, ``mcp-mate``, ``mcp-panel`` and ``mcp-work``: they import
 #: the validation names from the ``validation_parts`` owners, so the facade and the owners
 #: only it loads (cron schemas, member goals, monitoring, the artifact store) stay out.
+#: Lowered by 180 for ``mcp-cron`` (305 loaded): the cron engine, the script runner, the
+#: trigger client and the hook graph load on a tool's first call, not with the handlers.
 HANDLER_MODULE_CEILING = {
-    "mcp-cron": 500,
+    "mcp-cron": 320,
     "mcp-crew-log": 320,
     "mcp-debug": 320,
     "mcp-guide": 351,
@@ -345,6 +347,15 @@ FORBIDDEN_IN_A_SMALL_HANDLER = {
     command: ("kiro_crew.validation", "pysqlite3", "sqlite3")
     for command in ("mcp-guide", "mcp-mate", "mcp-panel", "mcp-work")
 }
+#: ``mcp-cron`` reads its schedule, store and model names from the ``cron_service``
+#: owners and imports the cron engine, the script runner and the trigger client on a
+#: tool's first call, so listing does not pay for them or the hook graph (about 7 MB RSS).
+FORBIDDEN_IN_A_SMALL_HANDLER["mcp-cron"] = (
+    "kiro_crew.cron",
+    "kiro_crew.cron_script",
+    "kiro_crew.cron_trigger",
+    "kiro_crew.hooks",
+)
 
 _HANDLER_PROBE = f"""
 import importlib, json, sys
