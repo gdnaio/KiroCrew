@@ -149,6 +149,8 @@ def _load_sibling(module_name: str, filename: str) -> Any:
     return module
 
 
+# How --base is read, the same in every prepare-pr script.
+_base_ref = _load_sibling("_lr_base_ref", "_base_ref.py")
 # argv[0] resolution and the batch-launcher guard ``run`` applies.
 _tool_argv = _load_sibling("_lr_tool_argv", "_tool_argv.py")
 # The base-side reads of one review, through one git process.
@@ -1517,7 +1519,8 @@ def _assemble(
     # trusted -- the caller's --base, else git's own record of the remote
     # default branch. Deriving it FROM the profile would read review authority
     # out of the branch checkout, which is the input this pinning distrusts.
-    profile_ref = base_ref or resolve_profile.default_base_ref(worktree) or "origin/main"
+    profile_ref = base_ref or resolve_profile.default_base_ref(worktree) or _base_ref.ORIGIN_MAIN
+    profile_ref = _base_ref.base_revision(profile_ref, lambda a: run(["git", *a], cwd=worktree)[0])
     try:
         profile = resolve_profile.resolve(worktree, base_ref=profile_ref)
     except (EnvironmentError, ParityError):
@@ -1552,9 +1555,8 @@ def _assemble(
     # safe -- the profile itself came from `profile_ref`, not the checkout --
     # and it keeps one skill from reviewing against a base its own PR will not
     # target on a repo whose PRs go to a non-default branch.
-    if not base_ref:
-        declared = profile.get("base_branch")
-        base_ref = "origin/{}".format(declared) if declared else profile_ref
+    declared = None if base_ref else profile.get("base_branch")
+    base_ref = "refs/remotes/origin/{}".format(declared) if declared else profile_ref
     rc, base_sha, _ = run(["git", "merge-base", "HEAD", base_ref], cwd=worktree)
     if rc != 0 or not base_sha.strip():
         raise EnvironmentError(
