@@ -551,6 +551,7 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
     from kiro_crew.platform_compat_ports import (  # noqa: F401
         _LOOPBACK_COVERING_ADDRESSES,
         _LSOF_TIMEOUT_SECS,
+        _PROC_NET_TCP_PASSES,
         _WINDOWS_ERROR_INSUFFICIENT_BUFFER,
         _WINDOWS_TCP_STATE_ESTABLISHED,
         _WINDOWS_TCP_STATE_LISTEN,

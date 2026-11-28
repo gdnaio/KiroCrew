@@ -268,7 +268,7 @@ _MOVED: dict[str, tuple[str, ...]] = {
         _WINDOWS_TCP_STATE_LISTEN _WINDOWS_TCP_STATE_ESTABLISHED _WINDOWS_TCP_TABLE_MAX_BYTES
         _WINDOWS_ERROR_INSUFFICIENT_BUFFER _windows_tcp_owner_rows get_tcp_peer_pid
         listening_pid_tool listening_pid_tool_available PortListener
-        _LOOPBACK_COVERING_ADDRESSES _LSOF_TIMEOUT_SECS _normalize_local_address
+        _LOOPBACK_COVERING_ADDRESSES _LSOF_TIMEOUT_SECS _PROC_NET_TCP_PASSES _normalize_local_address
         address_covers_loopback loopback_owner_pids probe_port_listeners
         _linux_loopback_listener_inodes _windows_loopback_listener_owner_pids
         process_owns_loopback_listener process_owns_port_listener find_port_listeners
