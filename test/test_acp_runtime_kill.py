@@ -746,8 +746,9 @@ async def test_kill_releases_stdin_so_the_tree_a_dead_root_left_reads_eof(monkey
         )
     finally:
         if _still_running(child, child_start):
-            # The child still holds the group the root led, so its number is still ours.
-            os.killpg(proc.pid, signal.SIGKILL)
+            # The child holds the group the root led, unless init reaped it after that read.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
 
 
 #: On SIGTERM, closes its stdio -- the pipes the root's transport waits on -- and
@@ -991,7 +992,8 @@ async def test_kill_ends_a_job_the_root_left_in_its_session_outside_its_group(mo
     finally:
         for root, leftover, leftover_start in started:
             if _still_running(leftover, leftover_start):
-                os.kill(leftover, signal.SIGKILL)
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(leftover, signal.SIGKILL)
             if root.returncode is None:
                 # The root leads its own group, so its number is still ours to signal.
                 os.killpg(root.pid, signal.SIGKILL)
