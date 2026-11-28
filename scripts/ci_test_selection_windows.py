@@ -16,11 +16,27 @@ No lane runs fewer tests because of it.
    (`scripts/ci_test_data_readers.py`): what they read is the same on Windows;
 5. the test files the map has no entry for: it cannot say what they run;
 6. tiers A to D of the OS-sensitive changed files scored as a diff of their own:
-   a changed `.py` file the bundle's `os_sensitive` table names, or one whose
-   added lines hit a pattern of `ci_test_os_tables` (W1, W2 or W3). The added
-   lines are matched as they are, comments included, and with no added lines
-   to read every changed `.py` file counts: both err toward more tests;
+   a changed `.py` file the bundle's `os_sensitive` table names, one whose
+   added lines hit a pattern of `ci_test_os_tables` (W1, W2 or W3), or one
+   whose added lines call into a file the table names (`calls_into`). The
+   added lines are matched as they are, comments included, and with no added
+   lines to read every changed `.py` file counts: both err toward more tests;
 minus the files Windows never collects (`test/windows-collect-ignore.txt`).
+
+`calls_into`. A file can act differently on Windows with nothing in its own text
+saying so: it calls a function that branches on the OS in another file. A
+changed file counts when the lines the diff adds to it use, outside a comment,
+
+* a name it imports from a module whose file the `os_sensitive` table names,
+  where that file defines the name as a function or a class
+  (`from kiro_crew.lock import held`, then `held()`); or
+* an attribute of such a module it imports, defined there the same way
+  (`from kiro_crew import lock` or `import kiro_crew.lock`, then
+  `lock.held()`).
+
+The imports are read from the file at the head and the definitions from the
+imported file there. A name is followed one step, to the module the import
+names: a name that module only passes on from a third is not followed.
 
 The verdict is `full`, first match wins, when
 * the Linux verdict is `full` (`linux_full`);
@@ -37,6 +53,7 @@ does (`ci_test_map.node_weights`).
 
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 from collections.abc import Callable, Iterable, Mapping
@@ -164,16 +181,101 @@ def is_stale(built_at: object, at: datetime) -> bool:
         return True
 
 
+Source = Callable[[str], "str | None"]
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _module_files(module: str) -> tuple[str, str]:
+    """The two files a dotted module of the source tree can be."""
+    stem = "src/" + module.replace(".", "/")
+    return stem + ".py", stem + "/__init__.py"
+
+
+def _defined(text: str | None) -> set[str]:
+    """The functions and classes a file's text defines at its top level."""
+    try:
+        tree = ast.parse(text or "")
+    except (SyntaxError, ValueError):
+        return set()
+    kinds = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    return {node.name for node in tree.body if isinstance(node, kinds)}
+
+
+def calls_into(path: str, added: str, table: Mapping[str, Any], source: Source) -> bool:
+    """Whether the lines a diff adds to `path` use a function or class of an OS-sensitive file.
+
+    `source` gives a file's text at the head, None when it is not there. A file
+    that does not parse, the changed one or an imported one, brings nothing.
+    """
+    code = "\n".join(line.split("#", 1)[0] for line in added.splitlines())
+    words = set(_WORD.findall(code))
+    if not words:
+        return False
+    try:
+        tree = ast.parse(source(path) or "")
+    except (SyntaxError, ValueError):
+        return False
+    package = (
+        path[len("src/") :].rsplit("/", 1)[0].replace("/", ".") if path.startswith("src/") else ""
+    )
+    defined: dict[str, set[str]] = {}
+
+    def has(file: str, name: str) -> bool:
+        if file not in table:
+            return False
+        if file not in defined:
+            defined[file] = _defined(source(file))
+        return name in defined[file]
+
+    def attribute(local: str, files: tuple[str, str]) -> bool:
+        named = re.findall(r"(?<![\w.])" + re.escape(local) + r"\.([A-Za-z_][A-Za-z0-9_]*)", code)
+        return any(has(file, name) for file in files for name in named)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if attribute(alias.asname or alias.name, _module_files(alias.name)):
+                    return True
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level:
+                parts = package.split(".") if package else []
+                parts = parts[: len(parts) - (node.level - 1)] if node.level > 1 else parts
+                module = ".".join([*parts, module] if module else parts)
+            if not module:
+                continue
+            for alias in node.names:
+                local = alias.asname or alias.name
+                if local in words and any(has(f, alias.name) for f in _module_files(module)):
+                    return True
+                if attribute(local, _module_files(f"{module}.{alias.name}")):
+                    return True
+    return False
+
+
 def os_sensitive_changes(
-    changes: Changes, table: Mapping[str, Any], added: Mapping[str, str] | None
+    changes: Changes,
+    table: Mapping[str, Any],
+    added: Mapping[str, str] | None,
+    source: Source | None = None,
 ) -> Changes:
-    """The changed `.py` files, tests apart, that can act differently on Windows."""
+    """The changed `.py` files, tests apart, that can act differently on Windows.
+
+    `source` gives a file's text at the head; without it no file counts for
+    calling into another (`calls_into`).
+    """
     picked: Changes = []
     for status, paths in changes:
         path = paths[-1] if paths else ""
         if not path.endswith(".py") or ctm.is_test_file(path):
             continue
-        if path in table or added is None or ost.tier_of(added.get(path, "")) is not None:
+        lines = None if added is None else added.get(path, "")
+        if (
+            path in table
+            or lines is None
+            or ost.tier_of(lines) is not None
+            or (source is not None and calls_into(path, lines, table, source))
+        ):
             picked.append((status, paths))
     return picked
 
@@ -192,6 +294,7 @@ def block(
     score: Callable[[Changes], Mapping[str, Any]],
     readers: Iterable[str] = (),
     unknown: Iterable[str] = (),
+    source: Source | None = None,
 ) -> dict[str, Any]:
     """The `windows` block for one diff the scorer gave the verdict body `linux`.
 
@@ -199,7 +302,8 @@ def block(
     did this one; `added` is `added_lines` of the diff, None when there are none
     to read; `at` is the head's commit time; `readers` is the test files that
     read a changed doc or frontend file (`ci_test_map.data_rows`); `unknown` is
-    the test files the map has no entry for.
+    the test files the map has no entry for; `source` gives a file's text at
+    the head, for `calls_into`.
     """
     if linux["verdict"] != "select":
         return full(f"linux_full: {linux['reason']}")
@@ -224,7 +328,7 @@ def block(
     run |= set(readers)
     # The map cannot say what a test file it has no entry for runs, on any system.
     run |= set(unknown)
-    sensitive = os_sensitive_changes(changes, bundle["os_sensitive"], added)
+    sensitive = os_sensitive_changes(changes, bundle["os_sensitive"], added, source)
     if sensitive:
         scored = score(sensitive)
         if scored["verdict"] != "select":

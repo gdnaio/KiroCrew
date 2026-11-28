@@ -596,7 +596,16 @@ def _windows_block(
         score=lambda part: tiered(part, within=named),
         readers=rule.tests(data) if rule is not None and data else (),
         unknown=[t for kind in ctm.unknown_tests(tests[0], counts, ()).values() for t in kind],
+        source=(lambda path: _head_text(root, path)) if base and head else None,
     )
+
+
+def _head_text(root: Path, path: str) -> str | None:
+    """A file's text in the checkout, which is the head's (`check_checkout`); None when absent."""
+    try:
+        return (root / path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
 
 
 def run(args: argparse.Namespace, grep: Grep = git_grep) -> dict[str, Any]:

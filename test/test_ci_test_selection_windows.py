@@ -164,6 +164,100 @@ def test_added_lines_are_read_per_file_from_a_zero_context_diff() -> None:
     assert win.added_lines(diff) == {"src/a.py": "new\n+++ plus\n", "b.py": "only\n"}
 
 
+# -- a changed file that calls into an OS-sensitive file ----------------------
+
+GROWN = "src/kiro_crew/grown.py"
+# The head's files: `lock.py` is the OS-sensitive one (BUNDLE), `plain.py` is not.
+HEAD = {
+    "src/kiro_crew/lock.py": (
+        "import fcntl\n\n\ndef lock_default():\n    return 1\n\n\n"
+        "class Held:\n    pass\n\n\nLIMIT = 3\n"
+    ),
+    "src/kiro_crew/plain.py": "def lock_default():\n    return 2\n\n\ndef plain_default():\n    return 3\n",
+    "src/kiro_crew/passes_on.py": "from kiro_crew.lock import lock_default\n",
+}
+
+
+def _calls(source: str, added: str, head: dict[str, str] | None = None) -> bool:
+    """Whether `grown.py`, holding `source` at the head, counts for the lines `added` to it."""
+    files = {**(head or HEAD), GROWN: source}
+    block = _block(f"M\t{GROWN}\n", added={GROWN: added}, source=files.get)
+    assert block["verdict"] == "select"
+    assert win.calls_into(GROWN, added, BUNDLE["os_sensitive"], files.get) is (
+        "test/test_named.py" in block["run"]
+    )
+    return "test/test_named.py" in block["run"]
+
+
+def test_a_file_that_calls_a_function_of_an_os_sensitive_file_brings_its_tests_to_windows() -> None:
+    """A file that calls an OS-sensitive file's function says nothing of the OS in its own lines.
+
+    The table does not name it and its added lines hit no pattern, so before this
+    rule the tests the map links to it stayed off Windows.
+    """
+    imported = "from kiro_crew.lock import lock_default\n"
+    call = "    cfg.agent.allow = lock_default()\n"
+    assert cts.ost.tier_of(imported + call) is None
+    assert GROWN not in BUNDLE["os_sensitive"] and "src/kiro_crew/lock.py" in BUNDLE["os_sensitive"]
+    assert "test/test_named.py" in _ad(f"M\t{GROWN}\n")
+    body = "def build(cfg):\n" + call
+    # The import and the call are both added; or the import was there and the call is added.
+    assert _calls(imported + body, imported + call)
+    assert _calls(imported + "x = 1\n" + body, call)
+    # A class counts as a function does, under the name the file gives it.
+    assert _calls("from kiro_crew.lock import Held as Kept\n", "    held = Kept()\n")
+    # A relative import of the same module.
+    assert _calls("from .lock import lock_default\n", call)
+    assert _calls("from . import lock\n", "    x = lock.lock_default()\n")
+
+
+def test_an_attribute_of_an_imported_os_sensitive_module_brings_its_tests_to_windows() -> None:
+    """The module form of the same call: import the module, then `module.name`."""
+    call = "    cfg.agent.allow = lock.lock_default()\n"
+    assert cts.ost.tier_of("from kiro_crew import lock\n" + call) is None
+    assert _calls("from kiro_crew import lock\n", call)
+    assert _calls("import kiro_crew.lock\n", "    x = kiro_crew.lock.lock_default()\n")
+    assert _calls("import kiro_crew.lock as held\n", "    x = held.Held()\n")
+    # An attribute the module does not define as a function or class, the same attribute of
+    # a module that is not OS-sensitive, and an attribute of something else of that name.
+    assert not _calls("from kiro_crew import lock\n", "    x = lock.other_name()\n")
+    assert not _calls("from kiro_crew import lock\n", "    x = lock.LIMIT\n")
+    assert not _calls("from kiro_crew import plain\n", "    x = plain.lock_default()\n")
+    assert not _calls("from kiro_crew import lock\n", "    x = self.lock.lock_default()\n")
+    assert not _calls("from kiro_crew import lock\n", "    x = padlock.lock_default()\n")
+
+
+def test_a_name_that_is_not_an_os_sensitive_files_own_brings_nothing() -> None:
+    call = "    x = lock_default()\n"
+    # The same name from a file the table does not name.
+    assert not _calls("from kiro_crew.plain import lock_default\n", call)
+    # A name the changed file defines itself, and one it never imports.
+    assert not _calls("def lock_default():\n    return 1\n", call)
+    assert not _calls("x = 1\n", call)
+    # Imported from the OS-sensitive file, and not used in the added lines.
+    assert not _calls("from kiro_crew.lock import lock_default\n", "    x = 1\n")
+    assert not _calls("from kiro_crew.lock import lock_default\n", "    x = 1  # lock_default()\n")
+    assert not _calls("from kiro_crew.lock import lock_default\n", "")
+    # A name the OS-sensitive file holds and does not define as a function or a class.
+    assert not _calls("from kiro_crew.lock import LIMIT\n", "    x = LIMIT\n")
+    # A name followed one step: a module that only passes it on is not the file that defines it.
+    assert not _calls("from kiro_crew.passes_on import lock_default\n", call)
+
+
+def test_a_file_that_does_not_parse_or_is_not_there_brings_nothing() -> None:
+    call = "    x = lock_default()\n"
+    imported = "from kiro_crew.lock import lock_default\n"
+    assert not _calls("def broken(:\n" + imported, call)
+    assert not _calls(imported, call, head={**HEAD, "src/kiro_crew/lock.py": "def broken(:\n"})
+    gone = {name: text for name, text in HEAD.items() if name != "src/kiro_crew/lock.py"}
+    assert not _calls(imported, call, head=gone)
+    # With no file text to read, the rule is off and the others still decide.
+    diff = f"M\t{GROWN}\n"
+    assert "test/test_named.py" not in _block(diff, added={GROWN: imported + call})["run"]
+    assert "test/test_named.py" in _block(diff, added={GROWN: "import fcntl\n"})["run"]
+    assert "test/test_lock.py" in _block("M\tsrc/kiro_crew/lock.py\n", source=HEAD.get)["run"]
+
+
 @pytest.mark.parametrize("table", win.TABLES)
 @pytest.mark.parametrize("without", ["left out", None, {}, []])
 def test_an_absent_table_is_a_full_windows_verdict(table: str, without: object) -> None:
@@ -409,6 +503,29 @@ def test_the_cli_writes_the_block_and_prints_its_reason_and_share(
     by_file = _score(repo, tmp_path, fresh, "--name-status", str(diff))["windows"]
     assert set(by_file["run"]) == _ad("M\tsrc/kiro_crew/plain.py\n") - IGNORED
     assert _score(repo, tmp_path, old, "--name-status", str(diff))["windows"]["verdict"] == "full"
+
+
+def test_the_cli_reads_a_call_into_an_os_sensitive_file_from_the_checkout(
+    repo: Path, tmp_path: Path
+) -> None:
+    bundle = {**BUNDLE, "guard": GUARD, "built_at": NOW.isoformat()}
+    _write(repo, {"src/kiro_crew/lock.py": "def lock_default():\n    return 1\n"})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "the file the table names", when=NOW - timedelta(hours=1))
+    base = _git(repo, "rev-parse", "HEAD")
+    called = "from kiro_crew.lock import lock_default\n\nx = lock_default()\n"
+    _write(repo, {"src/kiro_crew/grown.py": called})
+    _git(repo, "commit", "-qam", "head", when=NOW)
+
+    block = _score(repo, tmp_path, bundle, "--base", base, "--head", "HEAD")["windows"]
+
+    assert block["verdict"] == "select" and "test/test_named.py" in block["run"]
+    # The same diff given as a file has no head to read: every `.py` file counts already.
+    plain = "x = 2\n"
+    _write(repo, {"src/kiro_crew/grown.py": plain})
+    _git(repo, "commit", "-qam", "no call", when=NOW)
+    quiet = _score(repo, tmp_path, bundle, "--base", base, "--head", "HEAD")["windows"]
+    assert quiet["verdict"] == "select" and "test/test_named.py" not in quiet["run"]
 
 
 def test_the_guard_tier_of_the_block_is_the_one_the_diff_was_scored_with(
